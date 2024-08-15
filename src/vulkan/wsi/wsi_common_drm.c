@@ -45,6 +45,9 @@
 static VkResult
 wsi_dma_buf_export_sync_file(int dma_buf_fd, int *sync_file_fd)
 {
+   #ifdef HAVE_FREEDRENO_KGSL
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   #endif
    /* Don't keep trying an IOCTL that doesn't exist. */
    static bool no_dma_buf_sync_file = false;
    if (no_dma_buf_sync_file)
@@ -73,6 +76,9 @@ wsi_dma_buf_export_sync_file(int dma_buf_fd, int *sync_file_fd)
 static VkResult
 wsi_dma_buf_import_sync_file(int dma_buf_fd, int sync_file_fd)
 {
+   #ifdef HAVE_FREEDRENO_KGSL
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   #endif
    /* Don't keep trying an IOCTL that doesn't exist. */
    static bool no_dma_buf_sync_file = false;
    if (no_dma_buf_sync_file)

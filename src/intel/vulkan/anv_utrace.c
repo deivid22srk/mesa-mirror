@@ -50,7 +50,19 @@ union anv_utrace_timestamp {
     *        [2] = 32b Context Timestamp End
     *        [3] = 32b Global Timestamp End"
     */
-   uint32_t compute_walker[8];
+   uint32_t gfx125_postsync_data[4];
+
+   /* Timestamp written by COMPUTE_WALKER::PostSync
+    *
+    * BSpec 56591:
+    *
+    *    "The timestamp layout :
+    *       [0] = 64b Context Timestamp Start
+    *       [1] = 64b Global Timestamp Start
+    *       [2] = 64b Context Timestamp End
+    *       [3] = 64b Global Timestamp End"
+    */
+   uint64_t gfx20_postsync_data[4];
 };
 
 static uint32_t
@@ -86,9 +98,6 @@ anv_utrace_delete_submit(struct u_trace_context *utctx, void *submit_data)
 
    anv_state_stream_finish(&submit->dynamic_state_stream);
    anv_state_stream_finish(&submit->general_state_stream);
-
-   if (submit->trace_bo)
-      anv_bo_pool_free(&device->utrace_bo_pool, submit->trace_bo);
 
    anv_async_submit_fini(&submit->base);
 
@@ -170,7 +179,7 @@ anv_device_utrace_flush_cmd_buffers(struct anv_queue *queue,
       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    result = anv_async_submit_init(&submit->base, queue,
-                                  &device->utrace_bo_pool,
+                                  &device->batch_bo_pool,
                                   false, true);
    if (result != VK_SUCCESS)
       goto error_async;
@@ -179,12 +188,6 @@ anv_device_utrace_flush_cmd_buffers(struct anv_queue *queue,
 
    struct anv_batch *batch = &submit->base.batch;
    if (utrace_copies > 0) {
-      result = anv_bo_pool_alloc(&device->utrace_bo_pool,
-                                 utrace_copies * 4096,
-                                 &submit->trace_bo);
-      if (result != VK_SUCCESS)
-         goto error_sync;
-
       anv_state_stream_init(&submit->dynamic_state_stream,
                             &device->dynamic_state_pool, 16384);
       anv_state_stream_init(&submit->general_state_stream,
@@ -228,7 +231,7 @@ anv_device_utrace_flush_cmd_buffers(struct anv_queue *queue,
                                            ANV_INTERNAL_KERNEL_MEMCPY_COMPUTE,
                                            &copy_kernel);
          if (ret != VK_SUCCESS)
-            goto error_batch;
+            goto error_sync;
 
          trace_intel_begin_trace_copy_cb(&submit->ds.trace, batch);
 
@@ -266,7 +269,7 @@ anv_device_utrace_flush_cmd_buffers(struct anv_queue *queue,
 
       if (batch->status != VK_SUCCESS) {
          result = batch->status;
-         goto error_batch;
+         goto error_sync;
       }
 
       intel_ds_queue_flush_data(&queue->ds, &submit->ds.trace, &submit->ds,
@@ -284,8 +287,6 @@ anv_device_utrace_flush_cmd_buffers(struct anv_queue *queue,
 
    return VK_SUCCESS;
 
- error_batch:
-   anv_bo_pool_free(&device->utrace_bo_pool, submit->trace_bo);
  error_sync:
    intel_ds_flush_data_fini(&submit->ds);
    anv_async_submit_fini(&submit->base);
@@ -410,8 +411,15 @@ anv_utrace_read_ts(struct u_trace_context *utctx,
    if (ts->timestamp == U_TRACE_NO_TIMESTAMP)
       return U_TRACE_NO_TIMESTAMP;
 
-   /* Detect a 16bytes timestamp write */
-   if (ts->compute_walker[2] != 0 || ts->compute_walker[3] != 0) {
+   /* Detect a 16/32 bytes timestamp write */
+   if (ts->gfx20_postsync_data[1] != 0 ||
+       ts->gfx20_postsync_data[2] != 0 ||
+       ts->gfx20_postsync_data[3] != 0) {
+      if (device->info->ver >= 20) {
+         return intel_device_info_timebase_scale(device->info,
+                                                 ts->gfx20_postsync_data[3]);
+      }
+
       /* The timestamp written by COMPUTE_WALKER::PostSync only as 32bits. We
        * need to rebuild the full 64bits using the previous timestamp. We
        * assume that utrace is reading the timestamp in order. Anyway
@@ -420,7 +428,7 @@ anv_utrace_read_ts(struct u_trace_context *utctx,
        */
       uint64_t timestamp =
          (submit->last_full_timestamp & 0xffffffff00000000) |
-         (uint64_t) ts->compute_walker[3];
+         (uint64_t) ts->gfx125_postsync_data[3];
 
       return intel_device_info_timebase_scale(device->info, timestamp);
    }
@@ -580,7 +588,7 @@ anv_queue_trace(struct anv_queue *queue, const char *label, bool frame, bool beg
       return;
 
    result = anv_async_submit_init(&submit->base, queue,
-                                  &device->utrace_bo_pool,
+                                  &device->batch_bo_pool,
                                   false, true);
    if (result != VK_SUCCESS)
       goto error_async;

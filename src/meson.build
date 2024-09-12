@@ -104,7 +104,11 @@ if with_gallium_asahi or with_tools.contains('asahi')
 endif
 if with_gallium
   subdir('mesa')
+endif
+if with_gallium_or_lvp
   subdir('gallium')
+endif
+if with_gallium
   # This has to be here since it requires libgallium, and subdir cannot
   # contain ..
   if with_tests
@@ -112,11 +116,6 @@ if with_gallium
   endif
   if with_tests and with_shared_glapi
     subdir('mesa/state_tracker/tests')
-  endif
-  if with_dri
-    if with_gallium or with_gbm or with_platform_wayland
-      subdir('loader_dri3')
-    endif
   endif
 endif
 if with_glx == 'dri'

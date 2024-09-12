@@ -69,14 +69,26 @@ struct nvk_root_descriptor_table {
 #define nvk_root_descriptor_offset(member)\
    offsetof(struct nvk_root_descriptor_table, member)
 
+enum ENUM_PACKED nvk_descriptor_set_type {
+   NVK_DESCRIPTOR_SET_TYPE_NONE,
+   NVK_DESCRIPTOR_SET_TYPE_SET,
+   NVK_DESCRIPTOR_SET_TYPE_PUSH,
+   NVK_DESCRIPTOR_SET_TYPE_BUFFER,
+};
+
+struct nvk_descriptor_set_binding {
+   enum nvk_descriptor_set_type type;
+   struct nvk_descriptor_set *set;
+   struct nvk_push_descriptor_set *push;
+};
+
 struct nvk_descriptor_state {
    alignas(16) char root[sizeof(struct nvk_root_descriptor_table)];
    void (*flush_root)(struct nvk_cmd_buffer *cmd,
                       struct nvk_descriptor_state *desc,
                       size_t offset, size_t size);
 
-   struct nvk_descriptor_set *sets[NVK_MAX_SETS];
-   struct nvk_push_descriptor_set *push[NVK_MAX_SETS];
+   struct nvk_descriptor_set_binding sets[NVK_MAX_SETS];
    uint32_t push_dirty;
 };
 
@@ -147,6 +159,8 @@ struct nvk_rendering_state {
    struct nvk_attachment color_att[NVK_MAX_RTS];
    struct nvk_attachment depth_att;
    struct nvk_attachment stencil_att;
+
+   bool all_linear;
 };
 
 struct nvk_graphics_state {
@@ -185,6 +199,7 @@ struct nvk_cmd_buffer {
    struct vk_command_buffer vk;
 
    struct {
+      uint64_t descriptor_buffers[NVK_MAX_SETS];
       struct nvk_graphics_state gfx;
       struct nvk_compute_state cs;
    } state;
@@ -331,6 +346,13 @@ uint64_t
 nvk_cmd_buffer_get_cbuf_descriptor_addr(struct nvk_cmd_buffer *cmd,
                                         const struct nvk_descriptor_state *desc,
                                         const struct nvk_cbuf *cbuf);
+
+void nvk_cmd_dispatch_shader(struct nvk_cmd_buffer *cmd,
+                             struct nvk_shader *shader,
+                             const void *push_data, size_t push_size,
+                             uint32_t groupCountX,
+                             uint32_t groupCountY,
+                             uint32_t groupCountZ);
 
 void nvk_meta_resolve_rendering(struct nvk_cmd_buffer *cmd,
                                 const VkRenderingInfo *pRenderingInfo);

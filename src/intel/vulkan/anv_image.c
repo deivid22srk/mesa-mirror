@@ -668,11 +668,9 @@ add_aux_state_tracking_buffer(struct anv_device *device,
       binding = ANV_IMAGE_MEMORY_BINDING_PRIVATE;
    }
 
-   /* We believe that 256B alignment may be sufficient, but we choose 4K due to
-    * lack of testing.  And MI_LOAD/STORE operations require dword-alignment.
-    */
+   /* The indirect clear color BO requires 64B-alignment on gfx11+. */
    return image_binding_grow(device, image, binding,
-                             state_offset, state_size, 4096,
+                             state_offset, state_size, 64,
                              &image->planes[plane].fast_clear_memory_range);
 }
 
@@ -690,6 +688,29 @@ add_compression_control_buffer(struct anv_device *device,
                              INTEL_AUX_MAP_MAIN_SIZE_SCALEDOWN,
                              INTEL_AUX_MAP_META_ALIGNMENT_B,
                              &image->planes[plane].compr_ctrl_memory_range);
+}
+
+static bool
+want_hiz_wt_for_image(const struct intel_device_info *devinfo,
+                      const struct anv_image *image)
+{
+   /* Gen12 only supports single-sampled while Gen20+ supports
+    * multi-sampled images.
+    */
+   if (devinfo->ver < 20 && image->vk.samples > 1)
+      return false;
+
+   if ((image->vk.usage & (VK_IMAGE_USAGE_SAMPLED_BIT |
+                           VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT)) == 0)
+      return false;
+
+   /* If this image has the maximum number of samples supported by
+    * running platform and will be used as a texture, put the HiZ surface
+    * in write-through mode so that we can sample from it.
+    *
+    * TODO: This is a heuristic trade-off; we haven't tuned it at all.
+    */
+   return true;
 }
 
 /**
@@ -746,17 +767,7 @@ add_aux_surface_if_supported(struct anv_device *device,
                                  &image->planes[plane].primary_surface.isl,
                                  &image->planes[plane].aux_surface.isl)) {
          image->planes[plane].aux_usage = ISL_AUX_USAGE_HIZ;
-      } else if (image->vk.usage & (VK_IMAGE_USAGE_SAMPLED_BIT |
-                                    VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT) &&
-                 image->vk.samples == 1) {
-         /* If it's used as an input attachment or a texture and it's
-          * single-sampled (this is a requirement for HiZ+CCS write-through
-          * mode), use write-through mode so that we don't need to resolve
-          * before texturing.  This will make depth testing a bit slower but
-          * texturing faster.
-          *
-          * TODO: This is a heuristic trade-off; we haven't tuned it at all.
-          */
+      } else if (want_hiz_wt_for_image(device->info, image)) {
          assert(device->info->ver >= 12);
          image->planes[plane].aux_usage = ISL_AUX_USAGE_HIZ_CCS_WT;
       } else {
@@ -1109,11 +1120,8 @@ check_memory_bindings(const struct anv_device *device,
             binding = ANV_IMAGE_MEMORY_BINDING_PRIVATE;
          }
 
-         /* We believe that 256B alignment may be sufficient, but we choose 4K
-          * due to lack of testing.  And MI_LOAD/STORE operations require
-          * dword-alignment.
-          */
-         assert(plane->fast_clear_memory_range.alignment == 4096);
+         /* The indirect clear color BO requires 64B-alignment on gfx11+. */
+         assert(plane->fast_clear_memory_range.alignment == 64);
          check_memory_range(accum_ranges,
                             .test_range = &plane->fast_clear_memory_range,
                             .expect_binding = binding);
@@ -1588,16 +1596,12 @@ anv_image_init(struct anv_device *device, struct anv_image *image,
       if (isl_drm_modifier_needs_display_layout(image->vk.drm_format_mod))
          isl_extra_usage_flags |= ISL_SURF_USAGE_DISPLAY_BIT;
 
-      if (device->info->ver >= 20 &&
+      /* Disable compression on gen12+ if the selected/requested modifier
+       * doesn't support it. Prior to that we can use a private binding for
+       * the aux surface and it should be transparent to users.
+       */
+      if (device->info->ver >= 12 &&
           !isl_drm_modifier_has_aux(image->vk.drm_format_mod)) {
-         /* TODO: On Xe2+, we cannot support modifiers that don't support
-          * compression because such support requires an explicit resolve
-          * that hasn't been implemented.
-          *
-          * We disable this in anv_AllocateMemory() as well.
-          *
-          * https://gitlab.freedesktop.org/mesa/mesa/-/issues/11537
-          */
          isl_extra_usage_flags |= ISL_SURF_USAGE_DISABLE_AUX_BIT;
       }
    }
@@ -1893,18 +1897,6 @@ anv_image_init_from_create_info(struct anv_device *device,
       .no_private_binding_alloc = no_private_binding_alloc,
    };
 
-   /* For dmabuf imports, configure the primary surface without support for
-    * compression if the modifier doesn't specify it. This helps to create
-    * VkImages with memory requirements that are compatible with the buffers
-    * apps provide.
-    */
-   const struct VkImageDrmFormatModifierExplicitCreateInfoEXT *mod_explicit_info =
-      vk_find_struct_const(pCreateInfo->pNext,
-                           IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT);
-   if (mod_explicit_info &&
-       !isl_drm_modifier_has_aux(mod_explicit_info->drmFormatModifier))
-      create_info.isl_extra_usage_flags |= ISL_SURF_USAGE_DISABLE_AUX_BIT;
-
    return anv_image_init(device, image, &create_info);
 }
 
@@ -2093,19 +2085,6 @@ anv_image_is_pat_compressible(struct anv_device *device, struct anv_image *image
     */
    if (image->vk.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT)
       return false;
-
-   /* TODO: Enable compression on depth surfaces.
-    * https://gitlab.freedesktop.org/mesa/mesa/-/issues/11361
-    */
-   for (uint32_t plane = 0; plane < image->n_planes; plane++) {
-      const struct isl_surf *surf =
-         &image->planes[plane].primary_surface.isl;
-      if (surf && isl_surf_usage_is_depth(surf->usage)) {
-         anv_perf_warn(VK_LOG_OBJS(&image->vk.base),
-                       "Disable PAT-based compression on depth images.");
-         return false;
-      }
-   }
 
    return true;
 }

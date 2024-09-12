@@ -41,7 +41,7 @@
 #include <xcb/xfixes.h>
 
 #include "loader_dri_helper.h"
-#ifdef HAVE_DRI3
+#ifdef HAVE_LIBDRM
 #include "loader_dri3_helper.h"
 #endif
 #endif
@@ -258,6 +258,7 @@ struct dri2_egl_display {
    bool own_device;
    bool invalidate_available;
    bool kopper;
+   bool kopper_without_modifiers;
    bool swrast;
    bool swrast_not_kms;
    int min_swap_interval;
@@ -270,16 +271,16 @@ struct dri2_egl_display {
    char *driver_name;
 
    const __DRIextension **loader_extensions;
-   const __DRIextension **driver_extensions;
 
    bool has_dmabuf_import;
-   bool has_modifiers;
+   bool has_dmabuf_export;
+   bool explicit_modifiers;
    bool multibuffers_available;
 #ifdef HAVE_X11_PLATFORM
    xcb_connection_t *conn;
    xcb_screen_t *screen;
    bool swap_available;
-#ifdef HAVE_DRI3
+#ifdef HAVE_LIBDRM
    struct loader_screen_resources screen_resources;
 #endif
 #endif
@@ -308,6 +309,7 @@ struct dri2_egl_display {
    /* gralloc vendor usage bit for front rendering */
    uint32_t front_rendering_usage;
    bool has_native_fence_fd;
+   bool pure_swrast;
 #endif
 };
 

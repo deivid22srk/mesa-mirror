@@ -86,7 +86,7 @@ type_size_xvec4(const struct glsl_type *type, bool as_vec4, bool bindless)
    case GLSL_TYPE_ATOMIC_UINT:
       return 0;
    case GLSL_TYPE_IMAGE:
-      return bindless ? 1 : DIV_ROUND_UP(ISL_IMAGE_PARAM_SIZE, 4);
+      return bindless ? 1 : 0;
    case GLSL_TYPE_VOID:
    case GLSL_TYPE_ERROR:
    case GLSL_TYPE_COOPERATIVE_MATRIX:
@@ -1421,8 +1421,7 @@ brw_nir_should_vectorize_mem(unsigned align_mul, unsigned align_offset,
    if (bit_size > 32)
       return false;
 
-   if (low->intrinsic == nir_intrinsic_load_global_const_block_intel ||
-       low->intrinsic == nir_intrinsic_load_ubo_uniform_block_intel ||
+   if (low->intrinsic == nir_intrinsic_load_ubo_uniform_block_intel ||
        low->intrinsic == nir_intrinsic_load_ssbo_uniform_block_intel ||
        low->intrinsic == nir_intrinsic_load_shared_uniform_block_intel ||
        low->intrinsic == nir_intrinsic_load_global_constant_uniform_block_intel) {
@@ -1745,6 +1744,7 @@ brw_postprocess_nir(nir_shader *nir, const struct brw_compiler *compiler,
    do {
       progress = false;
 
+      OPT(brw_nir_opt_fsat);
       OPT(nir_opt_algebraic_late);
       OPT(brw_nir_lower_fsign);
 
@@ -1762,8 +1762,6 @@ brw_postprocess_nir(nir_shader *nir, const struct brw_compiler *compiler,
          brw_nir_optimize(nir, devinfo);
       }
    }
-
-   OPT(intel_nir_lower_conversions);
 
    OPT(nir_lower_alu_to_scalar, NULL, NULL);
 
@@ -1808,11 +1806,24 @@ brw_postprocess_nir(nir_shader *nir, const struct brw_compiler *compiler,
       /* Some of the optimizations can generate 64-bit integer multiplication
        * that must be lowered.
        */
-      if (OPT(nir_lower_int64))
-         brw_nir_optimize(nir, devinfo);
+      OPT(nir_lower_int64);
+
+      /* Even if nir_lower_int64 did not make progress, re-run the main
+       * optimization loop. nir_opt_uniform_subgroup may have made some things
+       * that previously appeared divergent be marked as convergent. This
+       * allows the elimination of some loops over, say, a TXF instruction
+       * with a non-uniform texture handle.
+       */
+      brw_nir_optimize(nir, devinfo);
 
       OPT(nir_lower_subgroups, &subgroups_options);
    }
+
+   /* Run intel_nir_lower_conversions only after the last tiem
+    * brw_nir_optimize is called. Various optimizations invoked there can
+    * rematerialize the conversions that the lowering pass eliminates.
+    */
+   OPT(intel_nir_lower_conversions);
 
    /* Do this only after the last opt_gcm. GCM will undo this lowering. */
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
@@ -1910,6 +1921,9 @@ get_subgroup_size(const struct shader_info *info, unsigned max_subgroup_size)
        * size.
        */
       return info->stage == MESA_SHADER_FRAGMENT ? 0 : max_subgroup_size;
+
+   case SUBGROUP_SIZE_REQUIRE_4:
+      unreachable("Unsupported subgroup size type");
 
    case SUBGROUP_SIZE_REQUIRE_8:
    case SUBGROUP_SIZE_REQUIRE_16:
@@ -2174,8 +2188,11 @@ brw_nir_load_global_const(nir_builder *b, nir_intrinsic_instr *load_uniform,
       nir_def *data[2];
       for (unsigned i = 0; i < 2; i++) {
          nir_def *addr = nir_iadd_imm(b, base_addr, aligned_offset + i * 64);
-         data[i] = nir_load_global_const_block_intel(b, 16, addr,
-                                                     nir_imm_true(b));
+
+         data[i] = nir_load_global_constant_uniform_block_intel(
+            b, 16, 32, addr,
+            .access = ACCESS_CAN_REORDER | ACCESS_NON_WRITEABLE,
+            .align_mul = 64);
       }
 
       sysval = nir_extract_bits(b, data, 2, suboffset * 8,

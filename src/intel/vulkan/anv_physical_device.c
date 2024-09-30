@@ -85,6 +85,7 @@ get_device_extensions(const struct anv_physical_device *device,
       .KHR_draw_indirect_count               = true,
       .KHR_driver_properties                 = true,
       .KHR_dynamic_rendering                 = true,
+      .KHR_dynamic_rendering_local_read      = true,
       .KHR_external_fence                    = has_syncobj_wait,
       .KHR_external_fence_fd                 = has_syncobj_wait,
       .KHR_external_memory                   = true,
@@ -243,6 +244,7 @@ get_device_extensions(const struct anv_physical_device *device,
       .EXT_pipeline_creation_cache_control   = true,
       .EXT_pipeline_creation_feedback        = true,
       .EXT_pipeline_library_group_handles    = rt_enabled,
+      .EXT_pipeline_protected_access         = device->has_protected_contexts,
       .EXT_pipeline_robustness               = true,
       .EXT_post_depth_coverage               = true,
       .EXT_primitives_generated_query        = true,
@@ -273,6 +275,7 @@ get_device_extensions(const struct anv_physical_device *device,
       .EXT_transform_feedback                = true,
       .EXT_vertex_attribute_divisor          = true,
       .EXT_vertex_input_dynamic_state        = true,
+      .EXT_ycbcr_2plane_444_formats          = true,
       .EXT_ycbcr_image_arrays                = true,
       .AMD_buffer_marker                     = true,
       .AMD_texture_gather_bias_lod           = device->info.ver >= 20,
@@ -661,6 +664,9 @@ get_features(const struct anv_physical_device *pdevice,
       /* VK_EXT_ycbcr_image_arrays */
       .ycbcrImageArrays = true,
 
+      /* VK_EXT_ycbcr_2plane_444_formats */
+      .ycbcr2plane444Formats = true,
+
       /* VK_EXT_extended_dynamic_state */
       .extendedDynamicState = true,
 
@@ -809,6 +815,12 @@ get_features(const struct anv_physical_device *pdevice,
 
       /* VK_KHR_shader_relaxed_extended_instruction */
       .shaderRelaxedExtendedInstruction = true,
+
+      /* VK_KHR_dynamic_rendering_local_read */
+      .dynamicRenderingLocalRead = true,
+
+      /* VK_EXT_pipeline_protected_access */
+      .pipelineProtectedAccess = true,
    };
 
    /* The new DOOM and Wolfenstein games require depthBounds without
@@ -1887,6 +1899,7 @@ anv_physical_device_init_heaps(struct anv_physical_device *device, int fd)
                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
             continue;
 
+         assert(device->memory.type_count < ARRAY_SIZE(device->memory.types));
          struct anv_memory_type *new_type =
             &device->memory.types[device->memory.type_count++];
          *new_type = device->memory.types[i];
@@ -1929,6 +1942,7 @@ anv_physical_device_init_heaps(struct anv_physical_device *device, int fd)
       device->memory.dynamic_visible_mem_types |=
          BITFIELD_BIT(device->memory.type_count);
 
+      assert(device->memory.type_count < ARRAY_SIZE(device->memory.types));
       struct anv_memory_type *new_type =
          &device->memory.types[device->memory.type_count++];
       *new_type = device->memory.types[i];
@@ -2127,8 +2141,6 @@ anv_physical_device_init_queue_families(struct anv_physical_device *pdevice)
       if (can_use_non_render_engines) {
          c_count = pdevice->info.engine_class_supported_count[INTEL_ENGINE_CLASS_COMPUTE];
       }
-      enum intel_engine_class compute_class =
-         c_count < 1 ? INTEL_ENGINE_CLASS_RENDER : INTEL_ENGINE_CLASS_COMPUTE;
 
       int blit_count = 0;
       if (pdevice->info.verx10 >= 125 && can_use_non_render_engines) {
@@ -2136,6 +2148,11 @@ anv_physical_device_init_queue_families(struct anv_physical_device *pdevice)
       }
 
       anv_override_engine_counts(&gc_count, &g_count, &c_count, &v_count, &blit_count);
+
+      enum intel_engine_class compute_class =
+         pdevice->info.engine_class_supported_count[INTEL_ENGINE_CLASS_COMPUTE] &&
+         c_count >= 1 ? INTEL_ENGINE_CLASS_COMPUTE :
+                        INTEL_ENGINE_CLASS_RENDER;
 
       if (gc_count > 0) {
          pdevice->queue.families[family_count++] = (struct anv_queue_family) {
@@ -2146,6 +2163,7 @@ anv_physical_device_init_queue_families(struct anv_physical_device *pdevice)
                           protected_flag,
             .queueCount = gc_count,
             .engine_class = INTEL_ENGINE_CLASS_RENDER,
+            .supports_perf = true,
          };
       }
       if (g_count > 0) {

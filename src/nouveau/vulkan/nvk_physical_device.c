@@ -28,6 +28,7 @@
 
 #include <sys/sysmacros.h>
 
+#include "nv_push.h"
 #include "cl90c0.h"
 #include "cl91c0.h"
 #include "cla097.h"
@@ -151,10 +152,12 @@ nvk_get_device_extensions(const struct nvk_instance *instance,
       .KHR_shader_draw_parameters = true,
       .KHR_shader_expect_assume = true,
       .KHR_shader_float_controls = true,
+      .KHR_shader_float_controls2 = true,
       .KHR_shader_float16_int8 = true,
       .KHR_shader_integer_dot_product = true,
       .KHR_shader_maximal_reconvergence = true,
       .KHR_shader_non_semantic_info = true,
+      .KHR_shader_relaxed_extended_instruction = true,
       .KHR_shader_subgroup_extended_types = true,
       .KHR_shader_subgroup_rotate = nvk_use_nak(info),
       .KHR_shader_subgroup_uniform_control_flow = nvk_use_nak(info),
@@ -189,6 +192,7 @@ nvk_get_device_extensions(const struct nvk_instance *instance,
       .EXT_depth_range_unrestricted = info->cls_eng3d >= VOLTA_A,
       .EXT_descriptor_buffer = true,
       .EXT_descriptor_indexing = true,
+      .EXT_device_generated_commands = true,
 #ifdef VK_USE_PLATFORM_DISPLAY_KHR
       .EXT_display_control = true,
 #endif
@@ -200,6 +204,7 @@ nvk_get_device_extensions(const struct nvk_instance *instance,
       .EXT_external_memory_dma_buf = true,
       .EXT_graphics_pipeline_library = true,
       .EXT_host_query_reset = true,
+      .EXT_host_image_copy = info->cls_eng3d >= TURING_A,
       .EXT_image_2d_view_of_3d = true,
       .EXT_image_robustness = true,
       .EXT_image_sliced_view_of_3d = true,
@@ -450,6 +455,9 @@ nvk_get_device_features(const struct nv_device_info *info,
       /* VK_KHR_shader_expect_assume */
       .shaderExpectAssume = true,
 
+      /* VK_KHR_shader_float_controls2 */
+      .shaderFloatControls2 = true,
+
       /* VK_KHR_shader_maximal_reconvergence */
       .shaderMaximalReconvergence = true,
 
@@ -510,6 +518,10 @@ nvk_get_device_features(const struct nv_device_info *info,
       .descriptorBufferImageLayoutIgnored = true,
       .descriptorBufferPushDescriptors = false,
 
+      /* VK_EXT_device_generated_commands */
+      .deviceGeneratedCommands = true,
+      .dynamicGeneratedPipelineLayout = true,
+
       /* VK_EXT_dynamic_rendering_unused_attachments */
       .dynamicRenderingUnusedAttachments = true,
 
@@ -556,6 +568,9 @@ nvk_get_device_features(const struct nv_device_info *info,
 
       /* VK_EXT_graphics_pipeline_library */
       .graphicsPipelineLibrary = true,
+
+      /* VK_EXT_host_image_copy */
+      .hostImageCopy = info->cls_eng3d >= TURING_A,
 
       /* VK_EXT_image_2d_view_of_3d */
       .image2DViewOf3D = true,
@@ -651,6 +666,9 @@ nvk_get_device_features(const struct nv_device_info *info,
 
       /* VK_NV_shader_sm_builtins */
       .shaderSMBuiltins = true,
+
+      /* VK_KHR_shader_relaxed_extended_instruction */
+      .shaderRelaxedExtendedInstruction = true,
    };
 }
 
@@ -954,6 +972,25 @@ nvk_get_device_properties(const struct nvk_instance *instance,
       .resourceDescriptorBufferAddressSpaceSize = UINT32_MAX,
       .descriptorBufferAddressSpaceSize = UINT32_MAX,
 
+      /* VK_EXT_device_generated_commands */
+      .maxIndirectPipelineCount = UINT32_MAX,
+      .maxIndirectShaderObjectCount = UINT32_MAX,
+      .maxIndirectSequenceCount = 1 << 20,
+      .maxIndirectCommandsTokenCount = 16,
+      .maxIndirectCommandsTokenOffset = 2047,
+      .maxIndirectCommandsIndirectStride = 1 << 12,
+      .supportedIndirectCommandsInputModes =
+         VK_INDIRECT_COMMANDS_INPUT_MODE_VULKAN_INDEX_BUFFER_EXT |
+         VK_INDIRECT_COMMANDS_INPUT_MODE_DXGI_INDEX_BUFFER_EXT,
+      .supportedIndirectCommandsShaderStages =
+         NVK_SHADER_STAGE_GRAPHICS_BITS | VK_SHADER_STAGE_COMPUTE_BIT,
+      .supportedIndirectCommandsShaderStagesPipelineBinding =
+         NVK_SHADER_STAGE_GRAPHICS_BITS | VK_SHADER_STAGE_COMPUTE_BIT,
+      .supportedIndirectCommandsShaderStagesShaderBinding =
+         NVK_SHADER_STAGE_GRAPHICS_BITS | VK_SHADER_STAGE_COMPUTE_BIT,
+      .deviceGeneratedCommandsTransformFeedback = true,
+      .deviceGeneratedCommandsMultiDrawIndirectCount = true,
+
       /* VK_EXT_extended_dynamic_state3 */
       .dynamicPrimitiveTopologyUnrestricted = true,
 
@@ -1068,6 +1105,43 @@ nvk_get_device_properties(const struct nvk_instance *instance,
       snprintf(properties->deviceName, sizeof(properties->deviceName),
                "%s (NVK %s)", info->device_name, info->chipset_name);
    }
+
+   /* VK_EXT_host_image_copy */
+
+   /* Not sure if there are layout specific things, so for now just reporting 
+    * all layouts from extensions.
+    */
+   static const VkImageLayout supported_layouts[] = {
+      VK_IMAGE_LAYOUT_GENERAL, /* this one is required by spec */
+      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+      VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+      VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+      VK_IMAGE_LAYOUT_PREINITIALIZED,
+      VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL,
+      VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_STENCIL_READ_ONLY_OPTIMAL,
+      VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+      VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL,
+      VK_IMAGE_LAYOUT_STENCIL_ATTACHMENT_OPTIMAL,
+      VK_IMAGE_LAYOUT_STENCIL_READ_ONLY_OPTIMAL,
+      VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL,
+      VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL,
+      VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT,
+      VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT,
+   };
+
+   properties->pCopySrcLayouts = (VkImageLayout *)supported_layouts;
+   properties->copySrcLayoutCount = ARRAY_SIZE(supported_layouts);
+   properties->pCopyDstLayouts = (VkImageLayout *)supported_layouts;
+   properties->copyDstLayoutCount = ARRAY_SIZE(supported_layouts);
+
+   STATIC_ASSERT(sizeof(instance->driver_build_sha) >= VK_UUID_SIZE);
+   memcpy(properties->optimalTilingLayoutUUID,
+          instance->driver_build_sha, VK_UUID_SIZE);
+
+   properties->identicalMemoryTypeRequirements = false;
 
    /* VK_EXT_shader_module_identifier */
    STATIC_ASSERT(sizeof(vk_shaderModuleIdentifierAlgorithmUUID) ==

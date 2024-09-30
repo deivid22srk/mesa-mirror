@@ -235,7 +235,6 @@ struct pipe_picture_desc
    unsigned flush_flags;
    /* A fence for pipe_video_codec::end_frame to signal job completion */
    struct pipe_fence_handle **fence;
-   unsigned packed_headers;
 };
 
 struct pipe_quant_matrix
@@ -538,9 +537,6 @@ struct pipe_h264_enc_rate_control
    unsigned vbv_buf_lv;
    unsigned vbv_buf_initial_size;
    bool app_requested_hrd_buffer;
-   unsigned target_bits_picture;
-   unsigned peak_bits_picture_integer;
-   unsigned peak_bits_picture_fraction;
    unsigned fill_data_enable;
    unsigned skip_frame_enable;
    unsigned enforce_hrd;
@@ -758,6 +754,7 @@ struct pipe_h264_enc_dpb_entry
    uint32_t id;
    uint32_t frame_idx;
    uint32_t pic_order_cnt;
+   uint32_t temporal_id;
    bool is_ltr;
    struct pipe_video_buffer *buffer;
 };
@@ -1143,9 +1140,6 @@ struct pipe_h265_enc_rate_control
    unsigned vbv_buf_lv;
    unsigned vbv_buf_initial_size;
    bool app_requested_hrd_buffer;
-   unsigned target_bits_picture;
-   unsigned peak_bits_picture_integer;
-   unsigned peak_bits_picture_fraction;
    unsigned fill_data_enable;
    unsigned skip_frame_enable;
    unsigned enforce_hrd;
@@ -1162,6 +1156,7 @@ struct pipe_h265_enc_dpb_entry
 {
    uint32_t id;
    uint32_t pic_order_cnt;
+   uint32_t temporal_id;
    bool is_ltr;
    struct pipe_video_buffer *buffer;
 };
@@ -1225,9 +1220,6 @@ struct pipe_av1_enc_rate_control
    unsigned vbv_buf_lv;
    unsigned vbv_buf_initial_size;
    bool app_requested_hrd_buffer;
-   unsigned target_bits_picture;
-   unsigned peak_bits_picture_integer;
-   unsigned peak_bits_picture_fraction;
    unsigned fill_data_enable;
    unsigned skip_frame_enable;
    unsigned enforce_hrd;

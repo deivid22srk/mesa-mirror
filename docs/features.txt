@@ -351,6 +351,9 @@ Khronos, ARB, and OES extensions that are not part of any OpenGL or OpenGL ES ve
   GL_OES_texture_half_float_linear                      DONE (freedreno, r300, r600, radeonsi, nv30, nv50, nvc0, softpipe, llvmpipe, panfrost, v3d, zink, lima, asahi, iris, crocus, etnaviv/HALF_FLOAT)
   GL_OES_texture_view                                   DONE (freedreno, r600, radeonsi, nv50, nvc0, softpipe, llvmpipe, v3d, zink, iris, crocus/gen7+, d3d12)
   GL_OES_viewport_array                                 DONE (freedreno/a6xx, nvc0, r600, radeonsi, softpipe, zink, iris, crocus/gen7.5+, asahi)
+  GL_OVR_multiview                                      DONE (zink)
+  GL_OVR_multiview2                                     DONE (zink)
+  GL_OVR_multiview_multisampled_render_to_texture       DONE (zink)
   GLX_ARB_context_flush_control                         DONE (all drivers)
   GLX_ARB_robustness_application_isolation              not started
   GLX_ARB_robustness_share_group_isolation              not started
@@ -483,6 +486,7 @@ Vulkan 1.3 -- all DONE: anv, lvp, nvk, radv, tu, vn, v3dv
   VK_KHR_maintenance4                                   DONE (anv, hasvk, lvp, nvk, radv, tu, v3dv, vn)
   VK_KHR_shader_integer_dot_product                     DONE (anv, dzn, hasvk, lvp, nvk, radv, tu, v3dv, vn)
   VK_KHR_shader_non_semantic_info                       DONE (anv, hasvk, nvk, radv, tu, v3dv, vn)
+  VK_KHR_shader_relaxed_extended_instruction            DONE (anv, hasvk, nvk, radv, tu, v3dv)
   VK_KHR_shader_terminate_invocation                    DONE (anv, hasvk, lvp, nvk, radv, tu, v3dv, vn)
   VK_KHR_synchronization2                               DONE (anv, dzn, hasvk, lvp, nvk, panvk, radv, tu, v3dv, vn)
   VK_KHR_zero_initialize_workgroup_memory               DONE (anv, hasvk, lvp, nvk, radv, tu, v3dv, vn)
@@ -499,13 +503,13 @@ Vulkan 1.3 -- all DONE: anv, lvp, nvk, radv, tu, vn, v3dv
   VK_EXT_texel_buffer_alignment                         DONE (anv, hasvk, lvp, nvk, pvr, radv, tu, v3dv, vn)
   VK_EXT_texture_compression_astc_hdr                   DONE (vn)
   VK_EXT_tooling_info                                   DONE (anv, hasvk, nvk, pvr, radv, tu, v3dv, vn)
-  VK_EXT_ycbcr_2plane_444_formats                       DONE (lvp, nvk, vn)
+  VK_EXT_ycbcr_2plane_444_formats                       DONE (anv, lvp, nvk, vn)
 
 Khronos extensions that are not part of any Vulkan version:
 
   VK_KHR_acceleration_structure                         DONE (anv/gfx12.5+, lvp, radv/gfx10.3+)
   VK_KHR_android_surface                                not started
-  VK_KHR_calibrated_timestamps                          DONE (anv, nvk, radv)
+  VK_KHR_calibrated_timestamps                          DONE (anv, nvk, radv, tu/a750+)
   VK_KHR_compute_shader_derivatives                     DONE (anv, nvk, radv)
   VK_KHR_cooperative_matrix                             DONE (anv, radv/gfx11+)
   VK_KHR_deferred_host_operations                       DONE (anv, hasvk, lvp, radv)
@@ -542,9 +546,9 @@ Khronos extensions that are not part of any Vulkan version:
   VK_KHR_ray_tracing_position_fetch                     DONE (anv, radv/gfx10.3+)
   VK_KHR_shader_clock                                   DONE (anv, hasvk, lvp, nvk, radv, vn)
   VK_KHR_shader_expect_assume                           DONE (anv, dzn, hasvk, lvp, nvk, panvk, pvr, radv, tu, v3dv, vn)
-  VK_KHR_shader_float_controls2                         DONE (anv, tu)
+  VK_KHR_shader_float_controls2                         DONE (anv, nvk, radv, tu)
   VK_KHR_shader_maximal_reconvergence                   DONE (anv, lvp, nvk, radv)
-  VK_KHR_shader_subgroup_rotate                         DONE (anv, nvk, radv)
+  VK_KHR_shader_subgroup_rotate                         DONE (anv, nvk, radv, tu)
   VK_KHR_shader_subgroup_uniform_control_flow           DONE (anv, hasvk, nvk, radv, tu)
   VK_KHR_shader_quad_control                            DONE (anv, radv)
   VK_KHR_shared_presentable_image                       not started
@@ -564,7 +568,7 @@ Khronos extensions that are not part of any Vulkan version:
   VK_EXT_attachment_feedback_loop_layout                DONE (anv, lvp, nvk, radv, tu, v3dv, vn)
   VK_EXT_border_color_swizzle                           DONE (anv, hasvk, lvp, nvk, radv/gfx10+, tu, v3dv, vn)
   VK_EXT_buffer_device_address                          DONE (anv, hasvk, nvk, panvk, radv)
-  VK_EXT_calibrated_timestamps                          DONE (anv, hasvk, nvk, lvp, radv, vn)
+  VK_EXT_calibrated_timestamps                          DONE (anv, hasvk, nvk, lvp, radv, vn, tu/a750+)
   VK_EXT_color_write_enable                             DONE (anv, hasvk, lvp, nvk, radv, tu, v3dv, vn)
   VK_EXT_conditional_rendering                          DONE (anv, hasvk, lvp, nvk, radv, tu, vn)
   VK_EXT_conservative_rasterization                     DONE (anv, nvk, radv, vn)
@@ -579,6 +583,7 @@ Khronos extensions that are not part of any Vulkan version:
   VK_EXT_descriptor_buffer                              DONE (anv, lvp, nvk, radv, tu)
   VK_EXT_device_address_binding_report                  DONE (radv, tu)
   VK_EXT_device_fault                                   DONE (radv)
+  VK_EXT_device_generated_commands                      DONE (nvk/Turing+)
   VK_EXT_device_memory_report                           DONE (vn)
   VK_EXT_direct_mode_display                            DONE (anv, lvp, nvk, radv, tu, v3dv)
   VK_EXT_discard_rectangles                             DONE (radv)
@@ -596,6 +601,7 @@ Khronos extensions that are not part of any Vulkan version:
   VK_EXT_global_priority_query                          DONE (anv, hasvk, radv, tu)
   VK_EXT_graphics_pipeline_library                      DONE (anv, lvp, nvk, panvk, radv, tu, vn)
   VK_EXT_headless_surface                               DONE (anv, dzn, hasvk, lvp, nvk, panvk, pvr, radv, tu, v3dv, vn)
+  VK_EXT_host_image_copy                                DONE (nvk/Turing+)
   VK_EXT_image_2d_view_of_3d                            DONE (anv, hasvk, lvp, nvk, radv, tu, vn)
   VK_EXT_image_compression_control                      DONE (radv)
   VK_EXT_image_drm_format_modifier                      DONE (anv, hasvk, nvk, radv/gfx9+, tu, v3dv, vn)

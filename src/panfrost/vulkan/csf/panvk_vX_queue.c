@@ -44,6 +44,11 @@ finish_render_desc_ringbuf(struct panvk_queue *queue)
       ASSERTED int ret =
          pan_kmod_vm_bind(dev->kmod.vm, PAN_KMOD_VM_OP_MODE_IMMEDIATE, &op, 1);
       assert(!ret);
+
+      simple_mtx_lock(&dev->as.lock);
+      util_vma_heap_free(&dev->as.heap, ringbuf->addr.dev,
+                         RENDER_DESC_RINGBUF_SIZE * 2);
+      simple_mtx_unlock(&dev->as.lock);
    }
 
    if (ringbuf->addr.host) {
@@ -64,6 +69,7 @@ init_render_desc_ringbuf(struct panvk_queue *queue)
    uint32_t flags = panvk_device_adjust_bo_flags(dev, PAN_KMOD_BO_FLAG_NO_MMAP);
    struct panvk_desc_ringbuf *ringbuf = &queue->render_desc_ringbuf;
    const size_t size = RENDER_DESC_RINGBUF_SIZE;
+   uint64_t dev_addr = 0;
    VkResult result;
    int ret;
 
@@ -76,7 +82,7 @@ init_render_desc_ringbuf(struct panvk_queue *queue)
       ringbuf->addr.host = pan_kmod_bo_mmap(
          ringbuf->bo, 0, size, PROT_READ | PROT_WRITE, MAP_SHARED, NULL);
       if (ringbuf->addr.host == MAP_FAILED) {
-         result = vk_errorf(phys_dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+         result = vk_errorf(phys_dev, VK_ERROR_OUT_OF_HOST_MEMORY,
                             "Failed to CPU map ringbuf BO");
          goto err_finish_ringbuf;
       }
@@ -85,7 +91,15 @@ init_render_desc_ringbuf(struct panvk_queue *queue)
    /* We choose the alignment to guarantee that we won't ever cross a 4G
     * boundary when accessing the mapping. This way we can encode the wraparound
     * using 32-bit operations. */
-   uint64_t dev_addr = util_vma_heap_alloc(&dev->as.heap, size * 2, size * 2);
+   simple_mtx_lock(&dev->as.lock);
+   dev_addr = util_vma_heap_alloc(&dev->as.heap, size * 2, size * 2);
+   simple_mtx_unlock(&dev->as.lock);
+
+   if (!dev_addr) {
+      result = vk_errorf(phys_dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                         "Failed to allocate virtual address for ringbuf BO");
+      goto err_finish_ringbuf;
+   }
 
    struct pan_kmod_vm_op vm_ops[] = {
       {
@@ -152,6 +166,12 @@ init_render_desc_ringbuf(struct panvk_queue *queue)
    return VK_SUCCESS;
 
 err_finish_ringbuf:
+   if (dev_addr && !ringbuf->addr.dev) {
+      simple_mtx_lock(&dev->as.lock);
+      util_vma_heap_free(&dev->as.heap, dev_addr, size * 2);
+      simple_mtx_unlock(&dev->as.lock);
+   }
+
    finish_render_desc_ringbuf(queue);
    return result;
 }
@@ -202,7 +222,7 @@ init_subqueue(struct panvk_queue *queue, enum panvk_subqueue_id subqueue)
    assert(panvk_priv_mem_dev_addr(queue->tiler_heap.desc) != 0);
 
    cs_builder_init(&b, &conf, root_cs);
-   /* Pass the context to through r62. */
+   /* Pass the context. */
    cs_move64_to(&b, cs_subqueue_ctx_reg(&b),
                 panvk_priv_mem_dev_addr(subq->context));
 
@@ -251,7 +271,7 @@ init_subqueue(struct panvk_queue *queue, enum panvk_subqueue_id subqueue)
       .queue_index = subqueue,
       .stream_size = cs_root_chunk_size(&b),
       .stream_addr = cs_root_chunk_gpu_addr(&b),
-      .latest_flush = 0,
+      .latest_flush = panthor_kmod_get_flush_id(dev->kmod.dev),
       .syncs = DRM_PANTHOR_OBJ_ARRAY(1, &syncop),
    };
    struct drm_panthor_group_submit gsubmit = {
@@ -568,7 +588,7 @@ panvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
             .queue_index = j,
             .stream_size = cs_root_chunk_size(&cmdbuf->state.cs[j].builder),
             .stream_addr = cs_root_chunk_gpu_addr(&cmdbuf->state.cs[j].builder),
-            .latest_flush = 0,
+            .latest_flush = cmdbuf->flush_id,
          };
       }
    }

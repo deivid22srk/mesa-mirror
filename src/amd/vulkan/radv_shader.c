@@ -197,6 +197,7 @@ radv_optimize_nir_algebraic(nir_shader *nir, bool opt_offsets, bool opt_mqsad)
       NIR_PASS(_, nir, nir_opt_constant_folding);
       NIR_PASS(_, nir, nir_opt_cse);
       NIR_PASS(more_algebraic, nir, nir_opt_algebraic);
+      NIR_PASS(_, nir, nir_opt_generate_bfi);
       NIR_PASS(_, nir, nir_opt_dead_cf);
    }
 
@@ -372,9 +373,6 @@ radv_shader_spirv_to_nir(struct radv_device *device, const struct radv_shader_st
       free(spec_entries);
 
       radv_device_associate_nir(device, nir);
-
-      /* TODO: This can be removed once GCM (which is more general) is used. */
-      NIR_PASS(_, nir, nir_opt_reuse_constants);
 
       const struct nir_lower_sysvals_to_varyings_options sysvals_to_varyings = {
          .point_coord = true,
@@ -2576,6 +2574,8 @@ radv_shader_create_uncached(struct radv_device *device, const struct radv_shader
       goto out;
    }
    simple_mtx_init(&shader->replay_mtx, mtx_plain);
+
+   _mesa_blake3_compute(binary, binary->total_size, shader->hash);
 
    vk_pipeline_cache_object_init(&device->vk, &shader->base, &radv_shader_ops, shader->hash, sizeof(shader->hash));
 

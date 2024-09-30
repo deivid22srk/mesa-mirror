@@ -80,6 +80,10 @@
     optional: true
   - job: windows-msvc
     optional: true
+  - job: debian-clang-release
+    optional: true
+  - job: python-test
+    optional: true
 
 
 debian-testing:
@@ -282,6 +286,7 @@ alpine-build-testing:
     C_ARGS: >
       -Wno-error=cpp
       -Wno-error=array-bounds
+      -Wno-error=stringop-overflow
       -Wno-error=stringop-overread
     DRI_LOADERS: >
       -D glx=disabled
@@ -563,6 +568,27 @@ debian-arm64-release:
     - .gitlab-ci/meson/build.sh
     - 'if [ -n "$MESA_CI_PERFORMANCE_ENABLED" ]; then .gitlab-ci/prepare-artifacts.sh; fi'
 
+debian-no-libdrm:
+  extends:
+    - .meson-arm
+  stage: build-only
+  needs:
+    - !reference [.meson-arm, needs]
+    - !reference [.build-for-tests-jobs]
+  variables:
+    VULKAN_DRIVERS: freedreno
+    GALLIUM_DRIVERS: "zink,llvmpipe"
+    BUILDTYPE: release
+    C_ARGS: >
+      -Wno-error=array-bounds
+      -Wno-error=stringop-truncation
+      -Wno-error=stringop-overread
+    EXTRA_OPTION: >
+      -D freedreno-kmds=kgsl
+      -D glx=disabled
+      -D gbm=disabled
+      -D egl=disabled
+
 debian-clang:
   extends: .meson-build
   needs:
@@ -620,7 +646,11 @@ debian-clang:
 
 debian-clang-release:
   extends: debian-clang
-  # `needs:` inherited from debian-clang
+  stage: build-for-tests
+  # `needs:` inherited from debian-clang, so we have to override it back to
+  # its original value
+  needs:
+    - !reference [.meson-build, needs]
   variables:
     BUILDTYPE: "release"
     DRI_LOADERS: >
@@ -754,3 +784,18 @@ debian-ppc64el:
     VULKAN_DRIVERS: "amd,swrast"
     DRI_LOADERS:
       -D glvnd=disabled
+
+# This job tests our Python scripts, and also emits our scripts into
+# artifacts, so they can be reused for job submission to hardware devices.
+python-test:
+  stage: build-for-tests
+  extends:
+    - .use-debian/x86_64_pyutils
+    - .build-common
+  variables:
+    GIT_STRATEGY: fetch
+    S3_ARTIFACT_NAME: mesa-python-test
+  timeout: 10m
+  script:
+    - .gitlab-ci/run-pytest.sh
+    - .gitlab-ci/prepare-artifacts-python.sh

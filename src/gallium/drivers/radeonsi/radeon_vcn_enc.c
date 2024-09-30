@@ -8,6 +8,7 @@
 
 #include "radeon_vcn_enc.h"
 #include "ac_vcn_enc_av1_default_cdf.h"
+#include "ac_debug.h"
 
 #include "pipe/p_video_codec.h"
 #include "radeon_video.h"
@@ -272,6 +273,7 @@ static void radeon_vcn_enc_h264_get_spec_misc_param(struct radeon_encoder *enc,
    enc->enc_pic.spec_misc.transform_8x8_mode =
       sscreen->info.vcn_ip_version >= VCN_5_0_0 &&
       pic->pic_ctrl.transform_8x8_mode_flag;
+   enc->enc_pic.spec_misc.level_idc = pic->seq.level_idc;
 }
 
 static void radeon_vcn_enc_h264_get_rc_param(struct radeon_encoder *enc,
@@ -905,10 +907,10 @@ static void radeon_vcn_enc_av1_get_param(struct radeon_encoder *enc,
    /* 1, 2 layer needs 1 reference, and 3, 4 layer needs 2 references */
    enc->base.max_references = (enc_pic->num_temporal_layers + 1) / 2
                               + RENCODE_VCN4_AV1_MAX_NUM_LTR;
-   for (int i = 0; i < RENCDOE_AV1_REFS_PER_FRAME; i++)
+   for (int i = 0; i < RENCODE_AV1_REFS_PER_FRAME; i++)
       enc_pic->av1_ref_frame_idx[i] = pic->ref_frame_idx[i];
 
-   for (int i = 0; i < RENCDOE_AV1_NUM_REF_FRAMES; i++)
+   for (int i = 0; i < RENCODE_AV1_NUM_REF_FRAMES; i++)
       enc_pic->av1_ref_list[i] = pic->ref_list[i];
 
    enc_pic->av1_recon_frame = pic->recon_frame;
@@ -961,6 +963,21 @@ static void radeon_vcn_enc_get_param(struct radeon_encoder *enc, struct pipe_pic
 
 static int flush(struct radeon_encoder *enc, unsigned flags, struct pipe_fence_handle **fence)
 {
+   struct si_screen *sscreen = (struct si_screen *)enc->screen;
+
+   if (sscreen->debug_flags & DBG(IB)) {
+      struct ac_ib_parser ib_parser = {
+         .f = stderr,
+         .ib = enc->cs.current.buf,
+         .num_dw = enc->cs.current.cdw,
+         .gfx_level = sscreen->info.gfx_level,
+         .vcn_version = sscreen->info.vcn_ip_version,
+         .family = sscreen->info.family,
+         .ip_type = AMD_IP_VCN_ENC,
+      };
+      ac_parse_ib(&ib_parser, "IB");
+   }
+
    return enc->ws->cs_flush(&enc->cs, flags, fence);
 }
 
@@ -1757,6 +1774,8 @@ struct pipe_video_codec *radeon_create_encoder(struct pipe_context *context,
    }
 
    enc->enc_pic.use_rc_per_pic_ex = false;
+
+   ac_vcn_enc_init_cmds(&enc->cmd, sscreen->info.vcn_ip_version);
 
    if (sscreen->info.vcn_ip_version >= VCN_5_0_0) {
       radeon_enc_5_0_init(enc);

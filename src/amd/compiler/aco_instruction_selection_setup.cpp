@@ -88,7 +88,7 @@ sanitize_if(nir_function_impl* impl, nir_if* nif)
     * or dead control-flow passes and are perfectly legal.  Run a quick phi
     * removal on the block after the if to clean up any such phis.
     */
-   nir_opt_remove_phis_block(nir_cf_node_as_block(nir_cf_node_next(&nif->cf_node)));
+   nir_remove_single_src_phis_block(nir_cf_node_as_block(nir_cf_node_next(&nif->cf_node)));
 
    /* Finally, move the continue from branch after the if-statement. */
    nir_block* last_continue_from_blk = then_jump ? else_block : then_block;
@@ -280,6 +280,8 @@ init_context(isel_context* ctx, nir_shader* shader)
    ctx->ub_config.max_workgroup_size[0] = 2048;
    ctx->ub_config.max_workgroup_size[1] = 2048;
    ctx->ub_config.max_workgroup_size[2] = 2048;
+
+   ac_nir_opt_shared_append(shader);
 
    nir_divergence_analysis(shader);
    if (nir_opt_uniform_atomics(shader, false) && nir_lower_int64(shader))

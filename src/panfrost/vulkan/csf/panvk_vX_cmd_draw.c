@@ -1,5 +1,6 @@
 /*
  * Copyright © 2024 Collabora Ltd.
+ * Copyright © 2024 Arm Ltd.
  *
  * Derived from tu_cmd_buffer.c which is:
  * Copyright © 2016 Red Hat.
@@ -53,6 +54,13 @@ struct panvk_draw_info {
       uint32_t base;
       uint32_t count;
    } instance;
+
+   struct {
+      struct panvk_buffer *buffer;
+      uint64_t offset;
+      uint32_t draw_count;
+      uint32_t stride;
+   } indirect;
 };
 
 #define is_dirty(__cmdbuf, __name)                                             \
@@ -60,8 +68,7 @@ struct panvk_draw_info {
                MESA_VK_DYNAMIC_##__name)
 
 static void
-emit_vs_attrib(const struct panvk_draw_info *draw,
-               const struct vk_vertex_attribute_state *attrib_info,
+emit_vs_attrib(const struct vk_vertex_attribute_state *attrib_info,
                const struct vk_vertex_binding_state *buf_info,
                const struct panvk_attrib_buf *buf, uint32_t vb_desc_offset,
                struct mali_attribute_packed *desc)
@@ -69,7 +76,6 @@ emit_vs_attrib(const struct panvk_draw_info *draw,
    bool per_instance = buf_info->input_rate == VK_VERTEX_INPUT_RATE_INSTANCE;
    enum pipe_format f = vk_format_to_pipe_format(attrib_info->format);
    unsigned buf_idx = vb_desc_offset + attrib_info->binding;
-   unsigned divisor = draw->vertex.count * buf_info->divisor;
 
    pan_pack(desc, ATTRIBUTE, cfg) {
       cfg.offset = attrib_info->offset;
@@ -82,24 +88,26 @@ emit_vs_attrib(const struct panvk_draw_info *draw,
          cfg.attribute_type = MALI_ATTRIBUTE_TYPE_1D;
          cfg.frequency = MALI_ATTRIBUTE_FREQUENCY_VERTEX;
          cfg.offset_enable = true;
-      } else if (util_is_power_of_two_or_zero(divisor)) {
+      } else if (buf_info->divisor == 1) {
+         cfg.attribute_type = MALI_ATTRIBUTE_TYPE_1D;
+         cfg.frequency = MALI_ATTRIBUTE_FREQUENCY_INSTANCE;
+      } else if (util_is_power_of_two_or_zero(buf_info->divisor)) {
          /* Per-instance, POT divisor */
          cfg.attribute_type = MALI_ATTRIBUTE_TYPE_1D_POT_DIVISOR;
          cfg.frequency = MALI_ATTRIBUTE_FREQUENCY_INSTANCE;
-         cfg.divisor_r = __builtin_ctz(divisor);
+         cfg.divisor_r = __builtin_ctz(buf_info->divisor);
       } else {
          /* Per-instance, NPOT divisor */
          cfg.attribute_type = MALI_ATTRIBUTE_TYPE_1D_NPOT_DIVISOR;
          cfg.frequency = MALI_ATTRIBUTE_FREQUENCY_INSTANCE;
-         cfg.divisor_d = panfrost_compute_magic_divisor(divisor, &cfg.divisor_r,
-                                                        &cfg.divisor_e);
+         cfg.divisor_d = panfrost_compute_magic_divisor(
+            buf_info->divisor, &cfg.divisor_r, &cfg.divisor_e);
       }
    }
 }
 
 static VkResult
-prepare_vs_driver_set(struct panvk_cmd_buffer *cmdbuf,
-                      struct panvk_draw_info *draw)
+prepare_vs_driver_set(struct panvk_cmd_buffer *cmdbuf)
 {
    struct panvk_shader_desc_state *vs_desc_state = &cmdbuf->state.gfx.vs.desc;
    bool dirty = is_dirty(cmdbuf, VI) || is_dirty(cmdbuf, VI_BINDINGS_VALID) ||
@@ -136,7 +144,7 @@ prepare_vs_driver_set(struct panvk_cmd_buffer *cmdbuf,
       if (vi->attributes_valid & BITFIELD_BIT(i)) {
          unsigned binding = vi->attributes[i].binding;
 
-         emit_vs_attrib(draw, &vi->attributes[i], &vi->bindings[binding],
+         emit_vs_attrib(&vi->attributes[i], &vi->bindings[binding],
                         &cmdbuf->state.gfx.vb.bufs[binding], vb_offset,
                         (struct mali_attribute_packed *)(&descs[i]));
       } else {
@@ -446,10 +454,14 @@ update_tls(struct panvk_cmd_buffer *cmdbuf)
    struct cs_builder *b =
       panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER);
 
-   if (!state->desc.gpu) {
-      state->desc = panvk_cmd_alloc_desc(cmdbuf, LOCAL_STORAGE);
-      if (!state->desc.gpu)
-         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   if (!cmdbuf->state.gfx.tsd) {
+      if (!state->desc.gpu) {
+         state->desc = panvk_cmd_alloc_desc(cmdbuf, LOCAL_STORAGE);
+         if (!state->desc.gpu)
+            return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+      }
+
+      cmdbuf->state.gfx.tsd = state->desc.gpu;
 
       cs_update_vt_ctx(b)
          cs_move64_to(b, cs_sr_reg64(b, 24), state->desc.gpu);
@@ -483,6 +495,7 @@ prepare_blend(struct panvk_cmd_buffer *cmdbuf)
 {
    bool dirty =
       is_dirty(cmdbuf, CB_LOGIC_OP_ENABLE) || is_dirty(cmdbuf, CB_LOGIC_OP) ||
+      is_dirty(cmdbuf, MS_ALPHA_TO_ONE_ENABLE) ||
       is_dirty(cmdbuf, CB_ATTACHMENT_COUNT) ||
       is_dirty(cmdbuf, CB_COLOR_WRITE_ENABLES) ||
       is_dirty(cmdbuf, CB_BLEND_ENABLES) ||
@@ -510,7 +523,7 @@ prepare_blend(struct panvk_cmd_buffer *cmdbuf)
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
 
    panvk_per_arch(blend_emit_descs)(
-      dev, cb, cmdbuf->state.gfx.render.color_attachments.fmts,
+      dev, dyns, cmdbuf->state.gfx.render.color_attachments.fmts,
       cmdbuf->state.gfx.render.color_attachments.samples, fs_info, fs_code, bds,
       &cmdbuf->state.gfx.cb.info);
 
@@ -583,11 +596,17 @@ calc_fbd_size(struct panvk_cmd_buffer *cmdbuf)
    return fbd_size;
 }
 
+#define MAX_LAYERS_PER_TILER_DESC 8
+
 static uint32_t
 calc_render_descs_size(struct panvk_cmd_buffer *cmdbuf)
 {
-   return (calc_fbd_size(cmdbuf) * cmdbuf->state.gfx.render.layer_count) +
-          pan_size(TILER_CONTEXT);
+   uint32_t fbd_count = cmdbuf->state.gfx.render.layer_count;
+   uint32_t td_count = DIV_ROUND_UP(cmdbuf->state.gfx.render.layer_count,
+                                    MAX_LAYERS_PER_TILER_DESC);
+
+   return (calc_fbd_size(cmdbuf) * fbd_count) +
+          (td_count * pan_size(TILER_CONTEXT));
 }
 
 static void
@@ -636,10 +655,9 @@ cs_render_desc_ringbuf_move_ptr(struct cs_builder *b, uint32_t size)
    cs_add32(b, scratch_reg, pos, -RENDER_DESC_RINGBUF_SIZE);
 
    /* Wrap-around. */
-   cs_while(b, MALI_CS_CONDITION_GEQUAL, scratch_reg) {
+   cs_if(b, MALI_CS_CONDITION_GEQUAL, scratch_reg) {
       cs_add32(b, ptr_lo, ptr_lo, -RENDER_DESC_RINGBUF_SIZE);
       cs_add32(b, pos, pos, -RENDER_DESC_RINGBUF_SIZE);
-      cs_loop_break(b, MALI_CS_CONDITION_ALWAYS, cs_undef());
    }
 
    cs_store(
@@ -665,19 +683,16 @@ get_tiler_desc(struct panvk_cmd_buffer *cmdbuf)
       cmdbuf->flags & VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
    struct panfrost_ptr tiler_desc = {0};
    struct mali_tiler_context_packed tiler_tmpl;
+   uint32_t td_count = DIV_ROUND_UP(cmdbuf->state.gfx.render.layer_count,
+                                    MAX_LAYERS_PER_TILER_DESC);
 
    if (!simul_use) {
-      tiler_desc = panvk_cmd_alloc_desc(cmdbuf, TILER_CONTEXT);
+      tiler_desc = panvk_cmd_alloc_desc_array(cmdbuf, td_count, TILER_CONTEXT);
       if (!tiler_desc.gpu)
          return VK_ERROR_OUT_OF_DEVICE_MEMORY;
-   } else {
-      /* If the tiler descriptor is allocated from the ring buffer, we set a
-       * dumb non-zero address to allow the is-tiler-acquired test to pass. */
-      tiler_desc.cpu = &tiler_tmpl;
-      tiler_desc.gpu = 0xdeadbeefdeadbeefull;
    }
 
-   pan_pack(tiler_desc.cpu, TILER_CONTEXT, cfg) {
+   pan_pack(&tiler_tmpl, TILER_CONTEXT, cfg) {
       unsigned max_levels = tiler_features.max_levels;
       assert(max_levels >= 2);
 
@@ -698,11 +713,13 @@ get_tiler_desc(struct panvk_cmd_buffer *cmdbuf)
       /* TODO: revisit for VK_EXT_provoking_vertex. */
       cfg.first_provoking_vertex = true;
 
-      cfg.layer_count = cmdbuf->state.gfx.render.layer_count;
+      /* This will be overloaded. */
+      cfg.layer_count = 1;
       cfg.layer_offset = 0;
    }
 
-   cmdbuf->state.gfx.render.tiler = tiler_desc.gpu;
+   cmdbuf->state.gfx.render.tiler =
+      simul_use ? 0xdeadbeefdeadbeefull : tiler_desc.gpu;
 
    struct cs_index tiler_ctx_addr = cs_sr_reg64(b, 40);
 
@@ -719,12 +736,6 @@ get_tiler_desc(struct panvk_cmd_buffer *cmdbuf)
       }
 
       cs_render_desc_ringbuf_move_ptr(b, descs_sz);
-
-      /* Lay out words 2:5, so they can be stored along the other updates. */
-      cs_move64_to(b, cs_scratch_reg64(b, 2),
-                   tiler_tmpl.opaque[2] | (uint64_t)tiler_tmpl.opaque[3] << 32);
-      cs_move64_to(b, cs_scratch_reg64(b, 4),
-                   tiler_tmpl.opaque[4] | (uint64_t)tiler_tmpl.opaque[5] << 32);
    } else {
       cs_update_vt_ctx(b) {
          cs_move64_to(b, tiler_ctx_addr, tiler_desc.gpu);
@@ -734,39 +745,113 @@ get_tiler_desc(struct panvk_cmd_buffer *cmdbuf)
    /* Reset the polygon list. */
    cs_move64_to(b, cs_scratch_reg64(b, 0), 0);
 
+   /* Lay out words 2, 3 and 5, so they can be stored along the other updates.
+    * Word 4 contains layer information and will be updated in the loop. */
+   cs_move64_to(b, cs_scratch_reg64(b, 2),
+                tiler_tmpl.opaque[2] | (uint64_t)tiler_tmpl.opaque[3] << 32);
+   cs_move32_to(b, cs_scratch_reg32(b, 5), tiler_tmpl.opaque[5]);
+
    /* Load the tiler_heap and geom_buf from the context. */
    cs_load_to(b, cs_scratch_reg_tuple(b, 6, 4), cs_subqueue_ctx_reg(b),
               BITFIELD_MASK(4),
               offsetof(struct panvk_cs_subqueue_context, render.tiler_heap));
 
-   /* Reset the completed chain. */
+   /* Fill extra fields with zeroes so we can reset the completed
+    * top/bottom and private states. */
    cs_move64_to(b, cs_scratch_reg64(b, 10), 0);
    cs_move64_to(b, cs_scratch_reg64(b, 12), 0);
-
-   cs_wait_slot(b, SB_ID(LS), false);
-
-   /* Update the first half of the tiler desc. */
-   if (simul_use) {
-      cs_store(b, cs_scratch_reg_tuple(b, 0, 14), tiler_ctx_addr,
-               BITFIELD_MASK(14), 0);
-   } else {
-      cs_store(b, cs_scratch_reg_tuple(b, 0, 2), tiler_ctx_addr,
-               BITFIELD_MASK(2), 0);
-      cs_store(b, cs_scratch_reg_tuple(b, 6, 8), tiler_ctx_addr,
-               BITFIELD_MASK(8), 24);
-   }
-
-   cs_wait_slot(b, SB_ID(LS), false);
-
-   /* r10:13 are already zero, fill r8:9 and r14:15 with zeros so we can reset
-    * the private state in one store. */
-   cs_move64_to(b, cs_scratch_reg64(b, 8), 0);
    cs_move64_to(b, cs_scratch_reg64(b, 14), 0);
 
-   /* Update the second half of the tiler descriptor. */
-   cs_store(b, cs_scratch_reg_tuple(b, 8, 8), tiler_ctx_addr, BITFIELD_MASK(8),
-            96);
    cs_wait_slot(b, SB_ID(LS), false);
+
+   /* Take care of the tiler desc with layer_offset=0 outside of the loop. */
+   cs_move32_to(b, cs_scratch_reg32(b, 4),
+                MIN2(cmdbuf->state.gfx.render.layer_count - 1,
+                     MAX_LAYERS_PER_TILER_DESC - 1));
+
+   /* Replace words 0:13 and 24:31. */
+   cs_store(b, cs_scratch_reg_tuple(b, 0, 16), tiler_ctx_addr,
+            BITFIELD_MASK(16), 0);
+   cs_store(b, cs_scratch_reg_tuple(b, 0, 16), tiler_ctx_addr,
+            BITFIELD_RANGE(0, 2) | BITFIELD_RANGE(10, 6), 64);
+   cs_store(b, cs_scratch_reg_tuple(b, 0, 16), tiler_ctx_addr,
+            BITFIELD_RANGE(0, 2) | BITFIELD_RANGE(10, 6), 96);
+
+   cs_wait_slot(b, SB_ID(LS), false);
+
+   uint32_t remaining_layers =
+      td_count > 1
+         ? cmdbuf->state.gfx.render.layer_count % MAX_LAYERS_PER_TILER_DESC
+         : 0;
+   uint32_t full_td_count =
+      cmdbuf->state.gfx.render.layer_count / MAX_LAYERS_PER_TILER_DESC;
+
+   if (remaining_layers) {
+      int32_t layer_offset =
+         -(cmdbuf->state.gfx.render.layer_count - remaining_layers) &
+         BITFIELD_MASK(9);
+
+      /* If the last tiler descriptor is not full, we emit it outside of the
+       * loop to pass the right layer count. All this would be a lot simpler
+       * if we had OR/AND instructions, but here we are. */
+      cs_update_vt_ctx(b)
+         cs_add64(b, tiler_ctx_addr, tiler_ctx_addr,
+                  pan_size(TILER_CONTEXT) * full_td_count);
+      cs_move32_to(b, cs_scratch_reg32(b, 4),
+                   (layer_offset << 8) | (remaining_layers - 1));
+      cs_store(b, cs_scratch_reg_tuple(b, 0, 16), tiler_ctx_addr,
+               BITFIELD_MASK(16), 0);
+      cs_store(b, cs_scratch_reg_tuple(b, 0, 16), tiler_ctx_addr,
+               BITFIELD_RANGE(0, 2) | BITFIELD_RANGE(10, 6), 64);
+      cs_store(b, cs_scratch_reg_tuple(b, 0, 16), tiler_ctx_addr,
+               BITFIELD_RANGE(0, 2) | BITFIELD_RANGE(10, 6), 96);
+      cs_wait_slot(b, SB_ID(LS), false);
+
+      cs_update_vt_ctx(b)
+         cs_add64(b, tiler_ctx_addr, tiler_ctx_addr,
+                  -pan_size(TILER_CONTEXT));
+   } else if (full_td_count > 1) {
+      cs_update_vt_ctx(b)
+         cs_add64(b, tiler_ctx_addr, tiler_ctx_addr,
+                  pan_size(TILER_CONTEXT) * (full_td_count - 1));
+   }
+
+   if (full_td_count > 1) {
+      struct cs_index counter_reg = cs_scratch_reg32(b, 17);
+      uint32_t layer_offset =
+         (-MAX_LAYERS_PER_TILER_DESC * (full_td_count - 1)) & BITFIELD_MASK(9);
+
+      cs_move32_to(b, counter_reg, full_td_count - 1);
+      cs_move32_to(b, cs_scratch_reg32(b, 4),
+                   (layer_offset << 8) | (MAX_LAYERS_PER_TILER_DESC - 1));
+
+      /* We iterate the remaining full tiler descriptors in reverse order, so we
+       * can start from the smallest layer offset, and increment it by
+       * MAX_LAYERS_PER_TILER_DESC << 8 at each iteration. Again, the split is
+       * mostly due to the lack of AND instructions, and the fact layer_offset
+       * is a 9-bit signed integer inside a 32-bit word, which ADD32 can't deal
+       * with unless the number we add is positive.
+       */
+      cs_while(b, MALI_CS_CONDITION_GREATER, counter_reg) {
+         /* Replace words 0:13 and 24:31. */
+         cs_store(b, cs_scratch_reg_tuple(b, 0, 16), tiler_ctx_addr,
+                  BITFIELD_MASK(16), 0);
+         cs_store(b, cs_scratch_reg_tuple(b, 0, 16), tiler_ctx_addr,
+                  BITFIELD_RANGE(0, 2) | BITFIELD_RANGE(10, 6), 64);
+         cs_store(b, cs_scratch_reg_tuple(b, 0, 16), tiler_ctx_addr,
+                  BITFIELD_RANGE(0, 2) | BITFIELD_RANGE(10, 6), 96);
+
+         cs_wait_slot(b, SB_ID(LS), false);
+
+         cs_add32(b, cs_scratch_reg32(b, 4), cs_scratch_reg32(b, 4),
+                  MAX_LAYERS_PER_TILER_DESC << 8);
+
+         cs_add32(b, counter_reg, counter_reg, -1);
+         cs_update_vt_ctx(b)
+            cs_add64(b, tiler_ctx_addr, tiler_ctx_addr,
+                     -pan_size(TILER_CONTEXT));
+      }
+   }
 
    /* Then we change the scoreboard slot used for iterators. */
    panvk_per_arch(cs_pick_iter_sb)(cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER);
@@ -785,9 +870,6 @@ get_fb_descs(struct panvk_cmd_buffer *cmdbuf)
    uint32_t fbds_sz =
       calc_fbd_size(cmdbuf) * cmdbuf->state.gfx.render.layer_count;
 
-   memset(&cmdbuf->state.gfx.render.fb.info.bifrost.pre_post.dcds, 0,
-          sizeof(cmdbuf->state.gfx.render.fb.info.bifrost.pre_post.dcds));
-
    cmdbuf->state.gfx.render.fbds = panvk_cmd_alloc_dev_mem(
       cmdbuf, desc, fbds_sz, pan_alignment(FRAMEBUFFER));
    if (!cmdbuf->state.gfx.render.fbds.gpu)
@@ -797,7 +879,7 @@ get_fb_descs(struct panvk_cmd_buffer *cmdbuf)
 }
 
 static VkResult
-prepare_vs(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_info *draw)
+prepare_vs(struct panvk_cmd_buffer *cmdbuf)
 {
    struct panvk_descriptor_state *desc_state = &cmdbuf->state.gfx.desc_state;
    struct panvk_shader_desc_state *vs_desc_state = &cmdbuf->state.gfx.vs.desc;
@@ -813,7 +895,7 @@ prepare_vs(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_info *draw)
    bool upd_res_table = false;
 
    if (!vs_desc_state->res_table) {
-      VkResult result = prepare_vs_driver_set(cmdbuf, draw);
+      VkResult result = prepare_vs_driver_set(cmdbuf);
       if (result != VK_SUCCESS)
          return result;
 
@@ -970,7 +1052,8 @@ prepare_ds(struct panvk_cmd_buffer *cmdbuf)
       if (rs->depth_clamp_enable)
          cfg.depth_clamp_mode = MALI_DEPTH_CLAMP_MODE_BOUNDS;
 
-      cfg.depth_source = pan_depth_source(&fs->info);
+      if (fs)
+         cfg.depth_source = pan_depth_source(&fs->info);
       cfg.depth_write_enable = ds->depth.write_enable;
       cfg.depth_bias_enable = rs->depth_bias.enable;
       cfg.depth_function = test_z ? translate_compare_func(ds->depth.compare_op)
@@ -993,7 +1076,7 @@ prepare_dcd(struct panvk_cmd_buffer *cmdbuf)
       panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER);
    const struct panvk_shader *fs = cmdbuf->state.gfx.fs.shader;
    bool fs_is_dirty =
-      cmdbuf->state.gfx.fs.spd != panvk_priv_mem_dev_addr(fs->spd);
+      cmdbuf->state.gfx.fs.spd != (fs ? panvk_priv_mem_dev_addr(fs->spd) : 0);
    bool dcd0_dirty = is_dirty(cmdbuf, RS_RASTERIZER_DISCARD_ENABLE) ||
                      is_dirty(cmdbuf, RS_CULL_MODE) ||
                      is_dirty(cmdbuf, RS_FRONT_FACE) ||
@@ -1097,6 +1180,26 @@ prepare_dcd(struct panvk_cmd_buffer *cmdbuf)
 }
 
 static void
+prepare_index_buffer(struct panvk_cmd_buffer *cmdbuf,
+                     struct panvk_draw_info *draw)
+{
+   struct cs_builder *b =
+      panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER);
+
+   if (draw->index.size && cmdbuf->state.gfx.ib.dirty) {
+      uint64_t ib_size =
+         panvk_buffer_range(cmdbuf->state.gfx.ib.buffer,
+                            cmdbuf->state.gfx.ib.offset, VK_WHOLE_SIZE);
+      assert(ib_size <= UINT32_MAX);
+      cs_move32_to(b, cs_sr_reg32(b, 39), ib_size);
+
+      cs_move64_to(b, cs_sr_reg64(b, 54),
+                   panvk_buffer_gpu_ptr(cmdbuf->state.gfx.ib.buffer,
+                                        cmdbuf->state.gfx.ib.offset));
+   }
+}
+
+static void
 clear_dirty(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_info *draw)
 {
    const struct panvk_shader *vs = cmdbuf->state.gfx.vs.shader;
@@ -1113,8 +1216,7 @@ clear_dirty(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_info *draw)
       cmdbuf->state.gfx.vs.spds.var = panvk_priv_mem_dev_addr(vs->spds.var);
    }
 
-   if (fs)
-      cmdbuf->state.gfx.fs.spd = panvk_priv_mem_dev_addr(fs->spd);
+   cmdbuf->state.gfx.fs.spd = fs ? panvk_priv_mem_dev_addr(fs->spd) : 0;
 
    if (draw->index.size)
       cmdbuf->state.gfx.ib.dirty = false;
@@ -1123,77 +1225,13 @@ clear_dirty(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_info *draw)
    vk_dynamic_graphics_state_clear_dirty(&cmdbuf->vk.dynamic_graphics_state);
 }
 
-static void
-panvk_cmd_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_info *draw)
+static struct mali_primitive_flags_packed
+get_tiler_idvs_flags(struct panvk_cmd_buffer *cmdbuf,
+                     struct panvk_draw_info *draw)
 {
    const struct panvk_shader *vs = cmdbuf->state.gfx.vs.shader;
-   const struct panvk_shader *fs = cmdbuf->state.gfx.fs.shader;
-   struct panvk_descriptor_state *desc_state = &cmdbuf->state.gfx.desc_state;
-   const struct vk_rasterization_state *rs =
-      &cmdbuf->vk.dynamic_graphics_state.rs;
    const struct vk_input_assembly_state *ia =
       &cmdbuf->vk.dynamic_graphics_state.ia;
-   bool idvs = vs->info.vs.idvs;
-   VkResult result;
-
-   /* If there's no vertex shader, we can skip the draw. */
-   if (!panvk_priv_mem_dev_addr(vs->spds.pos_points))
-      return;
-
-   /* FIXME: support non-IDVS. */
-   assert(idvs);
-
-   if (!cmdbuf->state.gfx.linked) {
-      result = panvk_per_arch(link_shaders)(&cmdbuf->desc_pool, vs, fs,
-                                            &cmdbuf->state.gfx.link);
-      if (result != VK_SUCCESS) {
-         vk_command_buffer_set_error(&cmdbuf->vk, result);
-         return;
-      }
-      cmdbuf->state.gfx.linked = true;
-   }
-
-   result = update_tls(cmdbuf);
-   if (result != VK_SUCCESS)
-      return;
-
-   bool needs_tiling = !rs->rasterizer_discard_enable;
-
-   if (needs_tiling) {
-      result = get_tiler_desc(cmdbuf);
-      if (result != VK_SUCCESS)
-         return;
-
-      get_fb_descs(cmdbuf);
-   }
-
-   struct cs_builder *b =
-      panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER);
-
-   uint32_t used_set_mask =
-      vs->desc_info.used_set_mask | (fs ? fs->desc_info.used_set_mask : 0);
-
-   result =
-      panvk_per_arch(cmd_prepare_push_descs)(cmdbuf, desc_state, used_set_mask);
-   if (result != VK_SUCCESS)
-      return;
-
-   prepare_sysvals(cmdbuf);
-
-   result = prepare_push_uniforms(cmdbuf);
-   if (result != VK_SUCCESS)
-      return;
-
-   result = prepare_vs(cmdbuf, draw);
-   if (result != VK_SUCCESS)
-      return;
-
-   /* No need to setup the FS desc tables if the FS is not executed. */
-   if (needs_tiling && fs_required(cmdbuf)) {
-      result = prepare_fs(cmdbuf);
-      if (result != VK_SUCCESS)
-         return;
-   }
 
    struct mali_primitive_flags_packed tiler_idvs_flags;
    bool writes_point_size =
@@ -1222,6 +1260,77 @@ panvk_cmd_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_info *draw)
       cfg.primitive_restart = ia->primitive_restart_enable;
    }
 
+   return tiler_idvs_flags;
+}
+
+static VkResult
+prepare_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_info *draw)
+{
+   const struct panvk_shader *vs = cmdbuf->state.gfx.vs.shader;
+   const struct panvk_shader *fs = cmdbuf->state.gfx.fs.shader;
+   struct panvk_descriptor_state *desc_state = &cmdbuf->state.gfx.desc_state;
+   const struct vk_rasterization_state *rs =
+      &cmdbuf->vk.dynamic_graphics_state.rs;
+   bool idvs = vs->info.vs.idvs;
+   VkResult result;
+
+   /* FIXME: support non-IDVS. */
+   assert(idvs);
+
+   if (!cmdbuf->state.gfx.linked) {
+      result = panvk_per_arch(link_shaders)(&cmdbuf->desc_pool, vs, fs,
+                                            &cmdbuf->state.gfx.link);
+      if (result != VK_SUCCESS) {
+         vk_command_buffer_set_error(&cmdbuf->vk, result);
+         return result;
+      }
+      cmdbuf->state.gfx.linked = true;
+   }
+
+   result = update_tls(cmdbuf);
+   if (result != VK_SUCCESS)
+      return result;
+
+   bool needs_tiling = !rs->rasterizer_discard_enable;
+
+   if (needs_tiling) {
+      result = get_tiler_desc(cmdbuf);
+      if (result != VK_SUCCESS)
+         return result;
+
+      result = get_fb_descs(cmdbuf);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+
+   struct cs_builder *b =
+      panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER);
+
+   uint32_t used_set_mask =
+      vs->desc_info.used_set_mask | (fs ? fs->desc_info.used_set_mask : 0);
+
+   result =
+      panvk_per_arch(cmd_prepare_push_descs)(cmdbuf, desc_state, used_set_mask);
+   if (result != VK_SUCCESS)
+      return result;
+
+   prepare_sysvals(cmdbuf);
+
+   result = prepare_push_uniforms(cmdbuf);
+   if (result != VK_SUCCESS)
+      return result;
+
+   result = prepare_vs(cmdbuf);
+   if (result != VK_SUCCESS)
+      return result;
+
+   /* No need to setup the FS desc tables if the FS is not executed. */
+   if (needs_tiling && fs_required(cmdbuf)) {
+      result = prepare_fs(cmdbuf);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+
    uint32_t varying_size = 0;
 
    if (vs && fs) {
@@ -1234,30 +1343,10 @@ panvk_cmd_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_info *draw)
    }
 
    cs_update_vt_ctx(b) {
-      cs_move32_to(b, cs_sr_reg32(b, 32), draw->vertex.base);
-      cs_move32_to(b, cs_sr_reg32(b, 33), draw->vertex.count);
-      cs_move32_to(b, cs_sr_reg32(b, 34), draw->instance.count);
-      cs_move32_to(b, cs_sr_reg32(b, 35), draw->index.offset);
-      cs_move32_to(b, cs_sr_reg32(b, 36), draw->index.vertex_offset);
-
-      /* Instance ID is assumed to be zero-based for now. See if we can
-       * extend nir_lower_system_values() and the lower options to make
-       * instance-ID non-zero based, or if it's fine to always return
-       * zero for the instance base. */
-      cs_move32_to(b, cs_sr_reg32(b, 37), 0);
-
       /* We don't use the resource dep system yet. */
       cs_move32_to(b, cs_sr_reg32(b, 38), 0);
 
-      cs_move32_to(
-         b, cs_sr_reg32(b, 39),
-         (draw->index.offset + draw->vertex.count) * draw->index.size);
-
-      if (draw->index.size && cmdbuf->state.gfx.ib.dirty) {
-         cs_move64_to(b, cs_sr_reg64(b, 54),
-                      panvk_buffer_gpu_ptr(cmdbuf->state.gfx.ib.buffer,
-                                           cmdbuf->state.gfx.ib.offset));
-      }
+      prepare_index_buffer(cmdbuf, draw);
 
       /* TODO: Revisit to avoid passing everything through the override flags
        * (likely needed for state preservation in secondary command buffers). */
@@ -1267,11 +1356,11 @@ panvk_cmd_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_info *draw)
 
       result = prepare_blend(cmdbuf);
       if (result != VK_SUCCESS)
-         return;
+         return result;
 
       result = prepare_ds(cmdbuf);
       if (result != VK_SUCCESS)
-         return;
+         return result;
 
       prepare_dcd(cmdbuf);
       prepare_vp(cmdbuf);
@@ -1279,10 +1368,68 @@ panvk_cmd_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_info *draw)
 
    clear_dirty(cmdbuf, draw);
 
+   return VK_SUCCESS;
+}
+
+static void
+panvk_cmd_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_info *draw)
+{
+   const struct panvk_shader *vs = cmdbuf->state.gfx.vs.shader;
+   struct cs_builder *b =
+      panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER);
+   VkResult result;
+
+   /* If there's no vertex shader, we can skip the draw. */
+   if (!panvk_priv_mem_dev_addr(vs->spds.pos_points))
+      return;
+
+   result = prepare_draw(cmdbuf, draw);
+   if (result != VK_SUCCESS)
+      return;
+
+   cs_update_vt_ctx(b) {
+      cs_move32_to(b, cs_sr_reg32(b, 32), draw->vertex.base);
+      cs_move32_to(b, cs_sr_reg32(b, 33), draw->vertex.count);
+      cs_move32_to(b, cs_sr_reg32(b, 34), draw->instance.count);
+      cs_move32_to(b, cs_sr_reg32(b, 35), draw->index.offset);
+      cs_move32_to(b, cs_sr_reg32(b, 36), draw->index.vertex_offset);
+      cs_move32_to(b, cs_sr_reg32(b, 37), draw->instance.base);
+   }
+
+   struct mali_primitive_flags_packed tiler_idvs_flags =
+      get_tiler_idvs_flags(cmdbuf, draw);
+
+   uint32_t idvs_count = DIV_ROUND_UP(cmdbuf->state.gfx.render.layer_count,
+                                      MAX_LAYERS_PER_TILER_DESC);
+
    cs_req_res(b, CS_IDVS_RES);
-   cs_run_idvs(b, tiler_idvs_flags.opaque[0], false, true,
-               cs_shader_res_sel(0, 0, 1, 0), cs_shader_res_sel(2, 2, 2, 0),
-               cs_undef());
+   if (idvs_count > 1) {
+      struct cs_index counter_reg = cs_scratch_reg32(b, 17);
+      struct cs_index tiler_ctx_addr = cs_sr_reg64(b, 40);
+
+      cs_move32_to(b, counter_reg, idvs_count);
+
+      cs_while(b, MALI_CS_CONDITION_GREATER, counter_reg) {
+         cs_run_idvs(b, tiler_idvs_flags.opaque[0], false, true,
+                     cs_shader_res_sel(0, 0, 1, 0),
+                     cs_shader_res_sel(2, 2, 2, 0), cs_undef());
+
+	 cs_add32(b, counter_reg, counter_reg, -1);
+         cs_update_vt_ctx(b) {
+            cs_add64(b, tiler_ctx_addr, tiler_ctx_addr,
+                     pan_size(TILER_CONTEXT));
+         }
+      }
+
+      cs_update_vt_ctx(b) {
+         cs_add64(b, tiler_ctx_addr, tiler_ctx_addr,
+                  -(idvs_count * pan_size(TILER_CONTEXT)));
+      }
+   } else {
+      cs_run_idvs(b, tiler_idvs_flags.opaque[0], false, true,
+                  cs_shader_res_sel(0, 0, 1, 0), cs_shader_res_sel(2, 2, 2, 0),
+                  cs_undef());
+   }
    cs_req_res(b, 0);
 }
 
@@ -1329,12 +1476,74 @@ panvk_per_arch(CmdDrawIndexed)(VkCommandBuffer commandBuffer,
    panvk_cmd_draw(cmdbuf, &draw);
 }
 
+static void
+panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
+                        struct panvk_draw_info *draw)
+{
+   const struct panvk_shader *vs = cmdbuf->state.gfx.vs.shader;
+   struct cs_builder *b =
+      panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER);
+   VkResult result;
+
+   /* If there's no vertex shader, we can skip the draw. */
+   if (!panvk_priv_mem_dev_addr(vs->spds.pos_points))
+      return;
+
+   /* Layered indirect draw (VK_EXT_shader_viewport_index_layer) needs
+    * additional changes. */
+   assert(cmdbuf->state.gfx.render.layer_count == 1);
+
+   /* MultiDrawIndirect (.maxDrawIndirectCount) needs additional changes. */
+   assert(draw->indirect.draw_count == 1);
+
+   result = prepare_draw(cmdbuf, draw);
+   if (result != VK_SUCCESS)
+      return;
+
+   struct cs_index draw_params_addr = cs_scratch_reg64(b, 0);
+   cs_move64_to(
+      b, draw_params_addr,
+      panvk_buffer_gpu_ptr(draw->indirect.buffer, draw->indirect.offset));
+
+   cs_update_vt_ctx(b) {
+      cs_move32_to(b, cs_sr_reg32(b, 32), 0);
+      /* Load SR33-37 from indirect buffer. */
+      unsigned reg_mask = draw->index.size ? 0b11111 : 0b11011;
+      cs_load_to(b, cs_sr_reg_tuple(b, 33, 5), draw_params_addr, reg_mask, 0);
+   }
+
+   struct mali_primitive_flags_packed tiler_idvs_flags =
+      get_tiler_idvs_flags(cmdbuf, draw);
+
+   /* Wait for the SR33-37 indirect buffer load. */
+   cs_wait_slot(b, SB_ID(LS), false);
+
+   cs_req_res(b, CS_IDVS_RES);
+   cs_run_idvs(b, tiler_idvs_flags.opaque[0], false, true,
+               cs_shader_res_sel(0, 0, 1, 0), cs_shader_res_sel(2, 2, 2, 0),
+               cs_undef());
+   cs_req_res(b, 0);
+}
+
 VKAPI_ATTR void VKAPI_CALL
 panvk_per_arch(CmdDrawIndirect)(VkCommandBuffer commandBuffer, VkBuffer _buffer,
                                 VkDeviceSize offset, uint32_t drawCount,
                                 uint32_t stride)
 {
-   panvk_stub();
+   VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+   VK_FROM_HANDLE(panvk_buffer, buffer, _buffer);
+
+   if (drawCount == 0)
+      return;
+
+   struct panvk_draw_info draw = {
+      .indirect.buffer = buffer,
+      .indirect.offset = offset,
+      .indirect.draw_count = drawCount,
+      .indirect.stride = stride,
+   };
+
+   panvk_cmd_draw_indirect(cmdbuf, &draw);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -1342,7 +1551,21 @@ panvk_per_arch(CmdDrawIndexedIndirect)(VkCommandBuffer commandBuffer,
                                        VkBuffer _buffer, VkDeviceSize offset,
                                        uint32_t drawCount, uint32_t stride)
 {
-   panvk_stub();
+   VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+   VK_FROM_HANDLE(panvk_buffer, buffer, _buffer);
+
+   if (drawCount == 0)
+      return;
+
+   struct panvk_draw_info draw = {
+      .index.size = cmdbuf->state.gfx.ib.index_size,
+      .indirect.buffer = buffer,
+      .indirect.offset = offset,
+      .indirect.draw_count = drawCount,
+      .indirect.stride = stride,
+   };
+
+   panvk_cmd_draw_indirect(cmdbuf, &draw);
 }
 
 static void
@@ -1758,8 +1981,9 @@ static uint8_t
 prepare_fb_desc(struct panvk_cmd_buffer *cmdbuf, uint32_t layer, void *fbd)
 {
    struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
-   bool simul_use =
-      !(cmdbuf->flags & VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT);
+
+   memset(&cmdbuf->state.gfx.render.fb.info.bifrost.pre_post.dcds, 0,
+          sizeof(cmdbuf->state.gfx.render.fb.info.bifrost.pre_post.dcds));
 
    if (cmdbuf->state.tls.desc.gpu) {
       ASSERTED unsigned num_preload_jobs =
@@ -1774,7 +1998,7 @@ prepare_fb_desc(struct panvk_cmd_buffer *cmdbuf, uint32_t layer, void *fbd)
    }
 
    struct pan_tiler_context tiler_ctx = {
-      .valhall.desc = !simul_use ? cmdbuf->state.gfx.render.tiler : 0,
+      .valhall.layer_offset = layer - (layer % MAX_LAYERS_PER_TILER_DESC),
    };
 
    return GENX(pan_emit_fbd)(&cmdbuf->state.gfx.render.fb.info, layer, NULL,
@@ -1924,25 +2148,31 @@ issue_fragment_jobs(struct panvk_cmd_buffer *cmdbuf)
    struct cs_index layer_count = cs_sr_reg32(b, 47);
    struct cs_index fbd_ptr = cs_sr_reg64(b, 48);
    struct cs_index tiler_ptr = cs_sr_reg64(b, 50);
-   struct cs_index src_fbd_ptr = cs_undef();
+   struct cs_index cur_tiler = cs_sr_reg64(b, 52);
+   struct cs_index remaining_layers_in_td = cs_sr_reg32(b, 54);
+   struct cs_index src_fbd_ptr = cs_sr_reg64(b, 56);
+   uint32_t td_count = DIV_ROUND_UP(cmdbuf->state.gfx.render.layer_count,
+                                    MAX_LAYERS_PER_TILER_DESC);
 
    if (copy_fbds) {
-      src_fbd_ptr = cs_sr_reg64(b, 52);
-
-      cs_move32_to(b, layer_count, cmdbuf->state.gfx.render.layer_count);
       cs_load64_to(
          b, tiler_ptr, cs_subqueue_ctx_reg(b),
          offsetof(struct panvk_cs_subqueue_context, render.desc_ringbuf.ptr));
       cs_wait_slot(b, SB_ID(LS), false);
 
-      cs_add64(b, fbd_ptr, tiler_ptr, pan_size(TILER_CONTEXT));
+      cs_add64(b, fbd_ptr, tiler_ptr, pan_size(TILER_CONTEXT) * td_count);
       cs_move64_to(b, src_fbd_ptr, fbds.gpu);
    } else if (cmdbuf->state.gfx.render.tiler) {
       cs_move64_to(b, fbd_ptr, fbds.gpu);
       cs_move64_to(b, tiler_ptr, cmdbuf->state.gfx.render.tiler);
    }
 
+
+   cs_add64(b, cur_tiler, tiler_ptr, 0);
    cs_move32_to(b, layer_count, cmdbuf->state.gfx.render.layer_count);
+   cs_move32_to(b, remaining_layers_in_td, MAX_LAYERS_PER_TILER_DESC);
+
+   cs_req_res(b, CS_FRAG_RES);
    cs_while(b, MALI_CS_CONDITION_GREATER, layer_count) {
       if (copy_fbds) {
          for (uint32_t fbd_off = 0; fbd_off < fbd_sz; fbd_off += 64) {
@@ -1958,19 +2188,23 @@ issue_fragment_jobs(struct panvk_cmd_buffer *cmdbuf)
       }
 
       if (cmdbuf->state.gfx.render.tiler) {
-         cs_store64(b, tiler_ptr, fbd_ptr, 56);
+         cs_store64(b, cur_tiler, fbd_ptr, 56);
          cs_wait_slot(b, SB_ID(LS), false);
       }
 
       cs_update_frag_ctx(b)
          cs_add64(b, cs_sr_reg64(b, 40), fbd_ptr, fbd_flags);
 
-      cs_req_res(b, CS_FRAG_RES);
       cs_run_fragment(b, false, MALI_TILE_RENDER_ORDER_Z_ORDER, false);
-      cs_req_res(b, 0);
       cs_add64(b, fbd_ptr, fbd_ptr, fbd_sz);
       cs_add32(b, layer_count, layer_count, -1);
+      cs_add32(b, remaining_layers_in_td, remaining_layers_in_td, -1);
+      cs_if(b, MALI_CS_CONDITION_LEQUAL, remaining_layers_in_td) {
+         cs_add64(b, cur_tiler, cur_tiler, pan_size(TILER_CONTEXT));
+         cs_move32_to(b, remaining_layers_in_td, MAX_LAYERS_PER_TILER_DESC);
+      }
    }
+   cs_req_res(b, 0);
 
    struct cs_index sync_addr = cs_scratch_reg64(b, 0);
    struct cs_index iter_sb = cs_scratch_reg32(b, 2);
@@ -1981,6 +2215,7 @@ issue_fragment_jobs(struct panvk_cmd_buffer *cmdbuf)
    struct cs_index completed = cs_scratch_reg_tuple(b, 10, 4);
    struct cs_index completed_top = cs_scratch_reg64(b, 10);
    struct cs_index completed_bottom = cs_scratch_reg64(b, 12);
+   struct cs_index tiler_count = cs_sr_reg32(b, 47);
 
    cs_move64_to(b, add_val, 1);
    cs_load_to(b, cs_scratch_reg_tuple(b, 0, 3), cs_subqueue_ctx_reg(b),
@@ -1994,21 +2229,26 @@ issue_fragment_jobs(struct panvk_cmd_buffer *cmdbuf)
                             render.desc_ringbuf.syncobj));
    }
 
-   if (cmdbuf->state.gfx.render.tiler)
-      cs_load_to(b, completed, tiler_ptr, BITFIELD_MASK(4), 40);
-
    cs_wait_slot(b, SB_ID(LS), false);
 
    cs_add64(b, sync_addr, sync_addr,
             PANVK_SUBQUEUE_FRAGMENT * sizeof(struct panvk_cs_sync64));
+   cs_move32_to(b, tiler_count, td_count);
+   cs_add64(b, cur_tiler, tiler_ptr, 0);
 
    cs_match(b, iter_sb, cmp_scratch) {
 #define CASE(x)                                                                \
       cs_case(b, x) {                                                          \
          if (cmdbuf->state.gfx.render.tiler) {                                 \
-            cs_finish_fragment(b, true, completed_top, completed_bottom,       \
-                               cs_defer(SB_WAIT_ITER(x),                       \
-                                        SB_ID(DEFERRED_SYNC)));                \
+            cs_while(b, MALI_CS_CONDITION_GREATER, tiler_count) {              \
+               cs_load_to(b, completed, cur_tiler, BITFIELD_MASK(4), 40);      \
+               cs_wait_slot(b, SB_ID(LS), false);                              \
+               cs_finish_fragment(b, true, completed_top, completed_bottom,    \
+                                  cs_defer(SB_WAIT_ITER(x),                    \
+                                           SB_ID(DEFERRED_SYNC)));             \
+               cs_add64(b, cur_tiler, cur_tiler, pan_size(TILER_CONTEXT));     \
+               cs_add32(b, tiler_count, tiler_count, -1);                      \
+            }                                                                  \
          }                                                                     \
          if (copy_fbds) {                                                      \
             cs_sync32_add(b, true, MALI_CS_SYNC_SCOPE_CSG,                     \
@@ -2071,8 +2311,11 @@ panvk_per_arch(CmdEndRendering)(VkCommandBuffer commandBuffer)
       for (unsigned i = 0; i < fbinfo->rt_count; i++)
          clear |= fbinfo->rts[i].clear;
 
-      if (clear)
-         get_fb_descs(cmdbuf);
+      if (clear) {
+         VkResult result = get_fb_descs(cmdbuf);
+         if (result != VK_SUCCESS)
+            return;
+      }
 
       flush_tiling(cmdbuf);
       issue_fragment_jobs(cmdbuf);

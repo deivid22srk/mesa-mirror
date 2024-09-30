@@ -195,13 +195,17 @@ typedef enum {
    nir_var_mem_node_payload      = (1 << 12),
    nir_var_mem_node_payload_in   = (1 << 13),
 
+   nir_var_function_in           = (1 << 14),
+   nir_var_function_out          = (1 << 15),
+   nir_var_function_inout        = (1 << 16),
+
    /* Generic modes intentionally come last. See encode_dref_modes() in
     * nir_serialize.c for more details.
     */
-   nir_var_shader_temp           = (1 << 14),
-   nir_var_function_temp         = (1 << 15),
-   nir_var_mem_shared            = (1 << 16),
-   nir_var_mem_global            = (1 << 17),
+   nir_var_shader_temp           = (1 << 17),
+   nir_var_function_temp         = (1 << 18),
+   nir_var_mem_shared            = (1 << 19),
+   nir_var_mem_global            = (1 << 20),
 
    nir_var_mem_generic           = (nir_var_shader_temp |
                                     nir_var_function_temp |
@@ -219,7 +223,7 @@ typedef enum {
                                  nir_var_mem_shared | nir_var_mem_global |
                                  nir_var_mem_push_const | nir_var_mem_task_payload |
                                  nir_var_shader_out | nir_var_system_value,
-   nir_num_variable_modes        = 18,
+   nir_num_variable_modes        = 21,
    nir_var_all                   = (1 << nir_num_variable_modes) - 1,
 } nir_variable_mode;
 MESA_DEFINE_CPP_ENUM_BITFIELD_OPERATORS(nir_variable_mode)
@@ -486,7 +490,7 @@ typedef struct nir_variable {
        *
        * :c:struct:`nir_variable_mode`
        */
-      unsigned mode : 18;
+      unsigned mode : 21;
 
       /**
        * Is the variable read-only?
@@ -836,6 +840,18 @@ typedef struct nir_variable {
 
    /* Number of nir_variable_data members */
    uint16_t num_members;
+
+   /**
+    * For variables with non NULL interface_type, this points to an array of
+    * integers such that if the ith member of the interface block is an array,
+    * max_ifc_array_access[i] is the maximum array element of that member that
+    * has been accessed.  If the ith member of the interface block is not an
+    * array, max_ifc_array_access[i] is unused.
+    *
+    * For variables whose type is not an interface block, this pointer is
+    * NULL.
+    */
+   int *max_ifc_array_access;
 
    /**
     * Built-in state that backs this uniform
@@ -3130,6 +3146,8 @@ nir_block_ends_in_break(nir_block *block)
           nir_instr_as_jump(instr)->type == nir_jump_break;
 }
 
+bool nir_block_contains_work(nir_block *block);
+
 #define nir_foreach_instr(instr, block) \
    foreach_list_typed(nir_instr, instr, node, &(block)->instr_list)
 #define nir_foreach_instr_reverse(instr, block) \
@@ -3608,6 +3626,10 @@ typedef struct {
    /* True if this paramater is actually the function return variable */
    bool is_return;
 
+   bool implicit_conversion_prohibited;
+
+   nir_variable_mode mode;
+
    /* The type of the function param */
    const struct glsl_type *type;
 } nir_parameter;
@@ -3643,6 +3665,11 @@ typedef struct nir_function {
     * e.g. subroutine void type1(float arg1);
     */
    bool is_subroutine;
+
+   /* Temporary function created to wrap global instructions before they can
+    * be inlined into the main function.
+    */
+   bool is_tmp_globals_wrapper;
 
    /**
     * Is this function associated to a subroutine type
@@ -5184,6 +5211,10 @@ nir_shader *nir_shader_clone(void *mem_ctx, const nir_shader *s);
 nir_function *nir_function_clone(nir_shader *ns, const nir_function *fxn);
 nir_function_impl *nir_function_impl_clone(nir_shader *shader,
                                            const nir_function_impl *fi);
+nir_function_impl *
+nir_function_impl_clone_remap_globals(nir_shader *shader,
+                                      const nir_function_impl *fi,
+                                      struct hash_table *remap_table);
 nir_constant *nir_constant_clone(const nir_constant *c, nir_variable *var);
 nir_variable *nir_variable_clone(const nir_variable *c, nir_shader *shader);
 
@@ -6635,7 +6666,14 @@ bool nir_rematerialize_derefs_in_use_blocks_impl(nir_function_impl *impl);
 bool nir_lower_samplers(nir_shader *shader);
 bool nir_lower_cl_images(nir_shader *shader, bool lower_image_derefs, bool lower_sampler_derefs);
 bool nir_dedup_inline_samplers(nir_shader *shader);
-bool nir_lower_ssbo(nir_shader *shader);
+
+typedef struct nir_lower_ssbo_options {
+   bool native_loads;
+   bool native_offset;
+} nir_lower_ssbo_options;
+
+bool nir_lower_ssbo(nir_shader *shader, const nir_lower_ssbo_options *opts);
+
 bool nir_lower_helper_writes(nir_shader *shader, bool lower_plain_stores);
 
 typedef struct nir_lower_printf_options {
@@ -6698,6 +6736,8 @@ bool nir_opt_find_array_copies(nir_shader *shader);
 bool nir_opt_fragdepth(nir_shader *shader);
 
 bool nir_opt_gcm(nir_shader *shader, bool value_number);
+
+bool nir_opt_generate_bfi(nir_shader *shader);
 
 bool nir_opt_idiv_const(nir_shader *shader, unsigned min_bit_size);
 
@@ -6777,7 +6817,7 @@ bool nir_opt_reassociate_bfi(nir_shader *shader);
 bool nir_opt_rematerialize_compares(nir_shader *shader);
 
 bool nir_opt_remove_phis(nir_shader *shader);
-bool nir_opt_remove_phis_block(nir_block *block);
+bool nir_remove_single_src_phis_block(nir_block *block);
 
 bool nir_opt_phi_precision(nir_shader *shader);
 
@@ -6804,8 +6844,6 @@ bool nir_opt_move_discards_to_top(nir_shader *shader);
 bool nir_opt_ray_queries(nir_shader *shader);
 
 bool nir_opt_ray_query_ranges(nir_shader *shader);
-
-bool nir_opt_reuse_constants(nir_shader *shader);
 
 void nir_sweep(nir_shader *shader);
 

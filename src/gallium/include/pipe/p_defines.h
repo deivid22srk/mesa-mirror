@@ -414,6 +414,15 @@ enum pipe_flush_flags
 #define PIPE_CONTEXT_MEDIA_ONLY      (1 << 9)
 
 /**
+ * Create a realtime priority context.
+ *
+ * The context must run at the highest possible priority and be capable of
+ * preempting the current executing context when commands are flushed
+ * by such a realtime context.
+ */
+#define PIPE_CONTEXT_REALTIME_PRIORITY (1 << 10)
+
+/**
  * Flags for pipe_context::memory_barrier.
  */
 #define PIPE_BARRIER_MAPPED_BUFFER     (1 << 0)
@@ -974,6 +983,7 @@ enum pipe_cap
    PIPE_CAP_SHADER_SUBGROUP_SUPPORTED_STAGES,
    PIPE_CAP_SHADER_SUBGROUP_SUPPORTED_FEATURES,
    PIPE_CAP_SHADER_SUBGROUP_QUAD_ALL_STAGES,
+   PIPE_CAP_MULTIVIEW,
    PIPE_CAP_LAST,
    /* XXX do not add caps after PIPE_CAP_LAST! */
 };
@@ -997,9 +1007,10 @@ enum pipe_texture_transfer_mode {
  *
  * Note that these match __EGL_CONTEXT_PRIORITY_*_BIT.
  */
-#define PIPE_CONTEXT_PRIORITY_LOW     (1 << 0)
-#define PIPE_CONTEXT_PRIORITY_MEDIUM  (1 << 1)
-#define PIPE_CONTEXT_PRIORITY_HIGH    (1 << 2)
+#define PIPE_CONTEXT_PRIORITY_LOW      (1 << 0)
+#define PIPE_CONTEXT_PRIORITY_MEDIUM   (1 << 1)
+#define PIPE_CONTEXT_PRIORITY_HIGH     (1 << 2)
+#define PIPE_CONTEXT_PRIORITY_REALTIME (1 << 3)
 
 enum pipe_quirk_texture_border_color_swizzle {
    PIPE_QUIRK_TEXTURE_BORDER_COLOR_SWIZZLE_NV50 = (1 << 0),

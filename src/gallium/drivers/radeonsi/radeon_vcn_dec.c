@@ -21,6 +21,7 @@
 
 #include "ac_vcn_av1_default.h"
 #include "ac_drm_fourcc.h"
+#include "ac_debug.h"
 
 #define FB_BUFFER_OFFSET             0x2000
 #define FB_BUFFER_SIZE               2048
@@ -2014,8 +2015,25 @@ static void rvcn_dec_sq_tail(struct radeon_decoder *dec)
 }
 /* flush IB to the hardware */
 static int flush(struct radeon_decoder *dec, unsigned flags,
-                 struct pipe_fence_handle **fence) {
+                 struct pipe_fence_handle **fence)
+{
+   struct si_screen *sscreen = (struct si_screen *)dec->screen;
+
    rvcn_dec_sq_tail(dec);
+
+   if (sscreen->debug_flags & DBG(IB)) {
+      struct ac_ib_parser ib_parser = {
+         .f = stderr,
+         .ib = dec->cs.current.buf,
+         .num_dw = dec->cs.current.cdw,
+         .gfx_level = sscreen->info.gfx_level,
+         .vcn_version = sscreen->info.vcn_ip_version,
+         .family = sscreen->info.family,
+         .ip_type = dec->stream_type == RDECODE_CODEC_JPEG ? AMD_IP_VCN_JPEG :
+                    dec->vcn_dec_sw_ring ? AMD_IP_VCN_ENC : AMD_IP_VCN_DEC,
+      };
+      ac_parse_ib(&ib_parser, "IB");
+   }
 
    return dec->ws->cs_flush(&dec->cs, flags, fence);
 }
@@ -2396,6 +2414,8 @@ static void radeon_dec_destroy(struct pipe_video_codec *decoder)
 
    dec->ws->fence_reference(dec->ws, &dec->prev_fence, NULL);
    dec->ws->cs_destroy(&dec->cs);
+   if (dec->ectx)
+      dec->ectx->destroy(dec->ectx);
 
    if (dec->stream_type == RDECODE_CODEC_JPEG) {
       for (i = 0; i < dec->njctx; i++) {
@@ -2744,8 +2764,14 @@ struct pipe_video_codec *radeon_create_decoder(struct pipe_context *context,
    if (!dec)
       return NULL;
 
+   if (sctx->vcn_has_ctx) {
+      dec->ectx = pipe_create_multimedia_context(context->screen);
+      if (!dec->ectx)
+         sctx->vcn_has_ctx = false;
+   }
+
    dec->base = *templ;
-   dec->base.context = context;
+   dec->base.context = (sctx->vcn_has_ctx) ? dec->ectx : context;
    dec->base.width = width;
    dec->base.height = height;
    dec->max_width = width;
@@ -2774,7 +2800,9 @@ struct pipe_video_codec *radeon_create_decoder(struct pipe_context *context,
    dec->sq.ib_total_size_in_dw = NULL;
    dec->sq.ib_checksum = NULL;
 
-   if (!ws->cs_create(&dec->cs, sctx->ctx, ring, NULL, NULL)) {
+   if (!ws->cs_create(&dec->cs,
+                      (sctx->vcn_has_ctx) ? ((struct si_context *)dec->ectx)->ctx : sctx->ctx,
+                      ring, NULL, NULL)) {
       RVID_ERR("Can't get command submission context.\n");
       goto error;
    }
@@ -3038,6 +3066,8 @@ struct pipe_video_codec *radeon_create_decoder(struct pipe_context *context,
 
 error:
    dec->ws->cs_destroy(&dec->cs);
+   if (dec->ectx)
+      dec->ectx->destroy(dec->ectx);
 
    if (dec->stream_type == RDECODE_CODEC_JPEG) {
       for (i = 0; i < dec->njctx; i++) {

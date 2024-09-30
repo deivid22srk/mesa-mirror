@@ -1560,13 +1560,18 @@ anv_pipeline_link_fs(const struct brw_compiler *compiler,
          }
       }
       num_rt_bindings = stage->key.wm.nr_color_regions;
-   } else {
+   } else if (brw_nir_fs_needs_null_rt(
+                 compiler->devinfo, stage->nir,
+                 stage->key.wm.multisample_fbo != BRW_NEVER,
+                 stage->key.wm.alpha_to_coverage != BRW_NEVER)) {
       /* Setup a null render target */
       rt_bindings[0] = (struct anv_pipeline_binding) {
          .set = ANV_DESCRIPTOR_SET_COLOR_ATTACHMENTS,
          .index = UINT32_MAX,
       };
       num_rt_bindings = 1;
+   } else {
+      num_rt_bindings = 0;
    }
 
    assert(num_rt_bindings <= MAX_RTS);
@@ -2964,6 +2969,36 @@ anv_graphics_pipeline_emit(struct anv_graphics_pipeline *pipeline,
       pipeline->min_sample_shading = state->ms->min_sample_shading;
    }
 
+   if (anv_pipeline_has_stage(pipeline, MESA_SHADER_FRAGMENT)) {
+      /* Count the number of color attachments in the binding table */
+      const struct anv_pipeline_bind_map *bind_map =
+         &pipeline->base.shaders[MESA_SHADER_FRAGMENT]->bind_map;
+
+      memset(pipeline->color_output_mapping,
+             MESA_VK_ATTACHMENT_UNUSED,
+             sizeof(pipeline->color_output_mapping));
+
+      if (state->cal != NULL) {
+         for (uint32_t i = 0; i < MAX_RTS; i++) {
+            if (state->cal->color_map[i] != MESA_VK_ATTACHMENT_UNUSED)
+               pipeline->color_output_mapping[state->cal->color_map[i]] = i;
+         }
+
+         unsigned i;
+         for (i = 0; i < MIN2(bind_map->surface_count, MAX_RTS); i++) {
+            if (bind_map->surface_to_descriptor[i].set !=
+                ANV_DESCRIPTOR_SET_COLOR_ATTACHMENTS)
+               break;
+
+            /* Helping Alpine builders... */
+            assert(i < MAX_RTS);
+            if (bind_map->surface_to_descriptor[i].index >= MAX_RTS)
+               pipeline->color_output_mapping[i] = MESA_VK_ATTACHMENT_UNUSED;
+         }
+         pipeline->num_color_outputs = i;
+      }
+   }
+
    const struct anv_device *device = pipeline->base.base.device;
    const struct intel_device_info *devinfo = device->info;
    anv_genX(devinfo, graphics_pipeline_emit)(pipeline, state);
@@ -3621,9 +3656,10 @@ static bool
 anv_ray_tracing_pipeline_load_cached_shaders(struct anv_ray_tracing_pipeline *pipeline,
                                              struct vk_pipeline_cache *cache,
                                              const VkRayTracingPipelineCreateInfoKHR *info,
-                                             struct anv_pipeline_stage *stages)
+                                             struct anv_pipeline_stage *stages,
+                                             VkPipelineCreationFeedback *pipeline_feedback)
 {
-   uint32_t shaders = 0, cache_hits = 0;
+   uint32_t shaders = 0, found = 0, cache_hits = 0;
    for (uint32_t i = 0; i < info->stageCount; i++) {
       if (stages[i].info == NULL)
          continue;
@@ -3643,13 +3679,20 @@ anv_ray_tracing_pipeline_load_cached_shaders(struct anv_ray_tracing_pipeline *pi
             VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT;
       }
 
-      if (stages[i].bin != NULL)
+      if (stages[i].bin != NULL) {
+         found++;
          anv_pipeline_add_executables(&pipeline->base, &stages[i]);
+      }
 
       stages[i].feedback.duration += os_time_get_nano() - stage_start;
    }
 
-   return cache_hits == shaders;
+   if (cache_hits == shaders) {
+      pipeline_feedback->flags |=
+         VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT;
+   }
+
+   return found == shaders;
 }
 
 static VkResult
@@ -3671,9 +3714,8 @@ anv_pipeline_compile_ray_tracing(struct anv_ray_tracing_pipeline *pipeline,
       (pipeline->base.flags & VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR);
 
    if (!skip_cache_lookup &&
-       anv_ray_tracing_pipeline_load_cached_shaders(pipeline, cache, info, stages)) {
-      pipeline_feedback.flags |=
-         VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT;
+       anv_ray_tracing_pipeline_load_cached_shaders(pipeline, cache, info, stages,
+                                                    &pipeline_feedback)) {
       goto done;
    }
 
@@ -3682,6 +3724,15 @@ anv_pipeline_compile_ray_tracing(struct anv_ray_tracing_pipeline *pipeline,
 
    for (uint32_t i = 0; i < info->stageCount; i++) {
       if (stages[i].info == NULL)
+         continue;
+
+      /* Intersection and any-hit need to fetch the nir always,
+       * so that they can be handled correctly below in the group section.
+       * For the other stages, if we found them in the cache, skip this part.
+       */
+      if (!(stages[i].stage == MESA_SHADER_INTERSECTION ||
+            stages[i].stage == MESA_SHADER_ANY_HIT) &&
+          stages[i].bin != NULL)
          continue;
 
       int64_t stage_start = os_time_get_nano();
@@ -4106,9 +4157,11 @@ anv_ray_tracing_pipeline_create(
    result = anv_pipeline_compile_ray_tracing(pipeline, tmp_ctx, stages,
                                              cache, pCreateInfo);
    if (result != VK_SUCCESS) {
+      for (uint32_t i = 0; i < pCreateInfo->stageCount; i++) {
+         if (stages[i].bin != NULL)
+            anv_shader_bin_unref(device, stages[i].bin);
+      }
       ralloc_free(tmp_ctx);
-      util_dynarray_foreach(&pipeline->shaders, struct anv_shader_bin *, shader)
-         anv_shader_bin_unref(device, *shader);
       anv_pipeline_finish(&pipeline->base, device);
       vk_free2(&device->vk.alloc, pAllocator, pipeline);
       return result;

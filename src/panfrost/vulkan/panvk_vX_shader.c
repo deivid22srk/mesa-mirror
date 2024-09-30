@@ -212,9 +212,9 @@ lower_layer_writes(nir_shader *nir)
 
    assert(temp_layer_var);
 
-   return nir_shader_instructions_pass(
-      nir, lower_gl_pos_layer_writes,
-      nir_metadata_block_index | nir_metadata_dominance, temp_layer_var);
+   return nir_shader_instructions_pass(nir, lower_gl_pos_layer_writes,
+                                       nir_metadata_control_flow,
+                                       temp_layer_var);
 }
 #endif
 
@@ -378,12 +378,25 @@ valhall_pack_buf_idx(nir_builder *b, nir_instr *instr, UNUSED void *data)
       return false;
 
    nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+   unsigned index_src;
 
-   if (intrin->intrinsic != nir_intrinsic_load_ubo &&
-       intrin->intrinsic != nir_intrinsic_load_ssbo)
+   switch (intrin->intrinsic) {
+   case nir_intrinsic_load_ubo:
+   case nir_intrinsic_load_ssbo:
+   case nir_intrinsic_ssbo_atomic:
+   case nir_intrinsic_ssbo_atomic_swap:
+      index_src = 0;
+      break;
+
+   case nir_intrinsic_store_ssbo:
+      index_src = 1;
+      break;
+
+   default:
       return false;
+   }
 
-   nir_def *index = intrin->src[0].ssa;
+   nir_def *index = intrin->src[index_src].ssa;
 
    /* The descriptor lowering pass can add UBO loads, and those already have the
     * right index format. */
@@ -401,10 +414,32 @@ valhall_pack_buf_idx(nir_builder *b, nir_instr *instr, UNUSED void *data)
     * have been lowered. */
    nir_def *packed_index =
       nir_iadd(b, nir_channel(b, index, 0), nir_channel(b, index, 1));
-   nir_src_rewrite(&intrin->src[0], packed_index);
+   nir_src_rewrite(&intrin->src[index_src], packed_index);
    return true;
 }
 #endif
+
+static bool
+valhall_lower_get_ssbo_size(struct nir_builder *b,
+                            nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_get_ssbo_size)
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+
+   nir_def *table_idx =
+      nir_ushr_imm(b, nir_channel(b, intr->src[0].ssa, 0), 24);
+   nir_def *res_table = nir_ior_imm(b, table_idx, pan_res_handle(62, 0));
+   nir_def *buf_idx = nir_channel(b, intr->src[0].ssa, 1);
+   nir_def *desc_offset = nir_imul_imm(b, buf_idx, PANVK_DESCRIPTOR_SIZE);
+   nir_def *size = nir_load_ubo(
+      b, 1, 32, res_table, nir_iadd_imm(b, desc_offset, 4), .range = ~0u,
+      .align_mul = PANVK_DESCRIPTOR_SIZE, .align_offset = 4);
+
+   nir_def_replace(&intr->def, size);
+   return true;
+}
 
 static void
 panvk_lower_nir(struct panvk_device *dev, nir_shader *nir,
@@ -418,8 +453,8 @@ panvk_lower_nir(struct panvk_device *dev, nir_shader *nir,
       to_panvk_instance(dev->vk.physical->instance);
    gl_shader_stage stage = nir->info.stage;
 
-   NIR_PASS_V(nir, panvk_per_arch(nir_lower_descriptors), dev, set_layout_count,
-              set_layouts, shader);
+   NIR_PASS_V(nir, panvk_per_arch(nir_lower_descriptors), dev, rs,
+              set_layout_count, set_layouts, shader);
 
    NIR_PASS_V(nir, nir_split_var_copies);
    NIR_PASS_V(nir, nir_lower_var_copies);
@@ -434,8 +469,11 @@ panvk_lower_nir(struct panvk_device *dev, nir_shader *nir,
               nir_address_format_64bit_global);
 
 #if PAN_ARCH >= 9
+   NIR_PASS_V(nir, nir_shader_intrinsics_pass,
+              valhall_lower_get_ssbo_size,
+              nir_metadata_control_flow, NULL);
    NIR_PASS_V(nir, nir_shader_instructions_pass, valhall_pack_buf_idx,
-              nir_metadata_block_index | nir_metadata_dominance, NULL);
+              nir_metadata_control_flow, NULL);
 #endif
 
    if (gl_shader_stage_uses_workgroup(stage)) {
@@ -1239,8 +1277,10 @@ panvk_per_arch(link_shaders)(struct panvk_pool *desc_pool,
    assert(vs->info.stage == MESA_SHADER_VERTEX);
 
    if (PAN_ARCH >= 9) {
-      link->buf_strides[PANVK_VARY_BUF_GENERAL] =
-         MAX2(fs->info.varyings.input_count, vs->info.varyings.output_count);
+      /* No need to calculate varying stride if there's no fragment shader. */
+      if (fs)
+         link->buf_strides[PANVK_VARY_BUF_GENERAL] =
+            MAX2(fs->info.varyings.input_count, vs->info.varyings.output_count);
       return VK_SUCCESS;
    }
 

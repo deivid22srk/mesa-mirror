@@ -99,6 +99,27 @@ panfrost_get_device_vendor(struct pipe_screen *screen)
 }
 
 static int
+from_kmod_group_allow_priority_flags(
+   enum pan_kmod_group_allow_priority_flags kmod_flags)
+{
+   int flags = 0;
+
+   if (kmod_flags & PAN_KMOD_GROUP_ALLOW_PRIORITY_REALTIME)
+      flags |= PIPE_CONTEXT_PRIORITY_REALTIME;
+
+   if (kmod_flags & PAN_KMOD_GROUP_ALLOW_PRIORITY_HIGH)
+      flags |= PIPE_CONTEXT_PRIORITY_HIGH;
+
+   if (kmod_flags & PAN_KMOD_GROUP_ALLOW_PRIORITY_MEDIUM)
+      flags |= PIPE_CONTEXT_PRIORITY_MEDIUM;
+
+   if (kmod_flags & PAN_KMOD_GROUP_ALLOW_PRIORITY_LOW)
+      flags |= PIPE_CONTEXT_PRIORITY_LOW;
+
+   return flags;
+}
+
+static int
 panfrost_get_param(struct pipe_screen *screen, enum pipe_cap param)
 {
    struct panfrost_device *dev = pan_device(screen);
@@ -115,7 +136,6 @@ panfrost_get_param(struct pipe_screen *screen, enum pipe_cap param)
    case PIPE_CAP_FRAGMENT_SHADER_TEXTURE_LOD:
    case PIPE_CAP_VERTEX_COLOR_UNCLAMPED:
    case PIPE_CAP_DEPTH_CLIP_DISABLE:
-   case PIPE_CAP_DEPTH_CLIP_DISABLE_SEPARATE:
    case PIPE_CAP_MIXED_FRAMEBUFFER_SIZES:
    case PIPE_CAP_FRONTEND_NOOP:
    case PIPE_CAP_SAMPLE_SHADING:
@@ -125,6 +145,10 @@ panfrost_get_param(struct pipe_screen *screen, enum pipe_cap param)
    case PIPE_CAP_SHADER_PACK_HALF_FLOAT:
    case PIPE_CAP_HAS_CONST_BW:
       return 1;
+
+   /* Removed in v9 (Valhall) */
+   case PIPE_CAP_DEPTH_CLIP_DISABLE_SEPARATE:
+      return dev->arch < 9;
 
    case PIPE_CAP_MAX_RENDER_TARGETS:
    case PIPE_CAP_FBFETCH:
@@ -373,6 +397,10 @@ panfrost_get_param(struct pipe_screen *screen, enum pipe_cap param)
 
    case PIPE_CAP_NATIVE_FENCE_FD:
       return 1;
+
+   case PIPE_CAP_CONTEXT_PRIORITY_MASK:
+      return from_kmod_group_allow_priority_flags(
+         dev->kmod.props.allowed_group_priorities_mask);
 
    case PIPE_CAP_ASTC_DECODE_MODE:
       return dev->arch >= 9 && (dev->compressed_formats & (1 << 30));
@@ -646,23 +674,6 @@ panfrost_query_compression_modifiers(struct pipe_screen *screen,
    }
 
    *count = panfrost_afrc_get_modifiers(format, rate, max, modifiers);
-}
-
-static bool
-panfrost_is_compression_modifier(struct pipe_screen *screen,
-                                 enum pipe_format format, uint64_t modifier,
-                                 uint32_t *rate)
-{
-   struct panfrost_device *dev = pan_device(screen);
-   uint32_t compression_rate = panfrost_afrc_get_rate(format, modifier);
-
-   if (!dev->has_afrc)
-      return false;
-
-   if (rate)
-      *rate = compression_rate;
-
-   return (compression_rate != 0);
 }
 
 /* We always support linear and tiled operations, both external and internal.
@@ -1005,7 +1016,6 @@ panfrost_create_screen(int fd, const struct pipe_screen_config *config,
    screen->base.query_compression_rates = panfrost_query_compression_rates;
    screen->base.query_compression_modifiers =
       panfrost_query_compression_modifiers;
-   screen->base.is_compression_modifier = panfrost_is_compression_modifier;
 
    panfrost_resource_screen_init(&screen->base);
    pan_blend_shader_cache_init(&dev->blend_shaders,

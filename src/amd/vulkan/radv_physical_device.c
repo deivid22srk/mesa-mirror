@@ -127,10 +127,44 @@ radv_emulate_rt(const struct radv_physical_device *pdev)
    return instance->perftest_flags & RADV_PERFTEST_EMULATE_RT;
 }
 
+static VkConformanceVersion
+radv_get_conformance_version(const struct radv_physical_device *pdev)
+{
+   VkConformanceVersion conformance_version;
+
+   if (pdev->info.gfx_level == GFX10_3) {
+      conformance_version = (VkConformanceVersion){
+         .major = 1,
+         .minor = 3,
+         .subminor = 0,
+         .patch = 0,
+      };
+   } else if (pdev->info.gfx_level >= GFX8) {
+      conformance_version = (VkConformanceVersion){
+         .major = 1,
+         .minor = 2,
+         .subminor = 7,
+         .patch = 1,
+      };
+   } else {
+      /* Non-conformat products. */
+      conformance_version = (VkConformanceVersion){
+         .major = 0,
+         .minor = 0,
+         .subminor = 0,
+         .patch = 0,
+      };
+   }
+
+   return conformance_version;
+}
+
 static bool
 radv_is_conformant(const struct radv_physical_device *pdev)
 {
-   return pdev->info.gfx_level >= GFX8;
+   VkConformanceVersion conformance_version = radv_get_conformance_version(pdev);
+
+   return conformance_version.major != 0;
 }
 
 static void
@@ -555,10 +589,12 @@ radv_physical_device_get_supported_extensions(const struct radv_physical_device 
       .KHR_shader_expect_assume = true,
       .KHR_shader_float16_int8 = true,
       .KHR_shader_float_controls = true,
+      .KHR_shader_float_controls2 = true,
       .KHR_shader_integer_dot_product = true,
       .KHR_shader_maximal_reconvergence = true,
       .KHR_shader_non_semantic_info = true,
       .KHR_shader_quad_control = true,
+      .KHR_shader_relaxed_extended_instruction = true,
       .KHR_shader_subgroup_extended_types = true,
       .KHR_shader_subgroup_rotate = true,
       .KHR_shader_subgroup_uniform_control_flow = true,
@@ -574,7 +610,7 @@ radv_physical_device_get_supported_extensions(const struct radv_physical_device 
       .KHR_uniform_buffer_standard_layout = true,
       .KHR_variable_pointers = true,
       .KHR_vertex_attribute_divisor = true,
-      .KHR_video_maintenance1 = true,
+      .KHR_video_maintenance1 = pdev->video_decode_enabled || pdev->video_encode_enabled,
       .KHR_video_queue = pdev->video_decode_enabled || pdev->video_encode_enabled,
       .KHR_video_decode_av1 = (pdev->info.vcn_ip_version >= VCN_3_0_0 && pdev->info.vcn_ip_version != VCN_3_0_33 &&
                                VIDEO_CODEC_AV1DEC && pdev->video_decode_enabled),
@@ -1241,6 +1277,12 @@ radv_physical_device_get_features(const struct radv_physical_device *pdev, struc
 
       /* VK_KHR_pipeline_binary */
       .pipelineBinaries = true,
+
+      /* VK_KHR_shader_relaxed_extended_instruction */
+      .shaderRelaxedExtendedInstruction = true,
+
+      /* VK_KHR_shader_float_controls2 */
+      .shaderFloatControls2 = true,
    };
 }
 
@@ -1471,30 +1513,7 @@ radv_get_physical_device_properties(struct radv_physical_device *pdev)
    snprintf(p->driverInfo, VK_MAX_DRIVER_INFO_SIZE, "Mesa " PACKAGE_VERSION MESA_GIT_SHA1 "%s",
             radv_get_compiler_string(pdev));
 
-   if (radv_is_conformant(pdev)) {
-      if (pdev->info.gfx_level >= GFX10_3) {
-         p->conformanceVersion = (VkConformanceVersion){
-            .major = 1,
-            .minor = 3,
-            .subminor = 0,
-            .patch = 0,
-         };
-      } else {
-         p->conformanceVersion = (VkConformanceVersion){
-            .major = 1,
-            .minor = 2,
-            .subminor = 7,
-            .patch = 1,
-         };
-      }
-   } else {
-      p->conformanceVersion = (VkConformanceVersion){
-         .major = 0,
-         .minor = 0,
-         .subminor = 0,
-         .patch = 0,
-      };
-   }
+   p->conformanceVersion = radv_get_conformance_version(pdev);
 
    /* On AMD hardware, denormals and rounding modes for fp16/fp64 are
     * controlled by the same config register.
@@ -1911,12 +1930,12 @@ radv_get_physical_device_properties(struct radv_physical_device *pdev)
    p->defaultRobustnessImages = VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_ROBUST_IMAGE_ACCESS_2_EXT;
 
    /* VK_KHR_maintenance5 */
-   p->earlyFragmentMultisampleCoverageAfterSampleCounting = false;
-   p->earlyFragmentSampleMaskTestBeforeSampleCounting = false;
-   p->depthStencilSwizzleOneSupport = false;
+   p->earlyFragmentMultisampleCoverageAfterSampleCounting = true;
+   p->earlyFragmentSampleMaskTestBeforeSampleCounting = true;
+   p->depthStencilSwizzleOneSupport = true;
    p->polygonModePointSize = true;
-   p->nonStrictSinglePixelWideLinesUseParallelogram = false;
-   p->nonStrictWideLinesUseParallelogram = false;
+   p->nonStrictSinglePixelWideLinesUseParallelogram = true;
+   p->nonStrictWideLinesUseParallelogram = true;
 
    /* VK_KHR_cooperative_matrix */
    p->cooperativeMatrixSupportedStages = VK_SHADER_STAGE_COMPUTE_BIT;

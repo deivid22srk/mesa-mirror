@@ -688,6 +688,49 @@ genX(emit_ds)(struct anv_cmd_buffer *cmd_buffer)
 }
 
 ALWAYS_INLINE static void
+cmd_buffer_maybe_flush_rt_writes(struct anv_cmd_buffer *cmd_buffer,
+                                 const struct anv_graphics_pipeline *pipeline)
+{
+   if (!anv_pipeline_has_stage(pipeline, MESA_SHADER_FRAGMENT))
+      return;
+
+   UNUSED bool need_rt_flush = false;
+   if (memcmp(cmd_buffer->state.gfx.color_output_mapping,
+              pipeline->color_output_mapping,
+              pipeline->num_color_outputs)) {
+      memcpy(cmd_buffer->state.gfx.color_output_mapping,
+             pipeline->color_output_mapping,
+             pipeline->num_color_outputs);
+      need_rt_flush = true;
+      cmd_buffer->state.descriptors_dirty |= VK_SHADER_STAGE_FRAGMENT_BIT;
+   }
+
+#if GFX_VER >= 11
+   if (need_rt_flush) {
+      /* The PIPE_CONTROL command description says:
+       *
+       *    "Whenever a Binding Table Index (BTI) used by a Render Target Message
+       *     points to a different RENDER_SURFACE_STATE, SW must issue a Render
+       *     Target Cache Flush by enabling this bit. When render target flush
+       *     is set due to new association of BTI, PS Scoreboard Stall bit must
+       *     be set in this packet."
+       *
+       * Within a renderpass, the render target entries in the binding tables
+       * remain the same as what was setup at CmdBeginRendering() with one
+       * exception where have to setup a null render target because a fragment
+       * writes only depth/stencil yet the renderpass has been setup with at
+       * least one color attachment. This is because our render target messages
+       * in the shader always send the color.
+       */
+      anv_add_pending_pipe_bits(cmd_buffer,
+                                ANV_PIPE_RENDER_TARGET_CACHE_FLUSH_BIT |
+                                ANV_PIPE_STALL_AT_SCOREBOARD_BIT,
+                                "change RT due to shader outputs");
+   }
+#endif
+}
+
+ALWAYS_INLINE static void
 genX(cmd_buffer_flush_gfx_state)(struct anv_cmd_buffer *cmd_buffer)
 {
    struct anv_graphics_pipeline *pipeline =
@@ -708,16 +751,18 @@ genX(cmd_buffer_flush_gfx_state)(struct anv_cmd_buffer *cmd_buffer)
 
    genX(flush_pipeline_select_3d)(cmd_buffer);
 
-   /* Wa_14015814527
-    *
-    * Apply task URB workaround when switching from task to primitive.
-    */
    if (cmd_buffer->state.gfx.dirty & ANV_CMD_DIRTY_PIPELINE) {
+      /* Wa_14015814527
+       *
+       * Apply task URB workaround when switching from task to primitive.
+       */
       if (anv_pipeline_is_primitive(pipeline)) {
          genX(apply_task_urb_workaround)(cmd_buffer);
       } else if (anv_pipeline_has_stage(pipeline, MESA_SHADER_TASK)) {
          cmd_buffer->state.gfx.used_task_shader = true;
       }
+
+      cmd_buffer_maybe_flush_rt_writes(cmd_buffer, pipeline);
    }
 
    /* Apply any pending pipeline flushes we may have.  We want to apply them
@@ -1137,7 +1182,8 @@ void genX(CmdDrawMultiEXT)(
          prim.VertexAccessType         = SEQUENTIAL;
          prim.VertexCountPerInstance   = draw->vertexCount;
          prim.StartVertexLocation      = draw->firstVertex;
-         prim.InstanceCount            = instanceCount;
+         prim.InstanceCount            = instanceCount *
+                                         pipeline->instance_multiplier;
          prim.StartInstanceLocation    = firstInstance;
          prim.BaseVertexLocation       = 0;
          prim.ExtendedParametersPresent = true;

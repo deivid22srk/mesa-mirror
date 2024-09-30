@@ -37,7 +37,7 @@ d3d12_video_encoder_references_manager_hevc::get_current_frame_picture_control_d
    assert((codecAllocation.DataSize == sizeof(D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC)) ||
           (codecAllocation.DataSize == sizeof(D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC1)));
    memcpy(codecAllocation.pHEVCPicData1, &m_curFrameState, codecAllocation.DataSize);
-   memset(codecAllocation.pHEVCPicData1 + codecAllocation.DataSize, 0, sizeof(m_curFrameState) - codecAllocation.DataSize);
+   memset((uint8_t *)(& codecAllocation.pHEVCPicData1) + codecAllocation.DataSize, 0, sizeof(m_curFrameState) - codecAllocation.DataSize);
    return true;
 }
 
@@ -254,7 +254,7 @@ d3d12_video_encoder_references_manager_hevc::begin_frame(D3D12_VIDEO_ENCODER_PIC
    assert((curFrameData.DataSize == sizeof(D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC)) ||
           (curFrameData.DataSize == sizeof(D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC1)));
    memcpy(&m_curFrameState, curFrameData.pHEVCPicData1, curFrameData.DataSize);
-   memset(&m_curFrameState + curFrameData.DataSize, 0, sizeof(m_curFrameState) - curFrameData.DataSize);
+   memset(((uint8_t*)(&m_curFrameState) + curFrameData.DataSize), 0, sizeof(m_curFrameState) - curFrameData.DataSize);
 
    m_isCurrentFrameUsedAsReference = bUsedAsReference;
 
@@ -282,7 +282,7 @@ d3d12_video_encoder_references_manager_hevc::begin_frame(D3D12_VIDEO_ENCODER_PIC
       // mirror indices between DPB entries and allocation arrays
       m_CurrentFrameReferencesData.pReferenceFramesReconPictureDescriptors[i].ReconstructedPictureResourceIndex = i;
       m_CurrentFrameReferencesData.pReferenceFramesReconPictureDescriptors[i].TemporalLayerIndex =
-         0u;   // hevcPic->dpb[i].temporal_id;
+         hevcPic->dpb[i].temporal_id;
 
       // Check if this i-th dpb descriptor entry is referenced by any entry in L0 or L1 lists
       // and set IsRefUsedByCurrentPic accordingly
@@ -315,7 +315,6 @@ d3d12_video_encoder_references_manager_hevc::begin_frame(D3D12_VIDEO_ENCODER_PIC
 
    m_curFrameState.FrameType = d3d12_video_encoder_convert_frame_type_hevc(hevcPic->picture_type);
    m_curFrameState.PictureOrderCountNumber = hevcPic->pic_order_cnt;
-   m_curFrameState.TemporalLayerIndex = 0u;   // hevcPic->temporal_id;
 
    ///
    /// Set reference pics info

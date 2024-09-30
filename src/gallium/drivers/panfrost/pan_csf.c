@@ -784,12 +784,17 @@ csf_emit_draw_state(struct panfrost_batch *batch,
    if (info->index_size)
       cs_move64_to(b, cs_reg64(b, 54), batch->indices);
 
+   struct pipe_rasterizer_state *rast = &ctx->rasterizer->base;
+
    uint32_t primitive_flags = 0;
    pan_pack(&primitive_flags, PRIMITIVE_FLAGS, cfg) {
       if (panfrost_writes_point_size(ctx))
          cfg.point_size_array_format = MALI_POINT_SIZE_ARRAY_FORMAT_FP16;
 
       cfg.allow_rotating_primitives = allow_rotating_primitives(fs, info);
+
+      cfg.low_depth_cull = rast->depth_clip_near;
+      cfg.high_depth_cull = rast->depth_clip_far;
 
       /* Non-fixed restart indices should have been lowered */
       assert(!cfg.primitive_restart || panfrost_is_implicit_prim_restart(info));
@@ -801,8 +806,6 @@ csf_emit_draw_state(struct panfrost_batch *batch,
    }
 
    cs_move32_to(b, cs_reg32(b, 56), primitive_flags);
-
-   struct pipe_rasterizer_state *rast = &ctx->rasterizer->base;
 
    uint32_t dcd_flags0 = 0, dcd_flags1 = 0;
    pan_pack(&dcd_flags0, DCD_FLAGS_0, cfg) {
@@ -918,7 +921,9 @@ csf_emit_draw_state(struct panfrost_batch *batch,
    cs_move64_to(b, cs_reg64(b, 60), primsize);
 
    uint32_t flags_override;
-   pan_pack(&flags_override, PRIMITIVE_FLAGS, cfg) {
+   /* Pack with nodefaults so only explicitly set override fields affect the
+    * previously set register values */
+   pan_pack_nodefaults(&flags_override, PRIMITIVE_FLAGS, cfg) {
       cfg.draw_mode = pan_draw_mode(info->mode);
       cfg.index_type = panfrost_translate_index_size(info->index_size);
       cfg.secondary_shader = secondary_shader;
@@ -1019,6 +1024,19 @@ GENX(csf_launch_draw_indirect)(struct panfrost_batch *batch,
 
 #define POSITION_FIFO_SIZE (64 * 1024)
 
+static enum drm_panthor_group_priority
+get_panthor_group_priority(struct panfrost_context *ctx)
+{
+   if (ctx->flags & PIPE_CONTEXT_REALTIME_PRIORITY)
+      return PANTHOR_GROUP_PRIORITY_REALTIME;
+   else if (ctx->flags & PIPE_CONTEXT_HIGH_PRIORITY)
+      return PANTHOR_GROUP_PRIORITY_HIGH;
+   else if (ctx->flags & PIPE_CONTEXT_LOW_PRIORITY)
+      return PANTHOR_GROUP_PRIORITY_LOW;
+
+   return PANTHOR_GROUP_PRIORITY_MEDIUM;
+}
+
 int
 GENX(csf_init_context)(struct panfrost_context *ctx)
 {
@@ -1035,7 +1053,7 @@ GENX(csf_init_context)(struct panfrost_context *ctx)
       .max_compute_cores = util_bitcount64(dev->kmod.props.shader_present),
       .max_fragment_cores = util_bitcount64(dev->kmod.props.shader_present),
       .max_tiler_cores = 1,
-      .priority = PANTHOR_GROUP_PRIORITY_MEDIUM,
+      .priority = get_panthor_group_priority(ctx),
       .queues = DRM_PANTHOR_OBJ_ARRAY(ARRAY_SIZE(qc), qc),
       .vm_id = pan_kmod_vm_handle(dev->kmod.vm),
    };

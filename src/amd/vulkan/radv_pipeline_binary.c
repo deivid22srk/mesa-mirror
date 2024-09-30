@@ -114,7 +114,7 @@ radv_create_pipeline_binary(struct radv_device *device, const VkAllocationCallba
    pipeline_binary->data = (void *)data;
    pipeline_binary->size = data_size;
 
-   memcpy(pipeline_binary->key, key, sizeof(*key));
+   memcpy(pipeline_binary->key, key, BLAKE3_OUT_LEN);
 
    *pipeline_binary_out = pipeline_binary;
    return VK_SUCCESS;
@@ -418,6 +418,9 @@ radv_GetPipelineBinaryDataKHR(VkDevice _device, const VkPipelineBinaryDataInfoKH
    VK_FROM_HANDLE(radv_pipeline_binary, pipeline_binary, pInfo->pipelineBinary);
    const size_t size = pipeline_binary->size;
 
+   memcpy(pPipelineBinaryKey->key, pipeline_binary->key, sizeof(pipeline_binary->key));
+   pPipelineBinaryKey->keySize = sizeof(pipeline_binary->key);
+
    if (!pPipelineBinaryData) {
       *pPipelineBinaryDataSize = size;
       return VK_SUCCESS;
@@ -430,9 +433,6 @@ radv_GetPipelineBinaryDataKHR(VkDevice _device, const VkPipelineBinaryDataInfoKH
 
    memcpy(pPipelineBinaryData, pipeline_binary->data, size);
    *pPipelineBinaryDataSize = size;
-
-   memcpy(pPipelineBinaryKey->key, pipeline_binary->key, sizeof(pipeline_binary->key));
-   pPipelineBinaryKey->keySize = sizeof(pipeline_binary->key);
 
    return VK_SUCCESS;
 }

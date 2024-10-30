@@ -1019,12 +1019,6 @@ brw_preprocess_nir(const struct brw_compiler *compiler, nir_shader *nir,
 
    OPT(nir_lower_alu_to_scalar, NULL, NULL);
 
-   struct nir_opt_16bit_tex_image_options options = {
-      .rounding_mode = nir_rounding_mode_undef,
-      .opt_tex_dest_types = nir_type_float | nir_type_int | nir_type_uint,
-   };
-   OPT(nir_opt_16bit_tex_image, &options);
-
    if (nir->info.stage == MESA_SHADER_GEOMETRY)
       OPT(nir_lower_gs_intrinsics, 0);
 
@@ -1083,6 +1077,12 @@ brw_preprocess_nir(const struct brw_compiler *compiler, nir_shader *nir,
    OPT(nir_split_struct_vars, nir_var_function_temp);
 
    brw_nir_optimize(nir, devinfo);
+
+   struct nir_opt_16bit_tex_image_options options = {
+      .rounding_mode = nir_rounding_mode_undef,
+      .opt_tex_dest_types = nir_type_float | nir_type_int | nir_type_uint,
+   };
+   OPT(nir_opt_16bit_tex_image, &options);
 
    OPT(nir_lower_doubles, opts->softfp64, nir->options->lower_doubles_options);
    if (OPT(nir_lower_int64_float_conversions)) {
@@ -1411,6 +1411,7 @@ bool
 brw_nir_should_vectorize_mem(unsigned align_mul, unsigned align_offset,
                              unsigned bit_size,
                              unsigned num_components,
+                             unsigned hole_size,
                              nir_intrinsic_instr *low,
                              nir_intrinsic_instr *high,
                              void *data)
@@ -1419,7 +1420,7 @@ brw_nir_should_vectorize_mem(unsigned align_mul, unsigned align_offset,
     * those back into 32-bit ones anyway and UBO loads aren't split in NIR so
     * we don't want to make a mess for the back-end.
     */
-   if (bit_size > 32)
+   if (bit_size > 32 || hole_size || !nir_num_components_valid(num_components))
       return false;
 
    if (low->intrinsic == nir_intrinsic_load_ubo_uniform_block_intel ||
@@ -1595,9 +1596,6 @@ brw_vectorize_lower_mem_access(nir_shader *nir,
 
    OPT(nir_opt_load_store_vectorize, &options);
 
-   /* Required for nir_divergence_analysis() */
-   OPT(nir_convert_to_lcssa, true, true);
-
    /* When HW supports block loads, using the divergence analysis, try
     * to find uniform SSBO loads and turn them into block loads.
     *
@@ -1611,7 +1609,6 @@ brw_vectorize_lower_mem_access(nir_shader *nir,
    nir_divergence_analysis(nir);
    if (OPT(intel_nir_blockify_uniform_loads, compiler->devinfo))
       OPT(nir_opt_load_store_vectorize, &options);
-   OPT(nir_opt_remove_phis);
 
    nir_lower_mem_access_bit_sizes_options mem_access_options = {
       .modes = nir_var_mem_ssbo |
@@ -1670,8 +1667,6 @@ brw_postprocess_nir(nir_shader *nir, const struct brw_compiler *compiler,
 
    OPT(nir_opt_combine_barriers, combine_all_memory_barriers, NULL);
 
-   OPT(intel_nir_lower_printf);
-
    do {
       progress = false;
       OPT(nir_opt_algebraic_before_ffma);
@@ -1702,6 +1697,11 @@ brw_postprocess_nir(nir_shader *nir, const struct brw_compiler *compiler,
    }
 
    brw_vectorize_lower_mem_access(nir, compiler, robust_flags);
+
+   /* Needs to be prior int64 lower because it generates 64bit address
+    * manipulations
+    */
+   OPT(intel_nir_lower_printf);
 
    /* Potentially perform this optimization pass twice because it can create
     * additional opportunities for itself.
@@ -1779,7 +1779,6 @@ brw_postprocess_nir(nir_shader *nir, const struct brw_compiler *compiler,
    OPT(nir_opt_dead_cf);
 
    bool divergence_analysis_dirty = false;
-   NIR_PASS(_, nir, nir_convert_to_lcssa, true, true);
    NIR_PASS_V(nir, nir_divergence_analysis);
 
    static const nir_lower_subgroups_options subgroups_options = {
@@ -1829,15 +1828,11 @@ brw_postprocess_nir(nir_shader *nir, const struct brw_compiler *compiler,
    /* Do this only after the last opt_gcm. GCM will undo this lowering. */
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       if (divergence_analysis_dirty) {
-         NIR_PASS(_, nir, nir_convert_to_lcssa, true, true);
          NIR_PASS_V(nir, nir_divergence_analysis);
       }
 
       OPT(intel_nir_lower_non_uniform_barycentric_at_sample);
    }
-
-   /* Clean up LCSSA phis */
-   OPT(nir_opt_remove_phis);
 
    OPT(nir_lower_bool_to_int32);
    OPT(nir_copy_prop);
@@ -2260,4 +2255,25 @@ brw_nir_get_var_type(const struct nir_shader *nir, nir_variable *var)
    }
 
    return type;
+}
+
+bool
+brw_nir_uses_inline_data(nir_shader *shader)
+{
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+
+            nir_intrinsic_instr *intrin  = nir_instr_as_intrinsic(instr);
+            if (intrin->intrinsic != nir_intrinsic_load_inline_data_intel)
+               continue;
+
+            return true;
+         }
+      }
+   }
+
+   return false;
 }

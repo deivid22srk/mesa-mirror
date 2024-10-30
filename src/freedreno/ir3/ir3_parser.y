@@ -148,6 +148,9 @@ static type_t parse_type(const char **type)
 	} else if (!strncmp("u8_32", *type, 5)) {
 		*type += 5;
 		return TYPE_U8_32;
+	} else if (!strncmp("u64", *type, 3)) {
+		*type += 3;
+		return TYPE_ATOMIC_U64;
 	} else {
 		assert(0);  /* shouldn't get here */
 		return ~0;
@@ -673,6 +676,7 @@ static void print_token(FILE *file, int type, YYSTYPE value)
 %token <tok> T_TYPE_S32
 %token <tok> T_TYPE_U8
 %token <tok> T_TYPE_U8_32
+%token <tok> T_TYPE_U64
 
 %token <tok> T_UNTYPED
 %token <tok> T_TYPED
@@ -1562,6 +1566,9 @@ relative:          relative_gpr_src
 /* cat1 immediates differ slighly in the floating point case from the cat2
  * case which can only encode certain predefined values (ie. and index into
  * the FLUT table)
+ *
+ * We have to special cases a few FLUT values which are ambiguous from the
+ * lexer PoV.
  */
 immediate_cat1:    integer             { new_src(0, IR3_REG_IMMED)->iim_val = type_size(instr->cat1.src_type) < 32 ? $1 & 0xffff : $1; }
 |                  '(' integer ')'     { new_src(0, IR3_REG_IMMED)->fim_val = $2; }
@@ -1570,6 +1577,11 @@ immediate_cat1:    integer             { new_src(0, IR3_REG_IMMED)->iim_val = ty
 |                  'h' '(' float ')'   { new_src(0, IR3_REG_IMMED | IR3_REG_HALF)->uim_val = _mesa_float_to_half($3); }
 |                  '(' T_NAN ')'       { new_src(0, IR3_REG_IMMED)->fim_val = NAN; }
 |                  '(' T_INF ')'       { new_src(0, IR3_REG_IMMED)->fim_val = INFINITY; }
+|                  T_FLUT_0_0          { new_src(0, IR3_REG_IMMED)->fim_val = 0.0; }
+|                  T_FLUT_0_5          { new_src(0, IR3_REG_IMMED)->fim_val = 0.5; }
+|                  T_FLUT_1_0          { new_src(0, IR3_REG_IMMED)->fim_val = 1.0; }
+|                  T_FLUT_2_0          { new_src(0, IR3_REG_IMMED)->fim_val = 2.0; }
+|                  T_FLUT_4_0          { new_src(0, IR3_REG_IMMED)->fim_val = 4.0; }
 
 immediate:         integer             { new_src(0, IR3_REG_IMMED)->iim_val = $1; }
 |                  '(' integer ')'     { new_src(0, IR3_REG_IMMED)->fim_val = $2; }
@@ -1607,3 +1619,4 @@ type:              T_TYPE_F16   { $$ = TYPE_F16;   }
 |                  T_TYPE_S32   { $$ = TYPE_S32;   }
 |                  T_TYPE_U8    { $$ = TYPE_U8;    }
 |                  T_TYPE_U8_32 { $$ = TYPE_U8_32; }
+|                  T_TYPE_U64   { $$ = TYPE_ATOMIC_U64;  }

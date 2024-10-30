@@ -50,6 +50,7 @@ convert_pc_to_bits(struct GENX(PIPE_CONTROL) *pc) {
 #endif
 #if GFX_VER == 12
    bits |= (pc->TileCacheFlushEnable) ?  ANV_PIPE_TILE_CACHE_FLUSH_BIT : 0;
+   bits |= (pc->L3FabricFlush) ?  ANV_PIPE_L3_FABRIC_FLUSH_BIT : 0;
 #endif
 #if GFX_VER >= 12
    bits |= (pc->HDCPipelineFlushEnable) ?  ANV_PIPE_HDC_PIPELINE_FLUSH_BIT : 0;
@@ -251,6 +252,8 @@ genX(cmd_buffer_emit_state_base_address)(struct anv_cmd_buffer *cmd_buffer)
     * necessary prior to changing the surface state base address.  Without
     * this, we get GPU hangs when using multi-level command buffers which
     * clear depth, reset state base address, and then go render stuff.
+    *
+    * Render target cache flush before SBA is required by Wa_18039438632.
     */
    genx_batch_emit_pipe_control(&cmd_buffer->batch, device->info,
                                 cmd_buffer->state.current_pipeline,
@@ -338,18 +341,6 @@ genX(cmd_buffer_emit_state_base_address)(struct anv_cmd_buffer *cmd_buffer)
       (intel_needs_workaround(device->info, 16013000631) ?
        ANV_PIPE_INSTRUCTION_CACHE_INVALIDATE_BIT : 0);
 
-#if GFX_VER >= 9 && GFX_VER <= 11
-      /* From the SKL PRM, Vol. 2a, "PIPE_CONTROL",
-       *
-       *    "Workaround : “CS Stall” bit in PIPE_CONTROL command must be
-       *     always set for GPGPU workloads when “Texture Cache Invalidation
-       *     Enable” bit is set".
-       *
-       * Workaround stopped appearing in TGL PRMs.
-       */
-      if (cmd_buffer->state.current_pipeline == GPGPU)
-         bits |= ANV_PIPE_CS_STALL_BIT;
-#endif
    genx_batch_emit_pipe_control(&cmd_buffer->batch, device->info,
                                 cmd_buffer->state.current_pipeline,
                                 bits);
@@ -465,14 +456,14 @@ transition_depth_buffer(struct anv_cmd_buffer *cmd_buffer,
       return;
 
    /* Initialize the indirect clear color prior to first use. */
+   const enum isl_format depth_format =
+      image->planes[depth_plane].primary_surface.isl.format;
    const struct anv_address clear_color_addr =
-      anv_image_get_clear_color_addr(cmd_buffer->device, image,
+      anv_image_get_clear_color_addr(cmd_buffer->device, image, depth_format,
                                      VK_IMAGE_ASPECT_DEPTH_BIT);
    if (!anv_address_is_null(clear_color_addr) &&
        (initial_layout == VK_IMAGE_LAYOUT_UNDEFINED ||
         initial_layout == VK_IMAGE_LAYOUT_PREINITIALIZED)) {
-      const enum isl_format depth_format =
-         image->planes[depth_plane].primary_surface.isl.format;
       const union isl_color_value clear_value =
          anv_image_hiz_clear_value(image);
 
@@ -871,14 +862,11 @@ genX(cmd_buffer_mark_image_written)(struct anv_cmd_buffer *cmd_buffer,
  * image's fast clear state buffer.
  */
 void
-genX(load_image_clear_color)(struct anv_cmd_buffer *cmd_buffer,
-                             struct anv_state surface_state,
-                             const struct anv_image *image)
+genX(cmd_buffer_load_clear_color)(struct anv_cmd_buffer *cmd_buffer,
+                                  struct anv_state surface_state,
+                                  const struct anv_image_view *iview)
 {
 #if GFX_VER < 10
-   assert(cmd_buffer && image);
-   assert(image->vk.aspects & VK_IMAGE_ASPECT_ANY_COLOR_BIT_ANV);
-
    struct anv_address ss_clear_addr =
       anv_state_pool_state_address(
          &cmd_buffer->device->internal_surface_state_pool,
@@ -887,8 +875,10 @@ genX(load_image_clear_color)(struct anv_cmd_buffer *cmd_buffer,
                       cmd_buffer->device->isl_dev.ss.clear_value_offset
          });
    const struct anv_address entry_addr =
-      anv_image_get_clear_color_addr(cmd_buffer->device, image,
+      anv_image_get_clear_color_addr(cmd_buffer->device, iview->image,
+                                     iview->planes[0].isl.format,
                                      VK_IMAGE_ASPECT_COLOR_BIT);
+
    unsigned copy_size = cmd_buffer->device->isl_dev.ss.clear_value_size;
 
    struct mi_builder b;
@@ -910,7 +900,7 @@ genX(load_image_clear_color)(struct anv_cmd_buffer *cmd_buffer,
     */
    anv_add_pending_pipe_bits(cmd_buffer,
                              ANV_PIPE_STATE_CACHE_INVALIDATE_BIT,
-                             "after load_image_clear_color surface state update");
+                             "after load_clear_color surface state update");
 #endif
 }
 
@@ -920,41 +910,38 @@ set_image_clear_color(struct anv_cmd_buffer *cmd_buffer,
                       const VkImageAspectFlags aspect,
                       const uint32_t *pixel)
 {
-   UNUSED struct anv_batch *batch = &cmd_buffer->batch;
-   uint32_t plane = anv_image_aspect_to_plane(image, aspect);
-   enum isl_format format = image->planes[plane].primary_surface.isl.format;
+   for (int i = 0; i < image->num_view_formats; i++) {
+      union isl_color_value clear_color;
+      isl_color_value_unpack(&clear_color, image->view_formats[i], pixel);
 
-   union isl_color_value clear_color;
-   isl_color_value_unpack(&clear_color, format, pixel);
+      const struct anv_address addr =
+         anv_image_get_clear_color_addr(cmd_buffer->device, image,
+                                        image->view_formats[i], aspect);
+      assert(!anv_address_is_null(addr));
 
-   struct anv_address addr =
-      anv_image_get_clear_color_addr(cmd_buffer->device, image, aspect);
-   assert(!anv_address_is_null(addr));
-
-#if GFX_VER >= 20
-   assert(cmd_buffer->device->isl_dev.ss.clear_color_state_size == 0);
-   assert(cmd_buffer->device->isl_dev.ss.clear_value_size == 0);
-   unreachable("storing clear colors on invalid gfx_ver" );
-#elif GFX_VER >= 11
-   assert(cmd_buffer->device->isl_dev.ss.clear_color_state_size == 32);
-   uint32_t *dw = anv_batch_emitn(batch, 3 + 6, GENX(MI_STORE_DATA_IMM),
-                                  .StoreQword = true, .Address = addr);
-   dw[3] = clear_color.u32[0];
-   dw[4] = clear_color.u32[1];
-   dw[5] = clear_color.u32[2];
-   dw[6] = clear_color.u32[3];
-   dw[7] = pixel[0];
-   dw[8] = pixel[1];
+#if GFX_VER >= 11
+      assert(cmd_buffer->device->isl_dev.ss.clear_color_state_size == 32);
+      uint32_t *dw = anv_batch_emitn(&cmd_buffer->batch, 3 + 6,
+                                     GENX(MI_STORE_DATA_IMM),
+                                     .StoreQword = true, .Address = addr);
+      dw[3] = clear_color.u32[0];
+      dw[4] = clear_color.u32[1];
+      dw[5] = clear_color.u32[2];
+      dw[6] = clear_color.u32[3];
+      dw[7] = pixel[0];
+      dw[8] = pixel[1];
 #else
-   assert(cmd_buffer->device->isl_dev.ss.clear_color_state_size == 0);
-   assert(cmd_buffer->device->isl_dev.ss.clear_value_size == 16);
-   uint32_t *dw = anv_batch_emitn(batch, 3 + 4, GENX(MI_STORE_DATA_IMM),
-                                  .StoreQword = true, .Address = addr);
-   dw[3] = clear_color.u32[0];
-   dw[4] = clear_color.u32[1];
-   dw[5] = clear_color.u32[2];
-   dw[6] = clear_color.u32[3];
+      assert(cmd_buffer->device->isl_dev.ss.clear_color_state_size == 0);
+      assert(cmd_buffer->device->isl_dev.ss.clear_value_size == 16);
+      uint32_t *dw = anv_batch_emitn(&cmd_buffer->batch, 3 + 4,
+                                     GENX(MI_STORE_DATA_IMM),
+                                     .StoreQword = true, .Address = addr);
+      dw[3] = clear_color.u32[0];
+      dw[4] = clear_color.u32[1];
+      dw[5] = clear_color.u32[2];
+      dw[6] = clear_color.u32[3];
 #endif
+   }
 }
 
 void
@@ -1658,37 +1645,37 @@ genX(emit_apply_pipe_flushes)(struct anv_batch *batch,
    if (bits & ANV_PIPE_FLUSH_BITS)
       bits |= ANV_PIPE_NEEDS_END_OF_PIPE_SYNC_BIT;
 
-
-   /* HSD 1209978178: docs say that before programming the aux table:
+   /* From Bspec 43904 (Register_CCSAuxiliaryTableInvalidate):
+    * RCS engine idle sequence:
     *
-    *    "Driver must ensure that the engine is IDLE but ensure it doesn't
-    *    add extra flushes in the case it knows that the engine is already
-    *    IDLE."
+    *    Gfx12+:
+    *       PIPE_CONTROL:- DC Flush + L3 Fabric Flush + CS Stall + Render
+    *                      Target Cache Flush + Depth Cache
     *
-    * HSD 22012751911: SW Programming sequence when issuing aux invalidation:
+    *    Gfx125+:
+    *       PIPE_CONTROL:- DC Flush + L3 Fabric Flush + CS Stall + Render
+    *                      Target Cache Flush + Depth Cache + CCS flush
     *
-    *    "Render target Cache Flush + L3 Fabric Flush + State Invalidation + CS Stall"
+    * Compute engine idle sequence:
     *
-    * Notice we don't set the L3 Fabric Flush here, because we have
-    * ANV_PIPE_END_OF_PIPE_SYNC_BIT which inserts a CS stall. The
-    * PIPE_CONTROL::L3 Fabric Flush documentation says :
+    *    Gfx12+:
+    *       PIPE_CONTROL:- DC Flush + L3 Fabric Flush + CS Stall
     *
-    *    "L3 Fabric Flush will ensure all the pending transactions in the L3
-    *     Fabric are flushed to global observation point. HW does implicit L3
-    *     Fabric Flush on all stalling flushes (both explicit and implicit)
-    *     and on PIPECONTROL having Post Sync Operation enabled."
-    *
-    * Therefore setting L3 Fabric Flush here would be redundant.
+    *    Gfx125+:
+    *       PIPE_CONTROL:- DC Flush + L3 Fabric Flush + CS Stall + CCS flush
     */
    if (GFX_VER == 12 && (bits & ANV_PIPE_AUX_TABLE_INVALIDATE_BIT)) {
       if (current_pipeline == GPGPU) {
-         bits |= (ANV_PIPE_NEEDS_END_OF_PIPE_SYNC_BIT |
-                  ANV_PIPE_DATA_CACHE_FLUSH_BIT |
-                  (GFX_VERx10 == 125 ? ANV_PIPE_CCS_CACHE_FLUSH_BIT: 0));
+         bits |=  (ANV_PIPE_DATA_CACHE_FLUSH_BIT |
+                   ANV_PIPE_L3_FABRIC_FLUSH_BIT |
+                   ANV_PIPE_CS_STALL_BIT |
+                   (GFX_VERx10 == 125 ? ANV_PIPE_CCS_CACHE_FLUSH_BIT: 0));
       } else if (current_pipeline == _3D) {
-         bits |= (ANV_PIPE_NEEDS_END_OF_PIPE_SYNC_BIT |
+         bits |= (ANV_PIPE_DATA_CACHE_FLUSH_BIT |
+                  ANV_PIPE_L3_FABRIC_FLUSH_BIT |
+                  ANV_PIPE_CS_STALL_BIT |
                   ANV_PIPE_RENDER_TARGET_CACHE_FLUSH_BIT |
-                  ANV_PIPE_STATE_CACHE_INVALIDATE_BIT |
+                  ANV_PIPE_DEPTH_CACHE_FLUSH_BIT |
                   (GFX_VERx10 == 125 ? ANV_PIPE_CCS_CACHE_FLUSH_BIT: 0));
       }
    }
@@ -2102,6 +2089,7 @@ emit_binding_table(struct anv_cmd_buffer *cmd_buffer,
             cmd_buffer->state.gfx.color_output_mapping[binding->index] :
             binding->index;
          if (index < cmd_buffer->state.gfx.color_att_count) {
+            assert(index < MAX_RTS);
             const struct anv_attachment *att =
                &cmd_buffer->state.gfx.color_att[index];
             surface_state = att->surface_state.state;
@@ -2111,29 +2099,6 @@ emit_binding_table(struct anv_cmd_buffer *cmd_buffer,
          assert(surface_state.map);
          bt_map[s] = surface_state.offset + state_offset;
          break;
-
-      case ANV_DESCRIPTOR_SET_NUM_WORK_GROUPS: {
-         /* This is always the first binding for compute shaders */
-         assert(shader->stage == MESA_SHADER_COMPUTE && s == 0);
-
-         struct anv_state surface_state =
-            anv_cmd_buffer_alloc_surface_states(cmd_buffer, 1);
-         if (surface_state.map == NULL)
-            return VK_ERROR_OUT_OF_DEVICE_MEMORY;
-
-         const enum isl_format format =
-            anv_isl_format_for_descriptor_type(cmd_buffer->device,
-                                               VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
-         anv_fill_buffer_surface_state(cmd_buffer->device, surface_state.map,
-                                       format, ISL_SWIZZLE_IDENTITY,
-                                       ISL_SURF_USAGE_CONSTANT_BUFFER_BIT,
-                                       cmd_buffer->state.compute.num_workgroups,
-                                       12, 1);
-
-         assert(surface_state.map);
-         bt_map[s] = surface_state.offset + state_offset;
-         break;
-      }
 
       case ANV_DESCRIPTOR_SET_DESCRIPTORS: {
          struct anv_descriptor_set *set =
@@ -2515,20 +2480,6 @@ genX(batch_emit_pipe_control_write)(struct anv_batch *batch,
    if (GFX_VER == 9 && (bits & ANV_PIPE_VF_CACHE_INVALIDATE_BIT))
       anv_batch_emit(batch, GENX(PIPE_CONTROL), pipe);
 
-#if GFX_VER >= 9 && GFX_VER <= 11
-   /* From the SKL PRM, Vol. 2a, "PIPE_CONTROL",
-    *
-    *    "Workaround : “CS Stall” bit in PIPE_CONTROL command must be
-    *     always set for GPGPU workloads when “Texture Cache
-    *     Invalidation Enable” bit is set".
-    *
-    * Workaround stopped appearing in TGL PRMs.
-    */
-   if (current_pipeline == GPGPU &&
-       (bits & ANV_PIPE_TEXTURE_CACHE_INVALIDATE_BIT))
-      bits |= ANV_PIPE_CS_STALL_BIT;
-#endif
-
    anv_batch_emit(batch, GENX(PIPE_CONTROL), pipe) {
 #if GFX_VERx10 >= 125
       pipe.UntypedDataPortCacheFlushEnable =
@@ -2537,6 +2488,7 @@ genX(batch_emit_pipe_control_write)(struct anv_batch *batch,
 #endif
 #if GFX_VER == 12
       pipe.TileCacheFlushEnable = bits & ANV_PIPE_TILE_CACHE_FLUSH_BIT;
+      pipe.L3FabricFlush = bits & ANV_PIPE_L3_FABRIC_FLUSH_BIT;
 #endif
 #if GFX_VER > 11
       pipe.HDCPipelineFlushEnable = bits & ANV_PIPE_HDC_PIPELINE_FLUSH_BIT;
@@ -4261,6 +4213,8 @@ cmd_buffer_barrier(struct anv_cmd_buffer *cmd_buffer,
    VkAccessFlags2 src_flags = 0;
    VkAccessFlags2 dst_flags = 0;
 
+   VkPipelineStageFlags2 src_stages = 0;
+
 #if GFX_VER < 20
    bool apply_sparse_flushes = false;
    struct anv_device *device = cmd_buffer->device;
@@ -4273,6 +4227,8 @@ cmd_buffer_barrier(struct anv_cmd_buffer *cmd_buffer,
       for (uint32_t i = 0; i < dep_info->memoryBarrierCount; i++) {
          src_flags |= dep_info->pMemoryBarriers[i].srcAccessMask;
          dst_flags |= dep_info->pMemoryBarriers[i].dstAccessMask;
+
+         src_stages |= dep_info->pMemoryBarriers[i].srcStageMask;
 
          /* Shader writes to buffers that could then be written by a transfer
           * command (including queries).
@@ -4306,6 +4262,8 @@ cmd_buffer_barrier(struct anv_cmd_buffer *cmd_buffer,
          src_flags |= buf_barrier->srcAccessMask;
          dst_flags |= buf_barrier->dstAccessMask;
 
+         src_stages |= buf_barrier->srcStageMask;
+
          /* Shader writes to buffers that could then be written by a transfer
           * command (including queries).
           */
@@ -4335,6 +4293,8 @@ cmd_buffer_barrier(struct anv_cmd_buffer *cmd_buffer,
 
          src_flags |= img_barrier->srcAccessMask;
          dst_flags |= img_barrier->dstAccessMask;
+
+         src_stages |= img_barrier->srcStageMask;
 
          ANV_FROM_HANDLE(anv_image, image, img_barrier->image);
          const VkImageSubresourceRange *range = &img_barrier->subresourceRange;
@@ -4443,13 +4403,82 @@ cmd_buffer_barrier(struct anv_cmd_buffer *cmd_buffer,
       anv_pipe_flush_bits_for_access_flags(cmd_buffer, src_flags) |
       anv_pipe_invalidate_bits_for_access_flags(cmd_buffer, dst_flags);
 
+   /* What stage require a stall at pixel scoreboard */
+   VkPipelineStageFlags2 pb_stall_stages =
+      VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+      VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
+      VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT |
+      VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT |
+      VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+   if (anv_cmd_buffer_is_render_queue(cmd_buffer)) {
+      /* On a render queue, the following stages can also use a pixel shader.
+       */
+      pb_stall_stages |=
+         VK_PIPELINE_STAGE_2_TRANSFER_BIT |
+         VK_PIPELINE_STAGE_2_RESOLVE_BIT |
+         VK_PIPELINE_STAGE_2_BLIT_BIT |
+         VK_PIPELINE_STAGE_2_CLEAR_BIT;
+   }
+   VkPipelineStageFlags2 cs_stall_stages =
+      VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT |
+      VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+      VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR |
+      VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR |
+      VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+   if (anv_cmd_buffer_is_compute_queue(cmd_buffer)) {
+      /* On a compute queue, the following stages can also use a compute
+       * shader.
+       */
+      cs_stall_stages |=
+         VK_PIPELINE_STAGE_2_TRANSFER_BIT |
+         VK_PIPELINE_STAGE_2_RESOLVE_BIT |
+         VK_PIPELINE_STAGE_2_BLIT_BIT |
+         VK_PIPELINE_STAGE_2_CLEAR_BIT;
+   } else if (anv_cmd_buffer_is_render_queue(cmd_buffer) &&
+              cmd_buffer->state.current_pipeline == GPGPU) {
+      /* In GPGPU mode, the render queue can also use a compute shader for
+       * transfer operations.
+       */
+      cs_stall_stages |= VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+   }
+
+   /* Prior to Gfx20, we can restrict pb-stall/cs-stall to some pipeline
+    * modes. Gfx20 doesn't do pipeline switches so we have to assume the worse
+    * case.
+    */
+   const bool needs_pb_stall =
+      anv_cmd_buffer_is_render_queue(cmd_buffer) &&
 #if GFX_VER < 20
-   /* Our HW implementation of the sparse feature lives in the GAM unit
-    * (interface between all the GPU caches and external memory). As a result
-    * writes to NULL bound images & buffers that should be ignored are
-    * actually still visible in the caches. The only way for us to get correct
-    * NULL bound regions to return 0s is to evict the caches to force the
-    * caches to be repopulated with 0s.
+      cmd_buffer->state.current_pipeline == _3D &&
+#endif
+      (src_stages & pb_stall_stages);
+   if (needs_pb_stall) {
+      bits |= GFX_VERx10 >= 125 ?
+              ANV_PIPE_PSS_STALL_SYNC_BIT :
+              ANV_PIPE_STALL_AT_SCOREBOARD_BIT;
+   }
+   const bool needs_cs_stall =
+      anv_cmd_buffer_is_render_or_compute_queue(cmd_buffer) &&
+#if GFX_VER < 20
+      cmd_buffer->state.current_pipeline == GPGPU &&
+#endif
+      (src_stages & cs_stall_stages);
+   if (needs_cs_stall)
+      bits |= ANV_PIPE_CS_STALL_BIT;
+
+#if GFX_VER < 20
+   /* Our HW implementation of the sparse feature prior to Xe2 lives in the
+    * GAM unit (interface between all the GPU caches and external memory).
+    * As a result writes to NULL bound images & buffers that should be
+    * ignored are actually still visible in the caches. The only way for us
+    * to get correct NULL bound regions to return 0s is to evict the caches
+    * to force the caches to be repopulated with 0s.
+    *
+    * Our understanding is that Xe2 started to tag the L3 cache with some
+    * kind physical address information rather. It is therefore able to
+    * detect that a cache line in the cache is going to a null tile and so
+    * the L3 cache also has a sparse compatible behavior and we don't need
+    * to flush anymore.
     */
    if (apply_sparse_flushes)
       bits |= ANV_PIPE_FLUSH_BITS;
@@ -4713,6 +4742,20 @@ genX(flush_pipeline_select)(struct anv_cmd_buffer *cmd_buffer,
          scec1.GLKBarrierModeMask = 1;
       }
    }
+#endif
+
+#if GFX_VER == 9
+   /* Undocumented workaround, we need to reemit MEDIA_CURBE_LOAD on Gfx9 when
+    * switching from 3D->GPGPU, otherwise the shader gets corrupted push
+    * constants. Note that this doesn't trigger a push constant reallocation,
+    * we just reprogram the same pointer.
+    *
+    * The issue reproduces pretty much 100% on
+    * dEQP-VK.memory_model.transitive.* tests. Reducing the number of
+    * iteration in the test from 50 to < 10 makes the tests flaky.
+    */
+   if (pipeline == GPGPU)
+      cmd_buffer->state.push_constants_dirty |= VK_SHADER_STAGE_COMPUTE_BIT;
 #endif
 #endif /* else of if GFX_VER >= 20 */
    cmd_buffer->state.current_pipeline = pipeline;
@@ -5366,13 +5409,14 @@ void genX(CmdBeginRendering)(
 
       if (GFX_VER < 10 &&
           (att->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD ||
+           render_area.extent.width != iview->vk.extent.width ||
+           render_area.extent.height != iview->vk.extent.height ||
            (gfx->rendering_flags & VK_RENDERING_RESUMING_BIT)) &&
           iview->image->planes[0].aux_usage != ISL_AUX_USAGE_NONE &&
           iview->planes[0].isl.base_level == 0 &&
           iview->planes[0].isl.base_array_layer == 0) {
-         genX(load_image_clear_color)(cmd_buffer,
-                                      gfx->color_att[i].surface_state.state,
-                                      iview->image);
+         struct anv_state surf_state = gfx->color_att[i].surface_state.state;
+         genX(cmd_buffer_load_clear_color)(cmd_buffer, surf_state, iview);
       }
 
       if (att->resolveMode != VK_RESOLVE_MODE_NONE) {
@@ -5706,13 +5750,13 @@ void genX(CmdEndRendering)(
 
    if (!(gfx->rendering_flags & VK_RENDERING_SUSPENDING_BIT)) {
       bool has_color_resolve = false;
-      bool has_sparse_color_resolve = false;
+      UNUSED bool has_sparse_color_resolve = false;
 
       for (uint32_t i = 0; i < gfx->color_att_count; i++) {
          if (gfx->color_att[i].resolve_mode != VK_RESOLVE_MODE_NONE) {
             has_color_resolve = true;
-            if (anv_image_is_sparse(gfx->color_att[i].iview->image))
-                  has_sparse_color_resolve = true;
+            has_sparse_color_resolve |=
+               anv_image_is_sparse(gfx->color_att[i].iview->image);
          }
       }
 
@@ -5731,12 +5775,6 @@ void genX(CmdEndRendering)(
          gfx->depth_att.resolve_mode != VK_RESOLVE_MODE_NONE;
       const bool has_stencil_resolve =
          gfx->stencil_att.resolve_mode != VK_RESOLVE_MODE_NONE;
-      const bool has_sparse_depth_resolve =
-         has_depth_resolve &&
-         anv_image_is_sparse(gfx->depth_att.iview->image);
-      const bool has_sparse_stencil_resolve =
-         has_stencil_resolve &&
-         anv_image_is_sparse(gfx->stencil_att.iview->image);
 
       if (has_depth_resolve || has_stencil_resolve) {
          /* We are about to do some MSAA resolves.  We need to flush so that
@@ -5749,6 +5787,26 @@ void genX(CmdEndRendering)(
                                  "MSAA resolve");
       }
 
+#if GFX_VER < 20
+      const bool has_sparse_depth_resolve =
+         has_depth_resolve &&
+         anv_image_is_sparse(gfx->depth_att.iview->image);
+      const bool has_sparse_stencil_resolve =
+         has_stencil_resolve &&
+         anv_image_is_sparse(gfx->stencil_att.iview->image);
+      /* Our HW implementation of the sparse feature prior to Xe2 lives in the
+       * GAM unit (interface between all the GPU caches and external memory).
+       * As a result writes to NULL bound images & buffers that should be
+       * ignored are actually still visible in the caches. The only way for us
+       * to get correct NULL bound regions to return 0s is to evict the caches
+       * to force the caches to be repopulated with 0s.
+       *
+       * Our understanding is that Xe2 started to tag the L3 cache with some
+       * kind physical address information rather. It is therefore able to
+       * detect that a cache line in the cache is going to a null tile and so
+       * the L3 cache also has a sparse compatible behavior and we don't need
+       * to flush anymore.
+       */
       if (has_sparse_color_resolve || has_sparse_depth_resolve ||
           has_sparse_stencil_resolve) {
          /* If the resolve image is sparse we need some extra bits to make
@@ -5758,6 +5816,7 @@ void genX(CmdEndRendering)(
          anv_add_pending_pipe_bits(cmd_buffer, ANV_PIPE_TILE_CACHE_FLUSH_BIT,
                                    "sparse MSAA resolve");
       }
+#endif
 
       for (uint32_t i = 0; i < gfx->color_att_count; i++) {
          const struct anv_attachment *att = &gfx->color_att[i];
@@ -6138,11 +6197,13 @@ void genX(cmd_emit_timestamp)(struct anv_batch *batch,
       uint32_t dwords[GENX(COMPUTE_WALKER_length)];
 
       GENX(COMPUTE_WALKER_pack)(batch, dwords, &(struct GENX(COMPUTE_WALKER)) {
-            .PostSync = (struct GENX(POSTSYNC_DATA)) {
-               .Operation = WriteTimestamp,
-               .DestinationAddress = addr,
-               .MOCS = anv_mocs(device, NULL, 0),
-            },
+            .body = {
+               .PostSync = (struct GENX(POSTSYNC_DATA)) {
+                  .Operation = WriteTimestamp,
+                  .DestinationAddress = addr,
+                  .MOCS = anv_mocs(device, NULL, 0),
+               },
+            }
          });
 
       for (uint32_t i = 0; i < ARRAY_SIZE(dwords); i++) {
@@ -6244,45 +6305,6 @@ genX(batch_emit_return)(struct anv_batch *batch)
                           GENX(MI_BATCH_BUFFER_START),
                           .AddressSpaceIndicator = ASI_PPGTT,
                           .SecondLevelBatchBuffer = Firstlevelbatch);
-}
-
-void
-genX(batch_emit_post_3dprimitive_was)(struct anv_batch *batch,
-                                      const struct anv_device *device,
-                                      uint32_t primitive_topology,
-                                      uint32_t vertex_count)
-{
-#if INTEL_WA_22014412737_GFX_VER || INTEL_WA_16014538804_GFX_VER
-   if (intel_needs_workaround(device->info, 22014412737) &&
-       (primitive_topology == _3DPRIM_POINTLIST ||
-        primitive_topology == _3DPRIM_LINELIST ||
-        primitive_topology == _3DPRIM_LINESTRIP ||
-        primitive_topology == _3DPRIM_LINELIST_ADJ ||
-        primitive_topology == _3DPRIM_LINESTRIP_ADJ ||
-        primitive_topology == _3DPRIM_LINELOOP ||
-        primitive_topology == _3DPRIM_POINTLIST_BF ||
-        primitive_topology == _3DPRIM_LINESTRIP_CONT ||
-        primitive_topology == _3DPRIM_LINESTRIP_BF ||
-        primitive_topology == _3DPRIM_LINESTRIP_CONT_BF) &&
-       (vertex_count == 1 || vertex_count == 2)) {
-      genx_batch_emit_pipe_control_write
-         (batch, device->info, 0, WriteImmediateData,
-          device->workaround_address, 0, 0);
-
-      /* Reset counter because we just emitted a PC */
-      batch->num_3d_primitives_emitted = 0;
-   } else if (intel_needs_workaround(device->info, 16014538804)) {
-      batch->num_3d_primitives_emitted++;
-      /* WA 16014538804:
-       *    After every 3 3D_Primitive command,
-       *    atleast 1 pipe_control must be inserted.
-       */
-      if (batch->num_3d_primitives_emitted == 3) {
-         anv_batch_emit(batch, GENX(PIPE_CONTROL), pc);
-         batch->num_3d_primitives_emitted = 0;
-      }
-   }
-#endif
 }
 
 /* Wa_16018063123 */

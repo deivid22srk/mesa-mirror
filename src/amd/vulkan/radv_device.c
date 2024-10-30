@@ -998,6 +998,15 @@ radv_emit_default_sample_locations(const struct radv_physical_device *pdev, stru
       break;
    }
 
+   /* The exclusion bits can be set to improve rasterization efficiency if no sample lies on the
+    * pixel boundary (-8 sample offset). It's currently always TRUE because the driver doesn't
+    * support 16 samples.
+    */
+   if (pdev->info.gfx_level >= GFX7) {
+      radeon_set_context_reg(cs, R_02882C_PA_SU_PRIM_FILTER_CNTL,
+                             S_02882C_XMAX_RIGHT_EXCLUSION(1) | S_02882C_YMAX_BOTTOM_EXCLUSION(1));
+   }
+
    if (pdev->info.gfx_level >= GFX12) {
       radeon_set_context_reg_seq(cs, R_028BF0_PA_SC_CENTROID_PRIORITY_0, 2);
    } else {
@@ -1091,7 +1100,6 @@ radv_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCr
    simple_mtx_init(&device->trace_mtx, mtx_plain);
    simple_mtx_init(&device->pstate_mtx, mtx_plain);
    simple_mtx_init(&device->rt_handles_mtx, mtx_plain);
-   simple_mtx_init(&device->compute_scratch_mtx, mtx_plain);
    simple_mtx_init(&device->pso_cache_stats_mtx, mtx_plain);
 
    device->rt_handles = _mesa_hash_table_create(NULL, _mesa_hash_u32, _mesa_key_u32_equal);
@@ -1350,7 +1358,6 @@ fail_queue:
    simple_mtx_destroy(&device->pstate_mtx);
    simple_mtx_destroy(&device->trace_mtx);
    simple_mtx_destroy(&device->rt_handles_mtx);
-   simple_mtx_destroy(&device->compute_scratch_mtx);
    simple_mtx_destroy(&device->pso_cache_stats_mtx);
    mtx_destroy(&device->overallocation_mutex);
 
@@ -1408,7 +1415,6 @@ radv_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    simple_mtx_destroy(&device->pstate_mtx);
    simple_mtx_destroy(&device->trace_mtx);
    simple_mtx_destroy(&device->rt_handles_mtx);
-   simple_mtx_destroy(&device->compute_scratch_mtx);
    simple_mtx_destroy(&device->pso_cache_stats_mtx);
 
    radv_destroy_shader_arenas(device);
@@ -1417,23 +1423,6 @@ radv_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
 
    vk_device_finish(&device->vk);
    vk_free(&device->vk.alloc, device);
-}
-
-bool
-radv_get_memory_fd(struct radv_device *device, struct radv_device_memory *memory, int *pFD)
-{
-   /* Set BO metadata for dedicated image allocations.  We don't need it for import when the image
-    * tiling is VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT, but we set it anyway for foreign consumers.
-    */
-   if (memory->image) {
-      struct radeon_bo_metadata metadata;
-
-      assert(memory->image->bindings[0].offset == 0);
-      radv_init_metadata(device, memory->image, &metadata);
-      device->ws->buffer_set_metadata(device->ws, memory->bo, &metadata);
-   }
-
-   return device->ws->buffer_get_fd(device->ws, memory->bo, pFD);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -1543,7 +1532,7 @@ radv_initialise_color_surface(struct radv_device *device, struct radv_color_buff
 
    const struct ac_cb_state cb_state = {
       .surf = surf,
-      .format = vk_format_to_pipe_format(iview->vk.format),
+      .format = radv_format_to_pipe_format(iview->vk.format),
       .width = vk_format_get_plane_width(iview->image->vk.format, iview->plane_id, iview->extent.width),
       .height = vk_format_get_plane_height(iview->image->vk.format, iview->plane_id, iview->extent.height),
       .first_layer = iview->vk.base_array_layer,
@@ -1625,7 +1614,7 @@ radv_initialise_ds_surface(const struct radv_device *device, struct radv_ds_buff
    const struct ac_ds_state ds_state = {
       .surf = &iview->image->planes[0].surface,
       .va = radv_image_get_va(iview->image, 0),
-      .format = vk_format_to_pipe_format(iview->image->vk.format),
+      .format = radv_format_to_pipe_format(iview->image->vk.format),
       .width = iview->image->vk.extent.width,
       .height = iview->image->vk.extent.height,
       .level = level,
@@ -1645,7 +1634,7 @@ radv_initialise_ds_surface(const struct radv_device *device, struct radv_ds_buff
 
    const struct ac_mutable_ds_state mutable_ds_state = {
       .ds = &ds->ac,
-      .format = vk_format_to_pipe_format(iview->image->vk.format),
+      .format = radv_format_to_pipe_format(iview->image->vk.format),
       .tc_compat_htile_enabled = radv_htile_enabled(iview->image, level) && radv_image_is_tc_compat_htile(iview->image),
       .zrange_precision = true,
       .no_d16_compression = true,
@@ -1695,7 +1684,18 @@ radv_GetMemoryFdKHR(VkDevice _device, const VkMemoryGetFdInfoKHR *pGetFdInfo, in
    assert(pGetFdInfo->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT ||
           pGetFdInfo->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT);
 
-   bool ret = radv_get_memory_fd(device, memory, pFD);
+   /* Set BO metadata for dedicated image allocations.  We don't need it for import when the image
+    * tiling is VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT, but we set it anyway for foreign consumers.
+    */
+   if (memory->image) {
+      struct radeon_bo_metadata metadata;
+
+      assert(memory->image->bindings[0].offset == 0);
+      radv_init_metadata(device, memory->image, &metadata);
+      device->ws->buffer_set_metadata(device->ws, memory->bo, &metadata);
+   }
+
+   bool ret = device->ws->buffer_get_fd(device->ws, memory->bo, pFD);
    if (ret == false)
       return vk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
    return VK_SUCCESS;

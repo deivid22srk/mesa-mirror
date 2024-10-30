@@ -493,8 +493,10 @@ double_check_ici(struct zink_screen *screen, VkImageCreateInfo *ici, VkImageUsag
 
    ici->usage = usage;
 
-   if (suboptimal_check_ici(screen, ici, mod))
-      return true;
+   if (ici->usage & VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT) {
+      if (suboptimal_check_ici(screen, ici, mod))
+         return true;
+   }
    if (check_ici(screen, ici, mod))
       return true;
    if (require_mutable)
@@ -529,9 +531,10 @@ double_check_ici(struct zink_screen *screen, VkImageCreateInfo *ici, VkImageUsag
 }
 
 static bool
-find_good_mod(struct zink_screen *screen, VkImageCreateInfo *ici, const struct pipe_resource *templ, unsigned bind, unsigned modifiers_count, uint64_t *modifiers, uint64_t *good_mod, VkImageUsageFlags *good_usage)
+find_good_mod(struct zink_screen *screen, VkImageCreateInfo *ici, const struct pipe_resource *templ, unsigned bind, unsigned modifiers_count, uint64_t *modifiers, uint64_t *good_mod)
 {
    bool found = false;
+   VkImageUsageFlags good_usage = 0;
    const struct zink_modifier_props *prop = zink_get_modifier_props(screen, templ->format);
    for (unsigned i = 0; i < modifiers_count; i++) {
       bool need_extended = false;
@@ -551,14 +554,17 @@ find_good_mod(struct zink_screen *screen, VkImageCreateInfo *ici, const struct p
          /* assume "best" modifiers are last in array; just return last good modifier */
          found = true;
          *good_mod = modifiers[i];
-         *good_usage = usage;
+         good_usage = usage;
       }
    }
+   if (found)
+      ici->usage = good_usage;
    return found;
 }
 
-static VkImageUsageFlags
-get_image_usage(struct zink_screen *screen, VkImageCreateInfo *ici, const struct pipe_resource *templ, unsigned bind, unsigned modifiers_count, uint64_t *modifiers, uint64_t *mod)
+/* subfunctions of this call must set ici->usage on success */
+static bool
+set_image_usage(struct zink_screen *screen, VkImageCreateInfo *ici, const struct pipe_resource *templ, unsigned bind, unsigned modifiers_count, uint64_t *modifiers, uint64_t *mod)
 {
    VkImageTiling tiling = ici->tiling;
    bool need_extended = false;
@@ -566,11 +572,10 @@ get_image_usage(struct zink_screen *screen, VkImageCreateInfo *ici, const struct
    if (modifiers_count) {
       assert(tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT);
       uint64_t good_mod = 0;
-      VkImageUsageFlags good_usage = 0;
       if (screen->info.have_EXT_image_drm_format_modifier &&
-          find_good_mod(screen, ici, templ, bind, modifiers_count, modifiers, &good_mod, &good_usage)) {
+          find_good_mod(screen, ici, templ, bind, modifiers_count, modifiers, &good_mod)) {
          *mod = good_mod;
-         return good_usage;
+         return true;
       }
       /* only try linear if no other options available */
       const struct zink_modifier_props *prop = zink_get_modifier_props(screen, templ->format);
@@ -582,7 +587,7 @@ get_image_usage(struct zink_screen *screen, VkImageCreateInfo *ici, const struct
          assert(!need_extended);
          if (double_check_ici(screen, ici, usage, DRM_FORMAT_MOD_LINEAR, true)) {
             *mod = DRM_FORMAT_MOD_LINEAR;
-            return usage;
+            return true;
          }
       }
    } else {
@@ -599,31 +604,44 @@ get_image_usage(struct zink_screen *screen, VkImageCreateInfo *ici, const struct
          usage = get_image_usage_for_feats(screen, feats, templ, bind, &need_extended);
       }
       if (double_check_ici(screen, ici, usage, DRM_FORMAT_MOD_INVALID, true))
-         return usage;
+         return true;
       if (util_format_is_depth_or_stencil(templ->format)) {
          if (!(templ->bind & PIPE_BIND_DEPTH_STENCIL)) {
             usage &= ~VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
             /* mutable doesn't apply to depth/stencil formats */
             if (double_check_ici(screen, ici, usage, DRM_FORMAT_MOD_INVALID, true))
-               return usage;
+               return true;
          }
       } else if (!(templ->bind & PIPE_BIND_RENDER_TARGET)) {
          usage &= ~VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
          if (double_check_ici(screen, ici, usage, DRM_FORMAT_MOD_INVALID, true))
-            return usage;
+            return true;
          usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
          if (double_check_ici(screen, ici, usage, DRM_FORMAT_MOD_INVALID, false))
-            return usage;
+            return true;
          usage &= ~VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
          if (double_check_ici(screen, ici, usage, DRM_FORMAT_MOD_INVALID, false))
-            return usage;
+            return true;
       } else {
          if (double_check_ici(screen, ici, usage, DRM_FORMAT_MOD_INVALID, false))
-            return usage;
+            return true;
       }
    }
+   ici->usage = 0;
    *mod = DRM_FORMAT_MOD_INVALID;
-   return 0;
+   return false;
+}
+
+static bool
+try_set_image_usage_or_EXTENDED(struct zink_screen *screen, VkImageCreateInfo *ici, const struct pipe_resource *templ, unsigned bind, unsigned modifiers_count, uint64_t *modifiers, uint64_t *mod)
+{
+   VkImageCreateFlags flags = ici->flags;
+   /* retry with EXTENDED: trust that the frontend isn't giving us anything insane and pray */
+   ici->flags |= VK_IMAGE_CREATE_EXTENDED_USAGE_BIT | VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+   bool success = set_image_usage(screen, ici, templ, bind, modifiers_count, modifiers, mod);
+   if (!success)
+      ici->flags = flags;
+   return success;
 }
 
 static uint64_t
@@ -642,51 +660,32 @@ eval_ici(struct zink_screen *screen, VkImageCreateInfo *ici, const struct pipe_r
    if (ici->tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT)
       modifiers_count = 0;
 
-   bool first = true;
-   bool tried[2] = {0};
    uint64_t mod = DRM_FORMAT_MOD_INVALID;
-retry:
-   while (!ici->usage) {
-      if (!first) {
-         switch (ici->tiling) {
-         case VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT:
-            ici->tiling = VK_IMAGE_TILING_OPTIMAL;
-            modifiers_count = 0;
-            break;
-         case VK_IMAGE_TILING_OPTIMAL:
-            ici->tiling = VK_IMAGE_TILING_LINEAR;
-            break;
-         case VK_IMAGE_TILING_LINEAR:
-            if (bind & PIPE_BIND_LINEAR) {
-               *success = false;
+   /* this should work most of the time */
+   if (!set_image_usage(screen, ici, templ, bind, modifiers_count, modifiers, &mod)) {
+      bool success = false;
+      /* dmabuf doesn't retry with EXTENDED */
+      if (ici->tiling == VK_IMAGE_TILING_OPTIMAL)
+         success = try_set_image_usage_or_EXTENDED(screen, ici, templ, bind, modifiers_count, modifiers, &mod);
+      if (!success) {
+         ici->tiling = VK_IMAGE_TILING_LINEAR;
+         modifiers_count = 0;
+         /* in theory LINEAR should work */
+         if (!set_image_usage(screen, ici, templ, bind, modifiers_count, modifiers, &mod)) {
+            /* ...in theory LINEAR + EXTENDED should definitely work */
+            if (!try_set_image_usage_or_EXTENDED(screen, ici, templ, bind, modifiers_count, modifiers, &mod))
+               /* ...so that was a lie */
                return DRM_FORMAT_MOD_INVALID;
-            }
-            ici->tiling = VK_IMAGE_TILING_OPTIMAL;
-            break;
-         default:
-            unreachable("unhandled tiling mode");
-         }
-         if (tried[ici->tiling]) {
-            if (ici->flags & VK_IMAGE_CREATE_EXTENDED_USAGE_BIT) {
-               *success = false;
-               return DRM_FORMAT_MOD_INVALID;
-            }
-            ici->flags |= VK_IMAGE_CREATE_EXTENDED_USAGE_BIT | VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
-            tried[0] = false;
-            tried[1] = false;
-            first = true;
-            goto retry;
          }
       }
-      ici->usage = get_image_usage(screen, ici, templ, bind, modifiers_count, modifiers, &mod);
-      first = false;
-      if (ici->tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT)
-         tried[ici->tiling] = true;
    }
    if (want_cube) {
       ici->flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
-      if ((get_image_usage(screen, ici, templ, bind, modifiers_count, modifiers, &mod) & ici->usage) != ici->usage)
+      VkImageUsageFlags usage = ici->usage;
+      if (!set_image_usage(screen, ici, templ, bind, modifiers_count, modifiers, &mod)) {
          ici->flags &= ~VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+         ici->usage = usage;
+      }
    }
 
    *success = true;
@@ -749,11 +748,11 @@ init_ici(struct zink_screen *screen, VkImageCreateInfo *ici, const struct pipe_r
 
    case PIPE_TEXTURE_3D:
       ici->imageType = VK_IMAGE_TYPE_3D;
-      if (!(templ->flags & PIPE_RESOURCE_FLAG_SPARSE))
+      if (!(templ->flags & PIPE_RESOURCE_FLAG_SPARSE)) {
          ici->flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
-      if (screen->info.have_EXT_image_2d_view_of_3d &&
-          (screen->driver_workarounds.can_2d_view_sparse || !(templ->flags & PIPE_RESOURCE_FLAG_SPARSE)))
-         ici->flags |= VK_IMAGE_CREATE_2D_VIEW_COMPATIBLE_BIT_EXT;
+         if (screen->info.have_EXT_image_2d_view_of_3d)
+            ici->flags |= VK_IMAGE_CREATE_2D_VIEW_COMPATIBLE_BIT_EXT;
+      }
       break;
 
    case PIPE_BUFFER:
@@ -1253,7 +1252,7 @@ create_image(struct zink_screen *screen, struct zink_resource_object *obj,
    /* we often need to be able to mutate between srgb and linear, but we don't need general
     * image view/shader image format compatibility (that path means losing fast clears or compression on some hardware).
     */
-   if (!(templ->bind & ZINK_BIND_MUTABLE)) {
+   if (!(templ->bind & ZINK_BIND_MUTABLE) && (!alloc_info->whandle || alloc_info->whandle->type == ZINK_EXTERNAL_MEMORY_HANDLE)) {
       srgb = util_format_is_srgb(templ->format) ? util_format_linear(templ->format) : util_format_srgb(templ->format);
       /* why do these helpers have different default return values? */
       if (srgb == templ->format)
@@ -1278,23 +1277,6 @@ create_image(struct zink_screen *screen, struct zink_resource_object *obj,
       ici.pNext = &format_list;
    } else {
       ici.pNext = NULL;
-   }
-   VkImageCompressionFixedRateFlagsEXT rate = 0;
-   VkImageCompressionControlEXT compression = {
-      VK_STRUCTURE_TYPE_IMAGE_COMPRESSION_CONTROL_EXT,
-      ici.pNext,
-      0,
-      1,
-      &rate
-   };
-   if (templ->compression_rate != PIPE_COMPRESSION_FIXED_RATE_NONE) {
-      if (templ->compression_rate == PIPE_COMPRESSION_FIXED_RATE_DEFAULT) {
-         compression.flags = VK_IMAGE_COMPRESSION_FIXED_RATE_DEFAULT_EXT;
-      } else {
-         compression.flags = VK_IMAGE_COMPRESSION_FIXED_RATE_EXPLICIT_EXT;
-         rate = BITFIELD_BIT(templ->compression_rate - 1);
-      }
-      ici.pNext = &compression;
    }
    init_ici(screen, &ici, templ, templ->bind, ici_modifier_count);
 
@@ -1327,10 +1309,16 @@ create_image(struct zink_screen *screen, struct zink_resource_object *obj,
 
    obj->render_target = (ici.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) != 0;
 
+   if (ici.tiling == VK_IMAGE_TILING_OPTIMAL) {
+      alloc_info->external &= ~VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+      alloc_info->export_types &= ~VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+   }
+
    if (alloc_info->shared || alloc_info->external) {
       emici.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
       emici.pNext = ici.pNext;
       emici.handleTypes = alloc_info->export_types;
+      assert(!(emici.handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) || ici.tiling != VK_IMAGE_TILING_OPTIMAL);
       ici.pNext = &emici;
 
       assert(ici.tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT || mod != DRM_FORMAT_MOD_INVALID);

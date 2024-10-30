@@ -76,6 +76,7 @@ static const struct {
    { "arl", 0x7d67 },
    { "lnl", 0x64a0 },
    { "bmg", 0xe202 },
+   { "ptl", 0xb080 },
 };
 
 /**
@@ -1260,6 +1261,17 @@ static const struct intel_device_info intel_device_info_lnl = {
    .has_local_mem = false,
 };
 
+#define XE3_FEATURES                                            \
+   XE2_FEATURES,                                                \
+   .ver = 30,                                                   \
+   .verx10 = 300
+
+static const struct intel_device_info intel_device_info_ptl = {
+   XE3_FEATURES,
+   .platform = INTEL_PLATFORM_PTL,
+   .has_local_mem = false,
+};
+
 void
 intel_device_info_topology_reset_masks(struct intel_device_info *devinfo)
 {
@@ -1585,6 +1597,7 @@ intel_device_info_init_common(int pci_id, bool building,
    case 11:
    case 12:
    case 20:
+   case 30:
       devinfo->max_wm_threads = 128 /* threads-per-PSD */
                               * devinfo->num_slices
                               * 8; /* subslices per slice */

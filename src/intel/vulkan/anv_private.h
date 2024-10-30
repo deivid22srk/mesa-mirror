@@ -222,6 +222,8 @@ struct intel_perf_query_result;
 
 #define ANV_GRAPHICS_SHADER_STAGE_COUNT (MESA_SHADER_MESH + 1)
 
+#define ANV_INLINE_PARAM_NUM_WORKGROUPS_OFFSET (8)
+
 /* RENDER_SURFACE_STATE is a bit smaller (48b) but since it is aligned to 64
  * and we can't put anything else there we use 64b.
  */
@@ -254,6 +256,9 @@ struct intel_perf_query_result;
  */
 #define ANV_TRTT_L1_NULL_TILE_VAL 0
 #define ANV_TRTT_L1_INVALID_TILE_VAL 1
+
+#define ANV_COLOR_OUTPUT_DISABLED (0xff)
+#define ANV_COLOR_OUTPUT_UNUSED   (0xfe)
 
 static inline uint32_t
 align_down_npot_u32(uint32_t v, uint32_t a)
@@ -1040,6 +1045,11 @@ struct anv_physical_device {
 
     /** Whether KMD has the ability to create VM objects */
     bool                                        has_vm_control;
+
+    /** Whether the device is not able map all the device local memory on the
+     * host
+     */
+    bool                                        has_small_bar;
 
     /** True if we have the means to do sparse binding (e.g., a Kernel driver
      * a vm_bind ioctl).
@@ -2139,6 +2149,26 @@ anv_mocs_for_address(const struct anv_device *device,
 void anv_device_init_blorp(struct anv_device *device);
 void anv_device_finish_blorp(struct anv_device *device);
 
+static inline void
+anv_sanitize_map_params(struct anv_device *device,
+                        uint64_t in_offset,
+                        uint64_t in_size,
+                        uint64_t *out_offset,
+                        uint64_t *out_size)
+{
+   /* GEM will fail to map if the offset isn't 4k-aligned.  Round down. */
+   if (!device->physical->info.has_mmap_offset)
+      *out_offset = in_offset & ~4095ull;
+   else
+      *out_offset = 0;
+   assert(in_offset >= *out_offset);
+   *out_size = (in_offset + in_size) - *out_offset;
+
+   /* Let's map whole pages */
+   *out_size = align64(*out_size, 4096);
+}
+
+
 VkResult anv_device_alloc_bo(struct anv_device *device,
                              const char *name, uint64_t size,
                              enum anv_bo_alloc_flags alloc_flags,
@@ -3073,11 +3103,10 @@ anv_descriptor_set_write_template(struct anv_device *device,
                                   const struct vk_descriptor_update_template *template,
                                   const void *data);
 
-#define ANV_DESCRIPTOR_SET_DESCRIPTORS_BUFFER (UINT8_MAX - 5)
-#define ANV_DESCRIPTOR_SET_NULL               (UINT8_MAX - 4)
-#define ANV_DESCRIPTOR_SET_PUSH_CONSTANTS     (UINT8_MAX - 3)
-#define ANV_DESCRIPTOR_SET_DESCRIPTORS        (UINT8_MAX - 2)
-#define ANV_DESCRIPTOR_SET_NUM_WORK_GROUPS    (UINT8_MAX - 1)
+#define ANV_DESCRIPTOR_SET_DESCRIPTORS_BUFFER (UINT8_MAX - 4)
+#define ANV_DESCRIPTOR_SET_NULL               (UINT8_MAX - 3)
+#define ANV_DESCRIPTOR_SET_PUSH_CONSTANTS     (UINT8_MAX - 2)
+#define ANV_DESCRIPTOR_SET_DESCRIPTORS        (UINT8_MAX - 1)
 #define ANV_DESCRIPTOR_SET_COLOR_ATTACHMENTS   UINT8_MAX
 
 struct anv_pipeline_binding {
@@ -3378,6 +3407,9 @@ enum anv_pipe_bits {
     * implement a workaround for Gfx9.
     */
    ANV_PIPE_POST_SYNC_BIT                    = (1 << 24),
+
+   /* L3 Fabric Flush */
+   ANV_PIPE_L3_FABRIC_FLUSH_BIT              = (1 << 25),
 };
 
 /* These bits track the state of buffer writes for queries. They get cleared
@@ -3440,7 +3472,8 @@ enum anv_query_bits {
    ANV_PIPE_HDC_PIPELINE_FLUSH_BIT | \
    ANV_PIPE_UNTYPED_DATAPORT_CACHE_FLUSH_BIT | \
    ANV_PIPE_RENDER_TARGET_CACHE_FLUSH_BIT | \
-   ANV_PIPE_TILE_CACHE_FLUSH_BIT)
+   ANV_PIPE_TILE_CACHE_FLUSH_BIT | \
+   ANV_PIPE_L3_FABRIC_FLUSH_BIT)
 
 #define ANV_PIPE_STALL_BITS ( \
    ANV_PIPE_STALL_AT_SCOREBOARD_BIT | \
@@ -3590,6 +3623,9 @@ struct anv_push_constants {
           * Used for vkCmdDispatchBase.
           */
          uint32_t base_work_group_id[3];
+
+         /** gl_NumWorkgroups */
+         uint32_t num_work_groups[3];
 
          /** Subgroup ID
           *
@@ -3900,8 +3936,6 @@ struct anv_cmd_compute_state {
    struct anv_cmd_pipeline_state base;
 
    bool pipeline_dirty;
-
-   struct anv_address num_workgroups;
 
    uint32_t scratch_size;
 };
@@ -5304,6 +5338,15 @@ struct anv_image {
    VkFormat emu_plane_format;
 
    /**
+    * The set of formats that will be used with the first plane of this image.
+    *
+    * Assuming all view formats have the same bits-per-channel, we support the
+    * largest number of variations which may exist.
+    */
+   enum isl_format view_formats[5];
+   unsigned num_view_formats;
+
+   /**
     * The memory bindings created by vkCreateImage and vkBindImageMemory.
     *
     * For details on the image's memory layout, see check_memory_bindings().
@@ -5316,11 +5359,16 @@ struct anv_image {
     * Usually, the app will provide the address via the parameters of
     * vkBindImageMemory.  However, special-case bindings may be bound to
     * driver-private memory.
+    *
+    * If needed a host pointer to the image is mapped for host image copies.
     */
    struct anv_image_binding {
       struct anv_image_memory_range memory_range;
       struct anv_address address;
       struct anv_sparse_binding_data sparse_data;
+      void *host_map;
+      uint64_t map_delta;
+      uint64_t map_size;
    } bindings[ANV_IMAGE_MEMORY_BINDING_END];
 
    /**
@@ -5425,6 +5473,22 @@ anv_image_format_is_d16_or_s8(const struct anv_image *image)
       image->vk.format == VK_FORMAT_S8_UINT;
 }
 
+static inline bool
+anv_image_can_host_memcpy(const struct anv_image *image)
+{
+   const struct isl_surf *surf = &image->planes[0].primary_surface.isl;
+   struct isl_tile_info tile_info;
+   isl_surf_get_tile_info(surf, &tile_info);
+
+   const bool array_pitch_aligned_to_tile =
+      surf->array_pitch_el_rows % tile_info.logical_extent_el.height == 0;
+
+   return image->vk.tiling != VK_IMAGE_TILING_LINEAR &&
+          image->n_planes == 1 &&
+          array_pitch_aligned_to_tile &&
+          image->vk.mip_levels == 1;
+}
+
 /* The ordering of this enum is important */
 enum anv_fast_clear_type {
    /** Image does not have/support any fast-clear blocks */
@@ -5494,19 +5558,35 @@ anv_image_address(const struct anv_image *image,
    return anv_address_add(binding->address, mem_range->offset);
 }
 
+bool
+anv_image_view_formats_incomplete(const struct anv_image *image);
+
 static inline struct anv_address
 anv_image_get_clear_color_addr(UNUSED const struct anv_device *device,
                                const struct anv_image *image,
+                               enum isl_format view_format,
                                VkImageAspectFlagBits aspect)
 {
-   assert(image->vk.aspects & (VK_IMAGE_ASPECT_ANY_COLOR_BIT_ANV |
-                               VK_IMAGE_ASPECT_DEPTH_BIT));
-
    uint32_t plane = anv_image_aspect_to_plane(image, aspect);
    const struct anv_image_memory_range *mem_range =
       &image->planes[plane].fast_clear_memory_range;
 
-   return anv_image_address(image, mem_range);
+   const struct anv_address base_addr = anv_image_address(image, mem_range);
+   if (anv_address_is_null(base_addr))
+      return ANV_NULL_ADDRESS;
+
+   if (view_format == ISL_FORMAT_UNSUPPORTED)
+      view_format = image->planes[plane].primary_surface.isl.format;
+
+   const unsigned clear_state_size = device->info->ver >= 11 ? 64 : 16;
+   for (int i = 0; i < image->num_view_formats; i++) {
+      if (view_format == image->view_formats[i]) {
+         return anv_address_add(base_addr, i * clear_state_size);
+      }
+   }
+
+   assert(anv_image_view_formats_incomplete(image));
+   return base_addr;
 }
 
 static inline struct anv_address
@@ -5517,18 +5597,19 @@ anv_image_get_fast_clear_type_addr(const struct anv_device *device,
    /* Xe2+ platforms don't need fast clear type. We shouldn't get here. */
    assert(device->info->ver < 20);
    struct anv_address addr =
-      anv_image_get_clear_color_addr(device, image, aspect);
+      anv_image_get_clear_color_addr(device, image, ISL_FORMAT_UNSUPPORTED,
+                                     aspect);
 
+   /* Refer to add_aux_state_tracking_buffer(). */
    unsigned clear_color_state_size;
    if (device->info->ver >= 11) {
-      /* The fast clear type and the first compression state are stored in the
-       * last 2 dwords of the clear color struct. Refer to the comment in
-       * add_aux_state_tracking_buffer().
-       */
-      assert(device->isl_dev.ss.clear_color_state_size >= 32);
-      clear_color_state_size = device->isl_dev.ss.clear_color_state_size - 8;
-   } else
-      clear_color_state_size = device->isl_dev.ss.clear_value_size;
+      assert(device->isl_dev.ss.clear_color_state_size == 32);
+      clear_color_state_size = (image->num_view_formats - 1) * 64 + 32 - 8;
+   } else {
+      assert(device->isl_dev.ss.clear_value_size == 16);
+      clear_color_state_size = image->num_view_formats * 16;
+   }
+
    return anv_address_add(addr, clear_color_state_size);
 }
 
@@ -5690,11 +5771,11 @@ anv_cmd_buffer_mark_image_fast_cleared(struct anv_cmd_buffer *cmd_buffer,
                                        union isl_color_value clear_color);
 
 void
-anv_cmd_buffer_load_clear_color_from_image(struct anv_cmd_buffer *cmd_buffer,
-                                           struct anv_state state,
-                                           const struct anv_image *image);
+anv_cmd_buffer_load_clear_color(struct anv_cmd_buffer *cmd_buffer,
+                                struct anv_state state,
+                                const struct anv_image_view *iview);
 
-struct anv_image_binding *
+enum anv_image_memory_binding
 anv_image_aspect_to_binding(struct anv_image *image,
                             VkImageAspectFlags aspect);
 
@@ -6348,6 +6429,9 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(anv_video_session_params, vk.base,
    case 200:                                    \
       genX_thing = &gfx20_##thing;              \
       break;                                    \
+   case 300:                                    \
+      genX_thing = &gfx30_##thing;              \
+      break;                                    \
    default:                                     \
       unreachable("Unknown hardware generation"); \
    }                                            \
@@ -6371,6 +6455,9 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(anv_video_session_params, vk.base,
 #  include "anv_genX.h"
 #  undef genX
 #  define genX(x) gfx20_##x
+#  include "anv_genX.h"
+#  undef genX
+#  define genX(x) gfx30_##x
 #  include "anv_genX.h"
 #  undef genX
 #endif

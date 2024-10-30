@@ -283,7 +283,7 @@ panvk_CreateImage(VkDevice device, const VkImageCreateInfo *pCreateInfo,
    struct panvk_image *image =
       vk_image_create(&dev->vk, pCreateInfo, pAllocator, sizeof(*image));
    if (!image)
-      return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return panvk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    image->pimage.layout = (struct pan_image_layout){
       .format = vk_format_to_pipe_format(image->vk.format),
@@ -304,6 +304,8 @@ panvk_CreateImage(VkDevice device, const VkImageCreateInfo *pCreateInfo,
    /* Now that we've patched the create/usage flags, we can proceed with the
     * modifier selection. */
    panvk_image_select_mod(image, pCreateInfo);
+
+   image->vk.drm_format_mod = image->pimage.layout.modifier;
 
    *pImage = panvk_image_to_handle(image);
    return VK_SUCCESS;
@@ -383,7 +385,8 @@ panvk_GetImageSparseMemoryRequirements2(
    uint32_t *pSparseMemoryRequirementCount,
    VkSparseImageMemoryRequirements2 *pSparseMemoryRequirements)
 {
-   panvk_stub();
+   /* Sparse images are not yet supported. */
+   *pSparseMemoryRequirementCount = 0;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -426,19 +429,5 @@ panvk_BindImageMemory2(VkDevice device, uint32_t bindInfoCount,
       pan_kmod_bo_put(old_bo);
    }
 
-   return VK_SUCCESS;
-}
-
-VKAPI_ATTR VkResult VKAPI_CALL
-panvk_GetImageDrmFormatModifierPropertiesEXT(
-   VkDevice device, VkImage _image,
-   VkImageDrmFormatModifierPropertiesEXT *pProperties)
-{
-   VK_FROM_HANDLE(panvk_image, image, _image);
-
-   assert(pProperties->sType ==
-          VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT);
-
-   pProperties->drmFormatModifier = image->pimage.layout.modifier;
    return VK_SUCCESS;
 }

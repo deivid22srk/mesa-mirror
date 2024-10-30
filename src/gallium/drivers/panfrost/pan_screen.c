@@ -76,6 +76,7 @@ static const struct debug_named_value panfrost_debug_options[] = {
 #endif
    {"yuv",        PAN_DBG_YUV,      "Tint YUV textures with blue for 1-plane and green for 2-plane"},
    {"forcepack",  PAN_DBG_FORCE_PACK,  "Force packing of AFBC textures on upload"},
+   {"cs",         PAN_DBG_CS,       "Enable extra checks in command stream"},
    DEBUG_NAMED_VALUE_END
 };
 /* clang-format on */
@@ -258,11 +259,11 @@ panfrost_get_param(struct pipe_screen *screen, enum pipe_cap param)
     * require element alignment for vertex buffers, using u_vbuf to
     * translate to match the hardware requirement.
     *
-    * This is less heavy-handed than the 4BYTE_ALIGNED_ONLY caps, which
+    * This is less heavy-handed than PIPE_VERTEX_INPUT_ALIGNMENT_4BYTE, which
     * would needlessly require alignment even for 8-bit formats.
     */
-   case PIPE_CAP_VERTEX_ATTRIB_ELEMENT_ALIGNED_ONLY:
-      return 1;
+   case PIPE_CAP_VERTEX_INPUT_ALIGNMENT:
+      return PIPE_VERTEX_INPUT_ALIGNMENT_ELEMENT;
 
    case PIPE_CAP_MAX_TEXTURE_2D_SIZE:
       return 1 << (PAN_MAX_MIP_LEVELS - 1);
@@ -628,7 +629,8 @@ panfrost_is_format_supported(struct pipe_screen *screen,
     * differences. */
 
    bool supported =
-      panfrost_supports_compressed_format(dev, MALI_EXTRACT_INDEX(fmt.hw));
+      !util_format_is_compressed(format) ||
+      panfrost_supports_compressed_format(dev, fmt.texfeat_bit);
 
    if (!supported)
       return false;
@@ -872,8 +874,8 @@ panfrost_destroy_screen(struct pipe_screen *pscreen)
    struct panfrost_screen *screen = pan_screen(pscreen);
 
    panfrost_resource_screen_destroy(pscreen);
-   panfrost_pool_cleanup(&screen->blitter.bin_pool);
-   panfrost_pool_cleanup(&screen->blitter.desc_pool);
+   panfrost_pool_cleanup(&screen->mempools.bin);
+   panfrost_pool_cleanup(&screen->mempools.desc);
    pan_blend_shader_cache_cleanup(&dev->blend_shaders);
 
    if (screen->vtbl.screen_destroy)
@@ -1023,10 +1025,10 @@ panfrost_create_screen(int fd, const struct pipe_screen_config *config,
 
    panfrost_disk_cache_init(screen);
 
-   panfrost_pool_init(&screen->blitter.bin_pool, NULL, dev, PAN_BO_EXECUTE,
-                      4096, "Blitter shaders", false, true);
-   panfrost_pool_init(&screen->blitter.desc_pool, NULL, dev, 0, 65536,
-                      "Blitter RSDs", false, true);
+   panfrost_pool_init(&screen->mempools.bin, NULL, dev, PAN_BO_EXECUTE, 4096,
+                      "Preload shaders", false, true);
+   panfrost_pool_init(&screen->mempools.desc, NULL, dev, 0, 65536,
+                      "Preload RSDs", false, true);
    if (dev->arch == 4)
       panfrost_cmdstream_screen_init_v4(screen);
    else if (dev->arch == 5)

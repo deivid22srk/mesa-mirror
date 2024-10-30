@@ -29,6 +29,7 @@
 #include "dev/intel_debug.h"
 #include "genxml/genX_bits.h"
 #include "util/log.h"
+#include "util/u_math.h"
 
 #include "isl.h"
 #include "isl_gfx4.h"
@@ -2943,6 +2944,9 @@ isl_surf_get_hiz_surf(const struct isl_device *dev,
    if (INTEL_DEBUG(DEBUG_NO_HIZ))
       return false;
 
+   if (surf->usage & ISL_SURF_USAGE_DISABLE_AUX_BIT)
+      return false;
+
    /* HiZ support does not exist prior to Gfx5 */
    if (ISL_GFX_VER(dev) < 5)
       return false;
@@ -3371,6 +3375,9 @@ isl_surf_get_ccs_surf(const struct isl_device *dev,
       break;                                       \
    case 200:                                       \
       isl_gfx20_##func(__VA_ARGS__);               \
+      break;                                       \
+   case 300:                                       \
+      isl_gfx30_##func(__VA_ARGS__);               \
       break;                                       \
    default:                                        \
       assert(!"Unknown hardware generation");      \
@@ -3835,10 +3842,15 @@ isl_surf_get_image_range_B_tile(const struct isl_surf *surf,
                                       &z_offset_el,
                                       &array_slice);
 
+   struct isl_tile_info tile_info;
+   isl_surf_get_tile_info(surf, &tile_info);
+
    /* We want the range we return to be exclusive but the tile containing the
-    * last pixel (what we just calculated) is inclusive.  Add one.
+    * last pixel (what we just calculated) is inclusive. Add one and round up
+    * to the tile size.
     */
-   (*end_tile_B)++;
+   *end_tile_B = ALIGN_NPOT(*end_tile_B + 1, tile_info.phys_extent_B.w *
+                                             tile_info.phys_extent_B.h);
 
    assert(*end_tile_B <= surf->size_B);
 }

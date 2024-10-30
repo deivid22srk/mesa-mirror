@@ -76,7 +76,8 @@ enum radv_dynamic_state_bits {
    RADV_DYNAMIC_ALPHA_TO_ONE_ENABLE = 1ull << 50,
    RADV_DYNAMIC_COLOR_ATTACHMENT_MAP = 1ull << 51,
    RADV_DYNAMIC_INPUT_ATTACHMENT_MAP = 1ull << 52,
-   RADV_DYNAMIC_ALL = (1ull << 53) - 1,
+   RADV_DYNAMIC_DEPTH_CLAMP_RANGE = 1ull << 53,
+   RADV_DYNAMIC_ALL = (1ull << 54) - 1,
 };
 
 enum radv_cmd_dirty_bits {
@@ -96,7 +97,9 @@ enum radv_cmd_dirty_bits {
    RADV_CMD_DIRTY_FS_STATE = 1ull << 13,
    RADV_CMD_DIRTY_NGG_STATE = 1ull << 14,
    RADV_CMD_DIRTY_TASK_STATE = 1ull << 15,
-   RADV_CMD_DIRTY_ALL = (1ull << 16) - 1,
+   RADV_CMD_DIRTY_DEPTH_STENCIL_STATE = 1ull << 16,
+   RADV_CMD_DIRTY_RASTER_STATE = 1ull << 17,
+   RADV_CMD_DIRTY_ALL = (1ull << 18) - 1,
 
    RADV_CMD_DIRTY_SHADER_QUERY = RADV_CMD_DIRTY_NGG_STATE | RADV_CMD_DIRTY_TASK_STATE,
 };
@@ -245,14 +248,34 @@ enum radv_tracked_reg {
    RADV_TRACKED_DB_SHADER_CONTROL,
    RADV_TRACKED_DB_VRS_OVERRIDE_CNTL,
 
+   /* 2 consecutive registers */
+   RADV_TRACKED_DB_DEPTH_BOUNDS_MIN,
+   RADV_TRACKED_DB_DEPTH_BOUNDS_MAX,
+
+   /* 2 consecutive registers */
+   RADV_TRACKED_DB_STENCILREFMASK,    /* GFX6-11.5 */
+   RADV_TRACKED_DB_STENCILREFMASK_BF, /* GFX6-11.5 */
+
+   /* 2 consecutive registers */
+   RADV_TRACKED_DB_STENCIL_READ_MASK,  /* GFX12 */
+   RADV_TRACKED_DB_STENCIL_WRITE_MASK, /* GFX12 */
+
+   RADV_TRACKED_DB_DEPTH_CONTROL,
+   RADV_TRACKED_DB_STENCIL_CONTROL,
+   RADV_TRACKED_DB_STENCIL_REF, /* GFX12 */
+
    RADV_TRACKED_GE_MAX_OUTPUT_PER_SUBGROUP,
    RADV_TRACKED_GE_NGG_SUBGRP_CNTL,
 
+   RADV_TRACKED_PA_CL_CLIP_CNTL,
    RADV_TRACKED_PA_CL_VRS_CNTL,
    RADV_TRACKED_PA_CL_VS_OUT_CNTL,
 
    RADV_TRACKED_PA_SC_BINNER_CNTL_0,
    RADV_TRACKED_PA_SC_SHADER_CONTROL,
+   RADV_TRACKED_PA_SC_LINE_CNTL,
+   RADV_TRACKED_PA_SC_LINE_STIPPLE,
+   RADV_TRACKED_PA_SC_LINE_STIPPLE_RESET, /* GFX12 */
 
    /* 2 consecutive registers */
    RADV_TRACKED_SPI_PS_INPUT_ENA,
@@ -299,6 +322,9 @@ enum radv_tracked_reg {
    RADV_TRACKED_VGT_REUSE_OFF,
    RADV_TRACKED_VGT_SHADER_STAGES_EN,
    RADV_TRACKED_VGT_VERTEX_REUSE_BLOCK_CNTL,
+
+   RADV_TRACKED_PA_SU_LINE_CNTL,
+   RADV_TRACKED_PA_SU_SC_MODE_CNTL,
 
    RADV_NUM_ALL_TRACKED_REGS,
 };
@@ -441,6 +467,8 @@ struct radv_cmd_state {
    unsigned custom_blend_mode;
    unsigned db_render_control;
 
+   unsigned last_cb_target_mask;
+
    unsigned rast_prim;
 
    uint32_t vtx_base_sgpr;
@@ -517,7 +545,6 @@ struct radv_cmd_buffer {
    bool gds_needed;    /* for GFX10 streamout and NGG GS queries */
    bool gds_oa_needed; /* for GFX10 streamout */
    bool sample_positions_needed;
-   bool has_indirect_pipeline_binds;
 
    uint64_t gfx9_fence_va;
    uint32_t gfx9_fence_idx;

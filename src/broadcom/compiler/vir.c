@@ -25,6 +25,7 @@
 #include "v3d_compiler.h"
 #include "compiler/nir/nir_schedule.h"
 #include "compiler/nir/nir_builder.h"
+#include "util/perf/cpu_trace.h"
 
 int
 vir_get_nsrc(struct qinst *inst)
@@ -1294,7 +1295,7 @@ v3d_instr_delay_cb(nir_instr *instr, void *data)
          case nir_intrinsic_image_load:
             return 3;
          case nir_intrinsic_load_ubo:
-            if (nir_src_is_divergent(intr->src[1]))
+            if (nir_src_is_divergent(&intr->src[1]))
                return 3;
             FALLTHROUGH;
          default:
@@ -1385,7 +1386,7 @@ v3d_nir_sort_constant_ubo_load(nir_block *block, nir_intrinsic_instr *ref)
                         continue;
 
                 /* We only produce unifa sequences for non-divergent loads */
-                if (nir_src_is_divergent(intr->src[1]))
+                if (nir_src_is_divergent(&intr->src[1]))
                         continue;
 
                 /* If there are any UBO loads that are not constant or that
@@ -1452,7 +1453,7 @@ v3d_nir_sort_constant_ubo_load(nir_block *block, nir_intrinsic_instr *ref)
                         if (tmp_intr->intrinsic != nir_intrinsic_load_ubo)
                                 continue;
 
-                        if (nir_src_is_divergent(tmp_intr->src[1]))
+                        if (nir_src_is_divergent(&tmp_intr->src[1]))
                                 continue;
 
                         /* Stop if we find a unifa UBO load that breaks the
@@ -1988,9 +1989,11 @@ uint64_t *v3d_compile(const struct v3d_compiler *compiler,
                       uint32_t *final_assembly_size)
 {
         struct v3d_compile *c = NULL;
-
         uint32_t best_spill_fill_count = UINT32_MAX;
         struct v3d_compile *best_c = NULL;
+
+        MESA_TRACE_FUNC();
+
         for (int32_t strat = 0; strat < ARRAY_SIZE(strategies); strat++) {
                 /* Fallback strategy */
                 if (strat > 0) {

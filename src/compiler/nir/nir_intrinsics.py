@@ -1016,7 +1016,8 @@ system_value("viewport_z_offset", 1)
 system_value("viewport_scale", 3)
 system_value("viewport_offset", 3)
 # Pack xy scale and offset into a vec4 load (used by AMD NGG primitive culling)
-system_value("viewport_xy_scale_and_offset", 4)
+system_value("cull_triangle_viewport_xy_scale_and_offset_amd", 4)
+system_value("cull_line_viewport_xy_scale_and_offset_amd", 4)
 
 # Blend constant color values.  Float values are clamped. Vectored versions are
 # provided as well for driver convenience
@@ -1436,6 +1437,15 @@ intrinsic("inclusive_scan_clusters_ir3", dest_comp=1, src_comp=[1],
 intrinsic("exclusive_scan_clusters_ir3", dest_comp=1, src_comp=[1, 1],
           bit_sizes=src0, indices=[REDUCTION_OP])
 
+# Like shuffle_{xor,up,down} except with a uniform index. Necessary since the
+# ir3 shfl instruction doesn't work with divergent indices.
+intrinsic("shuffle_xor_uniform_ir3", src_comp=[0, 1], dest_comp=0,
+          bit_sizes=src0, flags=[CAN_ELIMINATE])
+intrinsic("shuffle_up_uniform_ir3", src_comp=[0, 1], dest_comp=0,
+          bit_sizes=src0, flags=[CAN_ELIMINATE])
+intrinsic("shuffle_down_uniform_ir3", src_comp=[0, 1], dest_comp=0,
+          bit_sizes=src0, flags=[CAN_ELIMINATE])
+
 # IR3-specific intrinsics for prefetching descriptors in preambles.
 intrinsic("prefetch_sam_ir3", [1, 1], flags=[CAN_REORDER])
 intrinsic("prefetch_tex_ir3", [1], flags=[CAN_REORDER])
@@ -1635,12 +1645,16 @@ intrinsic("load_cull_front_face_enabled_amd", dest_comp=1, bit_sizes=[1], flags=
 intrinsic("load_cull_back_face_enabled_amd", dest_comp=1, bit_sizes=[1], flags=[CAN_ELIMINATE])
 # True if face culling should use CCW (false if CW).
 intrinsic("load_cull_ccw_amd", dest_comp=1, bit_sizes=[1], flags=[CAN_ELIMINATE])
-# Whether the shader should cull small primitives that are not visible in a pixel.
-intrinsic("load_cull_small_primitives_enabled_amd", dest_comp=1, bit_sizes=[1], flags=[CAN_ELIMINATE])
+# Whether the shader should cull small triangles that are not visible in a pixel.
+intrinsic("load_cull_small_triangles_enabled_amd", dest_comp=1, bit_sizes=[1], flags=[CAN_ELIMINATE])
+# Whether the shader should cull small lines that are not visible in a pixel.
+intrinsic("load_cull_small_lines_enabled_amd", dest_comp=1, bit_sizes=[1], flags=[CAN_ELIMINATE])
 # Whether any culling setting is enabled in the shader.
 intrinsic("load_cull_any_enabled_amd", dest_comp=1, bit_sizes=[1], flags=[CAN_ELIMINATE])
-# Small primitive culling precision
-intrinsic("load_cull_small_prim_precision_amd", dest_comp=1, bit_sizes=[32], flags=[CAN_ELIMINATE, CAN_REORDER])
+# Small triangle culling precision
+intrinsic("load_cull_small_triangle_precision_amd", dest_comp=1, bit_sizes=[32], flags=[CAN_ELIMINATE, CAN_REORDER])
+# Small line culling precision
+intrinsic("load_cull_small_line_precision_amd", dest_comp=1, bit_sizes=[32], flags=[CAN_ELIMINATE, CAN_REORDER])
 # Initial edge flags in a Vertex Shader, packed into the format the HW needs for primitive export.
 intrinsic("load_initial_edgeflags_amd", src_comp=[], dest_comp=1, bit_sizes=[32], indices=[])
 # Corresponds to s_sendmsg in the GCN/RDNA ISA, src[] = { m0_content }, BASE = imm
@@ -2207,8 +2221,10 @@ load("ssbo_uniform_block_intel", [-1, 1], [ACCESS, ALIGN_MUL, ALIGN_OFFSET], [CA
 # src[] = { offset }.
 load("shared_uniform_block_intel", [1], [BASE, ALIGN_MUL, ALIGN_OFFSET], [CAN_ELIMINATE])
 
-# Intrinsics for Intel mesh shading
-system_value("mesh_inline_data_intel", 1, [ALIGN_OFFSET], bit_sizes=[32, 64])
+# Inline register delivery (available on Gfx12.5+ for CS/Mesh/Task stages)
+intrinsic("load_inline_data_intel", [], dest_comp=0,
+          indices=[BASE],
+          flags=[CAN_ELIMINATE, CAN_REORDER])
 
 # Intrinsics for Intel bindless thread dispatch
 # BASE=brw_topoloy_id

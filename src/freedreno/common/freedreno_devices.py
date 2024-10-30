@@ -102,6 +102,7 @@ class GPUInfo(Struct):
                  tile_align_w, tile_align_h,
                  tile_max_w, tile_max_h, num_vsc_pipes,
                  cs_shared_mem_size, num_sp_cores, wave_granularity, fibers_per_sp,
+                 highest_bank_bit = 0, ubwc_swizzle = 0x7, macrotile_mode = 0,
                  threadsize_base = 64, max_waves = 16):
         self.chip          = chip.value
         self.gmem_align_w  = gmem_align_w
@@ -117,6 +118,9 @@ class GPUInfo(Struct):
         self.fibers_per_sp = fibers_per_sp
         self.threadsize_base = threadsize_base
         self.max_waves     = max_waves
+        self.highest_bank_bit = highest_bank_bit
+        self.ubwc_swizzle = ubwc_swizzle
+        self.macrotile_mode = macrotile_mode
 
         s.gpu_infos.append(self)
 
@@ -129,8 +133,9 @@ class A6xxGPUInfo(GPUInfo):
     def __init__(self, chip, template, num_ccu,
                  tile_align_w, tile_align_h, num_vsc_pipes,
                  cs_shared_mem_size, wave_granularity, fibers_per_sp,
-                 magic_regs, raw_magic_regs = None, threadsize_base = 64,
-                 max_waves = 16):
+                 magic_regs, raw_magic_regs = None, highest_bank_bit = 15,
+                 ubwc_swizzle = 0x6, macrotile_mode = 1,
+                 threadsize_base = 64, max_waves = 16):
         if chip == CHIP.A6XX:
             tile_max_w   = 1024 # max_bitfield_val(5, 0, 5)
             tile_max_h   = max_bitfield_val(14, 8, 4) # 1008
@@ -148,6 +153,9 @@ class A6xxGPUInfo(GPUInfo):
                          num_sp_cores = num_ccu, # The # of SP cores seems to always match # of CCU
                          wave_granularity   = wave_granularity,
                          fibers_per_sp      = fibers_per_sp,
+                         highest_bank_bit = highest_bank_bit,
+                         ubwc_swizzle = ubwc_swizzle,
+                         macrotile_mode = macrotile_mode,
                          threadsize_base    = threadsize_base,
                          max_waves    = max_waves)
 
@@ -249,6 +257,7 @@ add_gpus([
         num_sp_cores = 1,
         wave_granularity = 2,
         fibers_per_sp = 64 * 16, # Lowest number that didn't fault on spillall fs-varying-array-mat4-col-row-rd.
+        highest_bank_bit = 14,
         threadsize_base = 32,
     ))
 
@@ -266,6 +275,7 @@ add_gpus([
         num_sp_cores = 2,
         wave_granularity = 2,
         fibers_per_sp = 64 * 16, # Lowest number that didn't fault on spillall fs-varying-array-mat4-col-row-rd.
+        highest_bank_bit = 14,
         threadsize_base = 32,
     ))
 
@@ -283,6 +293,7 @@ add_gpus([
         num_sp_cores = 4,
         wave_granularity = 2,
         fibers_per_sp = 64 * 16, # Lowest number that didn't fault on spillall fs-varying-array-mat4-col-row-rd.
+        highest_bank_bit = 15,
         threadsize_base = 32,
     ))
 
@@ -330,9 +341,9 @@ a6xx_base = A6XXProps(
     )
 
 
-# a6xx can be divided into distinct sub-generations, where certain device-
-# info parameters are keyed to the sub-generation.  These templates reduce
-# the copypaste
+# a6xx and a7xx can be divided into distinct sub-generations, where certain
+# device-info parameters are keyed to the sub-generation.  These templates
+# reduce the copypaste
 
 a6xx_gen1_low = A6XXProps(
         reg_size_vec4 = 48,
@@ -421,10 +432,6 @@ a6xx_gen4 = A6XXProps(
         #has_early_preamble = True,
     )
 
-a6xx_a690_quirk = A6XXProps(
-        broken_ds_ubwc_quirk = True,
-    )
-
 add_gpus([
         GPUId(605), # TODO: Test it, based only on libwrapfake dumps
         GPUId(608), # TODO: Test it, based only on libwrapfake dumps
@@ -440,6 +447,9 @@ add_gpus([
         cs_shared_mem_size = 16 * 1024,
         wave_granularity = 1,
         fibers_per_sp = 128 * 16,
+        highest_bank_bit = 13,
+        ubwc_swizzle = 0x7,
+        macrotile_mode = 0,
         magic_regs = dict(
             PC_POWER_CNTL = 0,
             TPL1_DBG_ECO_CNTL = 0,
@@ -472,6 +482,8 @@ add_gpus([
         cs_shared_mem_size = 32 * 1024,
         wave_granularity = 2,
         fibers_per_sp = 128 * 16,
+        highest_bank_bit = 14,
+        macrotile_mode = 0,
         magic_regs = dict(
             PC_POWER_CNTL = 0,
             TPL1_DBG_ECO_CNTL = 0x00108000,
@@ -560,6 +572,8 @@ add_gpus([
         cs_shared_mem_size = 32 * 1024,
         wave_granularity = 2,
         fibers_per_sp = 128 * 16,
+        highest_bank_bit = 15,
+        macrotile_mode = 0,
         magic_regs = dict(
             PC_POWER_CNTL = 1,
             TPL1_DBG_ECO_CNTL = 0x00108000,
@@ -589,6 +603,8 @@ add_gpus([
         cs_shared_mem_size = 32 * 1024,
         wave_granularity = 2,
         fibers_per_sp = 128 * 4 * 16,
+        highest_bank_bit = 15,
+        macrotile_mode = 0,
         magic_regs = dict(
             PC_POWER_CNTL = 1,
             TPL1_DBG_ECO_CNTL = 0x00008000,
@@ -618,6 +634,8 @@ add_gpus([
         cs_shared_mem_size = 32 * 1024,
         wave_granularity = 2,
         fibers_per_sp = 128 * 4 * 16,
+        highest_bank_bit = 15,
+        macrotile_mode = 0,
         magic_regs = dict(
             PC_POWER_CNTL = 3,
             TPL1_DBG_ECO_CNTL = 0x00108000,
@@ -647,6 +665,7 @@ add_gpus([
         cs_shared_mem_size = 32 * 1024,
         wave_granularity = 2,
         fibers_per_sp = 128 * 2 * 16,
+        highest_bank_bit = 16,
         magic_regs = dict(
             PC_POWER_CNTL = 2,
             # this seems to be a chicken bit that fixes cubic filtering:
@@ -666,6 +685,7 @@ add_gpus([
     ))
 
 add_gpus([
+        # These are all speedbins/variants of A635
         GPUId(chip_id=0x00be06030500, name="Adreno 8c Gen 3"),
         GPUId(chip_id=0x007506030500, name="Adreno 7c+ Gen 3"),
         GPUId(chip_id=0x006006030500, name="Adreno 7c+ Gen 3 Lite"),
@@ -682,6 +702,7 @@ add_gpus([
         cs_shared_mem_size = 32 * 1024,
         wave_granularity = 2,
         fibers_per_sp = 128 * 2 * 16,
+        highest_bank_bit = 14,
         magic_regs = dict(
             PC_POWER_CNTL = 1,
             TPL1_DBG_ECO_CNTL = 0x05008000,
@@ -711,6 +732,7 @@ add_gpus([
         cs_shared_mem_size = 32 * 1024,
         wave_granularity = 2,
         fibers_per_sp = 128 * 2 * 16,
+        highest_bank_bit = 16,
         magic_regs = dict(
             PC_POWER_CNTL = 2,
             TPL1_DBG_ECO_CNTL = 0x05008000,
@@ -730,6 +752,7 @@ add_gpus([
 
 add_gpus([
         GPUId(chip_id=0x6060201, name="FD644"), # Called A662 in kgsl
+        GPUId(chip_id=0xffff06060300, name="FD663"),
     ], A6xxGPUInfo(
         CHIP.A6XX,
         [a6xx_base, a6xx_gen4],
@@ -762,7 +785,7 @@ add_gpus([
         GPUId(chip_id=0xffff06090000, name="FD690"), # Default no-speedbin fallback
     ], A6xxGPUInfo(
         CHIP.A6XX,
-        [a6xx_base, a6xx_gen4, a6xx_a690_quirk],
+        [a6xx_base, a6xx_gen4, A6XXProps(broken_ds_ubwc_quirk = True)],
         num_ccu = 8,
         tile_align_w = 64,
         tile_align_h = 32,
@@ -770,6 +793,7 @@ add_gpus([
         cs_shared_mem_size = 32 * 1024,
         wave_granularity = 2,
         fibers_per_sp = 128 * 2 * 16,
+        highest_bank_bit = 16,
         magic_regs = dict(
             PC_POWER_CNTL = 7,
             TPL1_DBG_ECO_CNTL = 0x04c00000,
@@ -835,29 +859,13 @@ a7xx_base = A6XXProps(
         has_early_preamble = True,
     )
 
-a7xx_725 = A7XXProps(
-        cmdbuf_start_a725_quirk = True,
+a7xx_gen1 = A7XXProps(
         supports_ibo_ubwc = True,
         fs_must_have_non_zero_constlen_quirk = True,
         enable_tp_ubwc_flag_hint = True,
     )
 
-a7xx_730 = A7XXProps(
-        supports_ibo_ubwc = True,
-        fs_must_have_non_zero_constlen_quirk = True,
-        enable_tp_ubwc_flag_hint = True,
-    )
-
-a7xx_735 = A7XXProps(
-        stsc_duplication_quirk = True,
-        has_event_write_sample_count = True,
-        ubwc_unorm_snorm_int_compatible = True,
-        supports_ibo_ubwc = True,
-        fs_must_have_non_zero_constlen_quirk = True,
-        enable_tp_ubwc_flag_hint = True,
-    )
-
-a7xx_740 = A7XXProps(
+a7xx_gen2 = A7XXProps(
         stsc_duplication_quirk = True,
         has_event_write_sample_count = True,
         ubwc_unorm_snorm_int_compatible = True,
@@ -866,28 +874,10 @@ a7xx_740 = A7XXProps(
         # Most devices with a740 have blob v6xx which doesn't have
         # this hint set. Match them for better compatibility by default.
         enable_tp_ubwc_flag_hint = False,
+        has_64b_ssbo_atomics = True,
     )
 
-a7xx_740_a32 = A7XXProps(
-        cmdbuf_start_a725_quirk = True,
-        stsc_duplication_quirk = True,
-        has_event_write_sample_count = True,
-        ubwc_unorm_snorm_int_compatible = True,
-        supports_ibo_ubwc = True,
-        fs_must_have_non_zero_constlen_quirk = True,
-        enable_tp_ubwc_flag_hint = False,
-    )
-
-a7xx_740v3 = A7XXProps(
-        stsc_duplication_quirk = True,
-        has_event_write_sample_count = True,
-        ubwc_unorm_snorm_int_compatible = True,
-        supports_ibo_ubwc = True,
-        fs_must_have_non_zero_constlen_quirk = True,
-        enable_tp_ubwc_flag_hint = True,
-    )
-
-a7xx_750 = A7XXProps(
+a7xx_gen3 = A7XXProps(
         has_event_write_sample_count = True,
         load_inline_uniforms_via_preamble_ldgk = True,
         load_shader_consts_via_preamble = True,
@@ -897,12 +887,14 @@ a7xx_750 = A7XXProps(
         ubwc_unorm_snorm_int_compatible = True,
         supports_ibo_ubwc = True,
         has_generic_clear = True,
+        r8g8_faulty_fast_clear_quirk = True,
         gs_vpc_adjacency_quirk = True,
         storage_8bit = True,
         ubwc_all_formats_compatible = True,
         has_compliant_dp4acc = True,
         ubwc_coherency_quirk = True,
         has_persistent_counter = True,
+        has_64b_ssbo_atomics = True,
     )
 
 a730_magic_regs = dict(
@@ -1043,7 +1035,7 @@ add_gpus([
         GPUId(chip_id=0xffff07030002, name="FD725"),
     ], A6xxGPUInfo(
         CHIP.A7XX,
-        [a7xx_base, a7xx_725],
+        [a7xx_base, a7xx_gen1, A7XXProps(cmdbuf_start_a725_quirk = True)],
         num_ccu = 4,
         tile_align_w = 64,
         tile_align_h = 32,
@@ -1051,6 +1043,7 @@ add_gpus([
         cs_shared_mem_size = 32 * 1024,
         wave_granularity = 2,
         fibers_per_sp = 128 * 2 * 16,
+        highest_bank_bit = 16,
         magic_regs = a730_magic_regs,
         raw_magic_regs = a730_raw_magic_regs,
     ))
@@ -1060,7 +1053,7 @@ add_gpus([
         GPUId(chip_id=0xffff07030001, name="FD730"), # Default no-speedbin fallback
     ], A6xxGPUInfo(
         CHIP.A7XX,
-        [a7xx_base, a7xx_730],
+        [a7xx_base, a7xx_gen1],
         num_ccu = 4,
         tile_align_w = 64,
         tile_align_h = 32,
@@ -1068,6 +1061,7 @@ add_gpus([
         cs_shared_mem_size = 32 * 1024,
         wave_granularity = 2,
         fibers_per_sp = 128 * 2 * 16,
+        highest_bank_bit = 16,
         magic_regs = a730_magic_regs,
         raw_magic_regs = a730_raw_magic_regs,
     ))
@@ -1076,7 +1070,7 @@ add_gpus([
         GPUId(chip_id=0x43030B00, name="FD735")
     ], A6xxGPUInfo(
         CHIP.A7XX,
-        [a7xx_base, a7xx_735],
+        [a7xx_base, a7xx_gen2, A7XXProps(enable_tp_ubwc_flag_hint = True)],
         num_ccu = 3,
         tile_align_w = 96,
         tile_align_h = 32,
@@ -1155,10 +1149,9 @@ add_gpus([
         GPUId(740), # Deprecated, used for dev kernels.
         GPUId(chip_id=0x43050a01, name="FD740"), # KGSL, no speedbin data
         GPUId(chip_id=0xffff43050a01, name="FD740"), # Default no-speedbin fallback
-        GPUId(chip_id=0xffff43050c01, name="Adreno X1-85"),
     ], A6xxGPUInfo(
         CHIP.A7XX,
-        [a7xx_base, a7xx_740],
+        [a7xx_base, a7xx_gen2],
         num_ccu = 6,
         tile_align_w = 96,
         tile_align_h = 32,
@@ -1166,6 +1159,24 @@ add_gpus([
         cs_shared_mem_size = 32 * 1024,
         wave_granularity = 2,
         fibers_per_sp = 128 * 2 * 16,
+        highest_bank_bit = 16,
+        magic_regs = a740_magic_regs,
+        raw_magic_regs = a740_raw_magic_regs,
+    ))
+
+add_gpus([
+        GPUId(chip_id=0xffff43050c01, name="Adreno X1-85"),
+    ], A6xxGPUInfo(
+        CHIP.A7XX,
+        [a7xx_base, a7xx_gen2, A7XXProps(compute_constlen_quirk = True)],
+        num_ccu = 6,
+        tile_align_w = 96,
+        tile_align_h = 32,
+        num_vsc_pipes = 32,
+        cs_shared_mem_size = 32 * 1024,
+        wave_granularity = 2,
+        fibers_per_sp = 128 * 2 * 16,
+        highest_bank_bit = 16,
         magic_regs = a740_magic_regs,
         raw_magic_regs = a740_raw_magic_regs,
     ))
@@ -1176,7 +1187,7 @@ add_gpus([
         GPUId(chip_id=0xffff43050a00, name="FDA32"),
     ], A6xxGPUInfo(
         CHIP.A7XX,
-        [a7xx_base, a7xx_740_a32],
+        [a7xx_base, a7xx_gen2, A7XXProps(cmdbuf_start_a725_quirk = True)],
         num_ccu = 6,
         tile_align_w = 96,
         tile_align_h = 32,
@@ -1241,7 +1252,7 @@ add_gpus([
         GPUId(chip_id=0xffff43050b00, name="FD740v3"),
     ], A6xxGPUInfo(
         CHIP.A7XX,
-        [a7xx_base, a7xx_740v3],
+        [a7xx_base, a7xx_gen2, A7XXProps(enable_tp_ubwc_flag_hint = True)],
         num_ccu = 6,
         tile_align_w = 96,
         tile_align_h = 32,
@@ -1276,7 +1287,7 @@ add_gpus([
         GPUId(chip_id=0xffff43051401, name="FD750"), # Default no-speedbin fallback
     ], A6xxGPUInfo(
         CHIP.A7XX,
-        [a7xx_base, a7xx_750],
+        [a7xx_base, a7xx_gen3],
         num_ccu = 6,
         tile_align_w = 96,
         tile_align_h = 32,
@@ -1284,6 +1295,7 @@ add_gpus([
         cs_shared_mem_size = 32 * 1024,
         wave_granularity = 2,
         fibers_per_sp = 128 * 2 * 16,
+        highest_bank_bit = 16,
         magic_regs = dict(
             TPL1_DBG_ECO_CNTL = 0x11100000,
             GRAS_DBG_ECO_CNTL = 0x00004800,

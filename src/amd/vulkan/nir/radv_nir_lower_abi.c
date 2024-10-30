@@ -222,10 +222,10 @@ lower_abi_instr(nir_builder *b, nir_intrinsic_instr *intrin, void *state)
    case nir_intrinsic_load_cull_ccw_amd:
       replacement = nggc_bool_setting(b, radv_nggc_face_is_ccw, s);
       break;
-   case nir_intrinsic_load_cull_small_primitives_enabled_amd:
+   case nir_intrinsic_load_cull_small_triangles_enabled_amd:
       replacement = nggc_bool_setting(b, radv_nggc_small_primitives, s);
       break;
-   case nir_intrinsic_load_cull_small_prim_precision_amd: {
+   case nir_intrinsic_load_cull_small_triangle_precision_amd: {
       /* To save space, only the exponent is stored in the high 8 bits.
        * We calculate the precision from those 8 bits:
        * exponent = nggc_settings >> 24
@@ -237,7 +237,7 @@ lower_abi_instr(nir_builder *b, nir_intrinsic_instr *intrin, void *state)
       break;
    }
 
-   case nir_intrinsic_load_viewport_xy_scale_and_offset: {
+   case nir_intrinsic_load_cull_triangle_viewport_xy_scale_and_offset_amd: {
       nir_def *comps[] = {
          ac_nir_load_arg(b, &s->args->ac, s->args->ngg_viewport_scale[0]),
          ac_nir_load_arg(b, &s->args->ac, s->args->ngg_viewport_scale[1]),

@@ -28,6 +28,8 @@
 #include "util/glheader.h"
 #include "compiler/glsl/list.h"
 #include "compiler/glsl_types.h"
+#include "main/mtypes.h"
+#include "main/shader_types.h"
 
 struct gl_constants;
 struct gl_shader_program;
@@ -84,6 +86,9 @@ struct array_deref_range {
 };
 
 void
+link_shaders_init(struct gl_context *ctx, struct gl_shader_program *prog);
+
+void
 linker_error(struct gl_shader_program *prog, const char *fmt, ...);
 
 void
@@ -127,6 +132,9 @@ void
 link_util_mark_array_elements_referenced(const struct array_deref_range *dr,
                                          unsigned count, unsigned array_depth,
                                          BITSET_WORD *bits);
+
+void
+resource_name_updated(struct gl_resource_name *name);
 
 /**
  * Get the string value for an interpolation qualifier

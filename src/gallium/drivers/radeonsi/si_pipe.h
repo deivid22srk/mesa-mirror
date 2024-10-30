@@ -671,9 +671,6 @@ struct si_compute {
 
    unsigned ir_type;
    unsigned input_size;
-
-   int max_global_buffers;
-   struct pipe_resource **global_buffers;
 };
 
 struct si_sampler_view {
@@ -752,7 +749,7 @@ struct si_framebuffer {
 
 enum si_quant_mode
 {
-   /* This is the list we want to support. */
+   /* The small prim precision computation depends on the enum values to be like this. */
    SI_QUANT_MODE_16_8_FIXED_POINT_1_256TH,
    SI_QUANT_MODE_14_10_FIXED_POINT_1_1024TH,
    SI_QUANT_MODE_12_12_FIXED_POINT_1_4096TH,
@@ -1108,6 +1105,10 @@ struct si_context {
    struct si_images images[SI_NUM_SHADERS];
    bool bo_list_add_all_resident_resources;
    bool bo_list_add_all_compute_resources;
+
+   /* tracked buffers for OpenCL */
+   int max_global_buffers;
+   struct pipe_resource **global_buffers;
 
    /* other shader resources */
    struct pipe_constant_buffer null_const_buf; /* used for set_constant_buffer(NULL) on GFX7 */
@@ -2027,11 +2028,6 @@ static inline bool util_prim_is_points_or_lines(unsigned prim)
 static inline bool util_rast_prim_is_triangles(unsigned prim)
 {
    return ((1 << prim) & UTIL_ALL_PRIM_TRIANGLE_MODES) != 0;
-}
-
-static inline bool util_rast_prim_is_lines_or_triangles(unsigned prim)
-{
-   return ((1 << prim) & (UTIL_ALL_PRIM_LINE_MODES | UTIL_ALL_PRIM_TRIANGLE_MODES)) != 0;
 }
 
 static inline void si_need_gfx_cs_space(struct si_context *ctx, unsigned num_draws)

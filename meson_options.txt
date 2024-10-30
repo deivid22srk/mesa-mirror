@@ -161,6 +161,14 @@ option(
 )
 
 option(
+  'gallium-rusticl-enable-drivers',
+  type : 'array',
+  value : ['auto', 'asahi'],
+  description : 'List of gallium drivers for which rusticl will be enabled ' +
+                'by default',
+)
+
+option(
   'gallium-wgl-dll-name',
   type : 'string',
   value : 'libgallium_wgl',
@@ -489,10 +497,8 @@ option(
 option(
   'selinux',
   type : 'boolean',
-  value : false,
-  description : 'Build an SELinux-aware Mesa.  This currently disables ' +
-                'execmem support at runtime unless SELinux is configured ' +
-                'with allow_execmem.'
+  deprecated : true,
+  description : 'Does nothing, left here for a while to avoid build breakages.',
 )
 
 option(

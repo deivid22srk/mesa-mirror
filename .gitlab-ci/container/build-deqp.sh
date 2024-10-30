@@ -8,7 +8,7 @@
 # DEBIAN_TEST_VK_TAG
 # KERNEL_ROOTFS_TAG
 
-set -ex -o pipefail
+set -uex -o pipefail
 
 # See `deqp_build_targets` below for which release is used to produce which
 # binary. Unless this comment has bitrotten:
@@ -16,7 +16,7 @@ set -ex -o pipefail
 # - the GL release produces `glcts`, and
 # - the GLES release produces `deqp-gles*` and `deqp-egl`
 
-DEQP_VK_VERSION=1.3.9.0
+DEQP_VK_VERSION=1.3.10.0
 DEQP_GL_VERSION=4.6.5.0
 DEQP_GLES_VERSION=3.2.11.0
 
@@ -28,14 +28,8 @@ DEQP_GLES_VERSION=3.2.11.0
 
 # shellcheck disable=SC2034
 vk_cts_commits_to_backport=(
-  # Add missing NonUniform decoration in variable pointers test
-  cd262587a42dcd20951c22f66d7525c76cf64af4
-
-  # Allow extra invocations in the pipeline stats
-  78f6618e147c0a745754b9e73ae10113a1ebde29
-
-  # Reduce the memory usage of the compute reconvergence tests
-  85b965dbb675d1fdb4ff367a342b9ee189394e95
+    # Remove multi-line test results in DRM format modifier tests
+    8c95af68a2a85cbdc7e1d9267ab029f73e9427d2
 )
 
 # shellcheck disable=SC2034
@@ -144,7 +138,7 @@ if [ "${DEQP_API}" = 'GLES' ]; then
     cmake -S /VK-GL-CTS -B . -G Ninja \
         -DDEQP_TARGET=android \
         -DCMAKE_BUILD_TYPE=Release \
-        $EXTRA_CMAKE_ARGS
+        ${EXTRA_CMAKE_ARGS:-}
     mold --run ninja modules/egl/deqp-egl
     mv /deqp/modules/egl/deqp-egl /deqp/modules/egl/deqp-egl-android
   else
@@ -153,14 +147,14 @@ if [ "${DEQP_API}" = 'GLES' ]; then
     cmake -S /VK-GL-CTS -B . -G Ninja \
         -DDEQP_TARGET=x11_egl_glx \
         -DCMAKE_BUILD_TYPE=Release \
-        $EXTRA_CMAKE_ARGS
+        ${EXTRA_CMAKE_ARGS:-}
     mold --run ninja modules/egl/deqp-egl
     mv /deqp/modules/egl/deqp-egl /deqp/modules/egl/deqp-egl-x11
 
     cmake -S /VK-GL-CTS -B . -G Ninja \
         -DDEQP_TARGET=wayland \
         -DCMAKE_BUILD_TYPE=Release \
-        $EXTRA_CMAKE_ARGS
+        ${EXTRA_CMAKE_ARGS:-}
     mold --run ninja modules/egl/deqp-egl
     mv /deqp/modules/egl/deqp-egl /deqp/modules/egl/deqp-egl-wayland
   fi
@@ -169,7 +163,7 @@ fi
 cmake -S /VK-GL-CTS -B . -G Ninja \
       -DDEQP_TARGET=${DEQP_TARGET} \
       -DCMAKE_BUILD_TYPE=Release \
-      $EXTRA_CMAKE_ARGS
+      ${EXTRA_CMAKE_ARGS:-}
 
 # Make sure `default` doesn't silently stop detecting one of the platforms we care about
 if [ "${DEQP_TARGET}" = 'default' ]; then
@@ -238,6 +232,10 @@ if [ "${DEQP_TARGET}" != 'android' ]; then
     rm -rf /deqp/executor
     mv /deqp/executor.save /deqp/executor
 fi
+
+# Compress the caselists, since Vulkan's in particular are gigantic; higher
+# compression levels provide no real measurable benefit.
+zstd -1 --rm /deqp/mustpass/*.txt
 
 # Remove other mustpass files, since we saved off the ones we wanted to conventient locations above.
 rm -rf /deqp/external/**/mustpass/

@@ -163,7 +163,6 @@ fn nir_options(dev: &nv_device_info) -> nir_shader_compiler_options {
     op.discard_is_demote = true;
 
     op.max_unroll_iterations = 32;
-    op.has_ddx_intrinsics = true;
     op.scalarize_ddx = true;
 
     op
@@ -290,6 +289,8 @@ impl ShaderBin {
                 ShaderIoInfo::Vtg(io) => nak_shader_info__bindgen_ty_2 {
                     writes_layer: io.attr_written(NAK_ATTR_RT_ARRAY_INDEX),
                     writes_point_size: io.attr_written(NAK_ATTR_POINT_SIZE),
+                    writes_vprs_table_index: io
+                        .attr_written(NAK_ATTR_VPRS_TABLE_INDEX),
                     clip_enable: io.clip_enable.try_into().unwrap(),
                     cull_enable: io.cull_enable.try_into().unwrap(),
                     xfb: if let Some(xfb) = &io.xfb {
@@ -297,6 +298,7 @@ impl ShaderBin {
                     } else {
                         unsafe { std::mem::zeroed() }
                     },
+                    _pad: Default::default(),
                 },
                 _ => unsafe { std::mem::zeroed() },
             },
@@ -400,7 +402,7 @@ pub extern "C" fn nak_compile_shader(
         panic!("Unsupported shader model");
     };
 
-    let mut s = nak_shader_from_nir(nir, sm.as_ref());
+    let mut s = nak_shader_from_nir(nak, nir, sm.as_ref());
 
     if DEBUG.print() {
         eprintln!("NAK IR:\n{}", &s);
@@ -423,6 +425,9 @@ pub extern "C" fn nak_compile_shader(
     } else {
         pass!(s, opt_crs);
     }
+
+    s.remove_annotations();
+
     pass!(s, calc_instr_deps);
 
     s.gather_info();
@@ -431,8 +436,6 @@ pub extern "C" fn nak_compile_shader(
     if dump_asm {
         write!(asm, "{}", s).expect("Failed to dump assembly");
     }
-
-    s.remove_annotations();
 
     let code = sm.encode_shader(&s);
     let bin =

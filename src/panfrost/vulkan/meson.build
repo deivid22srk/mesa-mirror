@@ -72,6 +72,7 @@ common_per_arch_files = [
   panvk_entrypoints[0],
   'panvk_vX_blend.c',
   'panvk_vX_buffer_view.c',
+  'panvk_vX_cmd_fb_preload.c',
   'panvk_vX_cmd_desc_state.c',
   'panvk_vX_cmd_meta.c',
   'panvk_vX_cmd_push_constant.c',
@@ -171,7 +172,7 @@ libvulkan_panfrost = shared_library(
     idep_mesautil,
   ],
   c_args : [no_override_init_args, panvk_flags],
-  link_args : [ld_args_bsymbolic, ld_args_gc_sections],
+  link_args : [ld_args_bsymbolic, ld_args_gc_sections, ld_args_build_id],
   install : true,
 )
 

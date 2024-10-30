@@ -520,6 +520,14 @@ ir3_lower_subgroups(struct ir3 *ir)
    return progress;
 }
 
+static const struct glsl_type *
+glsl_type_for_def(nir_def *def)
+{
+   assert(def->num_components == 1);
+   return def->bit_size == 1 ? glsl_bool_type()
+                             : glsl_uintN_t_type(def->bit_size);
+}
+
 static bool
 filter_scan_reduce(const nir_instr *instr, const void *data)
 {
@@ -543,6 +551,7 @@ lower_scan_reduce(struct nir_builder *b, nir_instr *instr, void *data)
 {
    nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
    unsigned bit_size = intrin->def.bit_size;
+   assert(bit_size < 64);
 
    nir_op op = nir_intrinsic_reduction_op(intrin);
    nir_const_value ident_val = nir_alu_binop_identity(op, bit_size);
@@ -580,4 +589,238 @@ ir3_nir_opt_subgroups(nir_shader *nir, struct ir3_shader_variant *v)
 
    return nir_shader_lower_instructions(nir, filter_scan_reduce,
                                         lower_scan_reduce, NULL);
+}
+
+static bool
+filter_64b_scan_reduce(const nir_instr *instr, const void *data)
+{
+   if (instr->type != nir_instr_type_intrinsic)
+      return false;
+
+   nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+
+   switch (intrin->intrinsic) {
+   case nir_intrinsic_reduce:
+   case nir_intrinsic_inclusive_scan:
+   case nir_intrinsic_exclusive_scan:
+      switch (nir_intrinsic_reduction_op(intrin)) {
+      case nir_op_imul:
+      case nir_op_imin:
+      case nir_op_imax:
+      case nir_op_umin:
+      case nir_op_umax:
+         return intrin->def.bit_size == 64;
+      default:
+         /* Will be handled by nir_lower_int64. */
+         return false;
+      }
+   default:
+      return false;
+   }
+}
+
+/* The existing scan/reduce macros (OPC_SCAN_MACRO/OPC_SCAN_CLUSTERS_MACRO) hard
+ * code the reduction operations in ir3. Adding support for 64b operations will
+ * blow up these already complicated macros. Implement a simple scan loop in NIR
+ * for the few (hopefully rare) cases where the generic passes cannot lower the
+ * reduction to 32b.
+ *
+ * inclusive = exclusive = ident;
+ * while (true) {
+ *    exclusive = inclusive;
+ *    inclusive = inclusive OP subgroupBroadcastFirst(inclusive_in);
+ *    if (elect()) {
+ *       break;
+ *    }
+ * }
+ * reduce = subgroupBroadcast(inclusive,
+ *                            subgroupBallotFindMSB(subgroupBallot(true)));
+ */
+static nir_def *
+lower_64b_scan_reduce(struct nir_builder *b, nir_instr *instr, void *data)
+{
+   nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+   assert(intrin->def.num_components == 1);
+
+   unsigned bit_size = intrin->def.bit_size;
+   nir_op op = nir_intrinsic_reduction_op(intrin);
+
+   nir_const_value ident_val = nir_alu_binop_identity(op, bit_size);
+   nir_def *ident = nir_build_imm(b, 1, bit_size, &ident_val);
+   nir_def *inclusive_in = intrin->src[0].ssa;
+
+   const glsl_type *var_type = glsl_type_for_def(inclusive_in);
+   nir_variable *inclusive_var =
+      nir_local_variable_create(b->impl, var_type, "inclusive");
+   nir_variable *exclusive_var =
+      nir_local_variable_create(b->impl, var_type, "exclusive");
+   nir_store_var(b, inclusive_var, ident, 1);
+   nir_store_var(b, exclusive_var, ident, 1);
+
+   nir_loop *loop = nir_push_loop(b);
+   {
+      nir_def *inclusive = nir_load_var(b, inclusive_var);
+      nir_store_var(b, exclusive_var, inclusive, 1);
+
+      nir_def *inclusive_in_next = nir_read_first_invocation(b, inclusive_in);
+      nir_def *inclusive_next =
+         nir_build_alu2(b, op, inclusive, inclusive_in_next);
+      nir_store_var(b, inclusive_var, inclusive_next, 1);
+
+      nir_break_if(b, nir_elect(b, 1));
+   }
+   nir_pop_loop(b, loop);
+
+   switch (intrin->intrinsic) {
+   case nir_intrinsic_reduce: {
+      nir_def *active_invocations = nir_ballot(b, 4, 32, nir_imm_true(b));
+      nir_def *last_active_invocation =
+         nir_ballot_find_msb(b, 32, active_invocations);
+      return nir_read_invocation(b, nir_load_var(b, inclusive_var),
+                                 last_active_invocation);
+   }
+   case nir_intrinsic_inclusive_scan:
+      return nir_load_var(b, inclusive_var);
+   case nir_intrinsic_exclusive_scan:
+      return nir_load_var(b, exclusive_var);
+   default:
+      unreachable("filtered intrinsic");
+   }
+}
+
+bool
+ir3_nir_lower_64b_subgroups(nir_shader *nir)
+{
+   return nir_shader_lower_instructions(nir, filter_64b_scan_reduce,
+                                        lower_64b_scan_reduce, NULL);
+}
+
+static bool
+filter_shuffle(const nir_instr *instr, const void *data)
+{
+   if (instr->type != nir_instr_type_intrinsic) {
+      return false;
+   }
+
+   nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+
+   switch (intrin->intrinsic) {
+   case nir_intrinsic_shuffle:
+   case nir_intrinsic_shuffle_up:
+   case nir_intrinsic_shuffle_down:
+   case nir_intrinsic_shuffle_xor:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static nir_def *
+shuffle_to_uniform(nir_builder *b, nir_intrinsic_op op, struct nir_def *val,
+                   struct nir_def *id)
+{
+   switch (op) {
+   case nir_intrinsic_shuffle:
+      return nir_rotate(b, val, id);
+   case nir_intrinsic_shuffle_up:
+      return nir_shuffle_up_uniform_ir3(b, val, id);
+   case nir_intrinsic_shuffle_down:
+      return nir_shuffle_down_uniform_ir3(b, val, id);
+   case nir_intrinsic_shuffle_xor:
+      return nir_shuffle_xor_uniform_ir3(b, val, id);
+   default:
+      unreachable("filtered intrinsic");
+   }
+}
+
+/* Transforms a shuffle operation into a loop that only uses shuffles with
+ * (dynamically) uniform indices. This is based on the blob's sequence and
+ * carefully makes sure that the least amount of iterations are performed (i.e.,
+ * one iteration per distinct index) while keeping all invocations active during
+ * each shfl operation. This is necessary since shfl does not update its dst
+ * when its src is inactive.
+ *
+ * done = false;
+ * while (true) {
+ *    next_index = read_invocation_cond_ir3(index, !done);
+ *    shuffled = op_uniform(val, next_index);
+ *
+ *    if (index == next_index) {
+ *       result = shuffled;
+ *       done = true;
+ *    }
+ *
+ *    if (subgroupAll(done)) {
+ *       break;
+ *    }
+ * }
+ */
+static nir_def *
+make_shuffle_uniform(nir_builder *b, nir_def *val, nir_def *index,
+                     nir_intrinsic_op op)
+{
+   nir_variable *done =
+      nir_local_variable_create(b->impl, glsl_bool_type(), "done");
+   nir_store_var(b, done, nir_imm_false(b), 1);
+   nir_variable *result =
+      nir_local_variable_create(b->impl, glsl_type_for_def(val), "result");
+
+   nir_loop *loop = nir_push_loop(b);
+   {
+      nir_def *next_index = nir_read_invocation_cond_ir3(
+         b, index->bit_size, index, nir_inot(b, nir_load_var(b, done)));
+      next_index->divergent = false;
+      nir_def *shuffled = shuffle_to_uniform(b, op, val, next_index);
+
+      nir_if *nif = nir_push_if(b, nir_ieq(b, index, next_index));
+      {
+         nir_store_var(b, result, shuffled, 1);
+         nir_store_var(b, done, nir_imm_true(b), 1);
+      }
+      nir_pop_if(b, nif);
+
+      nir_break_if(b, nir_vote_all(b, 1, nir_load_var(b, done)));
+   }
+   nir_pop_loop(b, loop);
+
+   return nir_load_var(b, result);
+}
+
+static nir_def *
+lower_shuffle(nir_builder *b, nir_instr *instr, void *data)
+{
+   nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+   nir_def *val = intrin->src[0].ssa;
+   nir_def *index = intrin->src[1].ssa;
+
+   if (intrin->intrinsic == nir_intrinsic_shuffle) {
+      /* The hw only does relative shuffles/rotates so transform shuffle(val, x)
+       * into rotate(val, x - gl_SubgroupInvocationID) which is valid since we
+       * make sure to only use it with uniform indices.
+       */
+      index = nir_isub(b, index, nir_load_subgroup_invocation(b));
+   }
+
+   if (!index->divergent) {
+      return shuffle_to_uniform(b, intrin->intrinsic, val, index);
+   }
+
+   return make_shuffle_uniform(b, val, index, intrin->intrinsic);
+}
+
+/* Lower (relative) shuffles to be able to use the shfl instruction. One quirk
+ * of shfl is that its index has to be dynamically uniform, so we transform the
+ * standard NIR intrinsics into ir3-specific ones which require their index to
+ * be uniform.
+ */
+bool
+ir3_nir_lower_shuffle(nir_shader *nir, struct ir3_shader *shader)
+{
+   if (!shader->compiler->has_shfl) {
+      return false;
+   }
+
+   nir_divergence_analysis(nir);
+   return nir_shader_lower_instructions(nir, filter_shuffle, lower_shuffle,
+                                        NULL);
 }

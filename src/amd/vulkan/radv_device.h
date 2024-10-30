@@ -541,11 +541,6 @@ struct radv_device {
    /* Not NULL if a GPU hang report has been generated for VK_EXT_device_fault. */
    char *gpu_hang_report;
 
-   /* For indirect compute pipeline binds with DGC only. */
-   simple_mtx_t compute_scratch_mtx;
-   uint32_t compute_scratch_size_per_wave;
-   uint32_t compute_scratch_waves;
-
    /* PSO cache stats */
    simple_mtx_t pso_cache_stats_mtx;
    struct radv_pso_cache_stats pso_cache_stats[RADV_PIPELINE_TYPE_COUNT];
@@ -557,12 +552,6 @@ static inline struct radv_physical_device *
 radv_device_physical(const struct radv_device *dev)
 {
    return (struct radv_physical_device *)dev->vk.physical;
-}
-
-static inline bool
-radv_uses_device_generated_commands(const struct radv_device *device)
-{
-   return device->vk.enabled_features.deviceGeneratedCommandsNV || device->vk.enabled_features.deviceGeneratedCompute;
 }
 
 static inline bool
@@ -588,8 +577,6 @@ unsigned radv_get_default_max_sample_dist(int log_samples);
 
 void radv_emit_default_sample_locations(const struct radv_physical_device *pdev, struct radeon_cmdbuf *cs,
                                         int nr_samples);
-
-bool radv_get_memory_fd(struct radv_device *device, struct radv_device_memory *memory, int *pFD);
 
 unsigned radv_get_dcc_max_uncompressed_block_size(const struct radv_device *device, const struct radv_image *image);
 

@@ -813,10 +813,6 @@ radv_emit_graphics(struct radv_device *device, struct radeon_cmdbuf *cs)
       radeon_set_context_reg(cs, R_02840C_VGT_MULTI_PRIM_IB_RESET_INDX, 0xffffffff);
    }
 
-   if (pdev->info.gfx_level >= GFX12) {
-      radeon_set_context_reg(cs, R_028C54_PA_SC_CONSERVATIVE_RASTERIZATION_CNTL, S_028C4C_NULL_SQUAD_AA_MASK_ENABLE(1));
-   }
-
    unsigned tmp = (unsigned)(1.0 * 8.0);
    radeon_set_context_reg(cs, R_028A00_PA_SU_POINT_SIZE, S_028A00_HEIGHT(tmp) | S_028A00_WIDTH(tmp));
    radeon_set_context_reg(
@@ -1272,7 +1268,6 @@ radv_update_preambles(struct radv_queue_state *queue, struct radv_device *device
                       bool *has_follower)
 {
    const struct radv_physical_device *pdev = radv_device_physical(device);
-   bool has_indirect_pipeline_binds = false;
 
    if (queue->qf != RADV_QUEUE_GENERAL && queue->qf != RADV_QUEUE_COMPUTE) {
       for (uint32_t j = 0; j < cmd_buffer_count; j++) {
@@ -1312,16 +1307,6 @@ radv_update_preambles(struct radv_queue_state *queue, struct radv_device *device
       needs.sample_positions |= cmd_buffer->sample_positions_needed;
       *use_perf_counters |= cmd_buffer->state.uses_perf_counters;
       *has_follower |= !!cmd_buffer->gang.cs;
-
-      has_indirect_pipeline_binds |= cmd_buffer->has_indirect_pipeline_binds;
-   }
-
-   if (has_indirect_pipeline_binds) {
-      /* Use the maximum possible scratch size for indirect compute pipelines with DGC. */
-      simple_mtx_lock(&device->compute_scratch_mtx);
-      needs.compute_scratch_size_per_wave = MAX2(needs.compute_scratch_waves, device->compute_scratch_size_per_wave);
-      needs.compute_scratch_waves = MAX2(needs.compute_scratch_waves, device->compute_scratch_waves);
-      simple_mtx_unlock(&device->compute_scratch_mtx);
    }
 
    /* Sanitize scratch size information. */

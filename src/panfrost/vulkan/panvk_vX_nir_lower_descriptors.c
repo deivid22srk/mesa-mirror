@@ -512,7 +512,7 @@ get_resource_deref_binding(nir_deref_instr *deref, uint32_t *set,
 
          /* Zero means variable array. The minus one should give us UINT32_MAX,
           * which matches what we want. */
-         *max_idx = glsl_array_size(nir_deref_instr_parent(deref)->type) - 1;
+         *max_idx = ((uint32_t)glsl_array_size(nir_deref_instr_parent(deref)->type)) - 1;
       }
 
       deref = nir_deref_instr_parent(deref);
@@ -570,9 +570,10 @@ load_resource_deref_desc(nir_builder *b, nir_deref_instr *deref,
                           nir_iadd(b, set_base_addr, nir_u2u64(b, set_offset)),
                           desc_align, num_components, bit_size);
 #else
+   /* note that user sets start from index 1 */
    return nir_load_ubo(
       b, num_components, bit_size,
-      nir_imm_int(b, pan_res_handle(VALHALL_RESOURCE_TABLE_IDX, set)),
+      nir_imm_int(b, pan_res_handle(VALHALL_RESOURCE_TABLE_IDX, set + 1)),
       set_offset, .range = ~0u, .align_mul = PANVK_DESCRIPTOR_SIZE,
       .align_offset = desc_offset);
 #endif
@@ -685,6 +686,15 @@ load_img_samples(nir_builder *b, nir_deref_instr *deref,
    return nir_iadd_imm(b, nir_u2u32(b, sample_count), 1);
 }
 
+static uint32_t
+get_desc_array_stride(const struct panvk_descriptor_set_binding_layout *layout)
+{
+   /* On Bifrost, descriptors are copied from the sets to the final
+    * descriptor tables which are per-type, making the stride one in
+    * this context. */
+   return PAN_ARCH >= 9 ? panvk_get_desc_stride(layout->type) : 1;
+}
+
 static bool
 lower_tex(nir_builder *b, nir_tex_instr *tex, const struct lower_desc_ctx *ctx)
 {
@@ -730,15 +740,21 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, const struct lower_desc_ctx *ctx)
 
       uint32_t set, binding, index_imm, max_idx;
       nir_def *index_ssa;
-      get_resource_deref_binding(deref, &set, &binding, &index_imm, &index_ssa,
-                                 &max_idx);
+      get_resource_deref_binding(deref, &set, &binding, &index_imm, &index_ssa, &max_idx);
+
+      const struct panvk_descriptor_set_layout *set_layout =
+         get_set_layout(set, ctx);
+      const struct panvk_descriptor_set_binding_layout *bind_layout =
+         &set_layout->bindings[binding];
+      uint32_t desc_stride = get_desc_array_stride(bind_layout);
 
       tex->sampler_index =
          shader_desc_idx(set, binding, VK_DESCRIPTOR_TYPE_SAMPLER, ctx) +
-         index_imm;
+         index_imm * desc_stride;
 
       if (index_ssa != NULL) {
-         nir_tex_instr_add_src(tex, nir_tex_src_sampler_offset, index_ssa);
+         nir_def *offset = nir_imul_imm(b, index_ssa, desc_stride);
+         nir_tex_instr_add_src(tex, nir_tex_src_sampler_offset, offset);
       }
       progress = true;
    } else {
@@ -757,12 +773,19 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, const struct lower_desc_ctx *ctx)
       get_resource_deref_binding(deref, &set, &binding, &index_imm, &index_ssa,
                                  &max_idx);
 
+      const struct panvk_descriptor_set_layout *set_layout =
+         get_set_layout(set, ctx);
+      const struct panvk_descriptor_set_binding_layout *bind_layout =
+         &set_layout->bindings[binding];
+      uint32_t desc_stride = get_desc_array_stride(bind_layout);
+
       tex->texture_index =
          shader_desc_idx(set, binding, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, ctx) +
-         index_imm;
+         index_imm * desc_stride;
 
       if (index_ssa != NULL) {
-         nir_tex_instr_add_src(tex, nir_tex_src_texture_offset, index_ssa);
+         nir_def *offset = nir_imul_imm(b, index_ssa, desc_stride);
+         nir_tex_instr_add_src(tex, nir_tex_src_texture_offset, offset);
       }
       progress = true;
    }
@@ -1150,19 +1173,19 @@ upload_shader_desc_info(struct panvk_device *dev, struct panvk_shader *shader,
          copy_count * sizeof(uint32_t), sizeof(uint32_t));
    }
 
-   assert(desc_info->dyn_ubos.count <
+   assert(desc_info->dyn_ubos.count <=
           ARRAY_SIZE(shader->desc_info.dyn_ubos.map));
    shader->desc_info.dyn_ubos.count = desc_info->dyn_ubos.count;
    memcpy(shader->desc_info.dyn_ubos.map, desc_info->dyn_ubos.map,
           desc_info->dyn_ubos.count * sizeof(*shader->desc_info.dyn_ubos.map));
-   assert(desc_info->dyn_ssbos.count <
+   assert(desc_info->dyn_ssbos.count <=
           ARRAY_SIZE(shader->desc_info.dyn_ssbos.map));
    shader->desc_info.dyn_ssbos.count = desc_info->dyn_ssbos.count;
    memcpy(
       shader->desc_info.dyn_ssbos.map, desc_info->dyn_ssbos.map,
       desc_info->dyn_ssbos.count * sizeof(*shader->desc_info.dyn_ssbos.map));
 #else
-   assert(desc_info->dyn_bufs.count <
+   assert(desc_info->dyn_bufs.count <=
           ARRAY_SIZE(shader->desc_info.dyn_bufs.map));
    shader->desc_info.dyn_bufs.count = desc_info->dyn_bufs.count;
    memcpy(shader->desc_info.dyn_bufs.map, desc_info->dyn_bufs.map,

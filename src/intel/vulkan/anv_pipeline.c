@@ -1113,15 +1113,10 @@ anv_pipeline_lower_nir(struct anv_pipeline *pipeline,
       NIR_PASS(progress, nir, nir_opt_dce);
    } while (progress);
 
-   /* Required for nir_divergence_analysis() which is needed for
-    * anv_nir_lower_ubo_loads.
-    */
-   NIR_PASS(_, nir, nir_convert_to_lcssa, true, true);
+   /* Needed for anv_nir_lower_ubo_loads. */
    nir_divergence_analysis(nir);
 
    NIR_PASS(_, nir, anv_nir_lower_ubo_loads);
-
-   NIR_PASS(_, nir, nir_opt_remove_phis);
 
    enum nir_lower_non_uniform_access_type lower_non_uniform_access_types =
       nir_lower_non_uniform_texture_access |
@@ -1554,7 +1549,7 @@ anv_pipeline_link_fs(const struct brw_compiler *compiler,
             /* Setup a null render target */
             rt_bindings[rt] = (struct anv_pipeline_binding) {
                .set = ANV_DESCRIPTOR_SET_COLOR_ATTACHMENTS,
-               .index = UINT32_MAX,
+               .index = ANV_COLOR_OUTPUT_UNUSED,
                .binding = UINT32_MAX,
             };
          }
@@ -1567,7 +1562,8 @@ anv_pipeline_link_fs(const struct brw_compiler *compiler,
       /* Setup a null render target */
       rt_bindings[0] = (struct anv_pipeline_binding) {
          .set = ANV_DESCRIPTOR_SET_COLOR_ATTACHMENTS,
-         .index = UINT32_MAX,
+         .index = ANV_COLOR_OUTPUT_DISABLED,
+         .binding = UINT32_MAX,
       };
       num_rt_bindings = 1;
    } else {
@@ -1698,9 +1694,6 @@ anv_pipeline_add_executable(struct anv_pipeline *pipeline,
                        stage->bind_map.push_ranges[i].index,
                        stage->bind_map.push_ranges[i].start * 32);
                break;
-
-            case ANV_DESCRIPTOR_SET_NUM_WORK_GROUPS:
-               unreachable("gl_NumWorkgroups is never pushed");
 
             case ANV_DESCRIPTOR_SET_COLOR_ATTACHMENTS:
                unreachable("Color attachments can't be pushed");
@@ -2683,13 +2676,6 @@ anv_pipeline_compile_cs(struct anv_compute_pipeline *pipeline,
 
       anv_stage_allocate_bind_map_tables(&pipeline->base, &stage, mem_ctx);
 
-      /* Set up a binding for the gl_NumWorkGroups */
-      stage.bind_map.surface_count = 1;
-      stage.bind_map.surface_to_descriptor[0] = (struct anv_pipeline_binding) {
-         .set = ANV_DESCRIPTOR_SET_NUM_WORK_GROUPS,
-         .binding = UINT32_MAX,
-      };
-
       VkResult result = anv_pipeline_stage_get_nir(&pipeline->base, cache,
                                                    mem_ctx, &stage);
       if (result != VK_SUCCESS) {
@@ -2734,12 +2720,6 @@ anv_pipeline_compile_cs(struct anv_compute_pipeline *pipeline,
 
       anv_nir_validate_push_layout(device->physical, &stage.prog_data.base,
                                    &stage.bind_map);
-
-      if (!stage.prog_data.cs.uses_num_work_groups) {
-         assert(stage.bind_map.surface_to_descriptor[0].set ==
-                ANV_DESCRIPTOR_SET_NUM_WORK_GROUPS);
-         stage.bind_map.surface_to_descriptor[0].set = ANV_DESCRIPTOR_SET_NULL;
-      }
 
       struct anv_shader_upload_params upload_params = {
          .stage               = MESA_SHADER_COMPUTE,
@@ -2969,31 +2949,41 @@ anv_graphics_pipeline_emit(struct anv_graphics_pipeline *pipeline,
       pipeline->min_sample_shading = state->ms->min_sample_shading;
    }
 
+   /* Mark all color output as unused by default */
+   memset(pipeline->color_output_mapping,
+          ANV_COLOR_OUTPUT_UNUSED,
+          sizeof(pipeline->color_output_mapping));
+
    if (anv_pipeline_has_stage(pipeline, MESA_SHADER_FRAGMENT)) {
       /* Count the number of color attachments in the binding table */
       const struct anv_pipeline_bind_map *bind_map =
          &pipeline->base.shaders[MESA_SHADER_FRAGMENT]->bind_map;
 
-      memset(pipeline->color_output_mapping,
-             MESA_VK_ATTACHMENT_UNUSED,
-             sizeof(pipeline->color_output_mapping));
-
       if (state->cal != NULL) {
+         /* Build a map of fragment color output to attachment */
+         uint8_t rt_to_att[MAX_RTS];
+         memset(rt_to_att, ANV_COLOR_OUTPUT_DISABLED, MAX_RTS);
          for (uint32_t i = 0; i < MAX_RTS; i++) {
             if (state->cal->color_map[i] != MESA_VK_ATTACHMENT_UNUSED)
-               pipeline->color_output_mapping[state->cal->color_map[i]] = i;
+               rt_to_att[state->cal->color_map[i]] = i;
          }
 
+         /* For each fragment shader output if not unused apply the remapping
+          * to pipeline->color_output_mapping
+          */
          unsigned i;
          for (i = 0; i < MIN2(bind_map->surface_count, MAX_RTS); i++) {
             if (bind_map->surface_to_descriptor[i].set !=
                 ANV_DESCRIPTOR_SET_COLOR_ATTACHMENTS)
                break;
 
-            /* Helping Alpine builders... */
-            assert(i < MAX_RTS);
-            if (bind_map->surface_to_descriptor[i].index >= MAX_RTS)
-               pipeline->color_output_mapping[i] = MESA_VK_ATTACHMENT_UNUSED;
+            uint32_t index = bind_map->surface_to_descriptor[i].index;
+            if (index >= MAX_RTS) {
+               assert(index <= 0xff);
+               pipeline->color_output_mapping[i] = index;
+            } else {
+               pipeline->color_output_mapping[i] = rt_to_att[i];
+            }
          }
          pipeline->num_color_outputs = i;
       }
@@ -4477,6 +4467,13 @@ VkResult anv_GetPipelineExecutableStatisticsKHR(
                 "hash = 0x%08x. Hash generated from shader source.", hash);
       stat->format = VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR;
       stat->value.u64 = hash;
+   }
+
+   vk_outarray_append_typed(VkPipelineExecutableStatisticKHR, &out, stat) {
+      WRITE_STR(stat->name, "Non SSA regs after NIR");
+      WRITE_STR(stat->description, "Non SSA regs after NIR translation to BRW.");
+      stat->format = VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR;
+      stat->value.u64 = exe->stats.non_ssa_registers_after_nir;
    }
 
    return vk_outarray_status(&out);

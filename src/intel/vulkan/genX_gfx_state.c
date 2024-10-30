@@ -1287,7 +1287,8 @@ genX(cmd_buffer_flush_gfx_runtime_state)(struct anv_cmd_buffer *cmd_buffer)
        BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_VP_VIEWPORTS) ||
        BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_VP_SCISSORS) ||
        BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_RS_DEPTH_CLAMP_ENABLE) ||
-       BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_VP_DEPTH_CLIP_NEGATIVE_ONE_TO_ONE)) {
+       BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_VP_DEPTH_CLIP_NEGATIVE_ONE_TO_ONE) ||
+       BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_VP_DEPTH_CLAMP_RANGE)) {
       struct anv_instance *instance = cmd_buffer->device->physical->instance;
       const VkViewport *viewports = dyn->vp.viewports;
 
@@ -1428,6 +1429,12 @@ genX(cmd_buffer_flush_gfx_runtime_state)(struct anv_cmd_buffer *cmd_buffer)
                            MIN2(vp->minDepth, vp->maxDepth) : min_depth_limit;
          float max_depth = dyn->rs.depth_clamp_enable ?
                            MAX2(vp->minDepth, vp->maxDepth) : max_depth_limit;
+
+         if (dyn->rs.depth_clamp_enable &&
+            dyn->vp.depth_clamp_mode == VK_DEPTH_CLAMP_MODE_USER_DEFINED_RANGE_EXT) {
+            min_depth = dyn->vp.depth_clamp_range.minDepthClamp;
+            max_depth = dyn->vp.depth_clamp_range.maxDepthClamp;
+         }
 
          SET(VIEWPORT_CC, vp_cc.elem[i].MinimumDepth, min_depth);
          SET(VIEWPORT_CC, vp_cc.elem[i].MaximumDepth, max_depth);
@@ -1675,6 +1682,20 @@ cmd_buffer_gfx_state_emission(struct anv_cmd_buffer *cmd_buffer)
    struct anv_gfx_dynamic_state *hw_state = &gfx->dyn_state;
    const bool protected = cmd_buffer->vk.pool->flags &
                           VK_COMMAND_POOL_CREATE_PROTECTED_BIT;
+
+#if INTEL_WA_16011107343_GFX_VER
+   /* Will be emitted in front of every draw instead */
+   if (intel_needs_workaround(cmd_buffer->device->info, 16011107343) &&
+       anv_pipeline_has_stage(pipeline, MESA_SHADER_TESS_CTRL))
+      BITSET_CLEAR(hw_state->dirty, ANV_GFX_STATE_HS);
+#endif
+
+#if INTEL_WA_22018402687_GFX_VER
+   /* Will be emitted in front of every draw instead */
+   if (intel_needs_workaround(cmd_buffer->device->info, 22018402687) &&
+       anv_pipeline_has_stage(pipeline, MESA_SHADER_TESS_EVAL))
+      BITSET_CLEAR(hw_state->dirty, ANV_GFX_STATE_DS);
+#endif
 
    if (BITSET_TEST(hw_state->dirty, ANV_GFX_STATE_URB)) {
       genX(urb_workaround)(cmd_buffer, &pipeline->urb_cfg);
@@ -2346,6 +2367,13 @@ genX(cmd_buffer_flush_gfx_hw_state)(struct anv_cmd_buffer *cmd_buffer)
     * Put potential workarounds here if you need to reemit an instruction
     * because of another one is changing.
     */
+
+   /* Wa_16012775297 - Emit dummy VF statistics before each 3DSTATE_VF. */
+#if INTEL_WA_16012775297_GFX_VER
+   if (intel_needs_workaround(device->info, 16012775297) &&
+       BITSET_TEST(hw_state->dirty, ANV_GFX_STATE_VF))
+      BITSET_SET(hw_state->dirty, ANV_GFX_STATE_VF_STATISTICS);
+#endif
 
    /* Since Wa_16011773973 will disable 3DSTATE_STREAMOUT, we need to reemit
     * it after.

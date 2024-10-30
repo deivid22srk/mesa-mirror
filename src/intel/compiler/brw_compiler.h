@@ -162,6 +162,14 @@ brw_shader_stage_requires_bindless_resources(gl_shader_stage stage)
    return brw_shader_stage_is_bindless(stage) || gl_shader_stage_is_mesh(stage);
 }
 
+static inline bool
+brw_shader_stage_has_inline_data(const struct intel_device_info *devinfo,
+                                 gl_shader_stage stage)
+{
+   return stage == MESA_SHADER_MESH || stage == MESA_SHADER_TASK ||
+          (stage == MESA_SHADER_COMPUTE && devinfo->verx10 >= 125);
+}
+
 /**
  * Program key structures.
  *
@@ -1311,6 +1319,7 @@ struct brw_compile_stats {
    uint32_t spills;
    uint32_t fills;
    uint32_t max_live_registers;
+   uint32_t non_ssa_registers_after_nir;
 };
 
 /** @} */
@@ -1595,7 +1604,7 @@ brw_stage_has_packed_dispatch(ASSERTED const struct intel_device_info *devinfo,
     * enabled by setting the macro below to true.
     */
    #define ENABLE_FS_TEST_DISPATCH_PACKING false
-   assert(devinfo->ver <= 20);
+   assert(devinfo->ver <= 30);
 
    switch (stage) {
    case MESA_SHADER_FRAGMENT: {

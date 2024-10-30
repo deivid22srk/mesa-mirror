@@ -334,7 +334,7 @@ nak_preprocess_nir(nir_shader *nir, const struct nak_compiler *nak)
 }
 
 uint16_t
-nak_varying_attr_addr(gl_varying_slot slot)
+nak_varying_attr_addr(const struct nak_compiler *nak, gl_varying_slot slot)
 {
    if (slot >= VARYING_SLOT_PATCH0) {
       return NAK_ATTR_PATCH_START + (slot - VARYING_SLOT_PATCH0) * 0x10;
@@ -351,6 +351,9 @@ nak_varying_attr_addr(gl_varying_slot slot)
       case VARYING_SLOT_POS:              return NAK_ATTR_POSITION;
       case VARYING_SLOT_CLIP_DIST0:       return NAK_ATTR_CLIP_CULL_DIST_0;
       case VARYING_SLOT_CLIP_DIST1:       return NAK_ATTR_CLIP_CULL_DIST_4;
+      case VARYING_SLOT_PRIMITIVE_SHADING_RATE:
+         return nak->sm >= 86 ? NAK_ATTR_VPRS_TABLE_INDEX
+                              : NAK_ATTR_VIEWPORT_INDEX;
       default: unreachable("Invalid varying slot");
       }
    }
@@ -381,7 +384,7 @@ nak_fs_out_addr(gl_frag_result slot, uint32_t blend_idx)
 }
 
 uint16_t
-nak_sysval_attr_addr(gl_system_value sysval)
+nak_sysval_attr_addr(const struct nak_compiler *nak, gl_system_value sysval)
 {
    switch (sysval) {
    case SYSTEM_VALUE_PRIMITIVE_ID:  return NAK_ATTR_PRIMITIVE_ID;
@@ -401,7 +404,7 @@ nak_sysval_sysval_idx(gl_system_value sysval)
 {
    switch (sysval) {
    case SYSTEM_VALUE_SUBGROUP_INVOCATION:    return NAK_SV_LANE_ID;
-   case SYSTEM_VALUE_VERTICES_IN:            return NAK_SV_VERTEX_COUNT;
+   case SYSTEM_VALUE_VERTICES_IN:            return NAK_SV_PRIM_TYPE;
    case SYSTEM_VALUE_INVOCATION_ID:          return NAK_SV_INVOCATION_ID;
    case SYSTEM_VALUE_HELPER_INVOCATION:      return NAK_SV_THREAD_KILL;
    case SYSTEM_VALUE_LOCAL_INVOCATION_ID:    return NAK_SV_TID;
@@ -434,7 +437,7 @@ nak_nir_lower_system_value_intrin(nir_builder *b, nir_intrinsic_instr *intrin,
              b->shader->info.stage == MESA_SHADER_GEOMETRY);
       const gl_system_value sysval =
          nir_system_value_from_intrinsic(intrin->intrinsic);
-      const uint32_t addr = nak_sysval_attr_addr(sysval);
+      const uint32_t addr = nak_sysval_attr_addr(nak, sysval);
       val = nir_ald_nv(b, 1, nir_imm_int(b, 0), nir_imm_int(b, 0),
                        .base = addr, .flags = 0,
                        .range_base = addr, .range = 4,
@@ -443,9 +446,29 @@ nak_nir_lower_system_value_intrin(nir_builder *b, nir_intrinsic_instr *intrin,
    }
 
    case nir_intrinsic_load_patch_vertices_in: {
-      val = nir_load_sysval_nv(b, 32, .base = NAK_SV_VERTEX_COUNT,
+      val = nir_load_sysval_nv(b, 32, .base = NAK_SV_PRIM_TYPE,
                                .access = ACCESS_CAN_REORDER);
       val = nir_extract_u8(b, val, nir_imm_int(b, 1));
+      break;
+   }
+
+   case nir_intrinsic_load_frag_shading_rate: {
+      val = nir_load_sysval_nv(b, 32, .base = NAK_SV_VARIABLE_RATE,
+                               .access = ACCESS_CAN_REORDER);
+
+      /* X is in bits 8..16 and Y is in bits 16..24.  However, we actually
+       * want the log2 of X and Y and, since we only support 1, 2, and 4, a
+       * right shift by 1 is log2.  So this gives us
+       *
+       * x_log2 = (sv >> 9) & 3
+       * y_log2 = (sv >> 17) & 3
+       *
+       * However, we actually want y_log2 at 0..2 and x_log2 at 2..4 so that
+       * gives us
+       */
+      nir_def *x = nir_iand_imm(b, nir_ushr_imm(b, val, 7), 0xc);
+      nir_def *y = nir_iand_imm(b, nir_ushr_imm(b, val, 17), 0x3);
+      val = nir_ior(b, x, y);
       break;
    }
 
@@ -637,7 +660,8 @@ nak_nir_lower_system_values(nir_shader *nir, const struct nak_compiler *nak)
 }
 
 struct nak_xfb_info
-nak_xfb_from_nir(const struct nir_xfb_info *nir_xfb)
+nak_xfb_from_nir(const struct nak_compiler *nak,
+                 const struct nir_xfb_info *nir_xfb)
 {
    if (nir_xfb == NULL)
       return (struct nak_xfb_info) { };
@@ -655,7 +679,7 @@ nak_xfb_from_nir(const struct nir_xfb_info *nir_xfb)
       const uint8_t b = out->buffer;
       assert(nir_xfb->buffers_written & BITFIELD_BIT(b));
 
-      const uint16_t attr_addr = nak_varying_attr_addr(out->location);
+      const uint16_t attr_addr = nak_varying_attr_addr(nak, out->location);
       assert(attr_addr % 4 == 0);
       const uint16_t attr_idx = attr_addr / 4;
 
@@ -775,14 +799,17 @@ nak_nir_remove_barriers(nir_shader *nir)
 static bool
 nak_mem_vectorize_cb(unsigned align_mul, unsigned align_offset,
                      unsigned bit_size, unsigned num_components,
-                     nir_intrinsic_instr *low, nir_intrinsic_instr *high,
-                     void *cb_data)
+                     unsigned hole_size, nir_intrinsic_instr *low,
+                     nir_intrinsic_instr *high, void *cb_data)
 {
    /*
     * Since we legalize these later with nir_lower_mem_access_bit_sizes,
     * we can optimistically combine anything that might be profitable
     */
    assert(util_is_power_of_two_nonzero(align_mul));
+
+   if (hole_size)
+      return false;
 
    unsigned max_bytes = 128u / 8u;
    if (low->intrinsic == nir_intrinsic_ldc_nv ||
@@ -890,6 +917,7 @@ nak_postprocess_nir(nir_shader *nir,
       .lower_first_invocation_to_ballot = true,
       .lower_read_first_invocation = true,
       .lower_elect = true,
+      .lower_quad_vote = true,
       .lower_inverse_ballot = true,
       .lower_rotate_to_shuffle = true
    };

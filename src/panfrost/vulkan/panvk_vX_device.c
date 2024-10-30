@@ -42,7 +42,8 @@ panvk_kmod_zalloc(const struct pan_kmod_allocator *allocator, size_t size,
 
    /* We force errno to -ENOMEM on host allocation failures so we can properly
     * report it back as VK_ERROR_OUT_OF_HOST_MEMORY. */
-   errno = obj ? 0 : -ENOMEM;
+   if (!obj)
+      errno = -ENOMEM;
 
    return obj;
 }
@@ -96,6 +97,7 @@ static void
 panvk_device_cleanup_mempools(struct panvk_device *dev)
 {
    panvk_pool_cleanup(&dev->mempools.rw);
+   panvk_pool_cleanup(&dev->mempools.rw_nc);
    panvk_pool_cleanup(&dev->mempools.exec);
 }
 
@@ -139,64 +141,13 @@ panvk_meta_init(struct panvk_device *device)
          MIN2(1024 >> i, pdev->properties.maxComputeWorkGroupSize[0]);
    }
 
-#if PAN_ARCH <= 7
-   panvk_per_arch(meta_desc_copy_init)(device);
-#endif
-
    return VK_SUCCESS;
 }
 
 static void
 panvk_meta_cleanup(struct panvk_device *device)
 {
-#if PAN_ARCH <= 7
-   panvk_per_arch(meta_desc_copy_cleanup)(device);
-#endif
-
    vk_meta_device_finish(&device->vk, &device->meta);
-}
-
-static void
-panvk_preload_blitter_init(struct panvk_device *device)
-{
-   const struct panvk_physical_device *physical_device =
-      to_panvk_physical_device(device->vk.physical);
-
-   struct panvk_pool_properties bin_pool_props = {
-      .create_flags = PAN_KMOD_BO_FLAG_EXECUTABLE,
-      .slab_size = 16 * 1024,
-      .label = "panvk_meta blitter binary pool",
-      .owns_bos = true,
-      .needs_locking = false,
-      .prealloc = false,
-   };
-   panvk_pool_init(&device->blitter.bin_pool, device, NULL, &bin_pool_props);
-
-   struct panvk_pool_properties desc_pool_props = {
-      .create_flags = 0,
-      .slab_size = 16 * 1024,
-      .label = "panvk_meta blitter descriptor pool",
-      .owns_bos = true,
-      .needs_locking = false,
-      .prealloc = false,
-   };
-   panvk_pool_init(&device->blitter.desc_pool, device, NULL, &desc_pool_props);
-
-   pan_blend_shader_cache_init(&device->blitter.blend_shader_cache,
-                               physical_device->kmod.props.gpu_prod_id);
-   GENX(pan_blitter_cache_init)
-   (&device->blitter.cache, physical_device->kmod.props.gpu_prod_id,
-    &device->blitter.blend_shader_cache, &device->blitter.bin_pool.base,
-    &device->blitter.desc_pool.base);
-}
-
-static void
-panvk_preload_blitter_cleanup(struct panvk_device *device)
-{
-   GENX(pan_blitter_cache_cleanup)(&device->blitter.cache);
-   pan_blend_shader_cache_cleanup(&device->blitter.blend_shader_cache);
-   panvk_pool_cleanup(&device->blitter.desc_pool);
-   panvk_pool_cleanup(&device->blitter.bin_pool);
 }
 
 /* Always reserve the lower 32MB. */
@@ -216,31 +167,37 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
    device = vk_zalloc2(&instance->vk.alloc, pAllocator, sizeof(*device), 8,
                        VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
    if (!device)
-      return vk_error(physical_device, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return panvk_error(physical_device, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    struct vk_device_dispatch_table dispatch_table;
 
-   /* For secondary command buffer support, overwrite any command entrypoints
-    * in the main device-level dispatch table with
-    * vk_cmd_enqueue_unless_primary_Cmd*.
-    */
-   vk_device_dispatch_table_from_entrypoints(
-      &dispatch_table, &vk_cmd_enqueue_unless_primary_device_entrypoints, true);
+
+
+   if (PAN_ARCH <= 9) {
+      /* For secondary command buffer support, overwrite any command entrypoints
+       * in the main device-level dispatch table with
+       * vk_cmd_enqueue_unless_primary_Cmd*.
+       */
+      vk_device_dispatch_table_from_entrypoints(
+         &dispatch_table, &vk_cmd_enqueue_unless_primary_device_entrypoints, true);
+
+      /* Populate our primary cmd_dispatch table. */
+      vk_device_dispatch_table_from_entrypoints(
+         &device->cmd_dispatch, &panvk_per_arch(device_entrypoints), true);
+      vk_device_dispatch_table_from_entrypoints(&device->cmd_dispatch,
+                                                &panvk_device_entrypoints,
+                                                false);
+      vk_device_dispatch_table_from_entrypoints(&device->cmd_dispatch,
+		                                &vk_common_device_entrypoints,
+                                                false);
+   }
 
    vk_device_dispatch_table_from_entrypoints(
-      &dispatch_table, &panvk_per_arch(device_entrypoints), false);
+      &dispatch_table, &panvk_per_arch(device_entrypoints), PAN_ARCH > 9);
    vk_device_dispatch_table_from_entrypoints(&dispatch_table,
                                              &panvk_device_entrypoints, false);
    vk_device_dispatch_table_from_entrypoints(&dispatch_table,
                                              &wsi_device_entrypoints, false);
-
-   /* Populate our primary cmd_dispatch table. */
-   vk_device_dispatch_table_from_entrypoints(
-      &device->cmd_dispatch, &panvk_per_arch(device_entrypoints), true);
-   vk_device_dispatch_table_from_entrypoints(&device->cmd_dispatch,
-                                             &panvk_device_entrypoints, false);
-   vk_device_dispatch_table_from_entrypoints(
-      &device->cmd_dispatch, &vk_common_device_entrypoints, false);
 
    result = vk_device_init(&device->vk, &physical_device->vk, &dispatch_table,
                            pCreateInfo, pAllocator);
@@ -265,7 +222,8 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
                           PAN_KMOD_DEV_FLAG_OWNS_FD, &device->kmod.allocator);
 
    if (!device->kmod.dev) {
-      result = vk_errorf(instance, panvk_errno_to_vk_error(), "cannot create device");
+      result = panvk_errorf(instance, VK_ERROR_OUT_OF_HOST_MEMORY,
+                            "cannot create device");
       goto err_finish_dev;
    }
 
@@ -291,47 +249,34 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
                          user_va_start, user_va_end - user_va_start);
 
    if (!device->kmod.vm) {
-      result = vk_error(physical_device, VK_ERROR_OUT_OF_HOST_MEMORY);
+      result = panvk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
       goto err_destroy_kdev;
    }
 
    panvk_device_init_mempools(device);
 
 #if PAN_ARCH <= 9
-   device->tiler_heap = panvk_priv_bo_create(
+   result = panvk_priv_bo_create(
       device, 128 * 1024 * 1024,
       PAN_KMOD_BO_FLAG_NO_MMAP | PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT,
-      VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
-
-   if (!device->tiler_heap) {
-      result = vk_error(physical_device, VK_ERROR_OUT_OF_HOST_MEMORY);
+      VK_SYSTEM_ALLOCATION_SCOPE_DEVICE, &device->tiler_heap);
+   if (result != VK_SUCCESS)
       goto err_free_priv_bos;
-   }
 #endif
 
-   device->sample_positions =
-      panvk_priv_bo_create(device, panfrost_sample_positions_buffer_size(), 0,
-                           VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
-
-   if (!device->sample_positions) {
-      result = vk_error(physical_device, VK_ERROR_OUT_OF_HOST_MEMORY);
+   result = panvk_priv_bo_create(
+      device, panfrost_sample_positions_buffer_size(), 0,
+      VK_SYSTEM_ALLOCATION_SCOPE_DEVICE, &device->sample_positions);
+   if (result != VK_SUCCESS)
       goto err_free_priv_bos;
-   }
 
    panfrost_upload_sample_positions(device->sample_positions->addr.host);
 
    vk_device_set_drm_fd(&device->vk, device->kmod.dev->fd);
 
-   result = panvk_per_arch(blend_shader_cache_init)(device);
-
-   if (result != VK_SUCCESS)
-      goto err_free_priv_bos;
-
-   panvk_preload_blitter_init(device);
-
    result = panvk_meta_init(device);
    if (result != VK_SUCCESS)
-      goto err_cleanup_blitter;
+      goto err_free_priv_bos;
 
    for (unsigned i = 0; i < pCreateInfo->queueCreateInfoCount; i++) {
       const VkDeviceQueueCreateInfo *queue_create =
@@ -342,20 +287,20 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
                   queue_create->queueCount * sizeof(struct panvk_queue), 8,
                   VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
       if (!device->queues[qfi]) {
-         result = VK_ERROR_OUT_OF_HOST_MEMORY;
+         result = panvk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
          goto err_finish_queues;
       }
 
       memset(device->queues[qfi], 0,
              queue_create->queueCount * sizeof(struct panvk_queue));
 
-      device->queue_count[qfi] = queue_create->queueCount;
-
       for (unsigned q = 0; q < queue_create->queueCount; q++) {
          result = panvk_per_arch(queue_init)(device, &device->queues[qfi][q], q,
                                              queue_create);
          if (result != VK_SUCCESS)
             goto err_finish_queues;
+
+         device->queue_count[qfi]++;
       }
    }
 
@@ -366,15 +311,11 @@ err_finish_queues:
    for (unsigned i = 0; i < PANVK_MAX_QUEUE_FAMILIES; i++) {
       for (unsigned q = 0; q < device->queue_count[i]; q++)
          panvk_per_arch(queue_finish)(&device->queues[i][q]);
-      if (device->queue_count[i])
+      if (device->queues[i])
          vk_object_free(&device->vk, NULL, device->queues[i]);
    }
 
    panvk_meta_cleanup(device);
-
-err_cleanup_blitter:
-   panvk_preload_blitter_cleanup(device);
-   panvk_per_arch(blend_shader_cache_cleanup)(device);
 
 err_free_priv_bos:
    panvk_priv_bo_unref(device->sample_positions);
@@ -410,8 +351,6 @@ panvk_per_arch(destroy_device)(struct panvk_device *device,
    }
 
    panvk_meta_cleanup(device);
-   panvk_preload_blitter_cleanup(device);
-   panvk_per_arch(blend_shader_cache_cleanup)(device);
    panvk_priv_bo_unref(device->tiler_heap);
    panvk_priv_bo_unref(device->sample_positions);
    panvk_device_cleanup_mempools(device);

@@ -27,9 +27,9 @@
 
 #include "drm-uapi/panfrost_drm.h"
 
-#include "pan_blitter.h"
 #include "pan_cmdstream.h"
 #include "pan_context.h"
+#include "pan_fb_preload.h"
 #include "pan_indirect_dispatch.h"
 #include "pan_jm.h"
 #include "pan_job.h"
@@ -241,8 +241,9 @@ GENX(jm_preload_fb)(struct panfrost_batch *batch, struct pan_fb_info *fb)
    struct panfrost_device *dev = pan_device(batch->ctx->base.screen);
    struct panfrost_ptr preload_jobs[2];
 
-   unsigned preload_job_count = GENX(pan_preload_fb)(
-      &dev->blitter, &batch->pool.base, fb, 0, batch->tls.gpu, preload_jobs);
+   unsigned preload_job_count =
+      GENX(pan_preload_fb)(&dev->fb_preload_cache, &batch->pool.base, fb,
+                           batch->tls.gpu, preload_jobs);
 
    assert(PAN_ARCH < 6 || !preload_job_count);
 
@@ -250,6 +251,14 @@ GENX(jm_preload_fb)(struct panfrost_batch *batch, struct pan_fb_info *fb)
       pan_jc_add_job(&batch->jm.jobs.vtc_jc, MALI_JOB_TYPE_TILER, false, false,
                      0, 0, &preload_jobs[j], true);
    }
+}
+
+void
+GENX(jm_emit_fbds)(struct panfrost_batch *batch, struct pan_fb_info *fb,
+                   struct pan_tls_info *tls)
+{
+   batch->framebuffer.gpu |= GENX(pan_emit_fbd)(
+      fb, 0, tls, &batch->tiler_ctx, batch->framebuffer.cpu);
 }
 
 void

@@ -154,28 +154,6 @@ format_is_float32(VkFormat format)
    return channel >= 0 && desc->channel[channel].type == UTIL_FORMAT_TYPE_FLOAT && desc->channel[channel].size == 32;
 }
 
-unsigned
-radv_compact_spi_shader_col_format(uint32_t spi_shader_col_format)
-{
-   unsigned value = 0, num_mrts = 0;
-   unsigned i, num_targets;
-
-   /* Compute the number of MRTs. */
-   num_targets = DIV_ROUND_UP(util_last_bit(spi_shader_col_format), 4);
-
-   /* Remove holes in spi_shader_col_format. */
-   for (i = 0; i < num_targets; i++) {
-      unsigned spi_format = (spi_shader_col_format >> (i * 4)) & 0xf;
-
-      if (spi_format) {
-         value |= spi_format << (num_mrts * 4);
-         num_mrts++;
-      }
-   }
-
-   return value;
-}
-
 /*
  * Ordered so that for each i,
  * radv_format_meta_fs_key(radv_fs_key_format_exemplars[i]) == i.
@@ -397,6 +375,8 @@ radv_dynamic_state_mask(VkDynamicState state)
       return RADV_DYNAMIC_SAMPLE_LOCATIONS_ENABLE;
    case VK_DYNAMIC_STATE_ALPHA_TO_ONE_ENABLE_EXT:
       return RADV_DYNAMIC_ALPHA_TO_ONE_ENABLE;
+   case VK_DYNAMIC_STATE_DEPTH_CLAMP_RANGE_EXT:
+      return RADV_DYNAMIC_DEPTH_CLAMP_RANGE;
    default:
       unreachable("Unhandled dynamic state");
    }
@@ -771,6 +751,11 @@ radv_pipeline_init_dynamic_state(const struct radv_device *device, struct radv_g
 
    if (states & RADV_DYNAMIC_DEPTH_CLIP_NEGATIVE_ONE_TO_ONE) {
       dynamic->vk.vp.depth_clip_negative_one_to_one = state->vp->depth_clip_negative_one_to_one;
+   }
+
+   if (states & RADV_DYNAMIC_DEPTH_CLAMP_RANGE) {
+      dynamic->vk.vp.depth_clamp_mode = state->vp->depth_clamp_mode;
+      dynamic->vk.vp.depth_clamp_range = state->vp->depth_clamp_range;
    }
 
    /* Discard rectangles. */
@@ -1807,10 +1792,7 @@ radv_pipeline_generate_ps_epilog_key(const struct radv_device *device, const str
             ps_epilog.mrt0_is_dual_src = true;
          }
 
-         if (eqRGB == VK_BLEND_OP_MIN || eqRGB == VK_BLEND_OP_MAX) {
-            srcRGB = VK_BLEND_FACTOR_ONE;
-            dstRGB = VK_BLEND_FACTOR_ONE;
-         }
+         radv_normalize_blend_factor(eqRGB, &srcRGB, &dstRGB);
 
          if (srcRGB == VK_BLEND_FACTOR_SRC_ALPHA || dstRGB == VK_BLEND_FACTOR_SRC_ALPHA ||
              srcRGB == VK_BLEND_FACTOR_SRC_ALPHA_SATURATE || dstRGB == VK_BLEND_FACTOR_SRC_ALPHA_SATURATE ||
@@ -1863,7 +1845,7 @@ radv_generate_graphics_state_key(const struct radv_device *device, const struct 
       u_foreach_bit (i, state->vi->attributes_valid) {
          uint32_t binding = state->vi->attributes[i].binding;
          uint32_t offset = state->vi->attributes[i].offset;
-         enum pipe_format format = vk_format_to_pipe_format(state->vi->attributes[i].format);
+         enum pipe_format format = radv_format_to_pipe_format(state->vi->attributes[i].format);
 
          key.vi.vertex_attribute_formats[i] = format;
          key.vi.vertex_attribute_bindings[i] = binding;
@@ -2683,7 +2665,19 @@ radv_graphics_shaders_compile(struct radv_device *device, struct vk_pipeline_cac
       unsigned rast_prim = radv_get_rasterization_prim(stages, gfx_state);
 
       NIR_PASS(_, stages[MESA_SHADER_FRAGMENT].nir, radv_nir_lower_fs_barycentric, gfx_state, rast_prim);
+
+      /* frag_depth = gl_FragCoord.z broadcasts to all samples of the fragment shader invocation,
+       * so only optimize it away if we know there is only one sample per invocation.
+       * Because we don't know if sample shading is used with factor 1.0f, this means
+       * we only optimize single sampled shaders.
+       */
+      if ((gfx_state->lib_flags & VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT) &&
+          !gfx_state->dynamic_rasterization_samples && gfx_state->ms.rasterization_samples == 0)
+         NIR_PASS(_, stages[MESA_SHADER_FRAGMENT].nir, nir_opt_fragdepth);
    }
+
+   if (stages[MESA_SHADER_VERTEX].nir && !gfx_state->vs.has_prolog)
+      NIR_PASS(_, stages[MESA_SHADER_VERTEX].nir, radv_nir_optimize_vs_inputs_to_const, gfx_state);
 
    radv_foreach_stage(i, active_nir_stages)
    {
@@ -3137,7 +3131,7 @@ radv_pipeline_init_vertex_input_state(const struct radv_device *device, struct r
 
          pipeline->vertex_input.offsets[i] = offset;
 
-         enum pipe_format format = vk_format_to_pipe_format(state->vi->attributes[i].format);
+         enum pipe_format format = radv_format_to_pipe_format(state->vi->attributes[i].format);
          const struct ac_vtx_format_info *vtx_info = &vtx_info_table[format];
 
          pipeline->vertex_input.formats[i] = format;
@@ -3231,18 +3225,7 @@ radv_pipeline_init_extra(struct radv_graphics_pipeline *pipeline,
                          const struct radv_graphics_pipeline_create_info *extra,
                          const struct vk_graphics_pipeline_state *state)
 {
-   if (extra->custom_blend_mode == V_028808_CB_ELIMINATE_FAST_CLEAR ||
-       extra->custom_blend_mode == V_028808_CB_FMASK_DECOMPRESS ||
-       extra->custom_blend_mode == V_028808_CB_DCC_DECOMPRESS_GFX8 ||
-       extra->custom_blend_mode == V_028808_CB_DCC_DECOMPRESS_GFX11 ||
-       extra->custom_blend_mode == V_028808_CB_RESOLVE) {
-      /* According to the CB spec states, CB_SHADER_MASK should be set to enable writes to all four
-       * channels of MRT0.
-       */
-      pipeline->cb_shader_mask = 0xf;
-
-      pipeline->custom_blend_mode = extra->custom_blend_mode;
-   }
+   pipeline->custom_blend_mode = extra->custom_blend_mode;
 
    if (extra->use_rectlist) {
       struct radv_dynamic_state *dynamic = &pipeline->dynamic_state;
@@ -3389,25 +3372,13 @@ radv_graphics_pipeline_init(struct radv_graphics_pipeline *pipeline, struct radv
       radv_pipeline_init_input_assembly_state(device, pipeline);
    radv_pipeline_init_dynamic_state(device, pipeline, &gfx_state.vk, pCreateInfo);
 
-   const struct radv_shader *ps = pipeline->base.shaders[MESA_SHADER_FRAGMENT];
-   if (ps && !ps->info.ps.has_epilog) {
-      pipeline->spi_shader_col_format = ps->info.ps.spi_shader_col_format;
-      pipeline->cb_shader_mask = ps->info.ps.cb_shader_mask;
-   }
-
-   unsigned custom_blend_mode = extra ? extra->custom_blend_mode : 0;
-   if (radv_needs_null_export_workaround(device, ps, custom_blend_mode) && !pipeline->spi_shader_col_format) {
-      pipeline->spi_shader_col_format = V_028714_SPI_SHADER_32_R;
-   }
-
    if (!radv_pipeline_has_stage(pipeline, MESA_SHADER_MESH))
       radv_pipeline_init_vertex_input_state(device, pipeline, &gfx_state.vk);
 
    radv_pipeline_init_shader_stages_state(device, pipeline);
 
    pipeline->is_ngg = pipeline->base.shaders[pipeline->last_vgt_api_stage]->info.is_ngg;
-   pipeline->has_ngg_culling =
-      pipeline->is_ngg && pipeline->base.shaders[pipeline->last_vgt_api_stage]->info.has_ngg_culling;
+   pipeline->has_ngg_culling = pipeline->base.shaders[pipeline->last_vgt_api_stage]->info.has_ngg_culling;
    pipeline->force_vrs_per_vertex = pipeline->base.shaders[pipeline->last_vgt_api_stage]->info.force_vrs_per_vertex;
    pipeline->rast_prim = vgt_gs_out_prim_type;
    pipeline->uses_out_of_order_rast = gfx_state.vk.rs->rasterization_order_amd == VK_RASTERIZATION_ORDER_RELAXED_AMD;

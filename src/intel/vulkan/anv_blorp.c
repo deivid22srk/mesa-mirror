@@ -271,6 +271,7 @@ get_blorp_surf_for_anv_image(const struct anv_cmd_buffer *cmd_buffer,
                              VkImageUsageFlags usage,
                              VkImageLayout layout,
                              enum isl_aux_usage aux_usage,
+                             enum isl_format view_fmt,
                              struct blorp_surf *blorp_surf)
 {
    const struct anv_device *device = cmd_buffer->device;
@@ -316,22 +317,12 @@ get_blorp_surf_for_anv_image(const struct anv_cmd_buffer *cmd_buffer,
          };
       }
 
-      /* If we're doing a partial resolve, then we need the indirect clear
-       * color.  If we are doing a fast clear and want to store/update the
-       * clear color, we also pass the address to blorp, otherwise it will only
-       * stomp the CCS to a particular value and won't care about format or
-       * clear value
-       */
-      if (aspect & VK_IMAGE_ASPECT_ANY_COLOR_BIT_ANV) {
-         const struct anv_address clear_color_addr =
-            anv_image_get_clear_color_addr(device, image, aspect);
-         blorp_surf->clear_color_addr = anv_to_blorp_address(clear_color_addr);
-      } else if (aspect & VK_IMAGE_ASPECT_DEPTH_BIT) {
-         const struct anv_address clear_color_addr =
-            anv_image_get_clear_color_addr(device, image, aspect);
-         blorp_surf->clear_color_addr = anv_to_blorp_address(clear_color_addr);
+      const struct anv_address clear_color_addr =
+         anv_image_get_clear_color_addr(device, image, view_fmt, aspect);
+      blorp_surf->clear_color_addr = anv_to_blorp_address(clear_color_addr);
+
+      if (aspect & VK_IMAGE_ASPECT_DEPTH_BIT)
          blorp_surf->clear_color = anv_image_hiz_clear_value(image);
-      }
    }
 }
 
@@ -380,17 +371,24 @@ copy_image(struct anv_cmd_buffer *cmd_buffer,
 
    if (util_bitcount(src_mask) > 1) {
       anv_foreach_image_aspect_bit(aspect_bit, src_image, src_mask) {
+         enum isl_format src_format, dst_format;
+         int plane = anv_image_aspect_to_plane(src_image, 1UL << aspect_bit);
+         blorp_copy_get_formats(&cmd_buffer->device->isl_dev,
+                                &src_image->planes[plane].primary_surface.isl,
+                                &dst_image->planes[plane].primary_surface.isl,
+                                &src_format, &dst_format);
+
          struct blorp_surf src_surf, dst_surf;
          get_blorp_surf_for_anv_image(cmd_buffer,
                                       src_image, 1UL << aspect_bit,
                                       VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
                                       src_image_layout, ISL_AUX_USAGE_NONE,
-                                      &src_surf);
+                                      src_format, &src_surf);
          get_blorp_surf_for_anv_image(cmd_buffer,
                                       dst_image, 1UL << aspect_bit,
                                       VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                                       dst_image_layout, ISL_AUX_USAGE_NONE,
-                                      &dst_surf);
+                                      dst_format, &dst_surf);
          anv_cmd_buffer_mark_image_written(cmd_buffer, dst_image,
                                            1UL << aspect_bit,
                                            dst_surf.aux_usage, dst_level,
@@ -408,15 +406,23 @@ copy_image(struct anv_cmd_buffer *cmd_buffer,
       /* This case handles the ycbcr images, aspect mask are compatible but
        * don't need to be the same.
        */
+      enum isl_format src_format, dst_format;
+      int s_plane = anv_image_aspect_to_plane(src_image, src_mask);
+      int d_plane = anv_image_aspect_to_plane(dst_image, dst_mask);
+      blorp_copy_get_formats(&cmd_buffer->device->isl_dev,
+                             &src_image->planes[s_plane].primary_surface.isl,
+                             &dst_image->planes[d_plane].primary_surface.isl,
+                             &src_format, &dst_format);
+
       struct blorp_surf src_surf, dst_surf;
       get_blorp_surf_for_anv_image(cmd_buffer, src_image, src_mask,
                                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
                                    src_image_layout, ISL_AUX_USAGE_NONE,
-                                   &src_surf);
+                                   src_format, &src_surf);
       get_blorp_surf_for_anv_image(cmd_buffer, dst_image, dst_mask,
                                    VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                                    dst_image_layout, ISL_AUX_USAGE_NONE,
-                                   &dst_surf);
+                                   dst_format, &dst_surf);
       anv_cmd_buffer_mark_image_written(cmd_buffer, dst_image, dst_mask,
                                         dst_surf.aux_usage, dst_level,
                                         dst_base_layer, layer_count);
@@ -519,6 +525,8 @@ static bool
 anv_blorp_execute_on_companion(struct anv_cmd_buffer *cmd_buffer,
                                struct anv_image *dst_image)
 {
+   const struct intel_device_info *devinfo = cmd_buffer->device->info;
+
    /* MSAA images have to be dealt with on the companion RCS command buffer
     * for both CCS && BCS engines.
     */
@@ -533,6 +541,21 @@ anv_blorp_execute_on_companion(struct anv_cmd_buffer *cmd_buffer,
    if (anv_cmd_buffer_is_blitter_queue(cmd_buffer) &&
        dst_image->emu_plane_format != VK_FORMAT_UNDEFINED)
       return true;
+
+   /* HSD 14021541470:
+    * The compression pairing bit on blitter engine is not programmed correctly
+    * for stencil resources. Fallback to RCS engine for performing a copy to
+    * workaround the issue.
+    */
+   if (anv_cmd_buffer_is_blitter_queue(cmd_buffer) &&
+       (devinfo->verx10 == 125) &&
+       (dst_image->vk.aspects & VK_IMAGE_ASPECT_STENCIL_BIT)) {
+      const uint32_t plane =
+         anv_image_aspect_to_plane(dst_image, VK_IMAGE_ASPECT_STENCIL_BIT);
+
+      if (isl_aux_usage_has_compression(dst_image->planes[plane].aux_usage))
+         return true;
+   }
 
    return false;
 }
@@ -620,10 +643,14 @@ copy_buffer_to_image(struct anv_cmd_buffer *cmd_buffer,
 {
    struct {
       struct blorp_surf surf;
+      struct isl_surf *isl_surf;
+      enum isl_format copy_format;
       uint32_t level;
       VkOffset3D offset;
    } image, buffer, *src, *dst;
 
+   struct isl_surf buffer_isl_surf;
+   buffer.isl_surf = &buffer_isl_surf;
    buffer.level = 0;
    buffer.offset = (VkOffset3D) { 0, 0, 0 };
 
@@ -636,13 +663,8 @@ copy_buffer_to_image(struct anv_cmd_buffer *cmd_buffer,
    }
 
    const VkImageAspectFlags aspect = region->imageSubresource.aspectMask;
-
-   get_blorp_surf_for_anv_image(cmd_buffer, anv_image, aspect,
-                                buffer_to_image ?
-                                VK_IMAGE_USAGE_TRANSFER_DST_BIT :
-                                VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-                                image_layout, ISL_AUX_USAGE_NONE,
-                                &image.surf);
+   const unsigned plane = anv_image_aspect_to_plane(anv_image, aspect);
+   image.isl_surf = &anv_image->planes[plane].primary_surface.isl;
    image.offset =
       vk_image_sanitize_offset(&anv_image->vk, region->imageOffset);
    image.level = region->imageSubresource.mipLevel;
@@ -659,43 +681,28 @@ copy_buffer_to_image(struct anv_cmd_buffer *cmd_buffer,
    const enum isl_format linear_format =
       anv_get_isl_format(cmd_buffer->device->info, anv_image->vk.format,
                          aspect, VK_IMAGE_TILING_LINEAR);
-   const struct isl_format_layout *linear_fmtl =
-      isl_format_get_layout(linear_format);
 
    const struct vk_image_buffer_layout buffer_layout =
       vk_image_buffer_copy_layout(&anv_image->vk, region);
 
-   /* Some formats have additional restrictions which may cause ISL to
-    * fail to create a surface for us.  For example, YCbCr formats
-    * have to have 2-pixel aligned strides.
-    *
-    * To avoid these issues, we always bind the buffer as if it's a
-    * "normal" format like RGBA32_UINT.  Since we're using blorp_copy,
-    * the format doesn't matter as long as it has the right bpb.
-    */
-   const VkExtent2D buffer_extent = {
-      .width = DIV_ROUND_UP(extent.width, linear_fmtl->bw),
-      .height = DIV_ROUND_UP(extent.height, linear_fmtl->bh),
-   };
-   const enum isl_format buffer_format =
-      isl_format_for_size(linear_fmtl->bpb / 8);
-
-   struct isl_surf buffer_isl_surf;
    get_blorp_surf_for_anv_buffer(cmd_buffer,
                                  anv_buffer, region->bufferOffset,
-                                 buffer_extent.width, buffer_extent.height,
-                                 buffer_layout.row_stride_B, buffer_format,
+                                 extent.width, extent.height,
+                                 buffer_layout.row_stride_B, linear_format,
                                  false, &buffer.surf, &buffer_isl_surf);
 
-   if (&image == dst) {
-      /* In this case, the source is the buffer and, since blorp takes its
-       * copy dimensions in terms of the source format, we have to use the
-       * scaled down version for compressed textures because the source
-       * format is an RGB format.
-       */
-      extent.width = buffer_extent.width;
-      extent.height = buffer_extent.height;
+   blorp_copy_get_formats(&cmd_buffer->device->isl_dev,
+                          src->isl_surf, dst->isl_surf,
+                          &src->copy_format, &dst->copy_format);
 
+   get_blorp_surf_for_anv_image(cmd_buffer, anv_image, aspect,
+                                buffer_to_image ?
+                                VK_IMAGE_USAGE_TRANSFER_DST_BIT :
+                                VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                                image_layout, ISL_AUX_USAGE_NONE,
+                                image.copy_format, &image.surf);
+
+   if (&image == dst) {
       anv_cmd_buffer_mark_image_written(cmd_buffer, anv_image,
                                         aspect, dst->surf.aux_usage,
                                         dst->level,
@@ -890,16 +897,27 @@ blit_image(struct anv_cmd_buffer *cmd_buffer,
                                        dst_res->aspectMask));
 
    anv_foreach_image_aspect_bit(aspect_bit, src_image, src_res->aspectMask) {
+      VkFormat src_vk_format =
+         src_image->emu_plane_format != VK_FORMAT_UNDEFINED ?
+         src_image->emu_plane_format : src_image->vk.format;
+
+      struct anv_format_plane src_format =
+         anv_get_format_aspect(cmd_buffer->device->info, src_vk_format,
+                               1U << aspect_bit, src_image->vk.tiling);
+      struct anv_format_plane dst_format =
+         anv_get_format_aspect(cmd_buffer->device->info, dst_image->vk.format,
+                               1U << aspect_bit, dst_image->vk.tiling);
+
       get_blorp_surf_for_anv_image(cmd_buffer,
                                    src_image, 1U << aspect_bit,
                                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-                                   src_image_layout, ISL_AUX_USAGE_NONE, &src);
+                                   src_image_layout, ISL_AUX_USAGE_NONE,
+                                   src_format.isl_format, &src);
       get_blorp_surf_for_anv_image(cmd_buffer,
                                    dst_image, 1U << aspect_bit,
                                    VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                                   dst_image_layout, ISL_AUX_USAGE_NONE, &dst);
-
-      VkFormat src_vk_format = src_image->vk.format;
+                                   dst_image_layout, ISL_AUX_USAGE_NONE,
+                                   dst_format.isl_format, &dst);
 
       if (src_image->emu_plane_format != VK_FORMAT_UNDEFINED) {
          /* redirect src to the hidden plane */
@@ -910,16 +928,7 @@ blit_image(struct anv_cmd_buffer *cmd_buffer,
             anv_image_address(src_image, &surface->memory_range);
          src.surf = &surface->isl,
          src.addr.offset = address.offset;
-
-         src_vk_format = src_image->emu_plane_format;
       }
-
-      struct anv_format_plane src_format =
-         anv_get_format_aspect(cmd_buffer->device->info, src_vk_format,
-                               1U << aspect_bit, src_image->vk.tiling);
-      struct anv_format_plane dst_format =
-         anv_get_format_aspect(cmd_buffer->device->info, dst_image->vk.format,
-                               1U << aspect_bit, dst_image->vk.tiling);
 
       unsigned dst_start, dst_end;
       if (dst_image->vk.image_type == VK_IMAGE_TYPE_3D) {
@@ -1294,7 +1303,7 @@ exec_ccs_op(struct anv_cmd_buffer *cmd_buffer,
    get_blorp_surf_for_anv_image(cmd_buffer, image, aspect,
                                 0, ANV_IMAGE_LAYOUT_EXPLICIT_AUX,
                                 image->planes[plane].aux_usage,
-                                &surf);
+                                format, &surf);
 
    uint32_t level_width = u_minify(surf.surf->logical_level0_px.w, level);
    uint32_t level_height = u_minify(surf.surf->logical_level0_px.h, level);
@@ -1358,7 +1367,7 @@ exec_mcs_op(struct anv_cmd_buffer *cmd_buffer,
    struct blorp_surf surf;
    get_blorp_surf_for_anv_image(cmd_buffer, image, aspect,
                                 0, ANV_IMAGE_LAYOUT_EXPLICIT_AUX,
-                                ISL_AUX_USAGE_MCS, &surf);
+                                ISL_AUX_USAGE_MCS, format, &surf);
 
    /* Blorp will store the clear color for us if we provide the clear color
     * address and we are doing a fast clear. So we save the clear value into
@@ -1408,22 +1417,21 @@ void anv_CmdClearColorImage(
    struct blorp_batch batch;
    anv_blorp_batch_init(cmd_buffer, &batch, 0);
 
+   struct anv_format_plane src_format =
+      anv_get_format_aspect(cmd_buffer->device->info, image->vk.format,
+                            VK_IMAGE_ASPECT_COLOR_BIT, image->vk.tiling);
+   struct blorp_surf surf;
+   get_blorp_surf_for_anv_image(cmd_buffer, image,
+                                VK_IMAGE_ASPECT_COLOR_BIT,
+                                VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                imageLayout, ISL_AUX_USAGE_NONE,
+                                src_format.isl_format, &surf);
+
+   union isl_color_value clear_color = vk_to_isl_color(*pColor);
+
+
    for (unsigned r = 0; r < rangeCount; r++) {
-      if (pRanges[r].aspectMask == 0)
-         continue;
-
-      assert(pRanges[r].aspectMask & VK_IMAGE_ASPECT_ANY_COLOR_BIT_ANV);
-
-      struct blorp_surf surf;
-      get_blorp_surf_for_anv_image(cmd_buffer,
-                                   image, pRanges[r].aspectMask,
-                                   VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                                   imageLayout, ISL_AUX_USAGE_NONE, &surf);
-
-      struct anv_format_plane src_format =
-         anv_get_format_aspect(cmd_buffer->device->info, image->vk.format,
-                               VK_IMAGE_ASPECT_COLOR_BIT, image->vk.tiling);
-      union isl_color_value clear_color = vk_to_isl_color(*pColor);
+      assert(pRanges[r].aspectMask == VK_IMAGE_ASPECT_COLOR_BIT);
 
       uint32_t level_count =
          vk_image_subresource_level_count(&image->vk, &pRanges[r]);
@@ -1515,7 +1523,8 @@ void anv_CmdClearDepthStencilImage(
       get_blorp_surf_for_anv_image(cmd_buffer,
                                    image, VK_IMAGE_ASPECT_DEPTH_BIT,
                                    VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                                   imageLayout, ISL_AUX_USAGE_NONE, &depth);
+                                   imageLayout, ISL_AUX_USAGE_NONE,
+                                   ISL_FORMAT_UNSUPPORTED, &depth);
    } else {
       memset(&depth, 0, sizeof(depth));
    }
@@ -1524,7 +1533,8 @@ void anv_CmdClearDepthStencilImage(
       get_blorp_surf_for_anv_image(cmd_buffer,
                                    image, VK_IMAGE_ASPECT_STENCIL_BIT,
                                    VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                                   imageLayout, ISL_AUX_USAGE_NONE, &stencil);
+                                   imageLayout, ISL_AUX_USAGE_NONE,
+                                   ISL_FORMAT_UNSUPPORTED, &stencil);
    } else {
       memset(&stencil, 0, sizeof(stencil));
    }
@@ -1693,9 +1703,8 @@ clear_color_attachment(struct anv_cmd_buffer *cmd_buffer,
          anv_cmd_buffer_mark_image_fast_cleared(cmd_buffer, iview->image,
                                                 iview->planes[0].isl.format,
                                                 clear_color);
-         anv_cmd_buffer_load_clear_color_from_image(cmd_buffer,
-                                                    att->surface_state.state,
-                                                    iview->image);
+         anv_cmd_buffer_load_clear_color(cmd_buffer, att->surface_state.state,
+                                         iview);
       }
       return;
    }
@@ -1763,7 +1772,8 @@ anv_fast_clear_depth_stencil(struct anv_cmd_buffer *cmd_buffer,
       get_blorp_surf_for_anv_image(cmd_buffer,
                                    image, VK_IMAGE_ASPECT_DEPTH_BIT,
                                    0, ANV_IMAGE_LAYOUT_EXPLICIT_AUX,
-                                   image->planes[plane].aux_usage, &depth);
+                                   image->planes[plane].aux_usage,
+                                   ISL_FORMAT_UNSUPPORTED, &depth);
    }
 
    struct blorp_surf stencil = {};
@@ -1773,7 +1783,8 @@ anv_fast_clear_depth_stencil(struct anv_cmd_buffer *cmd_buffer,
       get_blorp_surf_for_anv_image(cmd_buffer,
                                    image, VK_IMAGE_ASPECT_STENCIL_BIT,
                                    0, ANV_IMAGE_LAYOUT_EXPLICIT_AUX,
-                                   image->planes[plane].aux_usage, &stencil);
+                                   image->planes[plane].aux_usage,
+                                   ISL_FORMAT_UNSUPPORTED, &stencil);
    }
 
    /* From the Sky Lake PRM Volume 7, "Depth Buffer Clear":
@@ -2068,16 +2079,13 @@ anv_image_msaa_resolve(struct anv_cmd_buffer *cmd_buffer,
    get_blorp_surf_for_anv_image(cmd_buffer, src_image, aspect,
                                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
                                 ANV_IMAGE_LAYOUT_EXPLICIT_AUX,
-                                src_aux_usage, &src_surf);
-   if (src_aux_usage == ISL_AUX_USAGE_MCS) {
-      src_surf.clear_color_addr = anv_to_blorp_address(
-         anv_image_get_clear_color_addr(cmd_buffer->device, src_image,
-                                        VK_IMAGE_ASPECT_COLOR_BIT));
-   }
+                                src_aux_usage, src_format_override,
+                                &src_surf);
    get_blorp_surf_for_anv_image(cmd_buffer, dst_image, aspect,
                                 VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                                 ANV_IMAGE_LAYOUT_EXPLICIT_AUX,
-                                dst_aux_usage, &dst_surf);
+                                dst_aux_usage, dst_format_override,
+                                &dst_surf);
    anv_cmd_buffer_mark_image_written(cmd_buffer, dst_image,
                                      aspect, dst_aux_usage,
                                      dst_level, dst_base_layer, layer_count);
@@ -2284,7 +2292,7 @@ anv_image_clear_color(struct anv_cmd_buffer *cmd_buffer,
    get_blorp_surf_for_anv_image(cmd_buffer, image, aspect,
                                 VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                                 ANV_IMAGE_LAYOUT_EXPLICIT_AUX,
-                                aux_usage, &surf);
+                                aux_usage, format, &surf);
    anv_cmd_buffer_mark_image_written(cmd_buffer, image, aspect, aux_usage,
                                      level, base_layer, layer_count);
 
@@ -2321,7 +2329,8 @@ anv_image_clear_depth_stencil(struct anv_cmd_buffer *cmd_buffer,
       get_blorp_surf_for_anv_image(cmd_buffer,
                                    image, VK_IMAGE_ASPECT_DEPTH_BIT,
                                    0, ANV_IMAGE_LAYOUT_EXPLICIT_AUX,
-                                   depth_aux_usage, &depth);
+                                   depth_aux_usage, ISL_FORMAT_UNSUPPORTED,
+                                   &depth);
    }
 
    struct blorp_surf stencil = {};
@@ -2331,7 +2340,8 @@ anv_image_clear_depth_stencil(struct anv_cmd_buffer *cmd_buffer,
       get_blorp_surf_for_anv_image(cmd_buffer,
                                    image, VK_IMAGE_ASPECT_STENCIL_BIT,
                                    0, ANV_IMAGE_LAYOUT_EXPLICIT_AUX,
-                                   image->planes[plane].aux_usage, &stencil);
+                                   image->planes[plane].aux_usage,
+                                   ISL_FORMAT_UNSUPPORTED, &stencil);
    }
 
    /* Blorp may choose to clear stencil using RGBA32_UINT for better
@@ -2385,7 +2395,8 @@ anv_image_hiz_op(struct anv_cmd_buffer *cmd_buffer,
    get_blorp_surf_for_anv_image(cmd_buffer,
                                 image, VK_IMAGE_ASPECT_DEPTH_BIT,
                                 0, ANV_IMAGE_LAYOUT_EXPLICIT_AUX,
-                                image->planes[plane].aux_usage, &surf);
+                                image->planes[plane].aux_usage,
+                                ISL_FORMAT_UNSUPPORTED, &surf);
 
    blorp_hiz_op(&batch, &surf, level, base_layer, layer_count, hiz_op);
 

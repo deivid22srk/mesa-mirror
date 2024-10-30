@@ -10,6 +10,7 @@
 #include "radv_pipeline_rt.h"
 #include "radv_queue.h"
 #include "radv_shader.h"
+#include "radv_spm.h"
 #include "radv_sqtt.h"
 #include "vk_common_entrypoints.h"
 #include "vk_semaphore.h"
@@ -139,6 +140,7 @@ radv_sqtt_reloc_graphics_shaders(struct radv_device *device, struct radv_graphic
    struct radv_shader_dma_submission *submission = NULL;
    struct radv_sqtt_shaders_reloc *reloc;
    uint32_t code_size = 0;
+   VkResult result;
 
    reloc = calloc(1, sizeof(*reloc));
    if (!reloc)
@@ -156,8 +158,8 @@ radv_sqtt_reloc_graphics_shaders(struct radv_device *device, struct radv_graphic
    /* Allocate memory for all shader binaries. */
    reloc->alloc = radv_alloc_shader_memory(device, code_size, false, pipeline);
    if (!reloc->alloc) {
-      free(reloc);
-      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+      result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+      goto fail;
    }
 
    reloc->bo = reloc->alloc->arena->bo;
@@ -169,8 +171,10 @@ radv_sqtt_reloc_graphics_shaders(struct radv_device *device, struct radv_graphic
 
    if (device->shader_use_invisible_vram) {
       submission = radv_shader_dma_get_submission(device, reloc->bo, slab_va, code_size);
-      if (!submission)
-         return VK_ERROR_UNKNOWN;
+      if (!submission) {
+         result = VK_ERROR_UNKNOWN;
+         goto fail;
+      }
    }
 
    for (int i = 0; i < MESA_VULKAN_SHADER_STAGES; ++i) {
@@ -194,8 +198,10 @@ radv_sqtt_reloc_graphics_shaders(struct radv_device *device, struct radv_graphic
    if (device->shader_use_invisible_vram) {
       uint64_t upload_seq = 0;
 
-      if (!radv_shader_dma_submit(device, submission, &upload_seq))
-         return VK_ERROR_UNKNOWN;
+      if (!radv_shader_dma_submit(device, submission, &upload_seq)) {
+         result = VK_ERROR_UNKNOWN;
+         goto fail;
+      }
 
       for (int i = 0; i < MESA_VULKAN_SHADER_STAGES; ++i) {
          struct radv_shader *shader = pipeline->base.shaders[i];
@@ -213,6 +219,12 @@ radv_sqtt_reloc_graphics_shaders(struct radv_device *device, struct radv_graphic
    pipeline->sqtt_shaders_reloc = reloc;
 
    return VK_SUCCESS;
+
+fail:
+   if (reloc->alloc)
+      radv_free_shader_memory(device, reloc->alloc);
+   free(reloc);
+   return result;
 }
 
 static void
@@ -661,6 +673,7 @@ radv_handle_sqtt(VkQueue _queue)
 
    if (device->sqtt_enabled) {
       struct ac_sqtt_trace sqtt_trace = {0};
+      struct ac_spm_trace spm_trace;
 
       radv_end_sqtt(queue);
       device->sqtt_enabled = false;
@@ -668,12 +681,7 @@ radv_handle_sqtt(VkQueue _queue)
       /* TODO: Do something better than this whole sync. */
       device->vk.dispatch_table.QueueWaitIdle(_queue);
 
-      if (radv_get_sqtt_trace(queue, &sqtt_trace)) {
-         struct ac_spm_trace spm_trace;
-
-         if (device->spm.bo)
-            ac_spm_get_trace(&device->spm, &spm_trace);
-
+      if (radv_get_sqtt_trace(queue, &sqtt_trace) && (!device->spm.bo || radv_get_spm_trace(queue, &spm_trace))) {
          ac_dump_rgp_capture(&pdev->info, &sqtt_trace, device->spm.bo ? &spm_trace : NULL);
       } else {
          /* Trigger a new capture if the driver failed to get
@@ -1252,11 +1260,12 @@ sqtt_CmdExecuteCommands(VkCommandBuffer commandBuffer, uint32_t commandBufferCou
 }
 
 VKAPI_ATTR void VKAPI_CALL
-sqtt_CmdExecuteGeneratedCommandsNV(VkCommandBuffer commandBuffer, VkBool32 isPreprocessed,
-                                   const VkGeneratedCommandsInfoNV *pGeneratedCommandsInfo)
+sqtt_CmdExecuteGeneratedCommandsEXT(VkCommandBuffer commandBuffer, VkBool32 isPreprocessed,
+                                    const VkGeneratedCommandsInfoEXT *pGeneratedCommandsInfo)
 {
    /* There is no ExecuteIndirect Vulkan event in RGP yet. */
-   API_MARKER_ALIAS(ExecuteGeneratedCommandsNV, ExecuteCommands, commandBuffer, isPreprocessed, pGeneratedCommandsInfo);
+   API_MARKER_ALIAS(ExecuteGeneratedCommandsEXT, ExecuteCommands, commandBuffer, isPreprocessed,
+                    pGeneratedCommandsInfo);
 }
 
 VKAPI_ATTR void VKAPI_CALL

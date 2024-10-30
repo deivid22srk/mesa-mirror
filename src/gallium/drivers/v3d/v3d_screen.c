@@ -30,6 +30,7 @@
 #include "pipe/p_defines.h"
 #include "pipe/p_screen.h"
 #include "pipe/p_state.h"
+#include "util/perf/cpu_trace.h"
 
 #include "util/u_debug.h"
 #include "util/u_memory.h"
@@ -762,7 +763,6 @@ v3d_screen_get_compiler_options(struct pipe_screen *pscreen,
                  */
                 .max_unroll_iterations = 16,
                 .force_indirect_unrolling_sampler = true,
-                .has_ddx_intrinsics = true,
                 .scalarize_ddx = true,
         };
 
@@ -916,6 +916,8 @@ v3d_screen_create(int fd, const struct pipe_screen_config *config,
         struct v3d_screen *screen = rzalloc(NULL, struct v3d_screen);
         struct pipe_screen *pscreen;
 
+        util_cpu_trace_init();
+
         pscreen = &screen->base;
 
         pscreen->destroy = v3d_screen_destroy;
@@ -942,10 +944,13 @@ v3d_screen_create(int fd, const struct pipe_screen_config *config,
         if (!v3d_get_device_info(screen->fd, &screen->devinfo, &v3d_ioctl))
                 goto fail;
 
-        screen->perfcnt_names = rzalloc_array(screen, char*, screen->devinfo.max_perfcnt);
-        if (!screen->perfcnt_names) {
-                fprintf(stderr, "Error allocating performance counters names");
-                goto fail;
+        const uint8_t max_perfcnt = screen->devinfo.max_perfcnt;
+        if (max_perfcnt) {
+                screen->perfcnt_names = rzalloc_array(screen, char*, max_perfcnt);
+                if (!screen->perfcnt_names) {
+                        fprintf(stderr, "Error allocating performance counters names");
+                        goto fail;
+                }
         }
 
         driParseConfigFiles(config->options, config->options_info, 0, "v3d",

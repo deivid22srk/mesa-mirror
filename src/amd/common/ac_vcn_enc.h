@@ -149,10 +149,6 @@
 #define RENCODE_AV1_CDEF_MODE_DISABLE                                               0
 #define RENCODE_AV1_CDEF_MODE_ENABLE                                                1
 
-#define RENCODE_AV1_ORDER_HINT_BITS                                                 8
-#define RENCODE_AV1_DELTA_FRAME_ID_LENGTH                                           15
-#define RENCODE_AV1_ADDITIONAL_FRAME_ID_LENGTH                                      1
-
 #define RENCODE_AV1_NUM_REF_FRAMES                                                  8
 #define RENCODE_AV1_REFS_PER_FRAME                                                  7
 #define RENCODE_AV1_SDB_FRAME_CONTEXT_SIZE                                          947200
@@ -238,7 +234,6 @@
 #define RENCODE_COLOR_SPACE_YUV                                                     0
 #define RENCODE_COLOR_SPACE_RGB                                                     1
 
-#define RENCODE_VCN4_AV1_MAX_NUM_LTR                                                2
 #define RENCODE_AV1_CDEF_MODE_DEFAULT                                               1
 #define RENCODE_AV1_CDEF_MODE_EXPLICIT                                              2
 
@@ -342,6 +337,7 @@ typedef struct rvcn_enc_av1_spec_misc_s {
    uint32_t cdef_y_sec_strength[RENCODE_AV1_CDEF_MAX_NUM];
    uint32_t cdef_uv_pri_strength[RENCODE_AV1_CDEF_MAX_NUM];
    uint32_t cdef_uv_sec_strength[RENCODE_AV1_CDEF_MAX_NUM];
+   uint32_t disallow_skip_mode;
     int32_t delta_q_y_dc;
     int32_t delta_q_u_dc;
     int32_t delta_q_u_ac;
@@ -596,33 +592,6 @@ typedef struct rvcn_enc_metadata_buffer_s {
    uint32_t two_pass_search_center_map_offset;
 } rvcn_enc_metadata_buffer_t;
 
-typedef struct rvcn_enc_sei_hdr_cll_s {
-   uint16_t max_cll;
-   uint16_t max_fall;
-} rvcn_enc_sei_hdr_cll_t;
-
-typedef struct rvcn_enc_sei_hdr_mdcv_s {
-   uint16_t primary_chromaticity_x[3];
-   uint16_t primary_chromaticity_y[3];
-   uint16_t white_point_chromaticity_x;
-   uint16_t white_point_chromaticity_y;
-   uint32_t luminance_max;
-   uint32_t luminance_min;
-} rvcn_enc_sei_hdr_mdcv_t;
-
-/* shared sei structure */
-typedef struct rvcn_enc_seidata_s {
-   union {
-      struct {
-         uint32_t hdr_cll:1;
-         uint32_t hdr_mdcv:1;
-      };
-      uint32_t value;
-   } flags;
-   rvcn_enc_sei_hdr_cll_t hdr_cll;
-   rvcn_enc_sei_hdr_mdcv_t hdr_mdcv;
-} rvcn_enc_seidata_t;
-
 typedef struct rvcn_enc_video_bitstream_buffer_s {
    uint32_t mode;
    uint32_t video_bitstream_buffer_address_hi;
@@ -736,46 +705,6 @@ typedef struct rvcn_enc_output_format_s
    uint32_t output_chroma_location;  /* chroma location to luma */
    uint32_t output_color_bit_depth;
 } rvcn_enc_output_format_t;
-
-typedef struct rvcn_enc_av1_timing_info_s
-{
-   uint32_t num_units_in_display_tick;
-   uint32_t time_scale;
-   uint32_t num_tick_per_picture_minus1;
-}rvcn_enc_av1_timing_info_t;
-
-typedef struct rvcn_enc_av1_color_description_s
-{
-   uint32_t color_primaries;
-   uint32_t transfer_characteristics;
-   uint32_t maxtrix_coefficients;
-   uint32_t color_range;
-   uint32_t chroma_sample_position;
-}rvcn_enc_av1_color_description_t;
-
-#define AV1_ENC_FRAME_TYPE_KEY 0x00
-#define AV1_ENC_FRAME_TYPE_INTER 0x01
-#define AV1_ENC_FRAME_TYPE_INTRA_ONLY 0x02
-#define AV1_ENC_FRAME_TYPE_SWITCH 0x03
-#define AV1_ENC_FRAME_TYPE_SHOW_EXISTING 0x04
-
-typedef struct rvcn_enc_av1_ref_frame_s
-{
-   bool in_use;
-   bool is_ltr;
-   uint32_t frame_id;
-   uint32_t temporal_id;
-   uint32_t slot_id;
-   uint32_t frame_type;
-   uint32_t ltr_seq;
-   void *frame_signature;
-} rvcn_enc_av1_ref_frame_t;
-
-typedef struct rvcn_enc_av1_recon_slot_s
-{
-   bool in_use;
-   bool is_orphaned;
-} rvcn_enc_av1_recon_slot_t;
 
 #define RENCODE_QP_MAP_TYPE_NONE               0
 #define RENCODE_QP_MAP_TYPE_DELTA              1

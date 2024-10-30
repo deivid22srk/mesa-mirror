@@ -77,7 +77,7 @@ namespace elk {
 class fs_builder;
 }
 
-struct shader_stats {
+struct elk_shader_stats {
    const char *scheduler_mode;
    unsigned promoted_constants;
    unsigned spill_count;
@@ -266,6 +266,7 @@ public:
                                                     elk_fs_inst *inst);
    void insert_gfx4_post_send_dependency_workarounds(elk_bblock_t *block,
                                                      elk_fs_inst *inst);
+   bool workaround_source_arf_before_eot();
    void vfail(const char *msg, va_list args);
    void fail(const char *msg, ...);
    void limit_dispatch_width(unsigned n, const char *msg);
@@ -409,7 +410,7 @@ public:
    /* The API selected subgroup size */
    unsigned api_subgroup_size; /**< 0, 8, 16, 32 */
 
-   struct shader_stats shader_stats;
+   struct elk_shader_stats shader_stats;
 
    void lower_mul_dword_inst(elk_fs_inst *inst, elk_bblock_t *block);
    void lower_mul_qword_inst(elk_fs_inst *inst, elk_bblock_t *block);
@@ -452,7 +453,7 @@ public:
 
    void enable_debug(const char *shader_name);
    int generate_code(const elk_cfg_t *cfg, int dispatch_width,
-                     struct shader_stats shader_stats,
+                     struct elk_shader_stats shader_stats,
                      const elk::performance &perf,
                      struct elk_compile_stats *stats);
    void add_const_data(void *data, unsigned size);

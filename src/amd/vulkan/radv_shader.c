@@ -198,6 +198,7 @@ radv_optimize_nir_algebraic(nir_shader *nir, bool opt_offsets, bool opt_mqsad)
       NIR_PASS(_, nir, nir_opt_cse);
       NIR_PASS(more_algebraic, nir, nir_opt_algebraic);
       NIR_PASS(_, nir, nir_opt_generate_bfi);
+      NIR_PASS(_, nir, nir_opt_remove_phis);
       NIR_PASS(_, nir, nir_opt_dead_cf);
    }
 
@@ -206,6 +207,7 @@ radv_optimize_nir_algebraic(nir_shader *nir, bool opt_offsets, bool opt_mqsad)
          .uniform_max = 0,
          .buffer_max = ~0,
          .shared_max = ~0,
+         .shared_atomic_max = ~0,
       };
       NIR_PASS(_, nir, nir_opt_offsets, &offset_options);
    }
@@ -669,7 +671,7 @@ radv_consider_culling(const struct radv_physical_device *pdev, struct nir_shader
       max_ps_params = 12; /* GFX10.3 and newer discrete GPUs. */
 
    /* TODO: consider other heuristics here, such as PS execution time */
-   if (util_bitcount64(ps_inputs_read & ~VARYING_BIT_POS) > max_ps_params)
+   if (util_bitcount64(ps_inputs_read) > max_ps_params)
       return false;
 
    /* Only triangle culling is supported. */
@@ -884,13 +886,6 @@ radv_create_shader_arena(struct radv_device *device, struct radv_shader_free_lis
 
    if (replayable)
       flags |= RADEON_FLAG_REPLAYABLE;
-
-   /* vkCmdUpdatePipelineIndirectBufferNV() can be called on any queue supporting transfer
-    * operations and it's not required to call it on the same queue as DGC execute. To make sure the
-    * compute shader BO is part of the DGC execute submission, force all shaders to be local BOs.
-    */
-   if (device->vk.enabled_features.deviceGeneratedComputePipelines)
-      flags |= RADEON_FLAG_PREFER_LOCAL_BO;
 
    VkResult result;
    result = radv_bo_create(device, NULL, arena_size, RADV_SHADER_ALLOC_ALIGNMENT, RADEON_DOMAIN_VRAM, flags,
@@ -1284,8 +1279,10 @@ radv_init_shader_upload_queue(struct radv_device *device)
    for (unsigned i = 0; i < RADV_SHADER_UPLOAD_CS_COUNT; i++) {
       struct radv_shader_dma_submission *submission = calloc(1, sizeof(struct radv_shader_dma_submission));
       submission->cs = ws->cs_create(ws, AMD_IP_SDMA, false);
-      if (!submission->cs)
+      if (!submission->cs) {
+         free(submission);
          return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+      }
       list_addtail(&submission->list, &device->shader_dma_submissions);
    }
 

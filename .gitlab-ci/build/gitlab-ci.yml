@@ -64,11 +64,14 @@
 
 
 # Make sure this list stays the same as all the jobs with
-# `stage: build-for-tests`
+# `stage: build-for-tests`, except for the windows job as
+# explained below.
 .build-for-tests-jobs:
   - job: debian-testing
     optional: true
   - job: debian-testing-asan
+    optional: true
+  - job: debian-build-testing
     optional: true
   - job: debian-arm32
     optional: true
@@ -78,10 +81,10 @@
     optional: true
   - job: debian-arm64-asan
     optional: true
-  - job: windows-msvc
-    optional: true
-  - job: debian-clang-release
-    optional: true
+  # Windows runners don't have more than one build right now, so there is
+  # no need to wait on the "first one" to be done.
+  # - job: windows-msvc
+  #   optional: true
   - job: python-test
     optional: true
 
@@ -184,9 +187,7 @@ debian-testing-msan:
 
 debian-build-testing:
   extends: .meson-build
-  needs:
-    - !reference [.meson-build, needs]
-    - !reference [.build-for-tests-jobs]
+  stage: build-for-tests
   variables:
     BUILDTYPE: debug
     UNWIND: "enabled"
@@ -214,13 +215,26 @@ debian-build-testing:
   script: |
     .gitlab-ci/meson/build.sh
     .gitlab-ci/prepare-artifacts.sh
-  timeout: 15m
 
 shader-db:
   stage: code-validation
   extends:
     - .use-debian/x86_64_build
-    - .container+build-rules
+  rules:
+    - !reference [.never-post-merge-rules, rules]
+    - !reference [.core-rules, rules]
+    # Keep this list in sync with the drivers tested in run-shader-db.sh
+    - !reference [.freedreno-common-rules, rules]
+    - !reference [.intel-common-rules, rules]
+    - !reference [.lima-rules, rules]
+    - !reference [.v3d-rules, rules]
+    - !reference [.vc4-rules, rules]
+    - !reference [.nouveau-rules, rules]
+    - !reference [.r300-rules, rules]
+    # Also run if this job's own config or script changes
+    - changes:
+        - .gitlab-ci/build/gitlab-ci.yml
+        - .gitlab-ci/run-shader-db.sh
   needs:
     - debian-build-testing
   variables:
@@ -320,12 +334,17 @@ fedora-release:
     - !reference [.build-for-tests-jobs]
   variables:
     BUILDTYPE: "release"
-    C_LINK_ARGS: >
+    # array-bounds are pure non-LTO gcc buggy warning, verify after bump to F39
+    C_ARGS: >
       -Wno-error=stringop-overflow
       -Wno-error=stringop-overread
+      -Wno-error=array-bounds
     CPP_ARGS: >
       -Wno-error=dangling-reference
       -Wno-error=overloaded-virtual
+    C_LINK_ARGS: >
+      -Wno-error=stringop-overflow
+      -Wno-error=stringop-overread
     CPP_LINK_ARGS: >
       -Wno-error=stringop-overflow
       -Wno-error=stringop-overread
@@ -336,9 +355,7 @@ fedora-release:
       -D glvnd=enabled
       -D platforms=x11,wayland
     EXTRA_OPTION: >
-      -D b_lto=true
       -D osmesa=true
-      -D selinux=true
       -D tools=drm-shim,etnaviv,freedreno,glsl,intel,nir,nouveau,lima,panfrost,imagination
       -D vulkan-layers=device-select,overlay
       -D intel-rt=enabled
@@ -646,11 +663,7 @@ debian-clang:
 
 debian-clang-release:
   extends: debian-clang
-  stage: build-for-tests
-  # `needs:` inherited from debian-clang, so we have to override it back to
-  # its original value
-  needs:
-    - !reference [.meson-build, needs]
+  # `needs:` inherited from debian-clang
   variables:
     BUILDTYPE: "release"
     DRI_LOADERS: >

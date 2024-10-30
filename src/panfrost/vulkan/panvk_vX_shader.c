@@ -547,7 +547,7 @@ panvk_compile_nir(struct panvk_device *dev, nir_shader *nir,
       void *data = malloc(bin_size);
 
       if (data == NULL)
-         return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+         return panvk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
       memcpy(data, bin_ptr, bin_size);
       shader->bin_size = bin_size;
@@ -661,12 +661,16 @@ panvk_shader_upload(struct panvk_device *dev, struct panvk_shader *shader,
 
    shader->code_mem = panvk_pool_upload_aligned(
       &dev->mempools.exec, shader->bin_ptr, shader->bin_size, 128);
+   if (!panvk_priv_mem_dev_addr(shader->code_mem))
+      return panvk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
 
 #if PAN_ARCH <= 7
    if (shader->info.stage == MESA_SHADER_FRAGMENT)
       return VK_SUCCESS;
 
    shader->rsd = panvk_pool_alloc_desc(&dev->mempools.rw, RENDERER_STATE);
+   if (!panvk_priv_mem_dev_addr(shader->rsd))
+      return panvk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
 
    pan_pack(panvk_priv_mem_host_addr(shader->rsd), RENDERER_STATE, cfg) {
       pan_shader_prepare_rsd(&shader->info, panvk_shader_get_dev_addr(shader),
@@ -675,6 +679,8 @@ panvk_shader_upload(struct panvk_device *dev, struct panvk_shader *shader,
 #else
    if (shader->info.stage != MESA_SHADER_VERTEX) {
       shader->spd = panvk_pool_alloc_desc(&dev->mempools.rw, SHADER_PROGRAM);
+      if (!panvk_priv_mem_dev_addr(shader->spd))
+         return panvk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
 
       pan_pack(panvk_priv_mem_host_addr(shader->spd), SHADER_PROGRAM, cfg) {
          cfg.stage = pan_shader_stage(&shader->info);
@@ -696,6 +702,9 @@ panvk_shader_upload(struct panvk_device *dev, struct panvk_shader *shader,
    } else {
       shader->spds.pos_points =
          panvk_pool_alloc_desc(&dev->mempools.rw, SHADER_PROGRAM);
+      if (!panvk_priv_mem_dev_addr(shader->spds.pos_points))
+         return panvk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+
       pan_pack(panvk_priv_mem_host_addr(shader->spds.pos_points),
                SHADER_PROGRAM, cfg) {
          cfg.stage = pan_shader_stage(&shader->info);
@@ -709,6 +718,9 @@ panvk_shader_upload(struct panvk_device *dev, struct panvk_shader *shader,
 
       shader->spds.pos_triangles =
          panvk_pool_alloc_desc(&dev->mempools.rw, SHADER_PROGRAM);
+      if (!panvk_priv_mem_dev_addr(shader->spds.pos_triangles))
+         return panvk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+
       pan_pack(panvk_priv_mem_host_addr(shader->spds.pos_triangles),
                SHADER_PROGRAM, cfg) {
          cfg.stage = pan_shader_stage(&shader->info);
@@ -724,6 +736,9 @@ panvk_shader_upload(struct panvk_device *dev, struct panvk_shader *shader,
       if (shader->info.vs.secondary_enable) {
          shader->spds.var =
             panvk_pool_alloc_desc(&dev->mempools.rw, SHADER_PROGRAM);
+         if (!panvk_priv_mem_dev_addr(shader->spds.var))
+            return panvk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+
          pan_pack(panvk_priv_mem_host_addr(shader->spds.var), SHADER_PROGRAM,
                   cfg) {
             unsigned work_count = shader->info.vs.secondary_work_reg_count;
@@ -754,13 +769,19 @@ panvk_shader_destroy(struct vk_device *vk_dev, struct vk_shader *vk_shader,
    free((void *)shader->asm_str);
    ralloc_free((void *)shader->nir_str);
 
-   panvk_pool_free_mem(&dev->mempools.exec, shader->code_mem);
+   panvk_pool_free_mem(&shader->code_mem);
 
 #if PAN_ARCH <= 7
-   panvk_pool_free_mem(&dev->mempools.exec, shader->rsd);
-   panvk_pool_free_mem(&dev->mempools.exec, shader->desc_info.others.map);
+   panvk_pool_free_mem(&shader->rsd);
+   panvk_pool_free_mem(&shader->desc_info.others.map);
 #else
-   panvk_pool_free_mem(&dev->mempools.exec, shader->spd);
+   if (shader->info.stage != MESA_SHADER_VERTEX) {
+      panvk_pool_free_mem(&shader->spd);
+   } else {
+      panvk_pool_free_mem(&shader->spds.var);
+      panvk_pool_free_mem(&shader->spds.pos_points);
+      panvk_pool_free_mem(&shader->spds.pos_triangles);
+   }
 #endif
 
    free((void *)shader->bin_ptr);
@@ -788,7 +809,7 @@ panvk_compile_shader(struct panvk_device *dev,
    shader = vk_shader_zalloc(&dev->vk, &panvk_shader_ops, info->stage,
                              pAllocator, sizeof(*shader));
    if (shader == NULL)
-      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return panvk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    struct panfrost_compile_inputs inputs = {
       .gpu_id = phys_dev->kmod.props.gpu_prod_id,
@@ -891,7 +912,7 @@ shader_desc_info_deserialize(struct blob_reader *blob,
          panvk_priv_mem_host_addr(shader->desc_info.others.map);
 
       if (!copy_table)
-         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+         return panvk_error(shader, VK_ERROR_OUT_OF_DEVICE_MEMORY);
 
       blob_copy_bytes(blob, copy_table, others_count * sizeof(*copy_table));
    }
@@ -923,12 +944,12 @@ panvk_deserialize_shader(struct vk_device *vk_dev, struct blob_reader *blob,
    const uint32_t bin_size = blob_read_uint32(blob);
 
    if (blob->overrun)
-      return vk_error(device, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
+      return panvk_error(device, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
 
    shader = vk_shader_zalloc(vk_dev, &panvk_shader_ops, info.stage, pAllocator,
                              sizeof(*shader));
    if (shader == NULL)
-      return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return panvk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    shader->info = info;
    shader->local_size = local_size;
@@ -937,7 +958,7 @@ panvk_deserialize_shader(struct vk_device *vk_dev, struct blob_reader *blob,
    shader->bin_ptr = malloc(bin_size);
    if (shader->bin_ptr == NULL) {
       panvk_shader_destroy(vk_dev, &shader->vk, pAllocator);
-      return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return panvk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
    }
 
    blob_copy_bytes(blob, (void *)shader->bin_ptr, shader->bin_size);
@@ -946,12 +967,12 @@ panvk_deserialize_shader(struct vk_device *vk_dev, struct blob_reader *blob,
 
    if (result != VK_SUCCESS) {
       panvk_shader_destroy(vk_dev, &shader->vk, pAllocator);
-      return vk_error(device, result);
+      return panvk_error(device, result);
    }
 
    if (blob->overrun) {
       panvk_shader_destroy(vk_dev, &shader->vk, pAllocator);
-      return vk_error(device, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
+      return panvk_error(device, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
    }
 
    result = panvk_shader_upload(device, shader, pAllocator);
@@ -1424,3 +1445,63 @@ const struct vk_device_shader_ops panvk_per_arch(device_shader_ops) = {
    .cmd_set_dynamic_graphics_state = vk_cmd_set_dynamic_graphics_state,
    .cmd_bind_shaders = panvk_cmd_bind_shaders,
 };
+
+static void
+panvk_internal_shader_destroy(struct vk_device *vk_dev,
+                              struct vk_shader *vk_shader,
+                              const VkAllocationCallbacks *pAllocator)
+{
+   struct panvk_device *dev = to_panvk_device(vk_dev);
+   struct panvk_internal_shader *shader =
+      container_of(vk_shader, struct panvk_internal_shader, vk);
+
+   panvk_pool_free_mem(&shader->code_mem);
+
+#if PAN_ARCH <= 7
+   panvk_pool_free_mem(&shader->rsd);
+#else
+   panvk_pool_free_mem(&shader->spd);
+#endif
+
+   vk_shader_free(&dev->vk, pAllocator, &shader->vk);
+}
+
+static const struct vk_shader_ops panvk_internal_shader_ops = {
+   .destroy = panvk_internal_shader_destroy,
+};
+
+VkResult
+panvk_per_arch(create_internal_shader)(
+   struct panvk_device *dev, nir_shader *nir,
+   struct panfrost_compile_inputs *compiler_inputs,
+   struct panvk_internal_shader **shader_out)
+{
+   struct panvk_internal_shader *shader =
+      vk_shader_zalloc(&dev->vk, &panvk_internal_shader_ops, nir->info.stage,
+                       NULL, sizeof(*shader));
+   if (shader == NULL)
+      return panvk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   VkResult result;
+   struct util_dynarray binary;
+
+   util_dynarray_init(&binary, nir);
+   GENX(pan_shader_compile)(nir, compiler_inputs, &binary, &shader->info);
+
+   unsigned bin_size = util_dynarray_num_elements(&binary, uint8_t);
+   if (bin_size) {
+      shader->code_mem = panvk_pool_upload_aligned(&dev->mempools.exec,
+                                                   binary.data, bin_size, 128);
+      if (!panvk_priv_mem_dev_addr(shader->code_mem)) {
+         result = panvk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+         goto err_free_shader;
+      }
+   }
+
+   *shader_out = shader;
+   return VK_SUCCESS;
+
+err_free_shader:
+   vk_shader_free(&dev->vk, NULL, &shader->vk);
+   return result;
+}

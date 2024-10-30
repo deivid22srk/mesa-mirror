@@ -7,6 +7,7 @@
 
 #include "util/ralloc.h"
 
+#include "instr-a3xx.h"
 #include "ir3.h"
 #include "ir3_compiler.h"
 
@@ -347,6 +348,15 @@ validate_instr(struct ir3_validate_ctx *ctx, struct ir3_instruction *instr)
 
       break;
    case 3:
+      switch (instr->opc) {
+      case OPC_MAD_S24:
+      case OPC_MAD_U24:
+         validate_assert(ctx, !(instr->dsts[0]->flags & IR3_REG_HALF));
+         validate_assert(ctx, !(instr->srcs[0]->flags & IR3_REG_HALF));
+         break;
+      default:
+         break;
+      }
       /* Validate that cat3 opc matches the src type.  We've already checked
        * that all the src regs are same type
        */
@@ -433,6 +443,37 @@ validate_instr(struct ir3_validate_ctx *ctx, struct ir3_instruction *instr)
          validate_assert(ctx, !(instr->srcs[1]->flags & IR3_REG_HALF));
          validate_assert(ctx, !(instr->srcs[2]->flags & IR3_REG_HALF));
          validate_reg_size(ctx, instr->dsts[0], instr->cat6.type);
+	 break;
+      case OPC_ATOMIC_B_CMPXCHG:
+         if (instr->cat6.type == TYPE_ATOMIC_U64) {
+            validate_assert(ctx, !(instr->dsts[0]->flags & IR3_REG_HALF));
+            validate_assert(ctx, instr->dsts[0]->wrmask == 0x3f);
+         } else {
+            validate_reg_size(ctx, instr->dsts[0], instr->cat6.type);
+         }
+         validate_assert(ctx, !(instr->srcs[0]->flags & IR3_REG_HALF));
+         validate_assert(ctx, !(instr->srcs[1]->flags & IR3_REG_HALF));
+         break;
+      case OPC_ATOMIC_B_XCHG:
+         if (instr->cat6.type == TYPE_ATOMIC_U64) {
+            validate_assert(ctx, !(instr->dsts[0]->flags & IR3_REG_HALF));
+            validate_assert(ctx, instr->dsts[0]->wrmask == 0xf);
+         } else {
+            validate_reg_size(ctx, instr->dsts[0], instr->cat6.type);
+         }
+         validate_assert(ctx, !(instr->srcs[0]->flags & IR3_REG_HALF));
+         validate_assert(ctx, !(instr->srcs[1]->flags & IR3_REG_HALF));
+         break;
+      case OPC_ATOMIC_G_CMPXCHG:
+      case OPC_ATOMIC_G_XCHG:
+         if (instr->cat6.type == TYPE_ATOMIC_U64) {
+            validate_assert(ctx, !(instr->dsts[0]->flags & IR3_REG_HALF));
+            validate_assert(ctx, instr->dsts[0]->wrmask == 0x3);
+         } else {
+            validate_reg_size(ctx, instr->dsts[0], instr->cat6.type);
+         }
+         validate_assert(ctx, !(instr->srcs[0]->flags & IR3_REG_HALF));
+         validate_assert(ctx, !(instr->srcs[1]->flags & IR3_REG_HALF));
          break;
       case OPC_SHFL:
          validate_reg_size(ctx, instr->srcs[0], instr->cat6.type);

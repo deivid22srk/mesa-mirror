@@ -64,8 +64,10 @@ radv_pipeline_capture_shader_stats(const struct radv_device *device, VkPipelineC
    const struct radv_physical_device *pdev = radv_device_physical(device);
    const struct radv_instance *instance = radv_physical_device_instance(pdev);
 
+   /* Capture shader statistics when RGP is enabled to correlate shader hashes with Fossilize. */
    return (flags & VK_PIPELINE_CREATE_2_CAPTURE_STATISTICS_BIT_KHR) ||
-          (instance->debug_flags & RADV_DEBUG_DUMP_SHADER_STATS) || device->keep_shader_info;
+          (instance->debug_flags & RADV_DEBUG_DUMP_SHADER_STATS) || device->keep_shader_info ||
+          (instance->vk.trace_mode & RADV_TRACE_MODE_RGP);
 }
 
 void
@@ -135,7 +137,7 @@ radv_pipeline_get_shader_key(const struct radv_device *device, const VkPipelineS
    if (flags & VK_PIPELINE_CREATE_2_VIEW_INDEX_FROM_DEVICE_INDEX_BIT_KHR)
       key.view_index_from_device_index = 1;
 
-   if (flags & VK_PIPELINE_CREATE_INDIRECT_BINDABLE_BIT_NV)
+   if (flags & VK_PIPELINE_CREATE_2_INDIRECT_BINDABLE_BIT_EXT)
       key.indirect_bindable = 1;
 
    if (stage->stage & RADV_GRAPHICS_STAGE_BITS) {
@@ -446,10 +448,9 @@ radv_postprocess_nir(struct radv_device *device, const struct radv_graphics_stat
 
    bool fix_derivs_in_divergent_cf =
       stage->stage == MESA_SHADER_FRAGMENT && !radv_use_llvm_for_stage(pdev, stage->stage);
-   if (fix_derivs_in_divergent_cf) {
-      NIR_PASS(_, stage->nir, nir_convert_to_lcssa, true, true);
+   if (fix_derivs_in_divergent_cf)
       nir_divergence_analysis(stage->nir);
-   }
+
    NIR_PASS(_, stage->nir, ac_nir_lower_tex,
             &(ac_nir_lower_tex_options){
                .gfx_level = gfx_level,
@@ -457,8 +458,6 @@ radv_postprocess_nir(struct radv_device *device, const struct radv_graphics_stat
                .fix_derivs_in_divergent_cf = fix_derivs_in_divergent_cf,
                .max_wqm_vgprs = 64, // TODO: improve spiller and RA support for linear VGPRs
             });
-   if (fix_derivs_in_divergent_cf)
-      NIR_PASS(_, stage->nir, nir_opt_remove_phis); /* cleanup LCSSA phis */
 
    if (stage->nir->info.uses_resource_info_query)
       NIR_PASS(_, stage->nir, ac_nir_lower_resinfo, gfx_level);
@@ -572,22 +571,17 @@ radv_postprocess_nir(struct radv_device *device, const struct radv_graphics_stat
    NIR_PASS_V(stage->nir, radv_nir_lower_abi, gfx_level, stage, gfx_state, pdev->info.address32_hi);
    radv_optimize_nir_algebraic(
       stage->nir, io_to_mem || lowered_ngg || stage->stage == MESA_SHADER_COMPUTE || stage->stage == MESA_SHADER_TASK,
-      gfx_level >= GFX7);
+      gfx_level >= GFX8);
 
    NIR_PASS(_, stage->nir, nir_lower_fp16_casts, nir_lower_fp16_split_fp64);
 
    if (stage->nir->info.bit_sizes_int & (8 | 16)) {
-      if (gfx_level >= GFX8) {
-         NIR_PASS(_, stage->nir, nir_convert_to_lcssa, true, true);
+      if (gfx_level >= GFX8)
          nir_divergence_analysis(stage->nir);
-      }
 
       if (nir_lower_bit_size(stage->nir, lower_bit_size_callback, device)) {
          NIR_PASS(_, stage->nir, nir_opt_constant_folding);
       }
-
-      if (gfx_level >= GFX8)
-         NIR_PASS(_, stage->nir, nir_opt_remove_phis); /* cleanup LCSSA phis */
    }
    if (gfx_level >= GFX9) {
       bool separate_g16 = gfx_level >= GFX10;
@@ -1062,7 +1056,7 @@ radv_GetPipelineExecutableStatisticsKHR(VkDevice _device, const VkPipelineExecut
          break;
 
       case MESA_SHADER_FRAGMENT:
-         s->value.u64 += shader->info.ps.colors_written + !!shader->info.ps.writes_z +
+         s->value.u64 += DIV_ROUND_UP(util_bitcount(shader->info.ps.colors_written), 4) + !!shader->info.ps.writes_z +
                          !!shader->info.ps.writes_stencil + !!shader->info.ps.writes_sample_mask +
                          !!shader->info.ps.writes_mrt0_alpha;
          break;

@@ -762,7 +762,7 @@ radv_query_opaque_metadata(struct radv_device *device, struct radv_image *image,
 
    radv_make_texture_descriptor(device, image, false, (VkImageViewType)image->vk.image_type, plane_format,
                                 &fixedmapping, 0, image->vk.mip_levels - 1, 0, image->vk.array_layers - 1, plane_width,
-                                plane_height, image->vk.extent.depth, 0.0f, desc, NULL, 0, NULL, NULL);
+                                plane_height, image->vk.extent.depth, 0.0f, desc, NULL, NULL, NULL);
 
    radv_set_mutable_tex_desc_fields(device, image, base_level_info, plane_id, 0, 0, surface->blk_w, false, false, false,
                                     false, desc, NULL);
@@ -1066,12 +1066,31 @@ radv_get_ac_surf_info(struct radv_device *device, const struct radv_image *image
    info.num_channels = vk_format_get_nr_components(image->vk.format);
 
    if (!vk_format_is_depth_or_stencil(image->vk.format) && !image->shareable &&
-       !(image->vk.create_flags & (VK_IMAGE_CREATE_SPARSE_ALIASED_BIT | VK_IMAGE_CREATE_ALIAS_BIT)) &&
+       !(image->vk.create_flags & (VK_IMAGE_CREATE_SPARSE_ALIASED_BIT | VK_IMAGE_CREATE_ALIAS_BIT |
+                                   VK_IMAGE_CREATE_DESCRIPTOR_BUFFER_CAPTURE_REPLAY_BIT_EXT)) &&
        image->vk.tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) {
       info.surf_index = &device->image_mrt_offset_counter;
+      info.fmask_surf_index = &device->fmask_mrt_offset_counter;
    }
 
    return info;
+}
+
+static void
+radv_surface_init(struct radv_physical_device *pdev, const struct ac_surf_info *surf_info, struct radeon_surf *surf)
+{
+   uint32_t type = RADEON_SURF_GET(surf->flags, TYPE);
+   uint32_t mode = RADEON_SURF_GET(surf->flags, MODE);
+
+   struct ac_surf_config config;
+
+   memcpy(&config.info, surf_info, sizeof(config.info));
+   config.is_1d = type == RADEON_SURF_TYPE_1D || type == RADEON_SURF_TYPE_1D_ARRAY;
+   config.is_3d = type == RADEON_SURF_TYPE_3D;
+   config.is_cube = type == RADEON_SURF_TYPE_CUBEMAP;
+   config.is_array = type == RADEON_SURF_TYPE_1D_ARRAY || type == RADEON_SURF_TYPE_2D_ARRAY;
+
+   ac_compute_surface(pdev->addrlib, &pdev->info, &config, mode, surf);
 }
 
 VkResult
@@ -1128,7 +1147,7 @@ radv_image_create_layout(struct radv_device *device, struct radv_image_create_in
          image->planes[plane].surface.flags |= RADEON_SURF_DISABLE_DCC | RADEON_SURF_NO_FMASK | RADEON_SURF_NO_HTILE;
       }
 
-      device->ws->surface_init(device->ws, &info, &image->planes[plane].surface);
+      radv_surface_init(pdev, &info, &image->planes[plane].surface);
 
       if (plane == 0) {
          if (!radv_use_dcc_for_image_late(device, image))
@@ -1260,7 +1279,7 @@ radv_select_modifier(const struct radv_device *dev, VkFormat format,
       .dcc_retile = true,
    };
 
-   ac_get_supported_modifiers(&pdev->info, &modifier_options, vk_format_to_pipe_format(format), &mod_count, NULL);
+   ac_get_supported_modifiers(&pdev->info, &modifier_options, radv_format_to_pipe_format(format), &mod_count, NULL);
 
    uint64_t *mods = calloc(mod_count, sizeof(*mods));
 
@@ -1268,7 +1287,7 @@ radv_select_modifier(const struct radv_device *dev, VkFormat format,
    if (!mods)
       return mod_list->pDrmFormatModifiers[0];
 
-   ac_get_supported_modifiers(&pdev->info, &modifier_options, vk_format_to_pipe_format(format), &mod_count, mods);
+   ac_get_supported_modifiers(&pdev->info, &modifier_options, radv_format_to_pipe_format(format), &mod_count, mods);
 
    for (unsigned i = 0; i < mod_count; ++i) {
       for (uint32_t j = 0; j < mod_list->drmFormatModifierCount; ++j) {

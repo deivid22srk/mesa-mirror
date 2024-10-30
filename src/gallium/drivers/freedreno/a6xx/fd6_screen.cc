@@ -74,7 +74,7 @@ fd6_screen_is_format_supported(struct pipe_screen *pscreen,
    }
 
    if (usage & PIPE_BIND_SHADER_IMAGE) {
-      if (sample_count > 1)
+      if (sample_count > 0)
          return false;
 
       /* So, this only matters for image writes but 'usage' doesn't
@@ -154,8 +154,7 @@ fd6_screen_init(struct pipe_screen *pscreen)
    uint32_t depth_cache_size =
       screen->info->num_ccu * screen->info->a6xx.sysmem_per_ccu_depth_cache_size;
    uint32_t color_cache_size =
-      (screen->info->num_ccu * screen->info->a6xx.sysmem_per_ccu_color_cache_size) /
-      (1 << screen->info->a6xx.gmem_ccu_color_cache_fraction);
+      (screen->info->num_ccu * screen->info->a6xx.sysmem_per_ccu_color_cache_size);
    uint32_t color_cache_size_gmem =
       color_cache_size /
       (1 << screen->info->a6xx.gmem_ccu_color_cache_fraction);

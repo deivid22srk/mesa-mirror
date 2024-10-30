@@ -34,6 +34,7 @@
 #include "nv_push_cl9097.h"
 #include "nv_push_clb197.h"
 #include "nv_push_clc397.h"
+#include "nv_push_clc797.h"
 
 static void
 shared_var_info(const struct glsl_type *type, unsigned *size, unsigned *align)
@@ -715,10 +716,10 @@ nvk_max_shader_push_dw(struct nvk_physical_device *pdev,
       max_dw_count += 2;
 
    if (stage == MESA_SHADER_FRAGMENT)
-      max_dw_count += 11;
+      max_dw_count += 13;
 
    if (last_vtgm) {
-      max_dw_count += 6;
+      max_dw_count += 8;
       max_dw_count += 4 * (5 + (128 / 4));
    }
 
@@ -774,7 +775,7 @@ nvk_shader_fill_push(struct nvk_device *dev,
    }
 
    if (shader->info.stage == MESA_SHADER_FRAGMENT) {
-      max_dw_count += 11;
+      max_dw_count += 13;
 
       P_MTHD(p, NVC397, SET_SUBTILING_PERF_KNOB_A);
       P_NV9097_SET_SUBTILING_PERF_KNOB_A(p, {
@@ -800,9 +801,37 @@ nvk_shader_fill_push(struct nvk_device *dev,
          .z_max_unbounded_enable = shader->info.fs.writes_depth,
       });
 
+      if (pdev->info.cls_eng3d >= TURING_A) {
+         /* From the Vulkan 1.3.297 spec:
+          *
+          *    "If sample shading is enabled, an implementation must invoke
+          *    the fragment shader at least
+          *
+          *    max( ⌈ minSampleShading × rasterizationSamples ⌉, 1)
+          *
+          *    times per fragment."
+          *
+          * The max() here means that, regardless of the actual value of
+          * minSampleShading, we need to invoke at least once per pixel,
+          * meaning that we need to disable fragment shading rate.  We also
+          * need to disable FSR if sample shading is used by the shader.
+          */
+         P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_SET_SHADING_RATE_CONTROL));
+         P_INLINE_DATA(p, nvk_mme_shading_rate_control_sample_shading(
+            shader->sample_shading_enable ||
+            shader->info.fs.uses_sample_shading));
+      }
+
+      float mss = 0;
+      if (shader->info.fs.uses_sample_shading) {
+         mss = 1;
+      } else if (shader->sample_shading_enable) {
+         mss = CLAMP(shader->min_sample_shading, 0, 1);
+      } else {
+         mss = 0;
+      }
       P_1INC(p, NVB197, CALL_MME_MACRO(NVK_MME_SET_ANTI_ALIAS));
-      P_INLINE_DATA(p,
-         nvk_mme_anti_alias_min_sample_shading(shader->min_sample_shading));
+      P_INLINE_DATA(p, nvk_mme_anti_alias_min_sample_shading(mss));
    }
 
    /* Stash this before we do XFB and clip/cull */
@@ -812,7 +841,7 @@ nvk_shader_fill_push(struct nvk_device *dev,
 
    if (shader->info.stage != MESA_SHADER_FRAGMENT &&
        shader->info.stage != MESA_SHADER_TESS_CTRL) {
-      max_dw_count += 6;
+      max_dw_count += 8;
 
       P_IMMD(p, NV9097, SET_RT_LAYER, {
          .v       = 0,
@@ -820,6 +849,15 @@ nvk_shader_fill_push(struct nvk_device *dev,
                     CONTROL_GEOMETRY_SHADER_SELECTS_LAYER :
                     CONTROL_V_SELECTS_LAYER,
       });
+
+      if (pdev->info.cls_eng3d >= AMPERE_B) {
+         P_IMMD(p, NVC797, SET_VARIABLE_PIXEL_RATE_SHADING_TABLE_SELECT, {
+            .source = shader->info.vtg.writes_vprs_table_index ?
+                      SOURCE_FROM_VPRS_TABLE_INDEX :
+                      SOURCE_FROM_CONSTANT,
+            .source_constant_value = 0,
+         });
+      }
 
       const uint8_t clip_enable = shader->info.vtg.clip_enable;
       const uint8_t cull_enable = shader->info.vtg.cull_enable;
@@ -961,14 +999,10 @@ nvk_compile_shader(struct nvk_device *dev,
    }
 
    if (info->stage == MESA_SHADER_FRAGMENT) {
-      if (shader->info.fs.uses_sample_shading) {
-         shader->min_sample_shading = 1;
-      } else if (state != NULL && state->ms != NULL &&
-                 state->ms->sample_shading_enable) {
-         shader->min_sample_shading =
-            CLAMP(state->ms->min_sample_shading, 0, 1);
-      } else {
-         shader->min_sample_shading = 0;
+      if (state != NULL && state->ms != NULL) {
+         shader->sample_shading_enable = state->ms->sample_shading_enable;
+         if (state->ms->sample_shading_enable)
+            shader->min_sample_shading = state->ms->min_sample_shading;
       }
    }
 
@@ -1067,6 +1101,9 @@ nvk_deserialize_shader(struct vk_device *vk_dev,
    struct nvk_cbuf_map cbuf_map;
    blob_copy_bytes(blob, &cbuf_map, sizeof(cbuf_map));
 
+   bool sample_shading_enable;
+   blob_copy_bytes(blob, &sample_shading_enable, sizeof(sample_shading_enable));
+
    float min_sample_shading;
    blob_copy_bytes(blob, &min_sample_shading, sizeof(min_sample_shading));
 
@@ -1082,6 +1119,7 @@ nvk_deserialize_shader(struct vk_device *vk_dev,
 
    shader->info = info;
    shader->cbuf_map = cbuf_map;
+   shader->sample_shading_enable = sample_shading_enable;
    shader->min_sample_shading = min_sample_shading;
    shader->code_size = code_size;
    shader->data_size = data_size;
@@ -1137,6 +1175,8 @@ nvk_shader_serialize(struct vk_device *vk_dev,
 
    blob_write_bytes(blob, &shader->info, sizeof(shader->info));
    blob_write_bytes(blob, &shader->cbuf_map, sizeof(shader->cbuf_map));
+   blob_write_bytes(blob, &shader->sample_shading_enable,
+                    sizeof(shader->sample_shading_enable));
    blob_write_bytes(blob, &shader->min_sample_shading,
                     sizeof(shader->min_sample_shading));
 

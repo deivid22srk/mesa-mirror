@@ -198,6 +198,7 @@ can_do_blit(const struct pipe_blit_info *info)
    assert(info->dst.box.depth >= 0);
 
    fail_if(info->dst.resource->nr_samples > 1);
+   fail_if(info->src.resource->nr_samples > 1);
 
    fail_if(info->window_rectangle_include);
 
@@ -257,7 +258,6 @@ emit_setup(struct fd_batch *batch)
                           FD6_INVALIDATE_CCU_DEPTH);
 
    /* normal BLIT_OP_SCALE operation needs bypass RB_CCU_CNTL */
-   OUT_WFI5(ring);
    fd6_emit_ccu_cntl<CHIP>(ring, screen, false);
 }
 
@@ -310,8 +310,11 @@ emit_blit_setup(struct fd_ringbuffer *ring, enum pipe_format pfmt,
    OUT_RING(ring, blit_cntl);
 
    if (CHIP >= A7XX) {
-      OUT_PKT4(ring, REG_A7XX_SP_PS_UNKNOWN_B2D2, 1);
-      OUT_RING(ring, 0x20000000);
+      OUT_REG(ring, A7XX_TPL1_2D_SRC_CNTL(
+            .raw_copy = false,
+            .start_offset_texels = 0,
+            .type = A6XX_TEX_2D,
+      ));
    }
 
    if (fmt == FMT6_10_10_10_2_UNORM_DEST)

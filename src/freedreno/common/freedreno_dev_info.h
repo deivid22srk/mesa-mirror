@@ -35,6 +35,14 @@ struct fd_dev_info {
 
    int wave_granularity;
 
+   /* These are fallback values that should match what drm/msm programs, for
+    * kernels that don't support returning them. Newer devices should not set
+    * them and just use the value from the kernel.
+    */
+   uint32_t highest_bank_bit;
+   uint32_t ubwc_swizzle;
+   uint32_t macrotile_mode;
+
    /* Information for private memory calculations */
    uint32_t fibers_per_sp;
 
@@ -94,6 +102,11 @@ struct fd_dev_info {
       bool depth_bounds_require_depth_test_quirk;
 
       bool has_tex_filter_cubic;
+
+      /* The blob driver does not support SEPARATE_RECONSTRUCTION_FILTER_BIT
+       * before a6xx_gen3.  It still sets CHROMA_LINEAR bit according to
+       * chromaFilter, but the bit has no effect before a6xx_gen3.
+       */
       bool has_separate_chroma_filter;
 
       bool has_sample_locations;
@@ -212,6 +225,8 @@ struct fd_dev_info {
       /* Whether there is CP_EVENT_WRITE7::WRITE_SAMPLE_COUNT */
       bool has_event_write_sample_count;
 
+      bool has_64b_ssbo_atomics;
+
       /* Blob executes a special compute dispatch at the start of each
        * command buffers. We copy this dispatch as is.
        */
@@ -271,6 +286,9 @@ struct fd_dev_info {
       /* Whether a single clear blit could be used for both sysmem and gmem.*/
       bool has_generic_clear;
 
+      /* Whether r8g8 UBWC fast-clear work correctly. */
+      bool r8g8_faulty_fast_clear_quirk;
+
       /* a750 has a bug where writing and then reading a UBWC-compressed IBO
        * requires flushing UCHE. This is reproducible in many CTS tests, for
        * example dEQP-VK.image.load_store.with_format.2d.*.
@@ -281,6 +299,9 @@ struct fd_dev_info {
        * on every suspend/resume.
        */
       bool has_persistent_counter;
+
+      /* Whether only 256 vec4 constants are available for compute */
+      bool compute_constlen_quirk;
    } a7xx;
 };
 

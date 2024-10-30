@@ -33,13 +33,11 @@
 #include "main/consts_exts.h"
 #include "main/context.h"
 #include "main/shaderobj.h"
-#include "ir_uniform.h" /* for gl_uniform_storage */
 #include "util/glheader.h"
 #include "util/perf/cpu_trace.h"
 
 /**
- * This file included general link methods, using NIR, instead of IR as
- * the counter-part glsl/linker.cpp
+ * This file included general link methods, using NIR.
  */
 
 void
@@ -95,6 +93,8 @@ gl_nir_opts(nir_shader *nir)
       NIR_PASS(progress, nir, nir_opt_phi_precision);
       NIR_PASS(progress, nir, nir_opt_algebraic);
       NIR_PASS(progress, nir, nir_opt_constant_folding);
+      NIR_PASS(progress, nir, nir_io_add_const_offset_to_base,
+               nir_var_shader_in | nir_var_shader_out);
 
       if (!nir->info.flrp_lowered) {
          unsigned lower_flrp =
@@ -3514,23 +3514,6 @@ analyze_clip_cull_usage(struct gl_shader_program *prog, nir_shader *shader,
 
       if (cull_dist_written)
          info->cull_distance_array_size = glsl_get_length(cull_dist->type);
-
-      /* From the ARB_cull_distance spec:
-       *
-       * It is a compile-time or link-time error for the set of shaders forming
-       * a program to have the sum of the sizes of the gl_ClipDistance and
-       * gl_CullDistance arrays to be larger than
-       * gl_MaxCombinedClipAndCullDistances.
-       */
-      if ((uint32_t)(info->clip_distance_array_size + info->cull_distance_array_size) >
-          consts->MaxClipPlanes) {
-          linker_error(prog, "%s shader: the combined size of "
-                       "'gl_ClipDistance' and 'gl_CullDistance' size cannot "
-                       "be larger than "
-                       "gl_MaxCombinedClipAndCullDistances (%u)",
-                       _mesa_shader_stage_to_string(info->stage),
-                       consts->MaxClipPlanes);
-      }
    }
 }
 

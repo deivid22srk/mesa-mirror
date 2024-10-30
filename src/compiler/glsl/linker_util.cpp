@@ -27,9 +27,58 @@
 #include "linker_util.h"
 #include "util/bitscan.h"
 #include "util/set.h"
-#include "ir_uniform.h" /* for gl_uniform_storage */
-#include "main/shader_types.h"
 #include "main/consts_exts.h"
+
+void
+linker_error(gl_shader_program *prog, const char *fmt, ...)
+{
+   va_list ap;
+
+   ralloc_strcat(&prog->data->InfoLog, "error: ");
+   va_start(ap, fmt);
+   ralloc_vasprintf_append(&prog->data->InfoLog, fmt, ap);
+   va_end(ap);
+
+   prog->data->LinkStatus = LINKING_FAILURE;
+}
+
+void
+linker_warning(gl_shader_program *prog, const char *fmt, ...)
+{
+   va_list ap;
+
+   ralloc_strcat(&prog->data->InfoLog, "warning: ");
+   va_start(ap, fmt);
+   ralloc_vasprintf_append(&prog->data->InfoLog, fmt, ap);
+   va_end(ap);
+
+}
+
+void
+link_shaders_init(struct gl_context *ctx, struct gl_shader_program *prog)
+{
+   prog->data->LinkStatus = LINKING_SUCCESS; /* All error paths will set this to false */
+   prog->data->Validated = false;
+
+   /* Section 7.3 (Program Objects) of the OpenGL 4.5 Core Profile spec says:
+    *
+    *     "Linking can fail for a variety of reasons as specified in the
+    *     OpenGL Shading Language Specification, as well as any of the
+    *     following reasons:
+    *
+    *     - No shader objects are attached to program."
+    *
+    * The Compatibility Profile specification does not list the error.  In
+    * Compatibility Profile missing shader stages are replaced by
+    * fixed-function.  This applies to the case where all stages are
+    * missing.
+    */
+   if (prog->NumShaders == 0) {
+      if (ctx->API != API_OPENGL_COMPAT)
+         linker_error(prog, "no shaders attached to the program\n");
+      return;
+   }
+}
 
 /**
  * Given a string identifying a program resource, break it into a base name
@@ -508,4 +557,26 @@ _mesa_glsl_can_implicitly_convert(const glsl_type *from, const glsl_type *desire
    }
 
    return false;
+}
+
+void
+resource_name_updated(struct gl_resource_name *name)
+{
+   if (name->string) {
+      name->length = strlen(name->string);
+
+      const char *last_square_bracket = strrchr(name->string, '[');
+      if (last_square_bracket) {
+         name->last_square_bracket = last_square_bracket - name->string;
+         name->suffix_is_zero_square_bracketed =
+            strcmp(last_square_bracket, "[0]") == 0;
+      } else {
+         name->last_square_bracket = -1;
+         name->suffix_is_zero_square_bracketed = false;
+      }
+   } else {
+      name->length = 0;
+      name->last_square_bracket = -1;
+      name->suffix_is_zero_square_bracketed = false;
+   }
 }

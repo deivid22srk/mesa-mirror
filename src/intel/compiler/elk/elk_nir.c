@@ -1124,10 +1124,11 @@ elk_nir_link_shaders(const struct elk_compiler *compiler,
    }
 }
 
-bool
+static bool
 elk_nir_should_vectorize_mem(unsigned align_mul, unsigned align_offset,
                              unsigned bit_size,
                              unsigned num_components,
+                             unsigned hole_size,
                              nir_intrinsic_instr *low,
                              nir_intrinsic_instr *high,
                              void *data)
@@ -1136,7 +1137,7 @@ elk_nir_should_vectorize_mem(unsigned align_mul, unsigned align_offset,
     * those back into 32-bit ones anyway and UBO loads aren't split in NIR so
     * we don't want to make a mess for the back-end.
     */
-   if (bit_size > 32)
+   if (bit_size > 32 || hole_size || !nir_num_components_valid(num_components))
       return false;
 
    if (low->intrinsic == nir_intrinsic_load_ubo_uniform_block_intel ||
@@ -1463,7 +1464,6 @@ elk_postprocess_nir(nir_shader *nir, const struct elk_compiler *compiler,
    OPT(nir_opt_dead_cf);
 
    bool divergence_analysis_dirty = false;
-   NIR_PASS(_, nir, nir_convert_to_lcssa, true, true);
    NIR_PASS_V(nir, nir_divergence_analysis);
 
    /* TODO: Enable nir_opt_uniform_atomics on Gfx7.x too.
@@ -1488,15 +1488,11 @@ elk_postprocess_nir(nir_shader *nir, const struct elk_compiler *compiler,
    /* Do this only after the last opt_gcm. GCM will undo this lowering. */
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       if (divergence_analysis_dirty) {
-         NIR_PASS(_, nir, nir_convert_to_lcssa, true, true);
          NIR_PASS_V(nir, nir_divergence_analysis);
       }
 
       OPT(intel_nir_lower_non_uniform_barycentric_at_sample);
    }
-
-   /* Clean up LCSSA phis */
-   OPT(nir_opt_remove_phis);
 
    OPT(nir_lower_bool_to_int32);
    OPT(nir_copy_prop);

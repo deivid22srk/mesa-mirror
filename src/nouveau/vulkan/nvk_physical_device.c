@@ -45,6 +45,7 @@
 #include "clc3c0.h"
 #include "clc597.h"
 #include "clc5c0.h"
+#include "clc797.h"
 #include "clc997.h"
 
 static bool
@@ -108,6 +109,7 @@ nvk_get_device_extensions(const struct nvk_instance *instance,
       .KHR_format_feature_flags2 = true,
       .KHR_fragment_shader_barycentric = info->cls_eng3d >= TURING_A &&
          (nvk_nak_stages(info) & VK_SHADER_STAGE_FRAGMENT_BIT) != 0,
+      .KHR_fragment_shading_rate = info->cls_eng3d >= TURING_A,
       .KHR_get_memory_requirements2 = true,
       .KHR_image_format_list = true,
       .KHR_imageless_framebuffer = true,
@@ -157,6 +159,7 @@ nvk_get_device_extensions(const struct nvk_instance *instance,
       .KHR_shader_integer_dot_product = true,
       .KHR_shader_maximal_reconvergence = true,
       .KHR_shader_non_semantic_info = true,
+      .KHR_shader_quad_control = true,
       .KHR_shader_relaxed_extended_instruction = true,
       .KHR_shader_subgroup_extended_types = true,
       .KHR_shader_subgroup_rotate = nvk_use_nak(info),
@@ -187,6 +190,8 @@ nvk_get_device_extensions(const struct nvk_instance *instance,
       .EXT_color_write_enable = true,
       .EXT_custom_border_color = true,
       .EXT_depth_bias_control = true,
+      .EXT_depth_clamp_control = true,
+      .EXT_depth_clamp_zero_one = true,
       .EXT_depth_clip_control = true,
       .EXT_depth_clip_enable = true,
       .EXT_depth_range_unrestricted = info->cls_eng3d >= VOLTA_A,
@@ -419,6 +424,11 @@ nvk_get_device_features(const struct nv_device_info *info,
       .fragmentShaderBarycentric = info->cls_eng3d >= TURING_A &&
          (nvk_nak_stages(info) & VK_SHADER_STAGE_FRAGMENT_BIT) != 0,
 
+      /* VK_KHR_fragment_shading_rate */
+      .pipelineFragmentShadingRate = info->cls_eng3d >= TURING_A,
+      .primitiveFragmentShadingRate = info->cls_eng3d >= TURING_A,
+      .attachmentFragmentShadingRate = info->cls_eng3d >= TURING_A,
+
       /* VK_KHR_index_type_uint8 */
       .indexTypeUint8 = true,
 
@@ -448,6 +458,12 @@ nvk_get_device_features(const struct nv_device_info *info,
       /* VK_KHR_present_wait */
       .presentWait = supported_extensions->KHR_present_wait,
 
+      /* VK_KHR_shader_quad_control */
+      .shaderQuadControl = nvk_use_nak(info),
+
+      /* VK_KHR_shader_relaxed_extended_instruction */
+      .shaderRelaxedExtendedInstruction = true,
+
       /* VK_KHR_shader_clock */
       .shaderSubgroupClock = true,
       .shaderDeviceClock = true,
@@ -464,6 +480,9 @@ nvk_get_device_features(const struct nv_device_info *info,
       /* VK_KHR_shader_subgroup_rotate */
       .shaderSubgroupRotate = nvk_use_nak(info),
       .shaderSubgroupRotateClustered = nvk_use_nak(info),
+
+      /* VK_KHR_shader_subgroup_uniform_control_flow */
+      .shaderSubgroupUniformControlFlow = nvk_use_nak(info),
 
       /* VK_KHR_vertex_attribute_divisor */
       .vertexAttributeInstanceRateDivisor = true,
@@ -505,6 +524,12 @@ nvk_get_device_features(const struct nv_device_info *info,
       .leastRepresentableValueForceUnormRepresentation = true,
       .floatRepresentation = false,
       .depthBiasExact = true,
+
+      /* VK_EXT_depth_clamp_control */
+      .depthClampControl = true,
+
+      /* VK_EXT_depth_clamp_zero_one */
+      .depthClampZeroOne = true,
 
       /* VK_EXT_depth_clip_control */
       .depthClipControl = true,
@@ -645,9 +670,6 @@ nvk_get_device_features(const struct nv_device_info *info,
       /* VK_EXT_shader_replicated_composites */
       .shaderReplicatedComposites = true,
 
-      /* VK_KHR_shader_subgroup_uniform_control_flow */
-      .shaderSubgroupUniformControlFlow = nvk_use_nak(info),
-
       /* VK_EXT_texel_buffer_alignment */
       .texelBufferAlignment = true,
 
@@ -666,9 +688,6 @@ nvk_get_device_features(const struct nv_device_info *info,
 
       /* VK_NV_shader_sm_builtins */
       .shaderSMBuiltins = true,
-
-      /* VK_KHR_shader_relaxed_extended_instruction */
-      .shaderRelaxedExtendedInstruction = true,
    };
 }
 
@@ -1091,6 +1110,25 @@ nvk_get_device_properties(const struct nvk_instance *instance,
 
       /* VK_KHR_fragment_shader_barycentric */
       .triStripVertexOrderIndependentOfProvokingVertex = false,
+
+      /* VK_KHR_fragment_shading_rate */
+      .minFragmentShadingRateAttachmentTexelSize = { 16, 16 },
+      .maxFragmentShadingRateAttachmentTexelSize = { 16, 16 },
+      .maxFragmentShadingRateAttachmentTexelSizeAspectRatio = 1,
+      .primitiveFragmentShadingRateWithMultipleViewports = info->cls_eng3d >= AMPERE_B,
+      .layeredShadingRateAttachments = true,
+      .fragmentShadingRateNonTrivialCombinerOps = true,
+      .maxFragmentSize = { 4, 4 },
+      .maxFragmentSizeAspectRatio = 2,
+      .maxFragmentShadingRateCoverageSamples = 16,
+      .maxFragmentShadingRateRasterizationSamples = 16,
+      .fragmentShadingRateWithShaderDepthStencilWrites = true,
+      .fragmentShadingRateWithSampleMask = true,
+      .fragmentShadingRateWithShaderSampleMask = true,
+      .fragmentShadingRateWithConservativeRasterization = true,
+      //.fragmentShadingRateWithFragmentShaderInterlock = true,
+      .fragmentShadingRateWithCustomSampleLocations = true,
+      .fragmentShadingRateStrictMultiplyCombiner = true,
 
       /* VK_NV_shader_sm_builtins */
       .shaderSMCount = (uint32_t)info->tpc_count * info->mp_per_tpc,
@@ -1605,4 +1643,73 @@ nvk_GetPhysicalDeviceMultisamplePropertiesEXT(
    } else {
       pMultisampleProperties->maxSampleLocationGridSize = (VkExtent2D){0, 0};
    }
+}
+
+VkExtent2D
+nvk_max_shading_rate(const struct nvk_physical_device *pdev,
+                     VkSampleCountFlagBits samples)
+{
+   const struct nil_Extent4D_Samples px_extent_sa =
+      nil_px_extent_sa(nil_choose_sample_layout(samples));
+
+   assert(px_extent_sa.width <= 4);
+   assert(px_extent_sa.height <= 4);
+   assert(px_extent_sa.depth == 1);
+   assert(px_extent_sa.array_len == 1);
+
+   return (VkExtent2D) {
+      .width = 4 / px_extent_sa.width,
+      .height = 4 / px_extent_sa.height,
+   };
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+nvk_GetPhysicalDeviceFragmentShadingRatesKHR(
+   VkPhysicalDevice physicalDevice,
+   uint32_t *pFragmentShadingRateCount,
+   VkPhysicalDeviceFragmentShadingRateKHR *pFragmentShadingRates)
+{
+   VK_FROM_HANDLE(nvk_physical_device, pdev, physicalDevice);
+   VK_OUTARRAY_MAKE_TYPED(VkPhysicalDeviceFragmentShadingRateKHR, out,
+                          pFragmentShadingRates, pFragmentShadingRateCount);
+
+
+   /* From the Vulkan 1.3.297 spec:
+    *
+    *    "The returned array of fragment shading rates must be ordered from
+    *    largest fragmentSize.width value to smallest, and each set of
+    *    fragment shading rates with the same fragmentSize.width value must be
+    *    ordered from largest fragmentSize.height to smallest. Any two entries
+    *    in the array must not have the same fragmentSize values."
+    */
+   VkExtent2D shading_rates[] = {
+      { 4, 4 },
+      { 4, 2 },
+      { 2, 4 },
+      { 2, 2 },
+      { 2, 1 },
+      { 1, 2 },
+      { 1, 1 },
+   };
+
+   for (uint32_t i = 0; i < ARRAY_SIZE(shading_rates); i++) {
+      vk_outarray_append_typed(VkPhysicalDeviceFragmentShadingRateKHR, &out, p) {
+         p->fragmentSize = shading_rates[i];
+         if (shading_rates[i].width == 1 && shading_rates[i].height == 1) {
+            /* The Vulkan spec requires us to set ~0 for 1x1. */
+            p->sampleCounts = ~0;
+         } else {
+            for (uint32_t samples = 1; samples <= 16; samples <<= 1) {
+               VkExtent2D max_rate = nvk_max_shading_rate(pdev, samples);
+               if (shading_rates[i].width > max_rate.width ||
+                   shading_rates[i].height > max_rate.height)
+                  break;
+
+               p->sampleCounts |= samples;
+            }
+         }
+      }
+   }
+
+   return vk_outarray_status(&out);
 }

@@ -148,7 +148,6 @@ static const driOptionDescription radv_dri_options[] = {
       DRI_CONF_RADV_DISABLE_TRUNC_COORD(false)
       DRI_CONF_RADV_DISABLE_SINKING_LOAD_INPUT_FS(false)
       DRI_CONF_RADV_DISABLE_DEPTH_STORAGE(false)
-      DRI_CONF_RADV_DGC(false)
       DRI_CONF_RADV_FLUSH_BEFORE_QUERY_COPY(false)
       DRI_CONF_RADV_ENABLE_UNIFIED_HEAP_ON_APU(false)
       DRI_CONF_RADV_TEX_NON_UNIFORM(false)
@@ -243,8 +242,6 @@ radv_init_dri_options(struct radv_instance *instance)
    instance->drirc.override_ray_tracing_shader_version =
       driQueryOptioni(&instance->drirc.options, "radv_override_ray_tracing_shader_version");
 
-   instance->drirc.enable_dgc = driQueryOptionb(&instance->drirc.options, "radv_dgc");
-
    instance->drirc.override_vram_size = driQueryOptioni(&instance->drirc.options, "override_vram_size");
 
    instance->drirc.enable_khr_present_wait = driQueryOptionb(&instance->drirc.options, "vk_khr_present_wait");
@@ -299,17 +296,6 @@ static const struct vk_instance_extension_table radv_instance_extensions_support
 #endif
 };
 
-static void
-radv_handle_legacy_sqtt_trigger(struct vk_instance *instance)
-{
-   char *trigger_file = secure_getenv("RADV_THREAD_TRACE_TRIGGER");
-   if (trigger_file) {
-      instance->trace_trigger_file = trigger_file;
-      instance->trace_mode |= RADV_TRACE_MODE_RGP;
-      fprintf(stderr, "WARNING: RADV_THREAD_TRACE_TRIGGER is deprecated, please use MESA_VK_TRACE_TRIGGER instead.\n");
-   }
-}
-
 static enum radeon_ctx_pstate
 radv_parse_pstate(const char* str)
 {
@@ -352,7 +338,6 @@ radv_CreateInstance(const VkInstanceCreateInfo *pCreateInfo, const VkAllocationC
    }
 
    vk_instance_add_driver_trace_modes(&instance->vk, trace_options);
-   radv_handle_legacy_sqtt_trigger(&instance->vk);
 
    simple_mtx_init(&instance->shader_dump_mtx, mtx_plain);
 

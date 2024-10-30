@@ -204,6 +204,10 @@ VA_DRIVER_INIT_FUNC(VADriverContextP ctx)
    if (!drv->vscreen)
       goto error_screen;
 
+   /* video cannot work if these are not supported */
+   if (!drv->vscreen->pscreen->get_video_param || !drv->vscreen->pscreen->is_video_format_supported)
+      goto error_pipe;
+
    drv->pipe = pipe_create_multimedia_context(drv->vscreen->pscreen);
    if (!drv->pipe)
       goto error_pipe;
@@ -492,13 +496,32 @@ vlVaDestroyContext(VADriverContextP ctx, VAContextID context_id)
              PIPE_VIDEO_FORMAT_MPEG4_AVC) {
             if (context->desc.h264enc.frame_idx)
                _mesa_hash_table_destroy(context->desc.h264enc.frame_idx, NULL);
+            for (uint32_t i = 0; i < ARRAY_SIZE(context->desc.h264enc.dpb); i++) {
+               struct pipe_video_buffer *buf = context->desc.h264enc.dpb[i].buffer;
+               if (buf && !context->desc.h264enc.dpb[i].id)
+                  buf->destroy(buf);
+            }
             util_dynarray_fini(&context->desc.h264enc.raw_headers);
          }
          if (u_reduce_video_profile(context->decoder->profile) ==
              PIPE_VIDEO_FORMAT_HEVC) {
             if (context->desc.h265enc.frame_idx)
                _mesa_hash_table_destroy(context->desc.h265enc.frame_idx, NULL);
+            for (uint32_t i = 0; i < ARRAY_SIZE(context->desc.h265enc.dpb); i++) {
+               struct pipe_video_buffer *buf = context->desc.h265enc.dpb[i].buffer;
+               if (buf && !context->desc.h265enc.dpb[i].id)
+                  buf->destroy(buf);
+            }
             util_dynarray_fini(&context->desc.h265enc.raw_headers);
+         }
+         if (u_reduce_video_profile(context->decoder->profile) ==
+             PIPE_VIDEO_FORMAT_AV1) {
+            for (uint32_t i = 0; i < ARRAY_SIZE(context->desc.av1enc.dpb); i++) {
+               struct pipe_video_buffer *buf = context->desc.av1enc.dpb[i].buffer;
+               if (buf && !context->desc.av1enc.dpb[i].id)
+                  buf->destroy(buf);
+            }
+            util_dynarray_fini(&context->desc.av1enc.raw_headers);
          }
       } else {
          if (u_reduce_video_profile(context->decoder->profile) ==

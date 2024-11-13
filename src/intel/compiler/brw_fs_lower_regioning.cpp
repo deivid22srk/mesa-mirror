@@ -320,7 +320,7 @@ namespace {
 
       return (has_dst_aligned_region_restriction(devinfo, inst) &&
               !is_uniform(inst->src[i]) &&
-              (byte_stride(inst->src[i]) != byte_stride(inst->dst) ||
+              (byte_stride(inst->src[i]) != required_src_byte_stride(devinfo, inst, i) ||
                src_byte_offset != dst_byte_offset)) ||
              (has_subdword_integer_region_restriction(devinfo, inst) &&
               (byte_stride(inst->src[i]) != required_src_byte_stride(devinfo, inst, i) ||
@@ -628,34 +628,38 @@ namespace {
       ibld.UNDEF(tmp);
       tmp = horiz_stride(tmp, stride);
 
-      /* Emit a series of 32-bit integer copies from the temporary into the
-       * original destination.
-       */
-      const brw_reg_type raw_type = brw_int_type(MIN2(brw_type_size_bytes(tmp.type), 4),
-                                                 false);
-      const unsigned n = brw_type_size_bytes(tmp.type) / brw_type_size_bytes(raw_type);
-
-      if (inst->predicate && inst->opcode != BRW_OPCODE_SEL) {
-         /* Note that in general we cannot simply predicate the copies on the
-          * same flag register as the original instruction, since it may have
-          * been overwritten by the instruction itself.  Instead initialize
-          * the temporary with the previous contents of the destination
-          * register.
+      if (!inst->dst.is_null()) {
+         /* Emit a series of 32-bit integer copies from the temporary into the
+          * original destination.
           */
+         const brw_reg_type raw_type =
+            brw_int_type(MIN2(brw_type_size_bytes(tmp.type), 4), false);
+
+         const unsigned n =
+            brw_type_size_bytes(tmp.type) / brw_type_size_bytes(raw_type);
+
+         if (inst->predicate && inst->opcode != BRW_OPCODE_SEL) {
+            /* Note that in general we cannot simply predicate the copies on
+             * the same flag register as the original instruction, since it
+             * may have been overwritten by the instruction itself.  Instead
+             * initialize the temporary with the previous contents of the
+             * destination register.
+             */
+            for (unsigned j = 0; j < n; j++)
+               ibld.MOV(subscript(tmp, raw_type, j),
+                        subscript(inst->dst, raw_type, j));
+         }
+
          for (unsigned j = 0; j < n; j++)
-            ibld.MOV(subscript(tmp, raw_type, j),
-                     subscript(inst->dst, raw_type, j));
+            ibld.at(block, inst->next).MOV(subscript(inst->dst, raw_type, j),
+                                           subscript(tmp, raw_type, j));
+
+         /* If the destination was an accumulator, after lowering it will be a
+          * GRF. Clear writes_accumulator for the instruction.
+          */
+         if (inst->dst.is_accumulator())
+            inst->writes_accumulator = false;
       }
-
-      for (unsigned j = 0; j < n; j++)
-         ibld.at(block, inst->next).MOV(subscript(inst->dst, raw_type, j),
-                                        subscript(tmp, raw_type, j));
-
-      /* If the destination was an accumulator, after lowering it will be a
-       * GRF. Clear writes_accumulator for the instruction.
-       */
-      if (inst->dst.is_accumulator())
-         inst->writes_accumulator = false;
 
       /* Point the original instruction at the temporary, making sure to keep
        * any destination modifiers in the instruction.
@@ -717,6 +721,38 @@ namespace {
    }
 
    /**
+    * Fast-path for very specific kinds of invalid regions.
+    *
+    * Gfx12.5+ does not allow moves of B or UB sources to floating-point
+    * destinations. This restriction can be resolved more efficiently than by
+    * the general lowering in lower_src_modifiers or lower_src_region.
+    */
+   void
+   lower_src_conversion(fs_visitor *v, bblock_t *block, fs_inst *inst)
+   {
+      const intel_device_info *devinfo = v->devinfo;
+      const fs_builder ibld = fs_builder(v, block, inst).scalar_group();
+
+      /* We only handle scalar conversions from small types for now. */
+      assert(is_uniform(inst->src[0]));
+
+      brw_reg tmp = ibld.vgrf(brw_type_with_size(inst->src[0].type, 32));
+      fs_inst *mov = ibld.MOV(tmp, inst->src[0]);
+
+      inst->src[0] = component(tmp, 0);
+
+      /* Assert that neither the added MOV nor the original instruction will need
+       * any additional lowering.
+       */
+      assert(!has_invalid_src_region(devinfo, mov, 0));
+      assert(!has_invalid_src_modifiers(devinfo, mov, 0));
+      assert(!has_invalid_dst_region(devinfo, mov));
+
+      assert(!has_invalid_src_region(devinfo, inst, 0));
+      assert(!has_invalid_src_modifiers(devinfo, inst, 0));
+   }
+
+   /**
     * Legalize the source and destination regioning controls of the specified
     * instruction.
     */
@@ -731,6 +767,11 @@ namespace {
 
       if (has_invalid_dst_region(devinfo, inst))
          progress |= lower_dst_region(v, block, inst);
+
+      if (has_invalid_src_conversion(devinfo, inst)) {
+         lower_src_conversion(v, block, inst);
+         progress = true;
+      }
 
       for (unsigned i = 0; i < inst->sources; i++) {
          if (has_invalid_src_modifiers(devinfo, inst, i))

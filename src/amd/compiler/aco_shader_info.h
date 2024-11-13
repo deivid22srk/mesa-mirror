@@ -137,8 +137,6 @@ struct aco_shader_info {
    } cs;
 
    uint32_t gfx9_gs_ring_lds_size;
-
-   bool is_trap_handler_shader;
 };
 
 enum aco_compiler_debug_level {
@@ -196,6 +194,31 @@ enum aco_symbol_id {
 struct aco_symbol {
    enum aco_symbol_id id;
    unsigned offset;
+};
+
+#define MAX_SGPRS 108
+#define NUM_SAVED_VGPRS 2
+
+struct aco_trap_handler_layout {
+   uint32_t saved_vgprs[NUM_SAVED_VGPRS * 64];
+
+   uint32_t ttmp0;
+   uint32_t ttmp1;
+
+   struct {
+      uint32_t status;
+      uint32_t mode;
+      uint32_t trap_sts;
+      uint32_t hw_id1;
+      uint32_t gpr_alloc;
+      uint32_t lds_alloc;
+      uint32_t ib_sts;
+   } sq_wave_regs;
+
+   uint32_t m0;
+   uint32_t exec_lo;
+   uint32_t exec_hi;
+   uint32_t sgprs[MAX_SGPRS];
 };
 
 #ifdef __cplusplus

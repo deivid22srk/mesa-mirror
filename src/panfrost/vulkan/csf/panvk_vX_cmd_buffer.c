@@ -75,6 +75,39 @@ emit_tls(struct panvk_cmd_buffer *cmdbuf)
    }
 }
 
+/**
+ * Write all sync point updates to seqno registers and reset the relative sync
+ * points to 0.
+ */
+static void
+flush_sync_points(struct panvk_cmd_buffer *cmdbuf)
+{
+   for (uint32_t i = 0; i < ARRAY_SIZE(cmdbuf->state.cs); i++) {
+      struct cs_builder *b = panvk_get_cs_builder(cmdbuf, i);
+
+      if (!cs_is_valid(b)) {
+         vk_command_buffer_set_error(&cmdbuf->vk,
+                                     VK_ERROR_OUT_OF_DEVICE_MEMORY);
+         return;
+      }
+
+      cs_update_progress_seqno(b) {
+         for (uint32_t j = 0; j < PANVK_SUBQUEUE_COUNT; j++) {
+            uint32_t rel_sync_point = cmdbuf->state.cs[j].relative_sync_point;
+
+            if (!rel_sync_point)
+               continue;
+
+            cs_add64(b, cs_progress_seqno_reg(b, j), cs_progress_seqno_reg(b, j),
+                     rel_sync_point);
+         }
+      }
+   }
+
+   for (uint32_t i = 0; i < ARRAY_SIZE(cmdbuf->state.cs); i++)
+      cmdbuf->state.cs[i].relative_sync_point = 0;
+}
+
 static void
 finish_cs(struct panvk_cmd_buffer *cmdbuf, uint32_t subqueue)
 {
@@ -82,18 +115,6 @@ finish_cs(struct panvk_cmd_buffer *cmdbuf, uint32_t subqueue)
    struct panvk_instance *instance =
       to_panvk_instance(dev->vk.physical->instance);
    struct cs_builder *b = panvk_get_cs_builder(cmdbuf, subqueue);
-
-   cs_update_progress_seqno(b) {
-      for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
-         uint32_t rel_sync_point = cmdbuf->state.cs[i].relative_sync_point;
-
-         if (!rel_sync_point)
-            continue;
-
-         cs_add64(b, cs_progress_seqno_reg(b, i), cs_progress_seqno_reg(b, i),
-                  rel_sync_point);
-      }
-   }
 
    /* We need a clean because descriptor/CS memory can be returned to the
     * command pool where they get recycled. If we don't clean dirty cache lines,
@@ -150,6 +171,7 @@ panvk_per_arch(EndCommandBuffer)(VkCommandBuffer commandBuffer)
    struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
 
    emit_tls(cmdbuf);
+   flush_sync_points(cmdbuf);
 
    for (uint32_t i = 0; i < ARRAY_SIZE(cmdbuf->state.cs); i++) {
       struct cs_builder *b = &cmdbuf->state.cs[i].builder;
@@ -186,9 +208,11 @@ stages_cover_subqueue(enum panvk_subqueue_id subqueue,
                       VkPipelineStageFlags2 stages)
 {
    static const VkPipelineStageFlags2 queue_coverage[PANVK_SUBQUEUE_COUNT] = {
-      [PANVK_SUBQUEUE_VERTEX_TILER] = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT |
-                                      VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT |
-                                      VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
+      [PANVK_SUBQUEUE_VERTEX_TILER] =
+         VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT |
+         VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT |
+         VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT |
+         VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
       [PANVK_SUBQUEUE_FRAGMENT] =
          VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
          VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
@@ -232,35 +256,31 @@ collect_cache_flush_info(enum panvk_subqueue_id subqueue,
                          VkAccessFlags2 src_access, VkAccessFlags2 dst_access)
 {
    static const VkAccessFlags2 dev_writes[PANVK_SUBQUEUE_COUNT] = {
-      [PANVK_SUBQUEUE_VERTEX_TILER] = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
-                                      VK_ACCESS_2_SHADER_WRITE_BIT |
-                                      VK_ACCESS_2_TRANSFER_WRITE_BIT,
+      [PANVK_SUBQUEUE_VERTEX_TILER] =
+         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
       [PANVK_SUBQUEUE_FRAGMENT] =
-         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_WRITE_BIT |
+         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
          VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
          VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
          VK_ACCESS_2_TRANSFER_WRITE_BIT,
-      [PANVK_SUBQUEUE_COMPUTE] = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
-                                 VK_ACCESS_2_SHADER_WRITE_BIT |
-                                 VK_ACCESS_2_TRANSFER_WRITE_BIT,
+      [PANVK_SUBQUEUE_COMPUTE] =
+         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
    };
    static const VkAccessFlags2 dev_reads[PANVK_SUBQUEUE_COUNT] = {
       [PANVK_SUBQUEUE_VERTEX_TILER] =
          VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_INDEX_READ_BIT |
          VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_2_UNIFORM_READ_BIT |
-         VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_TRANSFER_READ_BIT |
-         VK_ACCESS_2_SHADER_SAMPLED_READ_BIT |
+         VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT |
          VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
       [PANVK_SUBQUEUE_FRAGMENT] =
-         VK_ACCESS_2_UNIFORM_READ_BIT | VK_ACCESS_2_SHADER_READ_BIT |
-         VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
+         VK_ACCESS_2_UNIFORM_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
          VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
          VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT |
          VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
-      [PANVK_SUBQUEUE_COMPUTE] =
-         VK_ACCESS_2_UNIFORM_READ_BIT | VK_ACCESS_2_SHADER_READ_BIT |
-         VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT |
-         VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+      [PANVK_SUBQUEUE_COMPUTE] = VK_ACCESS_2_UNIFORM_READ_BIT |
+                                 VK_ACCESS_2_TRANSFER_READ_BIT |
+                                 VK_ACCESS_2_SHADER_SAMPLED_READ_BIT |
+                                 VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
    };
 
    /* Note on the cache organization:
@@ -307,8 +327,8 @@ collect_cache_flush_info(enum panvk_subqueue_id subqueue,
 static void
 collect_cs_deps(struct panvk_cmd_buffer *cmdbuf,
                 VkPipelineStageFlags2 src_stages,
-                VkPipelineStageFlags2 dst_stages, VkAccessFlags src_access,
-                VkAccessFlags dst_access, struct panvk_cs_deps *deps)
+                VkPipelineStageFlags2 dst_stages, VkAccessFlags2 src_access,
+                VkAccessFlags2 dst_access, struct panvk_cs_deps *deps)
 {
    if (src_stages_need_draw_flush(src_stages) && cmdbuf->state.gfx.render.tiler)
       deps->needs_draw_flush = true;
@@ -316,7 +336,6 @@ collect_cs_deps(struct panvk_cmd_buffer *cmdbuf,
    uint32_t wait_subqueue_mask = 0;
    for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
       uint32_t sb_mask = src_stages_to_subqueue_sb_mask(i, src_stages);
-      assert((sb_mask != 0) == stages_cover_subqueue(i, src_stages));
       if (!sb_mask)
          continue;
 
@@ -330,7 +349,7 @@ collect_cs_deps(struct panvk_cmd_buffer *cmdbuf,
       if (!stages_cover_subqueue(i, dst_stages))
          continue;
 
-      deps->dst[i].wait_subqueue_mask |= wait_subqueue_mask & ~BITFIELD_BIT(i);
+      deps->dst[i].wait_subqueue_mask |= wait_subqueue_mask;
    }
 }
 
@@ -406,8 +425,14 @@ panvk_per_arch(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
       panvk_per_arch(cmd_flush_draws)(cmdbuf);
 
    uint32_t wait_subqueue_mask = 0;
-   for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++)
+   for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
+      /* no need to perform both types of waits on the same subqueue */
+      if (deps.src[i].wait_sb_mask)
+         deps.dst[i].wait_subqueue_mask &= ~BITFIELD_BIT(i);
+      assert(!(deps.dst[i].wait_subqueue_mask & BITFIELD_BIT(i)));
+
       wait_subqueue_mask |= deps.dst[i].wait_subqueue_mask;
+   }
 
    for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
       if (!deps.src[i].wait_sb_mask)
@@ -742,6 +767,10 @@ panvk_per_arch(CmdExecuteCommands)(VkCommandBuffer commandBuffer,
 
    if (commandBufferCount == 0)
       return;
+
+   /* Write out any pending seqno changes to registers before calling
+    * secondary command buffers. */
+   flush_sync_points(primary);
 
    for (uint32_t i = 0; i < commandBufferCount; i++) {
       VK_FROM_HANDLE(panvk_cmd_buffer, secondary, pCommandBuffers[i]);

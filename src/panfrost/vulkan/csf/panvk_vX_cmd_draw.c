@@ -212,11 +212,18 @@ prepare_fs_driver_set(struct panvk_cmd_buffer *cmdbuf)
    return VK_SUCCESS;
 }
 
+/* This value has been selected to get
+ * dEQP-VK.draw.renderpass.inverted_depth_ranges.nodepthclamp_deltazero passing.
+ */
+#define MIN_DEPTH_CLIP_RANGE 37.7E-06f
+
 static void
 prepare_sysvals(struct panvk_cmd_buffer *cmdbuf)
 {
    struct panvk_graphics_sysvals *sysvals = &cmdbuf->state.gfx.sysvals;
    struct vk_color_blend_state *cb = &cmdbuf->vk.dynamic_graphics_state.cb;
+   const struct vk_rasterization_state *rs =
+      &cmdbuf->vk.dynamic_graphics_state.rs;
 
    if (is_dirty(cmdbuf, CB_BLEND_CONSTANTS)) {
       for (unsigned i = 0; i < ARRAY_SIZE(cb->blend_constants); i++)
@@ -225,7 +232,8 @@ prepare_sysvals(struct panvk_cmd_buffer *cmdbuf)
       cmdbuf->state.gfx.push_uniforms = 0;
    }
 
-   if (is_dirty(cmdbuf, VP_VIEWPORTS)) {
+   if (is_dirty(cmdbuf, VP_VIEWPORTS) || is_dirty(cmdbuf, RS_CULL_MODE) ||
+       is_dirty(cmdbuf, RS_DEPTH_CLAMP_ENABLE)) {
       VkViewport *viewport = &cmdbuf->vk.dynamic_graphics_state.vp.viewports[0];
 
       /* Upload the viewport scale. Defined as (px/2, py/2, pz) at the start of
@@ -251,6 +259,38 @@ prepare_sysvals(struct panvk_cmd_buffer *cmdbuf)
       sysvals->viewport.offset.x = (0.5f * viewport->width) + viewport->x;
       sysvals->viewport.offset.y = (0.5f * viewport->height) + viewport->y;
       sysvals->viewport.offset.z = viewport->minDepth;
+
+      /* Doing the viewport transform in the vertex shader and then depth
+       * clipping with the viewport depth range gets a similar result to
+       * clipping in clip-space, but loses precision when the viewport depth
+       * range is very small. When minDepth == maxDepth, this completely
+       * flattens the clip-space depth and results in never clipping.
+       *
+       * To work around this, set a lower limit on depth range when clipping is
+       * enabled. This results in slightly incorrect fragment depth values, and
+       * doesn't help with the precision loss, but at least clipping isn't
+       * completely broken.
+       */
+      if (vk_rasterization_state_depth_clip_enable(rs) &&
+          fabsf(sysvals->viewport.scale.z) < MIN_DEPTH_CLIP_RANGE) {
+         float z_min = viewport->minDepth;
+         float z_max = viewport->maxDepth;
+         float z_sign = z_min <= z_max ? 1.0f : -1.0f;
+
+         sysvals->viewport.scale.z = z_sign * MIN_DEPTH_CLIP_RANGE;
+
+         /* Middle of the user range is
+         *    z_range_center = z_min + (z_max - z_min) * 0.5f,
+         * and we want to set the offset to
+         *    z_offset = z_range_center - viewport.scale.z * 0.5f
+         * which, when expanding, gives us
+         *    z_offset = (z_max + z_min - viewport.scale.z) * 0.5f
+         */
+         float z_offset = (z_max + z_min - sysvals->viewport.scale.z) * 0.5f;
+         /* Bump offset off-center if necessary, to not go out of range */
+         sysvals->viewport.offset.z = CLAMP(z_offset, 0.0f, 1.0f);
+      }
+
       cmdbuf->state.gfx.push_uniforms = 0;
    }
 }
@@ -424,26 +464,112 @@ translate_prim_topology(VkPrimitiveTopology in)
 }
 
 static void
-force_fb_preload(struct panvk_cmd_buffer *cmdbuf)
+force_fb_preload(struct panvk_cmd_buffer *cmdbuf,
+                 const VkRenderingInfo *render_info)
 {
-   for (unsigned i = 0; i < cmdbuf->state.gfx.render.fb.info.rt_count; i++) {
-      if (cmdbuf->state.gfx.render.fb.info.rts[i].view) {
-         cmdbuf->state.gfx.render.fb.info.rts[i].clear = false;
-         cmdbuf->state.gfx.render.fb.info.rts[i].preload = true;
+   /* We force preloading for all active attachments when the render area is
+    * unaligned or when a barrier flushes prior draw calls in the middle of a
+    * render pass.  The two cases can be distinguished by whether a
+    * render_info is provided.
+    *
+    * When the render area is unaligned, we force preloading to preserve
+    * contents falling outside of the render area.  We also make sure the
+    * initial attachment clears are performed.
+    */
+   struct pan_fb_info *fbinfo = &cmdbuf->state.gfx.render.fb.info;
+   VkClearAttachment clear_atts[MAX_RTS + 2];
+   uint32_t clear_att_count = 0;
+
+   if (!cmdbuf->state.gfx.render.bound_attachments)
+      return;
+
+   for (unsigned i = 0; i < fbinfo->rt_count; i++) {
+      if (!fbinfo->rts[i].view)
+         continue;
+
+      fbinfo->rts[i].preload = true;
+
+      if (fbinfo->rts[i].clear) {
+         if (render_info) {
+            const VkRenderingAttachmentInfo *att =
+               &render_info->pColorAttachments[i];
+
+            clear_atts[clear_att_count++] = (VkClearAttachment){
+               .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+               .colorAttachment = i,
+               .clearValue = att->clearValue,
+            };
+         }
+         fbinfo->rts[i].clear = false;
       }
    }
 
-   if (cmdbuf->state.gfx.render.fb.info.zs.view.zs) {
-      cmdbuf->state.gfx.render.fb.info.zs.clear.z = false;
-      cmdbuf->state.gfx.render.fb.info.zs.preload.z = true;
+   if (fbinfo->zs.view.zs) {
+      fbinfo->zs.preload.z = true;
+
+      if (fbinfo->zs.clear.z) {
+         if (render_info) {
+            const VkRenderingAttachmentInfo *att =
+               render_info->pDepthAttachment;
+
+            clear_atts[clear_att_count++] = (VkClearAttachment){
+               .aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT,
+               .clearValue = att->clearValue,
+            };
+         }
+         fbinfo->zs.clear.z = false;
+      }
    }
 
-   if (cmdbuf->state.gfx.render.fb.info.zs.view.s ||
-       (cmdbuf->state.gfx.render.fb.info.zs.view.zs &&
-        util_format_is_depth_and_stencil(
-           cmdbuf->state.gfx.render.fb.info.zs.view.zs->format))) {
-      cmdbuf->state.gfx.render.fb.info.zs.clear.s = false;
-      cmdbuf->state.gfx.render.fb.info.zs.preload.s = true;
+   if (fbinfo->zs.view.s ||
+       (fbinfo->zs.view.zs &&
+        util_format_is_depth_and_stencil(fbinfo->zs.view.zs->format))) {
+      fbinfo->zs.preload.s = true;
+
+      if (fbinfo->zs.clear.s) {
+         if (render_info) {
+            const VkRenderingAttachmentInfo *att =
+               render_info->pStencilAttachment;
+
+            clear_atts[clear_att_count++] = (VkClearAttachment){
+               .aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT,
+               .clearValue = att->clearValue,
+            };
+         }
+
+         fbinfo->zs.clear.s = false;
+      }
+   }
+
+   /* insert a barrier for preload */
+   const VkMemoryBarrier2 mem_barrier = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+      .srcStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                      VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
+                      VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+      .srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                       VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+      .dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+      .dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+   };
+   const VkDependencyInfo dep_info = {
+      .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+      .memoryBarrierCount = 1,
+      .pMemoryBarriers = &mem_barrier,
+   };
+   panvk_per_arch(CmdPipelineBarrier2)(panvk_cmd_buffer_to_handle(cmdbuf),
+                                       &dep_info);
+
+   if (clear_att_count && render_info) {
+      VkClearRect clear_rect = {
+         .rect = render_info->renderArea,
+         .baseArrayLayer = 0,
+         .layerCount = render_info->layerCount,
+      };
+
+      panvk_per_arch(CmdClearAttachments)(panvk_cmd_buffer_to_handle(cmdbuf),
+                                          clear_att_count, clear_atts, 1,
+                                          &clear_rect);
    }
 }
 
@@ -577,11 +703,14 @@ prepare_vp(struct panvk_cmd_buffer *cmdbuf)
       cs_move64_to(b, cs_sr_reg64(b, 42), scissor_box);
    }
 
-   if (is_dirty(cmdbuf, VP_VIEWPORTS)) {
-      cs_move32_to(b, cs_sr_reg32(b, 44),
-                   fui(MIN2(viewport->minDepth, viewport->maxDepth)));
-      cs_move32_to(b, cs_sr_reg32(b, 45),
-                   fui(MAX2(viewport->minDepth, viewport->maxDepth)));
+   if (is_dirty(cmdbuf, VP_VIEWPORTS) || is_dirty(cmdbuf, RS_CULL_MODE) ||
+       is_dirty(cmdbuf, RS_DEPTH_CLAMP_ENABLE)) {
+      struct panvk_graphics_sysvals *sysvals = &cmdbuf->state.gfx.sysvals;
+
+      float z_min = sysvals->viewport.offset.z;
+      float z_max = z_min + sysvals->viewport.scale.z;
+      cs_move32_to(b, cs_sr_reg32(b, 44), fui(MIN2(z_min, z_max)));
+      cs_move32_to(b, cs_sr_reg32(b, 45), fui(MAX2(z_min, z_max)));
    }
 }
 
@@ -1050,13 +1179,13 @@ prepare_ds(struct panvk_cmd_buffer *cmdbuf)
    bool dirty = is_dirty(cmdbuf, DS_DEPTH_TEST_ENABLE) ||
                 is_dirty(cmdbuf, DS_DEPTH_WRITE_ENABLE) ||
                 is_dirty(cmdbuf, DS_DEPTH_COMPARE_OP) ||
-                is_dirty(cmdbuf, DS_DEPTH_COMPARE_OP) ||
                 is_dirty(cmdbuf, DS_STENCIL_TEST_ENABLE) ||
                 is_dirty(cmdbuf, DS_STENCIL_OP) ||
                 is_dirty(cmdbuf, DS_STENCIL_COMPARE_MASK) ||
                 is_dirty(cmdbuf, DS_STENCIL_WRITE_MASK) ||
                 is_dirty(cmdbuf, DS_STENCIL_REFERENCE) ||
                 is_dirty(cmdbuf, RS_DEPTH_CLAMP_ENABLE) ||
+                is_dirty(cmdbuf, RS_DEPTH_CLIP_ENABLE) ||
                 is_dirty(cmdbuf, RS_DEPTH_BIAS_ENABLE) ||
                 is_dirty(cmdbuf, RS_DEPTH_BIAS_FACTORS) ||
                 /* fs_required() uses ms.alpha_to_coverage_enable
@@ -1111,6 +1240,7 @@ prepare_ds(struct panvk_cmd_buffer *cmdbuf)
       cfg.front_reference_value = ds->stencil.front.reference;
       cfg.back_reference_value = ds->stencil.back.reference;
 
+      cfg.depth_cull_enable = vk_rasterization_state_depth_clip_enable(rs);
       if (rs->depth_clamp_enable)
          cfg.depth_clamp_mode = MALI_DEPTH_CLAMP_MODE_BOUNDS;
 
@@ -1295,8 +1425,10 @@ set_tiler_idvs_flags(struct cs_builder *b, struct panvk_cmd_buffer *cmdbuf,
 {
    const struct panvk_shader *vs = cmdbuf->state.gfx.vs.shader;
    const struct panvk_shader *fs = cmdbuf->state.gfx.fs.shader;
-   const struct vk_input_assembly_state *ia =
-      &cmdbuf->vk.dynamic_graphics_state.ia;
+   const struct vk_dynamic_graphics_state *dyns =
+      &cmdbuf->vk.dynamic_graphics_state;
+   const struct vk_input_assembly_state *ia = &dyns->ia;
+   const struct vk_rasterization_state *rs = &dyns->rs;
 
    struct mali_primitive_flags_packed tiler_idvs_flags;
    bool writes_point_size =
@@ -1313,6 +1445,8 @@ set_tiler_idvs_flags(struct cs_builder *b, struct panvk_cmd_buffer *cmdbuf,
                 is_dirty(cmdbuf, CB_ATTACHMENT_COUNT) ||
                 is_dirty(cmdbuf, CB_COLOR_WRITE_ENABLES) ||
                 is_dirty(cmdbuf, CB_WRITE_MASKS) ||
+                is_dirty(cmdbuf, RS_DEPTH_CLAMP_ENABLE) ||
+                is_dirty(cmdbuf, RS_DEPTH_CLIP_ENABLE) ||
                 is_dirty(cmdbuf, IA_PRIMITIVE_RESTART_ENABLE) ||
                 is_dirty(cmdbuf, IA_PRIMITIVE_TOPOLOGY) ||
                 cmdbuf->state.gfx.fs.spd != get_fs_spd(fs);
@@ -1333,6 +1467,9 @@ set_tiler_idvs_flags(struct cs_builder *b, struct panvk_cmd_buffer *cmdbuf,
             cfg.layer_index_enable = true;
             cfg.position_fifo_format = MALI_FIFO_FORMAT_EXTENDED;
          }
+
+         cfg.low_depth_cull = cfg.high_depth_cull =
+            vk_rasterization_state_depth_clip_enable(rs);
 
          cfg.secondary_shader =
             vs->info.vs.secondary_enable && fs_required(cmdbuf);
@@ -1529,7 +1666,6 @@ panvk_per_arch(cmd_prepare_exec_cmd_for_draws)(
    VkResult result;
 
    if (secondary->flags & VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT) {
-      assert(primary->vk.render_pass);
       result = get_tiler_desc(primary);
       if (result != VK_SUCCESS)
          return;
@@ -1597,8 +1733,13 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
       return;
 
    /* Layered indirect draw (VK_EXT_shader_viewport_index_layer) needs
-    * additional changes. */
-   assert(cmdbuf->state.gfx.render.layer_count == 1);
+    * additional changes. We allow layer_count == 0 because that happens
+    * when mixing dynamic rendering and secondary command buffers. Once
+    * we decide to support layared+indirect, we'll need to pass the
+    * layer_count info through the tiler descriptor, for instance by
+    * re-using one of the word that's flagged 'ignored' in the descriptor
+    * (word 14:23). */
+   assert(cmdbuf->state.gfx.render.layer_count <= 1);
 
    /* MultiDrawIndirect (.maxDrawIndirectCount) needs additional changes. */
    assert(draw->indirect.draw_count == 1);
@@ -1907,74 +2048,8 @@ preload_render_area_border(struct panvk_cmd_buffer *cmdbuf,
        (fbinfo->extent.maxy % 32) == 31);
 
    /* If the render area is aligned on a 32x32 section, we're good. */
-   if (render_area_is_32x32_aligned)
-      return;
-
-   /* We force preloading for all active attachments to preserve content falling
-    * outside the render area, but we need to compensate with attachment clears
-    * for attachments that were initially cleared.
-    */
-   uint32_t bound_atts = cmdbuf->state.gfx.render.bound_attachments;
-   VkClearAttachment clear_atts[MAX_RTS + 2];
-   uint32_t clear_att_count = 0;
-
-   for (uint32_t i = 0; i < render_info->colorAttachmentCount; i++) {
-      if (bound_atts & MESA_VK_RP_ATTACHMENT_COLOR_BIT(i)) {
-         if (fbinfo->rts[i].clear) {
-            const VkRenderingAttachmentInfo *att =
-               &render_info->pColorAttachments[i];
-
-            clear_atts[clear_att_count++] = (VkClearAttachment){
-               .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-               .colorAttachment = i,
-               .clearValue = att->clearValue,
-            };
-         }
-
-         fbinfo->rts[i].preload = true;
-         fbinfo->rts[i].clear = false;
-      }
-   }
-
-   if (bound_atts & MESA_VK_RP_ATTACHMENT_DEPTH_BIT) {
-      if (fbinfo->zs.clear.z) {
-         const VkRenderingAttachmentInfo *att = render_info->pDepthAttachment;
-
-         clear_atts[clear_att_count++] = (VkClearAttachment){
-            .aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT,
-            .clearValue = att->clearValue,
-         };
-      }
-
-      fbinfo->zs.preload.z = true;
-      fbinfo->zs.clear.z = false;
-   }
-
-   if (bound_atts & MESA_VK_RP_ATTACHMENT_STENCIL_BIT) {
-      if (fbinfo->zs.clear.s) {
-         const VkRenderingAttachmentInfo *att = render_info->pStencilAttachment;
-
-         clear_atts[clear_att_count++] = (VkClearAttachment){
-            .aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT,
-            .clearValue = att->clearValue,
-         };
-      }
-
-      fbinfo->zs.preload.s = true;
-      fbinfo->zs.clear.s = false;
-   }
-
-   if (clear_att_count) {
-      VkClearRect clear_rect = {
-         .rect = render_info->renderArea,
-         .baseArrayLayer = 0,
-         .layerCount = render_info->layerCount,
-      };
-
-      panvk_per_arch(CmdClearAttachments)(panvk_cmd_buffer_to_handle(cmdbuf),
-                                          clear_att_count, clear_atts, 1,
-                                          &clear_rect);
-   }
+   if (!render_area_is_32x32_aligned)
+      force_fb_preload(cmdbuf, render_info);
 }
 
 void
@@ -2487,10 +2562,11 @@ panvk_per_arch(cmd_flush_draws)(struct panvk_cmd_buffer *cmdbuf)
 
    flush_tiling(cmdbuf);
    issue_fragment_jobs(cmdbuf);
-   force_fb_preload(cmdbuf);
    memset(&cmdbuf->state.gfx.render.fbds, 0,
           sizeof(cmdbuf->state.gfx.render.fbds));
    cmdbuf->state.gfx.render.tiler = 0;
+
+   force_fb_preload(cmdbuf, NULL);
 }
 
 VKAPI_ATTR void VKAPI_CALL

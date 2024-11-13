@@ -46,15 +46,21 @@ workflow:
     - if: &is-fork-push $CI_PROJECT_NAMESPACE != "mesa" && $CI_PIPELINE_SOURCE == "push"
     # nightly pipeline
     - if: &is-scheduled-pipeline $CI_PIPELINE_SOURCE == "schedule"
+      variables:
+        JOB_PRIORITY: 45
+        # (some) nightly builds perform LTO, so they take much longer than the
+        # short timeout allowed in other pipelines.
+        # Note: 0 = infinity = gitlab's job `timeout:` applies, which is 1h
+        BUILD_JOB_TIMEOUT_OVERRIDE: 0
     # pipeline for direct pushes that bypassed the CI
     - if: &is-direct-push $CI_PROJECT_NAMESPACE == "mesa" && $CI_PIPELINE_SOURCE == "push" && $GITLAB_USER_LOGIN != "marge-bot"
       variables:
-        JOB_PRIORITY: 40
+        JOB_PRIORITY: 70
 
 
 variables:
   FDO_UPSTREAM_REPO: mesa/mesa
-  MESA_TEMPLATES_COMMIT: &ci-templates-commit d5aa3941aa03c2f716595116354fb81eb8012acb
+  MESA_TEMPLATES_COMMIT: &ci-templates-commit e195d80f35b45cc73668be3767b923fd76c70ed5
   CI_PRE_CLONE_SCRIPT: |-
           set -o xtrace
           wget -q -O download-git-cache.sh ${CI_PROJECT_URL}/-/raw/${CI_COMMIT_SHA}/.gitlab-ci/download-git-cache.sh

@@ -11,10 +11,10 @@
 
 struct agx_cf_binding {
    /* Base coefficient register */
-   unsigned cf_base;
+   uint8_t cf_base;
 
    /* Slot being bound */
-   gl_varying_slot slot;
+   gl_varying_slot slot : 8;
 
    /* First component bound.
     *
@@ -30,6 +30,8 @@ struct agx_cf_binding {
 
    /* Perspective correct interpolation */
    bool perspective : 1;
+
+   uint8_t pad;
 };
 
 /* Conservative bound, * 4 due to offsets (TODO: maybe worth eliminating
@@ -64,6 +66,7 @@ static_assert(sizeof(struct agx_interp_info) == 16, "packed");
 
 struct agx_shader_info {
    enum pipe_shader_type stage;
+   uint32_t binary_size;
 
    union agx_varyings varyings;
 
@@ -132,16 +135,24 @@ struct agx_shader_info {
    /* Output mask set during driver lowering */
    uint64_t outputs;
 
-   /* Immediate data that must be uploaded and mapped as uniform registers */
-   unsigned immediate_base_uniform;
-   unsigned immediate_size_16;
-   uint16_t immediates[512];
+   /* There may be constants in the binary. The driver must map these to uniform
+    * registers as specified hre.
+    */
+   struct {
+      /* Offset in the binary */
+      uint32_t offset;
+
+      /* Base uniform to map constants */
+      uint16_t base_uniform;
+
+      /* Number of 16-bit constants to map contiguously there */
+      uint16_t size_16;
+   } rodata;
 };
 
 struct agx_shader_part {
    struct agx_shader_info info;
    void *binary;
-   size_t binary_size;
 };
 
 #define AGX_MAX_RTS (8)
@@ -252,6 +263,10 @@ bool agx_nir_lower_interpolation(nir_shader *s);
 bool agx_nir_lower_cull_distance_vs(struct nir_shader *s);
 bool agx_nir_lower_cull_distance_fs(struct nir_shader *s,
                                     unsigned nr_distances);
+bool agx_mem_vectorize_cb(unsigned align_mul, unsigned align_offset,
+                          unsigned bit_size, unsigned num_components,
+                          unsigned hole_size, nir_intrinsic_instr *low,
+                          nir_intrinsic_instr *high, void *data);
 
 void agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
                             struct util_debug_callback *debug,
@@ -306,10 +321,12 @@ static const nir_shader_compiler_options agx_nir_options = {
    .lower_hadd = true,
    .vectorize_io = true,
    .use_interpolated_input_intrinsics = true,
+   .has_amul = true,
    .has_isub = true,
    .support_16bit_alu = true,
    .max_unroll_iterations = 32,
    .lower_uniforms_to_ubo = true,
+   .late_lower_int64 = true,
    .lower_int64_options =
       (nir_lower_int64_options) ~(nir_lower_iadd64 | nir_lower_imul_2x32_64),
    .lower_doubles_options = (nir_lower_doubles_options)(~0),

@@ -22,7 +22,6 @@
 
 #include "geometry.h"
 #include "tessellator.h"
-#include <agx_pack.h>
 
 #if 0
 #include <math.h>
@@ -97,7 +96,6 @@ struct INDEX_PATCH_CONTEXT2 {
 };
 
 struct CHWTessellator {
-   enum libagx_tess_output_primitive outputPrimitive;
    enum libagx_tess_mode mode;
    uint index_bias;
 
@@ -154,51 +152,6 @@ libagx_draw(constant struct libagx_tess_args *p, enum libagx_tess_mode mode,
       p->counts[patch] = count;
    }
 
-   if (mode == LIBAGX_TESS_MODE_VDM) {
-      uint32_t elsize_B = sizeof(uint16_t);
-      uint32_t alloc_B = libagx_heap_alloc(p->heap, elsize_B * count);
-      uint64_t ib = ((uintptr_t)p->heap->heap) + alloc_B;
-
-      global uint32_t *desc = p->out_draws + (patch * 6);
-      agx_pack(&desc[0], INDEX_LIST, cfg) {
-         cfg.index_buffer_hi = (ib >> 32);
-         cfg.primitive = lines ? AGX_PRIMITIVE_LINES : AGX_PRIMITIVE_TRIANGLES;
-         cfg.restart_enable = false;
-         cfg.index_size = AGX_INDEX_SIZE_U16;
-         cfg.index_buffer_size_present = true;
-         cfg.index_buffer_present = true;
-         cfg.index_count_present = true;
-         cfg.instance_count_present = true;
-         cfg.start_present = true;
-         cfg.unk_1_present = false;
-         cfg.indirect_buffer_present = false;
-         cfg.unk_2_present = false;
-         cfg.block_type = AGX_VDM_BLOCK_TYPE_INDEX_LIST;
-      }
-
-      agx_pack(&desc[1], INDEX_LIST_BUFFER_LO, cfg) {
-         cfg.buffer_lo = ib & 0xffffffff;
-      }
-
-      agx_pack(&desc[2], INDEX_LIST_COUNT, cfg) {
-         cfg.count = count;
-      }
-
-      agx_pack(&desc[3], INDEX_LIST_INSTANCES, cfg) {
-         cfg.count = 1;
-      }
-
-      agx_pack(&desc[4], INDEX_LIST_START, cfg) {
-         cfg.start = patch * LIBAGX_TES_PATCH_ID_STRIDE;
-      }
-
-      agx_pack(&desc[5], INDEX_LIST_BUFFER_SIZE, cfg) {
-         cfg.size = align(count * 2, 4);
-      }
-
-      return (global void *)ib;
-   }
-
    if (mode == LIBAGX_TESS_MODE_WITH_COUNTS) {
       /* The index buffer is already allocated, get a pointer inside it.
        * p->counts has had an inclusive prefix sum hence the subtraction.
@@ -217,67 +170,26 @@ static void
 libagx_draw_points(private struct CHWTessellator *ctx,
                    constant struct libagx_tess_args *p, uint patch, uint count)
 {
-   if (ctx->mode == LIBAGX_TESS_MODE_VDM) {
-      /* Generate a non-indexed draw for points mode tessellation. */
-      global uint32_t *desc = p->out_draws + (patch * 4);
-      agx_pack(&desc[0], INDEX_LIST, cfg) {
-         cfg.index_buffer_hi = 0;
-         cfg.primitive = AGX_PRIMITIVE_POINTS;
-         cfg.restart_enable = false;
-         cfg.index_size = 0;
-         cfg.index_buffer_size_present = false;
-         cfg.index_buffer_present = false;
-         cfg.index_count_present = true;
-         cfg.instance_count_present = true;
-         cfg.start_present = true;
-         cfg.unk_1_present = false;
-         cfg.indirect_buffer_present = false;
-         cfg.unk_2_present = false;
-         cfg.block_type = AGX_VDM_BLOCK_TYPE_INDEX_LIST;
-      }
+   /* For points mode with a single draw, we need to generate a trivial index
+    * buffer to stuff in the patch ID in the right place.
+    */
+   global uint32_t *indices = libagx_draw(p, ctx->mode, false, patch, count);
 
-      agx_pack(&desc[1], INDEX_LIST_COUNT, cfg) {
-         cfg.count = count;
-      }
+   if (ctx->mode == LIBAGX_TESS_MODE_COUNT)
+      return;
 
-      agx_pack(&desc[2], INDEX_LIST_INSTANCES, cfg) {
-         cfg.count = 1;
-      }
-
-      agx_pack(&desc[3], INDEX_LIST_START, cfg) {
-         cfg.start = patch * LIBAGX_TES_PATCH_ID_STRIDE;
-      }
-   } else {
-      /* For points mode with a single draw, we need to generate a trivial index
-       * buffer to stuff in the patch ID in the right place.
-       */
-      global uint32_t *indices = libagx_draw(p, ctx->mode, false, patch, count);
-
-      if (ctx->mode == LIBAGX_TESS_MODE_COUNT)
-         return;
-
-      for (int i = 0; i < count; ++i) {
-         indices[i] = ctx->index_bias + i;
-      }
+   for (int i = 0; i < count; ++i) {
+      indices[i] = ctx->index_bias + i;
    }
 }
 
 static void
 libagx_draw_empty(constant struct libagx_tess_args *p,
                   enum libagx_tess_mode mode,
-                  enum libagx_tess_output_primitive output_primitive,
                   uint patch)
 {
    if (mode == LIBAGX_TESS_MODE_COUNT) {
       p->counts[patch] = 0;
-   } else if (mode == LIBAGX_TESS_MODE_VDM) {
-      uint32_t words = (output_primitive == LIBAGX_TESS_OUTPUT_POINT) ? 4 : 6;
-      global uint32_t *desc = p->out_draws + (patch * words);
-      uint32_t nop_token = AGX_VDM_BLOCK_TYPE_BARRIER << 29;
-
-      for (uint32_t i = 0; i < words; ++i) {
-         desc[i] = nop_token;
-      }
    }
 }
 
@@ -355,13 +267,6 @@ floatToFixed(const float input)
    return mad(input, FXP_ONE, 0.5f);
 }
 
-static float
-fixedToFloat(const FXP input)
-{
-   // Don't need to worry about special cases because the bounds are reasonable.
-   return ((float)input) / FXP_ONE;
-}
-
 static bool
 isOdd(const float input)
 {
@@ -400,13 +305,10 @@ PatchIndexValue(private struct CHWTessellator *ctx, int index)
             return index + ctx->IndexPatchCtx.insidePointIndexDeltaToRealValue;
       }
    } else if (ctx->bUsingPatchedIndices2) {
-      if (index >= ctx->IndexPatchCtx2.baseIndexToInvert) {
-         if (index == ctx->IndexPatchCtx2.cornerCaseBadValue)
-            return ctx->IndexPatchCtx2.cornerCaseReplacementValue;
-         else
-            return ctx->IndexPatchCtx2.indexInversionEndPoint - index;
-      } else if (index == ctx->IndexPatchCtx2.cornerCaseBadValue) {
+      if (index == ctx->IndexPatchCtx2.cornerCaseBadValue) {
          return ctx->IndexPatchCtx2.cornerCaseReplacementValue;
+      } else if (index >= ctx->IndexPatchCtx2.baseIndexToInvert) {
+         return ctx->IndexPatchCtx2.indexInversionEndPoint - index;
       }
    }
 
@@ -416,35 +318,28 @@ PatchIndexValue(private struct CHWTessellator *ctx, int index)
 static void
 DefinePoint(global struct libagx_tess_point *out, FXP fxpU, FXP fxpV)
 {
-   out->u = fixedToFloat(fxpU);
-   out->v = fixedToFloat(fxpV);
+   out->u = fxpU;
+   out->v = fxpV;
 }
 
 static void
 DefineIndex(private struct CHWTessellator *ctx, int index,
             int indexStorageOffset)
 {
-   int patched = PatchIndexValue(ctx, index);
-
-   if (ctx->mode == LIBAGX_TESS_MODE_WITH_COUNTS) {
-      global uint32_t *indices = (global uint32_t *)ctx->Index;
-      indices[indexStorageOffset] = ctx->index_bias + patched;
-   } else {
-      global uint16_t *indices = (global uint16_t *)ctx->Index;
-      indices[indexStorageOffset] = patched;
-   }
+   global uint32_t *indices = (global uint32_t *)ctx->Index;
+   indices[indexStorageOffset] = ctx->index_bias + PatchIndexValue(ctx, index);
 }
 
 static void
-DefineClockwiseTriangle(private struct CHWTessellator *ctx, int index0,
-                        int index1, int index2, int indexStorageBaseOffset)
+DefineTriangle(private struct CHWTessellator *ctx, int index0, int index1,
+               int index2, int indexStorageBaseOffset)
 {
-   // inputs a clockwise triangle, stores a CW or CCW triangle per state state
-   bool cw = ctx->outputPrimitive == LIBAGX_TESS_OUTPUT_TRIANGLE_CW;
+   index0 = PatchIndexValue(ctx, index0);
+   index1 = PatchIndexValue(ctx, index1);
+   index2 = PatchIndexValue(ctx, index2);
 
-   DefineIndex(ctx, index0, indexStorageBaseOffset);
-   DefineIndex(ctx, cw ? index1 : index2, indexStorageBaseOffset + 1);
-   DefineIndex(ctx, cw ? index2 : index1, indexStorageBaseOffset + 2);
+   vstore3(ctx->index_bias + (uint3)(index0, index1, index2), 0,
+           (global uint *)ctx->Index + indexStorageBaseOffset);
 }
 
 static uint32_t
@@ -558,7 +453,8 @@ StitchRegular(private struct CHWTessellator *ctx, bool bTrapezoid,
    int insidePoint = insideEdgePointBaseOffset;
    int outsidePoint = outsideEdgePointBaseOffset;
    if (bTrapezoid) {
-      DefineClockwiseTriangle(ctx, outsidePoint, outsidePoint + 1, insidePoint, baseIndexOffset);
+      DefineTriangle(ctx, outsidePoint, outsidePoint + 1, insidePoint,
+                     baseIndexOffset);
       baseIndexOffset += 3;
       outsidePoint++;
    }
@@ -567,11 +463,12 @@ StitchRegular(private struct CHWTessellator *ctx, bool bTrapezoid,
    case DIAGONALS_INSIDE_TO_OUTSIDE:
       // Diagonals pointing from inside edge forward towards outside edge
       for (p = 0; p < numInsideEdgePoints - 1; p++) {
-         DefineClockwiseTriangle(ctx, insidePoint, outsidePoint, outsidePoint + 1, baseIndexOffset);
+         DefineTriangle(ctx, insidePoint, outsidePoint, outsidePoint + 1,
+                        baseIndexOffset);
          baseIndexOffset += 3;
 
-         DefineClockwiseTriangle(ctx, insidePoint, outsidePoint + 1, insidePoint + 1,
-                                 baseIndexOffset);
+         DefineTriangle(ctx, insidePoint, outsidePoint + 1, insidePoint + 1,
+                        baseIndexOffset);
          baseIndexOffset += 3;
          insidePoint++;
          outsidePoint++;
@@ -582,20 +479,22 @@ StitchRegular(private struct CHWTessellator *ctx, bool bTrapezoid,
 
       // First half
       for (p = 0; p < numInsideEdgePoints / 2 - 1; p++) {
-         DefineClockwiseTriangle(ctx, outsidePoint, outsidePoint + 1, insidePoint, baseIndexOffset);
+         DefineTriangle(ctx, outsidePoint, outsidePoint + 1, insidePoint,
+                        baseIndexOffset);
          baseIndexOffset += 3;
-         DefineClockwiseTriangle(ctx, insidePoint, outsidePoint + 1, insidePoint + 1,
-                                 baseIndexOffset);
+         DefineTriangle(ctx, insidePoint, outsidePoint + 1, insidePoint + 1,
+                        baseIndexOffset);
          baseIndexOffset += 3;
          insidePoint++;
          outsidePoint++;
       }
 
       // Middle
-      DefineClockwiseTriangle(ctx, outsidePoint, insidePoint + 1, insidePoint, baseIndexOffset);
+      DefineTriangle(ctx, outsidePoint, insidePoint + 1, insidePoint,
+                     baseIndexOffset);
       baseIndexOffset += 3;
-      DefineClockwiseTriangle(ctx, outsidePoint, outsidePoint + 1, insidePoint + 1,
-                              baseIndexOffset);
+      DefineTriangle(ctx, outsidePoint, outsidePoint + 1, insidePoint + 1,
+                     baseIndexOffset);
       baseIndexOffset += 3;
       insidePoint++;
       outsidePoint++;
@@ -603,10 +502,11 @@ StitchRegular(private struct CHWTessellator *ctx, bool bTrapezoid,
 
       // Second half
       for (; p < numInsideEdgePoints; p++) {
-         DefineClockwiseTriangle(ctx, outsidePoint, outsidePoint + 1, insidePoint, baseIndexOffset);
+         DefineTriangle(ctx, outsidePoint, outsidePoint + 1, insidePoint,
+                        baseIndexOffset);
          baseIndexOffset += 3;
-         DefineClockwiseTriangle(ctx, insidePoint, outsidePoint + 1, insidePoint + 1,
-                                 baseIndexOffset);
+         DefineTriangle(ctx, insidePoint, outsidePoint + 1, insidePoint + 1,
+                        baseIndexOffset);
          baseIndexOffset += 3;
          insidePoint++;
          outsidePoint++;
@@ -616,10 +516,11 @@ StitchRegular(private struct CHWTessellator *ctx, bool bTrapezoid,
       // First half, diagonals pointing from outside of outside edge to inside of
       // inside edge
       for (p = 0; p < numInsideEdgePoints / 2; p++) {
-         DefineClockwiseTriangle(ctx, outsidePoint, insidePoint + 1, insidePoint, baseIndexOffset);
+         DefineTriangle(ctx, outsidePoint, insidePoint + 1, insidePoint,
+                        baseIndexOffset);
          baseIndexOffset += 3;
-         DefineClockwiseTriangle(ctx, outsidePoint, outsidePoint + 1, insidePoint + 1,
-                                 baseIndexOffset);
+         DefineTriangle(ctx, outsidePoint, outsidePoint + 1, insidePoint + 1,
+                        baseIndexOffset);
          baseIndexOffset += 3;
          insidePoint++;
          outsidePoint++;
@@ -627,10 +528,11 @@ StitchRegular(private struct CHWTessellator *ctx, bool bTrapezoid,
       // Second half, diagonals pointing from inside of inside edge to outside of
       // outside edge
       for (; p < numInsideEdgePoints - 1; p++) {
-         DefineClockwiseTriangle(ctx, insidePoint, outsidePoint, outsidePoint + 1, baseIndexOffset);
+         DefineTriangle(ctx, insidePoint, outsidePoint, outsidePoint + 1,
+                        baseIndexOffset);
          baseIndexOffset += 3;
-         DefineClockwiseTriangle(ctx, insidePoint, outsidePoint + 1, insidePoint + 1,
-                                 baseIndexOffset);
+         DefineTriangle(ctx, insidePoint, outsidePoint + 1, insidePoint + 1,
+                        baseIndexOffset);
          baseIndexOffset += 3;
          insidePoint++;
          outsidePoint++;
@@ -638,7 +540,8 @@ StitchRegular(private struct CHWTessellator *ctx, bool bTrapezoid,
       break;
    }
    if (bTrapezoid) {
-      DefineClockwiseTriangle(ctx, outsidePoint, outsidePoint + 1, insidePoint, baseIndexOffset);
+      DefineTriangle(ctx, outsidePoint, outsidePoint + 1, insidePoint,
+                     baseIndexOffset);
       baseIndexOffset += 3;
    }
 }
@@ -754,8 +657,8 @@ StitchTransition(private struct CHWTessellator *ctx, int baseIndexOffset,
    // since we don't start the loop at 0 below, we need a special case.
    if (0 < outsideNumHalfTessFactorPoints) {
       // Advance outside
-      DefineClockwiseTriangle(ctx, outsidePoint, outsidePoint + 1, insidePoint,
-                              baseIndexOffset);
+      DefineTriangle(ctx, outsidePoint, outsidePoint + 1, insidePoint,
+                     baseIndexOffset);
       baseIndexOffset += 3;
       outsidePoint++;
    }
@@ -765,15 +668,15 @@ StitchTransition(private struct CHWTessellator *ctx, int baseIndexOffset,
 
       if (bound < insideNumHalfTessFactorPoints) {
          // Advance inside
-         DefineClockwiseTriangle(ctx, insidePoint, outsidePoint,
-                                 insidePoint + 1, baseIndexOffset);
+         DefineTriangle(ctx, insidePoint, outsidePoint, insidePoint + 1,
+                        baseIndexOffset);
          baseIndexOffset += 3;
          insidePoint++;
       }
       if (bound < outsideNumHalfTessFactorPoints) {
          // Advance outside
-         DefineClockwiseTriangle(ctx, outsidePoint, outsidePoint + 1,
-                                 insidePoint, baseIndexOffset);
+         DefineTriangle(ctx, outsidePoint, outsidePoint + 1, insidePoint,
+                        baseIndexOffset);
          baseIndexOffset += 3;
          outsidePoint++;
       }
@@ -783,24 +686,24 @@ StitchTransition(private struct CHWTessellator *ctx, int baseIndexOffset,
        insideEdgeTessFactorOdd) {
       if (insideEdgeTessFactorOdd == outsideTessFactorOdd) {
          // Quad in the middle
-         DefineClockwiseTriangle(ctx, insidePoint, outsidePoint,
-                                 insidePoint + 1, baseIndexOffset);
+         DefineTriangle(ctx, insidePoint, outsidePoint, insidePoint + 1,
+                        baseIndexOffset);
          baseIndexOffset += 3;
-         DefineClockwiseTriangle(ctx, insidePoint + 1, outsidePoint,
-                                 outsidePoint + 1, baseIndexOffset);
+         DefineTriangle(ctx, insidePoint + 1, outsidePoint, outsidePoint + 1,
+                        baseIndexOffset);
          baseIndexOffset += 3;
          insidePoint++;
          outsidePoint++;
       } else if (!insideEdgeTessFactorOdd) {
          // Triangle pointing inside
-         DefineClockwiseTriangle(ctx, insidePoint, outsidePoint,
-                                 outsidePoint + 1, baseIndexOffset);
+         DefineTriangle(ctx, insidePoint, outsidePoint, outsidePoint + 1,
+                        baseIndexOffset);
          baseIndexOffset += 3;
          outsidePoint++;
       } else {
          // Triangle pointing outside
-         DefineClockwiseTriangle(ctx, insidePoint, outsidePoint,
-                                 insidePoint + 1, baseIndexOffset);
+         DefineTriangle(ctx, insidePoint, outsidePoint, insidePoint + 1,
+                        baseIndexOffset);
          baseIndexOffset += 3;
          insidePoint++;
       }
@@ -812,15 +715,15 @@ StitchTransition(private struct CHWTessellator *ctx, int baseIndexOffset,
 
       if (bound < outsideNumHalfTessFactorPoints) {
          // Advance outside
-         DefineClockwiseTriangle(ctx, outsidePoint, outsidePoint + 1,
-                                 insidePoint, baseIndexOffset);
+         DefineTriangle(ctx, outsidePoint, outsidePoint + 1, insidePoint,
+                        baseIndexOffset);
          baseIndexOffset += 3;
          outsidePoint++;
       }
       if (bound < insideNumHalfTessFactorPoints) {
          // Advance inside
-         DefineClockwiseTriangle(ctx, insidePoint, outsidePoint,
-                                 insidePoint + 1, baseIndexOffset);
+         DefineTriangle(ctx, insidePoint, outsidePoint, insidePoint + 1,
+                        baseIndexOffset);
          baseIndexOffset += 3;
          insidePoint++;
       }
@@ -828,8 +731,8 @@ StitchTransition(private struct CHWTessellator *ctx, int baseIndexOffset,
    // Below case is not needed if we didn't optimize loop above and made it run
    // from 31 down to 0.
    if (0 < outsideNumHalfTessFactorPoints) {
-      DefineClockwiseTriangle(ctx, outsidePoint, outsidePoint + 1, insidePoint,
-                              baseIndexOffset);
+      DefineTriangle(ctx, outsidePoint, outsidePoint + 1, insidePoint,
+                     baseIndexOffset);
       baseIndexOffset += 3;
       outsidePoint++;
    }
@@ -837,11 +740,10 @@ StitchTransition(private struct CHWTessellator *ctx, int baseIndexOffset,
 
 void
 libagx_tess_isoline(constant struct libagx_tess_args *p,
-                    enum libagx_tess_mode mode,
-                    enum libagx_tess_partitioning partitioning,
-                    enum libagx_tess_output_primitive output_primitive,
-                    uint patch)
+                    enum libagx_tess_mode mode, uint patch)
 {
+   enum libagx_tess_partitioning partitioning = p->partitioning;
+
    bool lineDensityOdd;
    bool lineDetailOdd;
    TESS_FACTOR_CONTEXT lineDensityTessFactorCtx;
@@ -853,7 +755,7 @@ libagx_tess_isoline(constant struct libagx_tess_args *p,
 
    // Is the patch culled? NaN will pass.
    if (!(TessFactor_V_LineDensity > 0) || !(TessFactor_U_LineDetail > 0)) {
-      libagx_draw_empty(p, mode, output_primitive, patch);
+      libagx_draw_empty(p, mode, patch);
       return;
    }
 
@@ -913,7 +815,7 @@ libagx_tess_isoline(constant struct libagx_tess_args *p,
    ctx.index_bias = patch * LIBAGX_TES_PATCH_ID_STRIDE;
 
    /* Connectivity */
-   if (output_primitive != LIBAGX_TESS_OUTPUT_POINT) {
+   if (!p->points_mode) {
       uint num_indices = numLines * (numPointsPerLine - 1) * 2;
       ctx.Index = libagx_draw(p, mode, true, patch, num_indices);
 
@@ -937,10 +839,10 @@ libagx_tess_isoline(constant struct libagx_tess_args *p,
 
 void
 libagx_tess_tri(constant struct libagx_tess_args *p, enum libagx_tess_mode mode,
-
-                enum libagx_tess_partitioning partitioning,
-                enum libagx_tess_output_primitive output_primitive, uint patch)
+                uint patch)
 {
+   enum libagx_tess_partitioning partitioning = p->partitioning;
+
    global float *factors = tess_factors(p, patch);
    float tessFactor_Ueq0 = factors[0];
    float tessFactor_Veq0 = factors[1];
@@ -948,7 +850,6 @@ libagx_tess_tri(constant struct libagx_tess_args *p, enum libagx_tess_mode mode,
    float insideTessFactor_f = factors[4];
 
    struct CHWTessellator ctx;
-   ctx.outputPrimitive = output_primitive;
    ctx.Point = NULL;
    ctx.Index = NULL;
    ctx.mode = mode;
@@ -960,7 +861,7 @@ libagx_tess_tri(constant struct libagx_tess_args *p, enum libagx_tess_mode mode,
    if (!(tessFactor_Ueq0 > 0) || !(tessFactor_Veq0 > 0) ||
        !(tessFactor_Weq0 > 0)) {
 
-      libagx_draw_empty(p, mode, output_primitive, patch);
+      libagx_draw_empty(p, mode, patch);
 
       return;
    }
@@ -1032,11 +933,11 @@ libagx_tess_tri(constant struct libagx_tess_args *p, enum libagx_tess_mode mode,
          DefinePoint(&points[2], FXP_ONE,
                      0); // U=1 (beginning of Weq0 edge UV)
 
-         if (output_primitive != LIBAGX_TESS_OUTPUT_POINT) {
+         if (!p->points_mode) {
             ctx.Index = libagx_draw(p, mode, false, patch, 3);
 
-            DefineClockwiseTriangle(&ctx, 0, 1, 2,
-                                    /*indexStorageBaseOffset*/ 0);
+            DefineTriangle(&ctx, 0, 1, 2,
+                           /*indexStorageBaseOffset*/ 0);
          } else {
             libagx_draw_points(&ctx, p, patch, 3);
          }
@@ -1103,12 +1004,11 @@ libagx_tess_tri(constant struct libagx_tess_args *p, enum libagx_tess_mode mode,
 
             FXP fxpParam = PlacePointIn1D(&outsideTessFactorCtx[edge],
                                           outsideTessFactorOdd[edge], q);
-            if (edge == 0) {
-               DefinePoint(&ctx.Point[pointOffset], 0, fxpParam);
-            } else {
-               DefinePoint(&ctx.Point[pointOffset], fxpParam,
-                           (edge == 2) ? FXP_ONE - fxpParam : 0);
-            }
+            bool first = edge == 0;
+            DefinePoint(&ctx.Point[pointOffset], (edge == 0) ? 0 : fxpParam,
+                        (edge == 0)   ? fxpParam
+                        : (edge == 2) ? FXP_ONE - fxpParam
+                                      : 0);
          }
       }
 
@@ -1166,7 +1066,7 @@ libagx_tess_tri(constant struct libagx_tess_args *p, enum libagx_tess_mode mode,
       }
    }
 
-   if (output_primitive == LIBAGX_TESS_OUTPUT_POINT) {
+   if (p->points_mode) {
       libagx_draw_points(&ctx, p, patch, NumPoints);
       return;
    }
@@ -1260,9 +1160,9 @@ libagx_tess_tri(constant struct libagx_tess_args *p, enum libagx_tess_mode mode,
       }
       if (insideTessFactorOdd) {
          // Triangulate center (a single triangle)
-         DefineClockwiseTriangle(&ctx, outsideEdgePointBaseOffset,
-                                 outsideEdgePointBaseOffset + 1,
-                                 outsideEdgePointBaseOffset + 2, NumIndices);
+         DefineTriangle(&ctx, outsideEdgePointBaseOffset,
+                        outsideEdgePointBaseOffset + 1,
+                        outsideEdgePointBaseOffset + 2, NumIndices);
          NumIndices += 3;
       }
    }
@@ -1270,10 +1170,9 @@ libagx_tess_tri(constant struct libagx_tess_args *p, enum libagx_tess_mode mode,
 
 void
 libagx_tess_quad(constant struct libagx_tess_args *p,
-                 enum libagx_tess_mode mode,
-                 enum libagx_tess_partitioning partitioning,
-                 enum libagx_tess_output_primitive output_primitive, uint patch)
+                 enum libagx_tess_mode mode, uint patch)
 {
+   enum libagx_tess_partitioning partitioning = p->partitioning;
    global float *factors = tess_factors(p, patch);
 
    float tessFactor_Ueq0 = factors[0];
@@ -1286,7 +1185,6 @@ libagx_tess_quad(constant struct libagx_tess_args *p,
 
    // TODO: fix designated initializer optimization in NIR
    struct CHWTessellator ctx;
-   ctx.outputPrimitive = output_primitive;
    ctx.Point = NULL;
    ctx.Index = NULL;
    ctx.mode = mode;
@@ -1298,7 +1196,7 @@ libagx_tess_quad(constant struct libagx_tess_args *p,
    if (!(tessFactor_Ueq0 > 0) || // NaN will pass
        !(tessFactor_Veq0 > 0) || !(tessFactor_Ueq1 > 0) ||
        !(tessFactor_Veq1 > 0)) {
-      libagx_draw_empty(p, mode, output_primitive, patch);
+      libagx_draw_empty(p, mode, patch);
       return;
    }
 
@@ -1368,15 +1266,17 @@ libagx_tess_quad(constant struct libagx_tess_args *p,
           (FXP_ONE == outsideTessFactor[Veq1])) {
 
          /* Just do minimum tess factor */
-         if (output_primitive != LIBAGX_TESS_OUTPUT_POINT) {
+         if (!p->points_mode) {
             ctx.Index = libagx_draw(p, mode, false, patch, 6);
             if (mode == LIBAGX_TESS_MODE_COUNT)
                return;
 
-            DefineClockwiseTriangle(&ctx, 0, 1, 3, /*indexStorageOffset*/ 0);
-            DefineClockwiseTriangle(&ctx, 1, 2, 3, /*indexStorageOffset*/ 3);
+            DefineTriangle(&ctx, 0, 1, 3, /*indexStorageOffset*/ 0);
+            DefineTriangle(&ctx, 1, 2, 3, /*indexStorageOffset*/ 3);
          } else {
             libagx_draw_points(&ctx, p, patch, 4);
+            if (mode == LIBAGX_TESS_MODE_COUNT)
+               return;
          }
 
          global struct libagx_tess_point *points =
@@ -1438,18 +1338,14 @@ libagx_tess_quad(constant struct libagx_tess_args *p,
          // don't include end, since next edge starts with it.
          int endPoint = numPointsForOutsideEdge[edge] - 1;
          for (int p = 0; p < endPoint; p++, pointOffset++) {
-            FXP fxpParam;
             int q =
                ((edge == 1) || (edge == 2)) ? p : endPoint - p; // reverse order
-            fxpParam = PlacePointIn1D(&outsideTessFactorCtx[edge],
-                                      outsideTessFactorOdd[edge], q);
-            if (odd) {
-               DefinePoint(&ctx.Point[pointOffset], fxpParam,
-                           (edge == 3) ? FXP_ONE : 0);
-            } else {
-               DefinePoint(&ctx.Point[pointOffset], (edge == 2) ? FXP_ONE : 0,
-                           fxpParam);
-            }
+            FXP fxpParam = PlacePointIn1D(&outsideTessFactorCtx[edge],
+                                          outsideTessFactorOdd[edge], q);
+
+            FXP u = odd ? fxpParam : ((edge == 2) ? FXP_ONE : 0);
+            FXP v = odd ? ((edge == 3) ? FXP_ONE : 0) : fxpParam;
+            DefinePoint(&ctx.Point[pointOffset], u, v);
          }
       }
 
@@ -1479,16 +1375,15 @@ libagx_tess_quad(constant struct libagx_tess_args *p,
                      pointOffset++) // don't include end: next edge starts with
                                     // it.
             {
+               bool odd_ = odd[1];
                int q = ((edge == 1) || (edge == 2))
                           ? p
-                          : endPoint[odd[1]] - (p - startPoint);
-               FXP fxpParam = PlacePointIn1D(&insideTessFactorCtx[odd[1]],
-                                             insideTessFactorOdd[odd[1]], q);
-               if (odd[1]) {
-                  DefinePoint(&ctx.Point[pointOffset], fxpPerpParam, fxpParam);
-               } else {
-                  DefinePoint(&ctx.Point[pointOffset], fxpParam, fxpPerpParam);
-               }
+                          : endPoint[odd_] - (p - startPoint);
+               FXP fxpParam = PlacePointIn1D(&insideTessFactorCtx[odd_],
+                                             insideTessFactorOdd[odd_], q);
+               DefinePoint(&ctx.Point[pointOffset],
+                           odd_ ? fxpPerpParam : fxpParam,
+                           odd_ ? fxpParam : fxpPerpParam);
             }
          }
       }
@@ -1515,7 +1410,7 @@ libagx_tess_quad(constant struct libagx_tess_args *p,
       }
    }
 
-   if (output_primitive == LIBAGX_TESS_OUTPUT_POINT) {
+   if (p->points_mode) {
       libagx_draw_points(&ctx, p, patch, NumPoints);
       return;
    }

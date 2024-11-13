@@ -72,6 +72,8 @@ static const struct debug_control radv_debug_options[] = {{"nofastclears", RADV_
                                                           {"nongg_gs", RADV_DEBUG_NO_NGG_GS},
                                                           {"noeso", RADV_DEBUG_NO_ESO},
                                                           {"psocachestats", RADV_DEBUG_PSO_CACHE_STATS},
+                                                          {"nirdebuginfo", RADV_DEBUG_NIR_DEBUG_INFO},
+                                                          {"dump_trap_handler", RADV_DEBUG_DUMP_TRAP_HANDLER},
                                                           {NULL, 0}};
 
 const char *
@@ -99,6 +101,14 @@ static const struct debug_control radv_perftest_options[] = {{"localbos", RADV_P
                                                              {"rtwave32", RADV_PERFTEST_RT_WAVE_32},
                                                              {"video_encode", RADV_PERFTEST_VIDEO_ENCODE},
                                                              {NULL, 0}};
+
+static const struct debug_control radv_trap_excp_options[] = {
+   {"mem_viol", RADV_PERFTEST_LOCAL_BOS},
+   {"float_div_by_zero", RADV_PERFTEST_DCC_MSAA},
+   {"float_overflow", RADV_PERFTEST_BO_LIST},
+   {"float_underflow", RADV_PERFTEST_CS_WAVE_32},
+   {NULL, 0},
+};
 
 const char *
 radv_get_perftest_option_name(int id)
@@ -343,6 +353,7 @@ radv_CreateInstance(const VkInstanceCreateInfo *pCreateInfo, const VkAllocationC
 
    instance->debug_flags = parse_debug_string(getenv("RADV_DEBUG"), radv_debug_options);
    instance->perftest_flags = parse_debug_string(getenv("RADV_PERFTEST"), radv_perftest_options);
+   instance->trap_excp_flags = parse_debug_string(getenv("RADV_TRAP_HANDLER_EXCP"), radv_trap_excp_options);
    instance->profile_pstate = radv_parse_pstate(debug_get_option("RADV_PROFILE_PSTATE", "peak"));
 
    /* When RADV_FORCE_FAMILY is set, the driver creates a null

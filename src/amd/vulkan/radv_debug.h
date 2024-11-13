@@ -59,6 +59,8 @@ enum {
    RADV_DEBUG_NO_NGG_GS = 1ull << 43,
    RADV_DEBUG_NO_ESO = 1ull << 44,
    RADV_DEBUG_PSO_CACHE_STATS = 1ull << 45,
+   RADV_DEBUG_NIR_DEBUG_INFO = 1ull << 46,
+   RADV_DEBUG_DUMP_TRAP_HANDLER = 1ull << 47,
 };
 
 enum {
@@ -79,6 +81,13 @@ enum {
    RADV_PERFTEST_NIR_CACHE = 1u << 14,
    RADV_PERFTEST_RT_WAVE_32 = 1u << 15,
    RADV_PERFTEST_VIDEO_ENCODE = 1u << 16,
+};
+
+enum {
+   RADV_TRAP_EXCP_MEM_VIOL = 1u << 0,
+   RADV_TRAP_EXCP_FLOAT_DIV_BY_ZERO = 1u << 1,
+   RADV_TRAP_EXCP_FLOAT_OVERFLOW = 1u << 2,
+   RADV_TRAP_EXCP_FLOAT_UNDERFLOW = 1u << 3,
 };
 
 bool radv_init_trace(struct radv_device *device);

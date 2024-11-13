@@ -641,13 +641,15 @@ genX(cmd_buffer_ray_query_globals)(struct anv_cmd_buffer *cmd_buffer)
    brw_rt_compute_scratch_layout(&layout, device->info,
                                  stack_ids_per_dss, 1 << 10);
 
+   uint8_t idx = anv_get_ray_query_bo_index(cmd_buffer);
+
    const struct GENX(RT_DISPATCH_GLOBALS) rtdg = {
       .MemBaseAddress = (struct anv_address) {
          /* The ray query HW computes offsets from the top of the buffer, so
           * let the address at the end of the buffer.
           */
-         .bo = device->ray_query_bo,
-         .offset = device->ray_query_bo->size
+         .bo = device->ray_query_bo[idx],
+         .offset = device->ray_query_bo[idx]->size
       },
       .AsyncRTStackSize = layout.ray_stack_stride / 64,
       .NumDSSRTStacks = layout.stack_ids_per_dss,
@@ -1130,7 +1132,7 @@ cmd_buffer_trace_rays(struct anv_cmd_buffer *cmd_buffer,
                                       pipeline->base.scratch_size);
          btd.ScratchSpaceBuffer = scratch_surf >> ANV_SCRATCH_SPACE_SHIFT(GFX_VER);
       }
-#if INTEL_NEEDS_WA_14017794102
+#if INTEL_NEEDS_WA_14017794102 || INTEL_NEEDS_WA_14023061436
       btd.BTDMidthreadpreemption = false;
 #endif
    }
@@ -1182,7 +1184,7 @@ cmd_buffer_trace_rays(struct anv_cmd_buffer *cmd_buffer,
          .BindingTablePointer = surfaces->offset,
          .NumberofThreadsinGPGPUThreadGroup = 1,
          .BTDMode = true,
-#if INTEL_NEEDS_WA_14017794102
+#if INTEL_NEEDS_WA_14017794102 || INTEL_NEEDS_WA_14023061436
          .ThreadPreemption = false,
 #endif
       },

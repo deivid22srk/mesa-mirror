@@ -54,6 +54,8 @@ agx_pack_txf_sampler(struct agx_sampler_packed *out)
 {
    agx_pack(out, SAMPLER, cfg) {
       /* Allow mipmapping. This is respected by txf, weirdly. */
+      cfg.minimum_lod = 0.0;
+      cfg.maximum_lod = INFINITY;
       cfg.mip_filter = AGX_MIP_FILTER_NEAREST;
 
       /* Out-of-bounds reads must return 0 */
@@ -148,16 +150,32 @@ agx_translate_depth_layout(enum gl_frag_depth_layout layout)
 }
 
 static void
-agx_ppp_fragment_face_2(struct agx_ppp_update *ppp,
-                        enum agx_object_type object_type,
-                        struct agx_shader_info *info)
+agx_pack_fragment_face_2(struct agx_fragment_face_2_packed *out,
+                         enum agx_object_type object_type,
+                         struct agx_shader_info *info)
 {
-   agx_ppp_push(ppp, FRAGMENT_FACE_2, cfg) {
+   agx_pack(out, FRAGMENT_FACE_2, cfg) {
+      /* These act like disables, ANDed in the hardware. Setting them like this
+       * means the draw-time flag is used.
+       */
+      cfg.disable_depth_write = true;
+      cfg.depth_function = AGX_ZS_FUNC_ALWAYS;
+
       cfg.object_type = object_type;
       cfg.conservative_depth =
          info ? agx_translate_depth_layout(info->depth_layout)
               : AGX_CONSERVATIVE_DEPTH_UNCHANGED;
    }
+}
+
+static void
+agx_ppp_fragment_face_2(struct agx_ppp_update *ppp,
+                        enum agx_object_type object_type,
+                        struct agx_shader_info *info)
+{
+   struct agx_fragment_face_2_packed packed;
+   agx_pack_fragment_face_2(&packed, object_type, info);
+   agx_ppp_push_packed(ppp, &packed, FRAGMENT_FACE_2);
 }
 
 static inline uint32_t
@@ -251,17 +269,6 @@ agx_calculate_vbo_clamp(uint64_t vbuf, uint64_t sink, enum pipe_format format,
       *vbuf_out = sink;
       return 0;
    }
-}
-
-static struct agx_device_key
-agx_gather_device_key(struct agx_device *dev)
-{
-   return (struct agx_device_key){
-      .needs_g13x_coherency = (dev->params.gpu_generation == 13 &&
-                               dev->params.num_clusters_total > 1) ||
-                              dev->params.num_dies > 1,
-      .soft_fault = agx_has_soft_fault(dev),
-   };
 }
 
 static void

@@ -48,7 +48,6 @@
 #include "vk_shader_module.h"
 
 #include "compiler/bifrost_nir.h"
-#include "util/pan_lower_framebuffer.h"
 #include "pan_shader.h"
 
 #include "vk_log.h"
@@ -338,7 +337,7 @@ panvk_preprocess_nir(UNUSED struct vk_physical_device *vk_pdev, nir_shader *nir)
       .lower_txs_lod = true,
       .lower_txp = ~0,
       .lower_tg4_broadcom_swizzle = true,
-      .lower_txd = true,
+      .lower_txd_cube_map = true,
       .lower_invalid_implicit_lod = true,
    };
    NIR_PASS_V(nir, nir_lower_tex, &lower_tex_options);

@@ -2107,6 +2107,7 @@ radv_consider_force_vrs(const struct radv_graphics_state_key *gfx_state, const s
     */
    nir_shader *fs_shader = fs_stage->nir;
    if (fs_shader && (BITSET_TEST(fs_shader->info.system_values_read, SYSTEM_VALUE_FRAG_COORD) ||
+                     BITSET_TEST(fs_shader->info.system_values_read, SYSTEM_VALUE_PIXEL_COORD) ||
                      fs_shader->info.fs.sample_interlock_ordered || fs_shader->info.fs.sample_interlock_unordered ||
                      fs_shader->info.fs.pixel_interlock_ordered || fs_shader->info.fs.pixel_interlock_unordered)) {
       return false;
@@ -2274,13 +2275,20 @@ radv_create_gs_copy_shader(struct radv_device *device, struct vk_pipeline_cache 
    if (dump_shader)
       simple_mtx_lock(&instance->shader_dump_mtx);
 
+   char *nir_string = NULL;
+   if (keep_executable_info || dump_shader)
+      nir_string = radv_dump_nir_shaders(instance, &nir, 1);
+
    *gs_copy_binary = radv_shader_nir_to_asm(device, &gs_copy_stage, &nir, 1, &key.gfx_state, keep_executable_info,
                                             keep_statistic_info);
    struct radv_shader *copy_shader =
       radv_shader_create(device, cache, *gs_copy_binary, keep_executable_info || dump_shader);
-   if (copy_shader)
+
+   if (copy_shader) {
+      copy_shader->nir_string = nir_string;
       radv_shader_generate_debug_info(device, dump_shader, keep_executable_info, *gs_copy_binary, copy_shader, &nir, 1,
                                       &gs_copy_stage.info);
+   }
 
    if (dump_shader)
       simple_mtx_unlock(&instance->shader_dump_mtx);
@@ -2334,9 +2342,16 @@ radv_graphics_shaders_nir_to_asm(struct radv_device *device, struct vk_pipeline_
             nir_print_shader(nir_shaders[i], stderr);
       }
 
+      char *nir_string = NULL;
+      if (keep_executable_info || dump_shader)
+         nir_string = radv_dump_nir_shaders(instance, nir_shaders, shader_count);
+
       binaries[s] = radv_shader_nir_to_asm(device, &stages[s], nir_shaders, shader_count, gfx_state,
                                            keep_executable_info, keep_statistic_info);
       shaders[s] = radv_shader_create(device, cache, binaries[s], keep_executable_info || dump_shader);
+
+      shaders[s]->nir_string = nir_string;
+
       radv_shader_generate_debug_info(device, dump_shader, keep_executable_info, binaries[s], shaders[s], nir_shaders,
                                       shader_count, &stages[s].info);
 
@@ -2523,10 +2538,10 @@ radv_skip_graphics_pipeline_compile(const struct radv_device *device, const VkGr
          active_stages |= gfx_pipeline_lib->base.active_stages;
 
          for (uint32_t s = 0; s < MESA_VULKAN_SHADER_STAGES; s++) {
-            if (!gfx_pipeline_lib->base.base.shaders[i])
+            if (!gfx_pipeline_lib->base.base.shaders[s])
                continue;
 
-            binary_stages |= mesa_to_vk_shader_stage(i);
+            binary_stages |= mesa_to_vk_shader_stage(s);
          }
       }
    }
@@ -2666,6 +2681,8 @@ radv_graphics_shaders_compile(struct radv_device *device, struct vk_pipeline_cac
 
       NIR_PASS(_, stages[MESA_SHADER_FRAGMENT].nir, radv_nir_lower_fs_barycentric, gfx_state, rast_prim);
 
+      NIR_PASS(_, stages[MESA_SHADER_FRAGMENT].nir, nir_lower_fragcoord_wtrans);
+
       /* frag_depth = gl_FragCoord.z broadcasts to all samples of the fragment shader invocation,
        * so only optimize it away if we know there is only one sample per invocation.
        * Because we don't know if sample shading is used with factor 1.0f, this means
@@ -2697,6 +2714,12 @@ radv_graphics_shaders_compile(struct radv_device *device, struct vk_pipeline_cac
 
       if (!gfx_state->ps.has_epilog)
          radv_nir_remap_color_attachment(stages[MESA_SHADER_FRAGMENT].nir, gfx_state);
+
+      bool update_info = false;
+      NIR_PASS(update_info, stages[MESA_SHADER_FRAGMENT].nir, nir_opt_frag_coord_to_pixel_coord);
+      if (update_info)
+         nir_shader_gather_info(stages[MESA_SHADER_FRAGMENT].nir,
+                                nir_shader_get_entrypoint(stages[MESA_SHADER_FRAGMENT].nir));
    }
 
    /* Optimize varyings on lowered shader I/O (more efficient than optimizing I/O derefs). */

@@ -49,6 +49,12 @@
       }                                                                                          \
    } while(0)
 
+#define RADEON_ENC_ERR(fmt, args...)                                                             \
+   do {                                                                                          \
+      enc->error = true;                                                                         \
+      fprintf(stderr, "EE %s:%d %s VCN - " fmt, __FILE__, __LINE__, __func__, ##args);           \
+   } while(0)
+
 typedef void (*radeon_enc_get_buffer)(struct pipe_resource *resource, struct pb_buffer_lean **handle,
                                       struct radeon_surf **surface);
 
@@ -87,10 +93,6 @@ struct radeon_enc_pic {
       } av1;
    };
 
-   unsigned crop_left;
-   unsigned crop_right;
-   unsigned crop_top;
-   unsigned crop_bottom;
    unsigned pic_width_in_luma_samples;
    unsigned pic_height_in_luma_samples;
    unsigned bit_depth_luma_minus8;
@@ -126,14 +128,11 @@ struct radeon_enc_pic {
    struct {
       struct {
          struct {
-            uint32_t enable_render_size:1;
             uint32_t enable_error_resilient_mode:1;
             uint32_t force_integer_mv:1;
             uint32_t disable_screen_content_tools:1;
             uint32_t is_obu_frame:1;
          };
-         uint32_t render_width;
-         uint32_t render_height;
          uint32_t *copy_start;
       };
       rvcn_enc_av1_spec_misc_t av1_spec_misc;
@@ -231,6 +230,7 @@ struct radeon_encoder {
    struct pb_buffer_lean *handle;
    struct radeon_surf *luma;
    struct radeon_surf *chroma;
+   struct pipe_video_buffer *source;
 
    struct pb_buffer_lean *bs_handle;
    unsigned bs_size;
@@ -268,6 +268,8 @@ struct radeon_encoder {
    unsigned dpb_slots;
    unsigned roi_size;
    unsigned metadata_size;
+
+   bool error;
 
    enum {
       DPB_LEGACY = 0,

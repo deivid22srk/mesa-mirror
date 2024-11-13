@@ -140,11 +140,52 @@ get_cache_uuid(uint16_t family, void *uuid)
    return 0;
 }
 
+static VkResult
+get_device_sync_types(struct panvk_physical_device *device,
+                      const struct panvk_instance *instance)
+{
+   const unsigned arch = pan_arch(device->kmod.props.gpu_prod_id);
+   uint32_t sync_type_count = 0;
+
+   device->drm_syncobj_type = vk_drm_syncobj_get_type(device->kmod.dev->fd);
+   if (!device->drm_syncobj_type.features) {
+      return vk_errorf(instance, VK_ERROR_INITIALIZATION_FAILED,
+                       "failed to query syncobj features");
+   }
+
+   device->sync_types[sync_type_count++] = &device->drm_syncobj_type;
+
+   if (arch >= 10) {
+      assert(device->drm_syncobj_type.features & VK_SYNC_FEATURE_TIMELINE);
+   } else {
+      /* We don't support timelines in the uAPI yet and we don't want it getting
+       * suddenly turned on by vk_drm_syncobj_get_type() without us adding panvk
+       * code for it first.
+       */
+      device->drm_syncobj_type.features &= ~VK_SYNC_FEATURE_TIMELINE;
+
+      /* vk_sync_timeline requires VK_SYNC_FEATURE_GPU_MULTI_WAIT.  Panfrost
+       * waits on the underlying dma-fences and supports the feature.
+       */
+      device->drm_syncobj_type.features |= VK_SYNC_FEATURE_GPU_MULTI_WAIT;
+
+      device->sync_timeline_type =
+         vk_sync_timeline_get_type(&device->drm_syncobj_type);
+      device->sync_types[sync_type_count++] = &device->sync_timeline_type.sync;
+   }
+
+   assert(sync_type_count < ARRAY_SIZE(device->sync_types));
+   device->sync_types[sync_type_count] = NULL;
+
+   return VK_SUCCESS;
+}
+
 static void
 get_device_extensions(const struct panvk_physical_device *device,
                       struct vk_device_extension_table *ext)
 {
    *ext = (struct vk_device_extension_table){
+      .KHR_16bit_storage = true,
       .KHR_bind_memory2 = true,
       .KHR_buffer_device_address = true,
       .KHR_copy_commands2 = true,
@@ -160,6 +201,7 @@ get_device_extensions(const struct panvk_physical_device *device,
       .KHR_external_semaphore = true,
       .KHR_external_semaphore_fd = true,
       .KHR_get_memory_requirements2 = true,
+      .KHR_global_priority = true,
       .KHR_image_format_list = true,
       .KHR_maintenance1 = true,
       .KHR_maintenance2 = true,
@@ -175,10 +217,14 @@ get_device_extensions(const struct panvk_physical_device *device,
       .KHR_swapchain = true,
 #endif
       .KHR_synchronization2 = true,
+      .KHR_timeline_semaphore = true,
       .KHR_variable_pointers = true,
       .EXT_buffer_device_address = true,
       .EXT_custom_border_color = true,
+      .EXT_depth_clip_enable = true,
       .EXT_external_memory_dma_buf = true,
+      .EXT_global_priority = true,
+      .EXT_global_priority_query = true,
       .EXT_graphics_pipeline_library = true,
       .EXT_image_drm_format_modifier = true,
       .EXT_index_type_uint8 = true,
@@ -218,7 +264,7 @@ get_features(const struct panvk_physical_device *device,
 
       /* Vulkan 1.1 */
       .storageBuffer16BitAccess = false,
-      .uniformAndStorageBuffer16BitAccess = false,
+      .uniformAndStorageBuffer16BitAccess = true,
       .storagePushConstant16 = false,
       .storageInputOutput16 = false,
       .multiview = false,
@@ -270,7 +316,7 @@ get_features(const struct panvk_physical_device *device,
       .shaderSubgroupExtendedTypes = false,
       .separateDepthStencilLayouts = false,
       .hostQueryReset = false,
-      .timelineSemaphore = false,
+      .timelineSemaphore = true,
       .bufferDeviceAddress = true,
       .bufferDeviceAddressCaptureReplay = false,
       .bufferDeviceAddressMultiDevice = false,
@@ -300,6 +346,9 @@ get_features(const struct panvk_physical_device *device,
 
       /* VK_EXT_graphics_pipeline_library */
       .graphicsPipelineLibrary = true,
+
+      /* VK_KHR_global_priority */
+      .globalPriorityQuery = true,
 
       /* VK_EXT_index_type_uint8 */
       .indexTypeUint8 = true,
@@ -649,7 +698,6 @@ get_device_properties(const struct panvk_instance *instance,
       /* XXX: VK_EXT_sampler_filter_minmax */
       .filterMinmaxSingleComponentFormats = false,
       .filterMinmaxImageComponentMapping = false,
-      /* XXX: VK_KHR_timeline_semaphore */
       .maxTimelineSemaphoreValueDifference = INT64_MAX,
       .framebufferIntegerColorSampleCounts = sample_counts,
 
@@ -800,14 +848,11 @@ panvk_physical_device_init(struct panvk_physical_device *device,
       goto fail;
    }
 
-   vk_warn_non_conformant_implementation("panvk");
+   result = get_device_sync_types(device, instance);
+   if (result != VK_SUCCESS)
+      goto fail;
 
-   device->drm_syncobj_type = vk_drm_syncobj_get_type(device->kmod.dev->fd);
-   /* We don't support timelines in the uAPI yet and we don't want it getting
-    * suddenly turned on by vk_drm_syncobj_get_type() without us adding panvk
-    * code for it first.
-    */
-   device->drm_syncobj_type.features &= ~VK_SYNC_FEATURE_TIMELINE;
+   vk_warn_non_conformant_implementation("panvk");
 
    struct vk_device_extension_table supported_extensions;
    get_device_extensions(device, &supported_extensions);
@@ -831,8 +876,6 @@ panvk_physical_device_init(struct panvk_physical_device *device,
    if (result != VK_SUCCESS)
       goto fail;
 
-   device->sync_types[0] = &device->drm_syncobj_type;
-   device->sync_types[1] = NULL;
    device->vk.supported_sync_types = device->sync_types;
 
    result = panvk_wsi_init(device);
@@ -858,17 +901,46 @@ static const VkQueueFamilyProperties panvk_queue_family_properties = {
    .minImageTransferGranularity = {1, 1, 1},
 };
 
+static void
+panvk_fill_global_priority(const struct panvk_physical_device *physical_device,
+                           VkQueueFamilyGlobalPriorityPropertiesKHR *prio)
+{
+   enum pan_kmod_group_allow_priority_flags prio_mask =
+      physical_device->kmod.props.allowed_group_priorities_mask;
+   uint32_t prio_idx = 0;
+
+   if (prio_mask & PAN_KMOD_GROUP_ALLOW_PRIORITY_LOW)
+      prio->priorities[prio_idx++] = VK_QUEUE_GLOBAL_PRIORITY_LOW_KHR;
+
+   if (prio_mask & PAN_KMOD_GROUP_ALLOW_PRIORITY_MEDIUM)
+      prio->priorities[prio_idx++] = VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR;
+
+   if (prio_mask & PAN_KMOD_GROUP_ALLOW_PRIORITY_HIGH)
+      prio->priorities[prio_idx++] = VK_QUEUE_GLOBAL_PRIORITY_HIGH_KHR;
+
+   if (prio_mask & PAN_KMOD_GROUP_ALLOW_PRIORITY_REALTIME)
+      prio->priorities[prio_idx++] = VK_QUEUE_GLOBAL_PRIORITY_REALTIME_KHR;
+
+   prio->priorityCount = prio_idx;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 panvk_GetPhysicalDeviceQueueFamilyProperties2(
    VkPhysicalDevice physicalDevice, uint32_t *pQueueFamilyPropertyCount,
    VkQueueFamilyProperties2 *pQueueFamilyProperties)
 {
+   VK_FROM_HANDLE(panvk_physical_device, physical_device, physicalDevice);
    VK_OUTARRAY_MAKE_TYPED(VkQueueFamilyProperties2, out, pQueueFamilyProperties,
                           pQueueFamilyPropertyCount);
 
    vk_outarray_append_typed(VkQueueFamilyProperties2, &out, p)
    {
       p->queueFamilyProperties = panvk_queue_family_properties;
+
+      VkQueueFamilyGlobalPriorityPropertiesKHR *prio =
+         vk_find_struct(p->pNext, QUEUE_FAMILY_GLOBAL_PRIORITY_PROPERTIES_KHR);
+      if (prio)
+         panvk_fill_global_priority(physical_device, prio);
    }
 }
 

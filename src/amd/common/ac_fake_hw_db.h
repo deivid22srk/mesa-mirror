@@ -12,7 +12,41 @@
 #include "amdgfxregs.h"
 #include "addrlib/src/amdgpu_asic_addr.h"
 
+#ifdef _WIN32
+#define AMDGPU_FAMILY_VI         130
+#define AMDGPU_FAMILY_AI         141
+#define AMDGPU_FAMILY_RV         142
+#define AMDGPU_FAMILY_NV         143
+#else
+#include "amdgpu_drm.h"
+#endif
+
 typedef void (*gpu_init_func)(struct radeon_info *info);
+
+static void init_polaris12(struct radeon_info *info)
+{
+   info->family = CHIP_POLARIS12;
+   info->gfx_level = GFX8;
+   info->family_id = AMDGPU_FAMILY_VI;
+   info->chip_external_rev = 0x64;
+   info->use_display_dcc_unaligned = false;
+   info->use_display_dcc_with_retile_blit = false;
+   info->has_graphics = true;
+   info->tcc_cache_line_size = 64;
+   info->max_render_backends = 4;
+
+   uint32_t si_tile_mode_array[] = {
+      0x00800150, 0x00800950, 0x00801150, 0x00801950, 0x00802950,
+      0x00802948, 0x00802954, 0x00802954, 0x00000144, 0x02000148,
+      0x02000150, 0x06000154, 0x06000154, 0x02400148, 0x02400150,
+      0x02400170, 0x06400154, 0x06400154, 0x0040014c, 0x0100014c,
+      0x0100015c, 0x01000174, 0x01000164, 0x01000164, 0x0040015c,
+      0x01000160, 0x01000178, 0x02c00148, 0x02c00150, 0x06c00154,
+      0x06c00154, 0x00000000
+   };
+   memcpy(info->si_tile_mode_array, si_tile_mode_array, sizeof(si_tile_mode_array));
+   info->gb_addr_config = 0x22011002;
+}
 
 static void init_vega10(struct radeon_info *info)
 {
@@ -149,7 +183,7 @@ static void init_gfx12(struct radeon_info *info)
    info->gb_addr_config = 0; /* Other fields are set by test cases. */
 }
 
-struct testcase {
+struct ac_fake_hw {
    const char *name;
    gpu_init_func init;
    int banks_or_pkrs;
@@ -158,7 +192,8 @@ struct testcase {
    int rb_per_se;
 };
 
-static struct testcase testcases[] = {
+static struct ac_fake_hw ac_fake_hw_db[] = {
+   {"polaris12", init_polaris12},
    {"vega10", init_vega10, 4, 2, 2, 2},
    {"vega10_diff_bank", init_vega10, 3, 2, 2, 2},
    {"vega10_diff_rb", init_vega10, 4, 2, 2, 0},
@@ -189,44 +224,42 @@ static struct testcase testcases[] = {
    {"gfx12_16pipe", init_gfx12, 4, 4},
 };
 
-static struct radeon_info get_radeon_info(struct testcase *testcase)
+static void get_radeon_info(struct radeon_info *info, struct ac_fake_hw *hw)
 {
-   struct radeon_info info = {
-      .drm_major = 3,
-      .drm_minor = 30,
-   };
+   if (info->drm_major != 3) {
+      info->drm_major = 3;
+      info->drm_minor = 30;
+   }
 
-   testcase->init(&info);
+   hw->init(info);
 
-   switch(info.gfx_level) {
+   switch(info->gfx_level) {
    case GFX9:
-      info.gb_addr_config = (info.gb_addr_config &
+      info->gb_addr_config = (info->gb_addr_config &
                              C_0098F8_NUM_PIPES &
                              C_0098F8_NUM_BANKS &
                              C_0098F8_NUM_SHADER_ENGINES_GFX9 &
                              C_0098F8_NUM_RB_PER_SE) |
-                             S_0098F8_NUM_PIPES(testcase->pipes) |
-                             S_0098F8_NUM_BANKS(testcase->banks_or_pkrs) |
-                             S_0098F8_NUM_SHADER_ENGINES_GFX9(testcase->se) |
-                             S_0098F8_NUM_RB_PER_SE(testcase->rb_per_se);
+                             S_0098F8_NUM_PIPES(hw->pipes) |
+                             S_0098F8_NUM_BANKS(hw->banks_or_pkrs) |
+                             S_0098F8_NUM_SHADER_ENGINES_GFX9(hw->se) |
+                             S_0098F8_NUM_RB_PER_SE(hw->rb_per_se);
       break;
    case GFX10:
    case GFX10_3:
    case GFX11:
    case GFX12:
-      info.gb_addr_config = (info.gb_addr_config &
+      info->gb_addr_config = (info->gb_addr_config &
                              C_0098F8_NUM_PIPES &
                              C_0098F8_NUM_PKRS) |
-                             S_0098F8_NUM_PIPES(testcase->pipes) |
-                             S_0098F8_NUM_PKRS(testcase->banks_or_pkrs);
+                             S_0098F8_NUM_PIPES(hw->pipes) |
+                             S_0098F8_NUM_PKRS(hw->banks_or_pkrs);
       /* 1 packer implies 1 RB except gfx10 where the field is ignored. */
-      info.max_render_backends = info.gfx_level == GFX10 || testcase->banks_or_pkrs ? 2 : 1;
+      info->max_render_backends = info->gfx_level == GFX10 || hw->banks_or_pkrs ? 2 : 1;
       break;
    default:
-      unreachable("Unhandled generation");
+      break;
    }
-
-   return info;
 }
 
 #endif

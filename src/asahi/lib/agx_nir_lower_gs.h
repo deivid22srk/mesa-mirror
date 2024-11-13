@@ -46,25 +46,21 @@ void agx_nir_gs_setup_indirect(struct nir_builder *b, const void *key);
 
 struct agx_unroll_restart_key {
    enum mesa_prim prim;
-   unsigned index_size_B;
 };
 
 void agx_nir_unroll_restart(struct nir_builder *b, const void *key);
 
 struct agx_tessellator_key {
-   enum tess_primitive_mode prim                      : 8;
-   enum libagx_tess_output_primitive output_primitive : 8;
-   enum libagx_tess_partitioning partitioning         : 8;
-   enum libagx_tess_mode mode                         : 8;
+   enum tess_primitive_mode prim : 8;
+   enum libagx_tess_mode mode    : 8;
+   unsigned pad                  : 16;
 };
 static_assert(sizeof(struct agx_tessellator_key) == 4, "padded");
 
 struct agx_tess_setup_indirect_key {
    bool point_mode;
-   bool with_counts;
-   bool padding[2];
 };
-static_assert(sizeof(struct agx_tess_setup_indirect_key) == 4, "padded");
+static_assert(sizeof(struct agx_tess_setup_indirect_key) == 1, "padded");
 
 void agx_nir_tessellate(struct nir_builder *b, const void *key);
 

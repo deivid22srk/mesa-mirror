@@ -58,11 +58,29 @@ brw_has_uip(const struct intel_device_info *devinfo, enum opcode opcode)
           opcode == BRW_OPCODE_HALT;
 }
 
-static bool
-has_branch_ctrl(const struct intel_device_info *devinfo, enum opcode opcode)
+bool
+brw_has_branch_ctrl(const struct intel_device_info *devinfo, enum opcode opcode)
 {
-   return opcode == BRW_OPCODE_IF ||
-          opcode == BRW_OPCODE_ELSE;
+   switch (opcode) {
+   case BRW_OPCODE_IF:
+   case BRW_OPCODE_ELSE:
+   case BRW_OPCODE_GOTO:
+   case BRW_OPCODE_BREAK:
+   case BRW_OPCODE_CALL:
+   case BRW_OPCODE_CALLA:
+   case BRW_OPCODE_CONTINUE:
+   case BRW_OPCODE_ENDIF:
+   case BRW_OPCODE_HALT:
+   case BRW_OPCODE_JMPI:
+   case BRW_OPCODE_RET:
+   case BRW_OPCODE_WHILE:
+   case BRW_OPCODE_BRC:
+   case BRW_OPCODE_BRD:
+      /* TODO: "join" should also be here if added */
+      return true;
+   default:
+      return false;
+   }
 }
 
 static bool
@@ -2556,7 +2574,7 @@ brw_disassemble_inst(FILE *file, const struct brw_isa_info *isa,
                      (devinfo->ver >= 12 ? brw_inst_atomic_control(devinfo, inst) :
                                            brw_inst_thread_control(devinfo, inst)),
                      &space);
-      if (has_branch_ctrl(devinfo, opcode)) {
+      if (brw_has_branch_ctrl(devinfo, opcode)) {
          err |= control(file, "branch ctrl", branch_ctrl,
                         brw_inst_branch_control(devinfo, inst), &space);
       } else if (devinfo->ver < 20) {

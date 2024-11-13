@@ -1347,6 +1347,13 @@ opcode("imadshl_agx", 0, tint, [0, 0, 0, 0], [tint, tint, tint, tint], False,
 opcode("imsubshl_agx", 0, tint, [0, 0, 0, 0], [tint, tint, tint, tint], False,
        "", f"(src0 * src1) - (src2 << src3)")
 
+# Address arithmetic instructions: extend, shift, and add
+# Shift must be a small constant.
+opcode("ilea_agx", 0, tuint64, [0, 0, 0], [tuint64, tint32, tuint32], False,
+       "", f"src0 + (((int64_t)src1) << src2)")
+opcode("ulea_agx", 0, tuint64, [0, 0, 0], [tuint64, tuint32, tuint32], False,
+       "", f"src0 + (((uint64_t)src1) << src2)")
+
 # Bounds check instruction.
 #
 # Sources: <data, end offset, bounds>
@@ -1363,6 +1370,14 @@ binop_convert("interleave_agx", tuint32, tuint16, "", """
       Interleave bits of 16-bit integers to calculate a 32-bit integer. This can
       be used as-is for Morton encoding.
       """)
+
+# These are like fmin/fmax, but do not flush denorms on the output which is why
+# they're modeled as conversions. AGX flushes fp32 denorms but preserves fp16
+# denorms, so fp16 fmin/fmax work without lowering.
+binop_convert("fmin_agx", tuint32, tfloat32, _2src_commutative + associative,
+              "(src0 < src1 || isnan(src1)) ? src0 : src1")
+binop_convert("fmax_agx", tuint32, tfloat32, _2src_commutative + associative,
+              "(src0 > src1 || isnan(src1)) ? src0 : src1")
 
 # NVIDIA PRMT
 opcode("prmt_nv", 0, tuint32, [0, 0, 0], [tuint32, tuint32, tuint32],

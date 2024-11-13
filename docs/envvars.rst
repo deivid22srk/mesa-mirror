@@ -1329,6 +1329,8 @@ RADV driver environment variables
       force all allocated buffers to be referenced in submissions
    ``checkir``
       validate the LLVM IR before LLVM compiles the shader
+   ``dump_trap_handler``
+      dump the trap handler shader
    ``epilogs``
       dump fragment shader epilogs
    ``extra_md``
@@ -1396,6 +1398,8 @@ RADV driver environment variables
       dump LLVM IR before any optimizations
    ``prologs``
       dump vertex shader prologs
+   ``psocachestats``
+     dump PSO cache stats (hits/misses) to verify precompilation of shaders
    ``shaders``
       dump shaders
    ``shaderstats``
@@ -1486,6 +1490,25 @@ RADV driver environment variables
 .. envvar:: RADV_THREAD_TRACE_QUEUE_EVENTS
 
    enable/disable SQTT/RGP queue events (enabled by default)
+
+.. envvar:: RADV_TRAP_HANDLER
+
+   enable/disable the experimental trap handler for debugging GPU hangs on GFX8
+   (disabled by default)
+
+.. envvar:: RADV_TRAP_HANDLER_EXCP
+
+  a comma-separated list of named flags to configure the trap handler
+  exceptions, see the list below:
+
+  ``mem_viol``
+    enable memory violation exception
+  ``float_div_by_zero``
+    enable floating point division by zero exception
+  ``float_overflow``
+    enable floating point overflow exception
+  ``float_underflow``
+    enable floating point underflow exception
 
 .. envvar:: RADV_RRA_TRACE_VALIDATE
 
@@ -1644,7 +1667,7 @@ RadeonSI driver environment variables
    ``nongg``
       Disable NGG and use the legacy pipeline.
    ``nggc``
-      Always use NGG culling even when it can hurt.
+      Always use NGG culling even on GPUs where it is disabled by default.
    ``nonggc``
       Disable NGG culling.
    ``switch_on_eop``
@@ -1850,6 +1873,13 @@ r300 driver environment variables
       Disable AA compression and fast AA clear
    ``notcl``
       Disable hardware accelerated Transform/Clip/Lighting
+   ``ieeemath``
+      Force IEEE versions of VS math opcodes where applicable
+      and also IEEE handling of multiply by zero (R5xx only)
+   ``ffmath``
+      Force FF versions of VS math opcodes where applicable
+      and 0 * anything = 0 rules in FS
+
 
 Asahi driver environment variables
 ----------------------------------

@@ -448,6 +448,14 @@ agx_nir_fs_epilog(nir_builder *b, const void *key_)
     * to the epilog, when sample shading is not used but blending is.
     */
    if (key->link.sample_shading) {
+      /* Lower the resulting discards. Done in agx_nir_lower_monolithic_msaa for
+       * the pixel shaded path. Must be done before agx_nir_lower_to_per_sample
+       * to avoid duplicating tests.
+       */
+      if (key->blend.alpha_to_coverage) {
+         NIR_PASS(_, b->shader, agx_nir_lower_sample_mask);
+      }
+
       NIR_PASS(_, b->shader, agx_nir_lower_to_per_sample);
       NIR_PASS(_, b->shader, agx_nir_lower_fs_active_samples_to_register);
 

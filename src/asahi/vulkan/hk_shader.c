@@ -734,17 +734,16 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
 static void
 hk_upload_shader(struct hk_device *dev, struct hk_shader *shader)
 {
-   if (shader->b.info.has_preamble) {
-      unsigned offs = shader->b.info.preamble_offset;
-      assert(offs < shader->b.binary_size);
-
-      size_t size = shader->b.binary_size - offs;
+   if (shader->b.info.has_preamble || shader->b.info.rodata.size_16) {
+      /* TODO: Do we wnat to compact? Revisit when we rework prolog/epilogs. */
+      size_t size = shader->b.info.binary_size;
       assert(size > 0);
 
       shader->bo = agx_bo_create(&dev->dev, size, 0,
                                  AGX_BO_EXEC | AGX_BO_LOW_VA, "Preamble");
-      memcpy(shader->bo->map, shader->b.binary + offs, size);
-      shader->preamble_addr = shader->bo->va->addr;
+      memcpy(shader->bo->map, shader->b.binary, size);
+      shader->preamble_addr =
+         shader->bo->va->addr + shader->b.info.preamble_offset;
    }
 
    if (!shader->linked.ht) {
@@ -753,10 +752,7 @@ hk_upload_shader(struct hk_device *dev, struct hk_shader *shader)
    }
 
    if (shader->info.stage == MESA_SHADER_FRAGMENT) {
-      agx_pack(&shader->frag_face, FRAGMENT_FACE_2, cfg) {
-         cfg.conservative_depth =
-            agx_translate_depth_layout(shader->b.info.depth_layout);
-      }
+      agx_pack_fragment_face_2(&shader->frag_face, 0, &shader->b.info);
    }
 
    agx_pack(&shader->counts, COUNTS, cfg) {
@@ -829,28 +825,26 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
 
       NIR_PASS(_, nir, agx_nir_lower_fs_active_samples_to_register);
       NIR_PASS(_, nir, agx_nir_lower_interpolation);
-   } else if (sw_stage == MESA_SHADER_TESS_EVAL) {
-      shader->info.ts.ccw = nir->info.tess.ccw;
-      shader->info.ts.point_mode = nir->info.tess.point_mode;
-      shader->info.ts.spacing = nir->info.tess.spacing;
-      shader->info.ts.mode = nir->info.tess._primitive_mode;
+   } else if (sw_stage == MESA_SHADER_TESS_EVAL ||
+              sw_stage == MESA_SHADER_TESS_CTRL) {
 
-      if (nir->info.tess.point_mode) {
-         shader->info.ts.out_prim = MESA_PRIM_POINTS;
-      } else if (nir->info.tess._primitive_mode == TESS_PRIMITIVE_ISOLINES) {
-         shader->info.ts.out_prim = MESA_PRIM_LINES;
+      shader->info.tess.info.ccw = nir->info.tess.ccw;
+      shader->info.tess.info.points = nir->info.tess.point_mode;
+      shader->info.tess.info.spacing = nir->info.tess.spacing;
+      shader->info.tess.info.mode = nir->info.tess._primitive_mode;
+
+      if (sw_stage == MESA_SHADER_TESS_CTRL) {
+         shader->info.tess.tcs_output_patch_size =
+            nir->info.tess.tcs_vertices_out;
+         shader->info.tess.tcs_per_vertex_outputs =
+            agx_tcs_per_vertex_outputs(nir);
+         shader->info.tess.tcs_nr_patch_outputs =
+            util_last_bit(nir->info.patch_outputs_written);
+         shader->info.tess.tcs_output_stride = agx_tcs_output_stride(nir);
       } else {
-         shader->info.ts.out_prim = MESA_PRIM_TRIANGLES;
+         /* This destroys info so it needs to happen after the gather */
+         NIR_PASS(_, nir, agx_nir_lower_tes, dev->dev.libagx, hw);
       }
-
-      /* This destroys info so it needs to happen after the gather */
-      NIR_PASS(_, nir, agx_nir_lower_tes, dev->dev.libagx, hw);
-   } else if (sw_stage == MESA_SHADER_TESS_CTRL) {
-      shader->info.tcs.output_patch_size = nir->info.tess.tcs_vertices_out;
-      shader->info.tcs.per_vertex_outputs = agx_tcs_per_vertex_outputs(nir);
-      shader->info.tcs.nr_patch_outputs =
-         util_last_bit(nir->info.patch_outputs_written);
-      shader->info.tcs.output_stride = agx_tcs_output_stride(nir);
    }
 
    uint64_t outputs = nir->info.outputs_written;
@@ -879,6 +873,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       .libagx = dev->dev.libagx,
       .no_stop = nir->info.stage == MESA_SHADER_FRAGMENT,
       .has_scratch = !nir->info.internal,
+      .promote_constants = true,
    };
 
    /* For now, sample shading is always dynamic. Indicate that. */
@@ -899,7 +894,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       simple_mtx_unlock(lock);
 
    shader->code_ptr = shader->b.binary;
-   shader->code_size = shader->b.binary_size;
+   shader->code_size = shader->b.info.binary_size;
 
    shader->info.stage = sw_stage;
    shader->info.clip_distance_array_size = nir->info.clip_distance_array_size;
@@ -1253,7 +1248,7 @@ hk_deserialize_shader(struct hk_device *dev, struct blob_reader *blob,
    shader->info = info;
    shader->code_size = code_size;
    shader->data_size = data_size;
-   shader->b.binary_size = code_size;
+   shader->b.info.binary_size = code_size;
 
    shader->code_ptr = malloc(code_size);
    if (shader->code_ptr == NULL)
@@ -1494,22 +1489,8 @@ hk_fast_link(struct hk_device *dev, bool fragment, struct hk_shader *main,
    /* Now that we've linked, bake the USC words to bind this program */
    struct agx_usc_builder b = agx_usc_builder(s->usc.data, sizeof(s->usc.data));
 
-   if (main && main->b.info.immediate_size_16) {
-      unreachable("todo");
-#if 0
-      /* XXX: do ahead of time */
-      uint64_t ptr = agx_pool_upload_aligned(
-         &cmd->pool, s->b.info.immediates, s->b.info.immediate_size_16 * 2, 64);
-
-      for (unsigned range = 0; range < constant_push_ranges; ++range) {
-         unsigned offset = 64 * range;
-         assert(offset < s->b.info.immediate_size_16);
-
-         agx_usc_uniform(&b, s->b.info.immediate_base_uniform + offset,
-                         MIN2(64, s->b.info.immediate_size_16 - offset),
-                         ptr + (offset * 2));
-      }
-#endif
+   if (main && main->b.info.rodata.size_16) {
+      agx_usc_immediates(&b, &main->b.info, main->bo->va->addr);
    }
 
    agx_usc_push_packed(&b, UNIFORM, dev->rodata.image_heap);

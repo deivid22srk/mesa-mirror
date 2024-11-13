@@ -611,6 +611,7 @@ struct tu_cmd_buffer
 
    uint32_t vsc_draw_strm_pitch;
    uint32_t vsc_prim_strm_pitch;
+   uint64_t vsc_draw_strm_va, vsc_draw_strm_size_va, vsc_prim_strm_va;
    bool vsc_initialized;
 };
 VK_DEFINE_HANDLE_CASTS(tu_cmd_buffer, vk.base, VkCommandBuffer,
@@ -677,6 +678,13 @@ template <chip CHIP>
 void tu_cmd_render(struct tu_cmd_buffer *cmd);
 
 enum fd_gpu_event : uint32_t;
+
+template <chip CHIP>
+void
+tu_emit_raw_event_write(struct tu_cmd_buffer *cmd,
+                        struct tu_cs *cs,
+                        enum vgt_event_type event,
+                        bool needs_seqno);
 
 template <chip CHIP>
 void

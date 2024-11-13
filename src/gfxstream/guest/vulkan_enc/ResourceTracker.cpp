@@ -268,6 +268,10 @@ bool descriptorBindingIsImmutableSampler(VkDescriptorSet dstSet, uint32_t dstBin
     return as_goldfish_VkDescriptorSet(dstSet)->reified->bindingIsImmutableSampler[dstBinding];
 }
 
+static bool isHostVisible(const VkPhysicalDeviceMemoryProperties* memoryProps, uint32_t index) {
+    return memoryProps->memoryTypes[index].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+}
+
 VkDescriptorImageInfo ResourceTracker::filterNonexistentSampler(
     const VkDescriptorImageInfo& inputInfo) {
     VkSampler sampler = inputInfo.sampler;
@@ -1413,7 +1417,8 @@ void ResourceTracker::setupCaps(uint32_t& noRenderControlEnc) {
         mFeatureInfo.hasVulkanCreateResourcesWithRequirements = true;
         mFeatureInfo.hasVirtioGpuNext = true;
         mFeatureInfo.hasVirtioGpuNativeSync = true;
-        mFeatureInfo.hasVulkanBatchedDescriptorSetUpdate = true;
+        mFeatureInfo.hasVulkanBatchedDescriptorSetUpdate =
+            mCaps.vulkanCapset.vulkanBatchedDescriptorSetUpdate;
         mFeatureInfo.hasVulkanAsyncQsri = true;
 
         ResourceTracker::streamFeatureBits |= VULKAN_STREAM_FEATURE_NULL_OPTIONAL_STRINGS_BIT;
@@ -1742,6 +1747,7 @@ VkResult ResourceTracker::on_vkEnumerateDeviceExtensionProperties(
         "VK_KHR_shader_subgroup_extended_types",
         "VK_EXT_subgroup_size_control",
         "VK_EXT_provoking_vertex",
+        "VK_KHR_line_rasterization",
         "VK_EXT_line_rasterization",
         "VK_KHR_shader_terminate_invocation",
         "VK_EXT_transform_feedback",

@@ -946,6 +946,12 @@ optimizations.extend([
    # fmin(0.0, b)) while the right one is "b", so this optimization is inexact.
    (('~fmin', ('fsat', a), '#b(is_zero_to_one)'), ('fsat', ('fmin', a, b))),
 
+   # If a >= 0 ... 1 + a >= 1 ... so fsat(1 + a) = 1
+   (('fsat', ('fadd', 1.0, 'a(is_ge_zero)')), 1.0),
+
+   # Let constant folding do its job. This can have emergent behaviour.
+   (('fneg', ('bcsel(is_used_once)', a, '#b', '#c')), ('bcsel', a, ('fneg', b), ('fneg', c))),
+
    # max(-min(b, a), b) -> max(abs(b), -a)
    # min(-max(b, a), b) -> min(-abs(b), -a)
    (('fmax', ('fneg', ('fmin', b, a)), b), ('fmax', ('fabs', b), ('fneg', a))),
@@ -1804,8 +1810,9 @@ optimizations.extend([
    (('ishr', 'a@32', 24), ('extract_i8', a, 3), '!options->lower_extract_byte'),
    (('ishr', 'a@64', 56), ('extract_i8', a, 7), '!options->lower_extract_byte'),
    (('iand', 0xff, a), ('extract_u8', a, 0), '!options->lower_extract_byte'),
-   (('ishr', ('iand', a, 0x0000ff00),  8), ('extract_u8', a, 1), '!options->lower_extract_byte'),
-   (('ishr', ('iand', a, 0x00ff0000), 16), ('extract_u8', a, 2), '!options->lower_extract_byte'),
+   (('ishr', ('iand', 'a@32', 0x0000ff00),  8), ('extract_u8', a, 1), '!options->lower_extract_byte'),
+   (('ishr', ('iand', 'a@64', 0x0000ff00),  8), ('extract_u8', a, 1), '!options->lower_extract_byte'),
+   (('ishr', ('iand',  a,     0x00ff0000), 16), ('extract_u8', a, 2), '!options->lower_extract_byte'),
 
    # Common pattern in many Vulkan CTS tests that read 8-bit integers from a
    # storage buffer.
@@ -1955,6 +1962,21 @@ optimizations.extend([
    # Reduce intermediate precision with int64.
    (('u2u32', ('iadd(is_used_once)', 'a@64', b)),
     ('iadd', ('u2u32', a), ('u2u32', b))),
+
+   (('u2u32', ('imul(is_used_once)', 'a@64', b)),
+    ('imul', ('u2u32', a), ('u2u32', b))),
+
+   (('u2f32', ('u2u64', 'a@32')), ('u2f32', a)),
+
+   # Redundant trip through 8-bit
+   (('i2i16', ('u2u8', ('iand', 'a@16', 1))), ('iand', 'a@16', 1)),
+   (('u2u16', ('u2u8', ('iand', 'a@16', 1))), ('iand', 'a@16', 1)),
+
+   # Reduce 16-bit integers to 1-bit booleans, hit with OpenCL. In turn, this
+   # lets iand(b2i1(...), 1) get simplified. Backends can usually fuse iand/inot
+   # so this should be no worse when it isn't strictly better.
+   (('bcsel', a, 0, ('b2i16', 'b@1')), ('b2i16', ('iand', ('inot', a), b))),
+   (('bcsel', a, ('b2i16', 'b@1'), ('b2i16', 'c@1')), ('b2i16', ('bcsel', a, b, c))),
 
    # Lowered pack followed by lowered unpack, for the high bits
    (('u2u32', ('ushr', ('ior', ('ishl', a, 32), ('u2u64', b)), 32)), ('u2u32', a)),
@@ -2455,9 +2477,9 @@ optimizations.extend([
    (('fsign', 'a@64'), ('fsub', ('b2f', ('!flt', 0.0, a)), ('b2f', ('!flt', a, 0.0))), 'options->lower_doubles_options & nir_lower_dsign'),
 
    # Address/offset calculations:
-   # Drivers supporting imul24 should use the nir_lower_amul() pass, this
+   # Drivers supporting imul24 should use a pass like nir_lower_amul(), this
    # rule converts everyone else to imul:
-   (('amul', a, b), ('imul', a, b), '!options->has_imul24'),
+   (('amul', a, b), ('imul', a, b), '!options->has_imul24 && !options->has_amul'),
 
    (('umul24', a, b),
     ('imul', ('iand', a, 0xffffff), ('iand', b, 0xffffff)),

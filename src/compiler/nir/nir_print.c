@@ -795,15 +795,21 @@ print_access(enum gl_access_qualifier access, print_state *state, const char *se
       const char *name;
    } modes[] = {
       { ACCESS_COHERENT, "coherent" },
-      { ACCESS_VOLATILE, "volatile" },
       { ACCESS_RESTRICT, "restrict" },
+      { ACCESS_VOLATILE, "volatile" },
       { ACCESS_NON_WRITEABLE, "readonly" },
       { ACCESS_NON_READABLE, "writeonly" },
+      { ACCESS_NON_UNIFORM, "non-uniform" },
       { ACCESS_CAN_REORDER, "reorderable" },
-      { ACCESS_CAN_SPECULATE, "speculatable" },
       { ACCESS_NON_TEMPORAL, "non-temporal" },
       { ACCESS_INCLUDE_HELPERS, "include-helpers" },
+      { ACCESS_IS_SWIZZLED_AMD, "is-swizzled-amd" },
+      { ACCESS_USES_FORMAT_AMD, "uses-format-amd" },
+      { ACCESS_FMASK_LOWERED_AMD, "fmask-lowered-amd" },
+      { ACCESS_CAN_SPECULATE, "speculatable" },
       { ACCESS_CP_GE_COHERENT_AMD, "cp-ge-coherent-amd" },
+      { ACCESS_IN_BOUNDS_AGX, "in-bounds-agx" },
+      { ACCESS_KEEP_SCALAR, "keep-scalar" },
    };
 
    bool first = true;
@@ -1607,6 +1613,11 @@ print_intrinsic_instr(nir_intrinsic_instr *instr, print_state *state)
          break;
       }
 
+      case NIR_INTRINSIC_INTERP_MODE:
+         fprintf(fp, "interp_mode=%s",
+                 glsl_interp_mode_name(nir_intrinsic_interp_mode(instr)));
+         break;
+
       default: {
          unsigned off = info->index_map[idx] - 1;
          fprintf(fp, "%s=%d", nir_intrinsic_index_names[idx], instr->const_index[off]);
@@ -2003,7 +2014,8 @@ print_instr(const nir_instr *instr, print_state *state, unsigned tabs)
 
    if (state->debug_info) {
       nir_debug_info_instr *di = state->debug_info[instr->index];
-      di->src_loc.column = (uint32_t)ftell(fp);
+      if (di)
+         di->src_loc.column = (uint32_t)ftell(fp);
    }
 
    print_indentation(tabs, fp);
@@ -2821,7 +2833,7 @@ nir_log_shader_annotated_tagged(enum mesa_log_level level, const char *tag,
 }
 
 char *
-nir_shader_gather_debug_info(nir_shader *shader, const char *filename)
+nir_shader_gather_debug_info(nir_shader *shader, const char *filename, uint32_t first_line)
 {
    uint32_t instr_count = 0;
    nir_foreach_function_impl(impl, shader) {
@@ -2845,7 +2857,8 @@ nir_shader_gather_debug_info(nir_shader *shader, const char *filename)
 
       nir_foreach_block(block, impl) {
          nir_foreach_instr_safe(instr, block) {
-            if (instr->type == nir_instr_type_debug_info)
+            if (instr->type == nir_instr_type_debug_info ||
+                instr->type == nir_instr_type_phi)
                continue;
 
             nir_debug_info_instr *di = nir_debug_info_instr_create(shader, nir_debug_info_src_loc, 0);
@@ -2858,11 +2871,13 @@ nir_shader_gather_debug_info(nir_shader *shader, const char *filename)
 
    char *str = _nir_shader_as_str_annotated(shader, NULL, NULL, debug_info);
 
-   uint32_t line = 1;
+   uint32_t line = first_line;
    uint32_t character_index = 0;
 
    for (uint32_t i = 0; i < instr_count; i++) {
       nir_debug_info_instr *di = debug_info[i];
+      if (!di)
+         continue;
 
       while (character_index < di->src_loc.column) {
          if (str[character_index] == '\n')
@@ -2878,7 +2893,8 @@ nir_shader_gather_debug_info(nir_shader *shader, const char *filename)
    nir_foreach_function_impl(impl, shader) {
       nir_foreach_block(block, impl) {
          nir_foreach_instr_safe(instr, block) {
-            if (instr->type != nir_instr_type_debug_info)
+            if (instr->type != nir_instr_type_debug_info &&
+                instr->type != nir_instr_type_phi)
                nir_instr_insert_before(instr, &debug_info[instr_count++]->instr);
          }
       }

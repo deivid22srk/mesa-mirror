@@ -379,7 +379,8 @@ validate_ir(Program* program)
                     instr->operands[i].regClass().is_subdword() && !instr->operands[i].isFixed()))
                   check(!valu.opsel[i], "Unexpected opsel for operand", instr.get());
             }
-            if (instr->definitions[0].regClass().is_subdword() && !instr->definitions[0].isFixed())
+            if (!instr->definitions.empty() && instr->definitions[0].regClass().is_subdword() &&
+                !instr->definitions[0].isFixed())
                check(!valu.opsel[3], "Unexpected opsel for sub-dword definition", instr.get());
          } else if (instr->opcode == aco_opcode::v_fma_mixlo_f16 ||
                     instr->opcode == aco_opcode::v_fma_mixhi_f16 ||
@@ -493,8 +494,9 @@ validate_ir(Program* program)
                   check(instr->definitions[0].regClass().type() == RegType::sgpr,
                         "Wrong Definition type for VALU instruction", instr.get());
                } else {
-                  check(instr->definitions[0].regClass().type() == RegType::vgpr,
-                        "Wrong Definition type for VALU instruction", instr.get());
+                  if (!instr->definitions.empty())
+                     check(instr->definitions[0].regClass().type() == RegType::vgpr,
+                           "Wrong Definition type for VALU instruction", instr.get());
                }
 
                unsigned num_sgprs = 0;
@@ -697,18 +699,22 @@ validate_ir(Program* program)
                unsigned data_bits = instr->operands[0].bytes() * 8u;
                unsigned op_bits = instr->operands[2].constantValue();
 
+               check(op_bits == 8 || op_bits == 16, "Size must be 8 or 16", instr.get());
                if (instr->opcode == aco_opcode::p_insert) {
-                  check(op_bits == 8 || op_bits == 16, "Size must be 8 or 16", instr.get());
                   check(op_bits < data_bits, "Size must be smaller than source", instr.get());
                } else if (instr->opcode == aco_opcode::p_extract) {
-                  check(op_bits == 8 || op_bits == 16 || op_bits == 32,
-                        "Size must be 8 or 16 or 32", instr.get());
                   check(data_bits >= op_bits, "Can't extract more bits than what the data has.",
                         instr.get());
                }
 
                unsigned comp = data_bits / MAX2(op_bits, 1);
                check(instr->operands[1].constantValue() < comp, "Index must be in-bounds",
+                     instr.get());
+
+               check(program->gfx_level >= GFX9 ||
+                        !instr->definitions[0].regClass().is_subdword() ||
+                        instr->operands[0].regClass().type() == RegType::vgpr,
+                     "Cannot extract/insert to subdword definition from SGPR before GFX9+",
                      instr.get());
             } else if (instr->opcode == aco_opcode::p_jump_to_epilog) {
                check(instr->definitions.size() == 0, "p_jump_to_epilog must have 0 definitions",

@@ -15,6 +15,7 @@
 
 #include "ac_binary.h"
 #include "ac_hw_stage.h"
+#include "ac_shader_debug_info.h"
 #include "ac_shader_util.h"
 #include "amd_family.h"
 #include <algorithm>
@@ -182,6 +183,7 @@ enum wait_type {
 };
 
 struct Instruction;
+class Builder;
 
 struct wait_imm {
    static const uint8_t unset_counter = 0xff;
@@ -208,6 +210,8 @@ struct wait_imm {
    bool empty() const;
 
    void print(FILE* output) const;
+
+   void build_waitcnt(Builder& bld);
 
    uint8_t& operator[](size_t i)
    {
@@ -420,8 +424,10 @@ static constexpr PhysReg flat_scr_lo{102}; /* GFX8-GFX9, encoded differently on 
 static constexpr PhysReg flat_scr_hi{103}; /* GFX8-GFX9, encoded differently on GFX6-7 */
 static constexpr PhysReg vcc{106};
 static constexpr PhysReg vcc_hi{107};
-static constexpr PhysReg tba{108}; /* GFX6-GFX8 */
-static constexpr PhysReg tma{110}; /* GFX6-GFX8 */
+static constexpr PhysReg tba_lo{108}; /* GFX6-GFX8 */
+static constexpr PhysReg tba_hi{109}; /* GFX6-GFX8 */
+static constexpr PhysReg tma_lo{110}; /* GFX6-GFX8 */
+static constexpr PhysReg tma_hi{111}; /* GFX6-GFX8 */
 static constexpr PhysReg ttmp0{112};
 static constexpr PhysReg ttmp1{113};
 static constexpr PhysReg ttmp2{114};
@@ -2126,6 +2132,8 @@ public:
    bool is_prolog = false;
    bool is_epilog = false;
 
+   std::vector<ac_shader_debug_info> debug_info;
+
    std::vector<uint8_t> constant_data;
    Temp private_segment_buffer;
    Temp scratch_offset;
@@ -2215,8 +2223,7 @@ void init_program(Program* program, Stage stage, const struct aco_shader_info* i
 void select_program(Program* program, unsigned shader_count, struct nir_shader* const* shaders,
                     ac_shader_config* config, const struct aco_compiler_options* options,
                     const struct aco_shader_info* info, const struct ac_shader_args* args);
-void select_trap_handler_shader(Program* program, struct nir_shader* shader,
-                                ac_shader_config* config,
+void select_trap_handler_shader(Program* program, ac_shader_config* config,
                                 const struct aco_compiler_options* options,
                                 const struct aco_shader_info* info,
                                 const struct ac_shader_args* args);
@@ -2252,6 +2259,7 @@ void lower_to_cssa(Program* program);
 void register_allocation(Program* program, ra_test_policy = {});
 void reindex_ssa(Program* program);
 void ssa_elimination(Program* program);
+void jump_threading(Program* program);
 void lower_to_hw_instr(Program* program);
 void schedule_program(Program* program);
 void schedule_ilp(Program* program);

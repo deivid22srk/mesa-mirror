@@ -138,6 +138,8 @@ vlVaDestroySurfaces(VADriverContextP ctx, VASurfaceID *surface_list, int num_sur
             drv->efc_count = -1;
          }
       }
+      if (surf->coded_buf)
+         surf->coded_buf->coded_surf = NULL;
       util_dynarray_fini(&surf->subpics);
       FREE(surf);
       handle_table_remove(drv->htab, surface_list[i]);
@@ -153,6 +155,7 @@ _vlVaSyncSurface(VADriverContextP ctx, VASurfaceID render_target, uint64_t timeo
    vlVaDriver *drv;
    vlVaContext *context;
    vlVaSurface *surf;
+   struct pipe_fence_handle *fence;
 
    if (!ctx)
       return VA_STATUS_ERROR_INVALID_CONTEXT;
@@ -168,19 +171,26 @@ _vlVaSyncSurface(VADriverContextP ctx, VASurfaceID render_target, uint64_t timeo
       return VA_STATUS_ERROR_INVALID_SURFACE;
    }
 
+   if (surf->coded_buf) {
+      context = surf->coded_buf->ctx;
+      fence = surf->coded_buf->fence;
+   } else {
+      context = surf->ctx;
+      fence = surf->fence;
+   }
+
    /* This is checked before getting the context below as
     * surf->ctx is only set in begin_frame
     * and not when the surface is created
     * Some apps try to sync/map the surface right after creation and
     * would get VA_STATUS_ERROR_INVALID_CONTEXT
     */
-   if (!surf->buffer || (!surf->feedback && !surf->fence)) {
+   if (!surf->buffer || !fence) {
       // No outstanding encode/decode operation: nothing to do.
       mtx_unlock(&drv->mutex);
       return VA_STATUS_SUCCESS;
    }
 
-   context = surf->ctx;
    if (!context) {
       mtx_unlock(&drv->mutex);
       return VA_STATUS_ERROR_INVALID_CONTEXT;
@@ -191,39 +201,7 @@ _vlVaSyncSurface(VADriverContextP ctx, VASurfaceID render_target, uint64_t timeo
       return VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
    }
 
-   /* If driver does not implement fence_wait assume no
-    * async work needed to be waited on and return success
-    */
-   int ret = (context->decoder->fence_wait) ? 0 : 1;
-   if (context->decoder->fence_wait)
-      ret = context->decoder->fence_wait(context->decoder, surf->fence, timeout_ns);
-
-   if (context->decoder->entrypoint == PIPE_VIDEO_ENTRYPOINT_ENCODE && surf->feedback) {
-      if (!drv->pipe->screen->get_video_param(drv->pipe->screen,
-                              context->decoder->profile,
-                              context->decoder->entrypoint,
-                              PIPE_VIDEO_CAP_REQUIRES_FLUSH_ON_END_FRAME)) {
-         if (u_reduce_video_profile(context->templat.profile) == PIPE_VIDEO_FORMAT_MPEG4_AVC) {
-            int frame_diff;
-            if (context->desc.h264enc.frame_num_cnt >= surf->frame_num_cnt)
-               frame_diff = context->desc.h264enc.frame_num_cnt - surf->frame_num_cnt;
-            else
-               frame_diff = 0xFFFFFFFF - surf->frame_num_cnt + 1 + context->desc.h264enc.frame_num_cnt;
-            if ((frame_diff == 0) &&
-               (surf->force_flushed == false) &&
-               (context->desc.h264enc.frame_num_cnt % 2 != 0)) {
-               context->decoder->flush(context->decoder);
-               context->first_single_submitted = true;
-            }
-         }
-      }
-      if (ret) {
-         context->decoder->get_feedback(context->decoder, surf->feedback, &(surf->coded_buf->coded_size), &(surf->coded_buf->extended_metadata));
-         surf->feedback = NULL;
-         surf->coded_buf->feedback = NULL;
-         surf->coded_buf->associated_encode_input_surf = VA_INVALID_ID;
-      }
-   }
+   int ret = context->decoder->fence_wait(context->decoder, fence, timeout_ns);
    mtx_unlock(&drv->mutex);
    return ret ? VA_STATUS_SUCCESS : VA_STATUS_ERROR_TIMEDOUT;
 }
@@ -248,6 +226,7 @@ vlVaQuerySurfaceStatus(VADriverContextP ctx, VASurfaceID render_target, VASurfac
    vlVaDriver *drv;
    vlVaSurface *surf;
    vlVaContext *context;
+   struct pipe_fence_handle *fence;
 
    if (!ctx)
       return VA_STATUS_ERROR_INVALID_CONTEXT;
@@ -264,20 +243,27 @@ vlVaQuerySurfaceStatus(VADriverContextP ctx, VASurfaceID render_target, VASurfac
       return VA_STATUS_ERROR_INVALID_SURFACE;
    }
 
+   if (surf->coded_buf) {
+      context = surf->coded_buf->ctx;
+      fence = surf->coded_buf->fence;
+   } else {
+      context = surf->ctx;
+      fence = surf->fence;
+   }
+
    /* This is checked before getting the context below as
     * surf->ctx is only set in begin_frame
     * and not when the surface is created
     * Some apps try to sync/map the surface right after creation and
     * would get VA_STATUS_ERROR_INVALID_CONTEXT
     */
-   if (!surf->buffer || (!surf->feedback && !surf->fence)) {
+   if (!surf->buffer || !fence) {
       // No outstanding encode/decode operation: nothing to do.
       *status = VASurfaceReady;
       mtx_unlock(&drv->mutex);
       return VA_STATUS_SUCCESS;
    }
 
-   context = surf->ctx;
    if (!context) {
       mtx_unlock(&drv->mutex);
       return VA_STATUS_ERROR_INVALID_CONTEXT;
@@ -288,16 +274,7 @@ vlVaQuerySurfaceStatus(VADriverContextP ctx, VASurfaceID render_target, VASurfac
       return VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
    }
 
-   /* If driver does not implement fence_wait assume no
-    * async work needed to be waited on and return surface ready
-    */
-   int ret = (context->decoder->fence_wait) ? 0 : 1;
-
-   if (context->decoder->entrypoint == PIPE_VIDEO_ENTRYPOINT_ENCODE && !surf->feedback)
-      ret = 1;
-   else if (context->decoder->fence_wait)
-      ret = context->decoder->fence_wait(context->decoder, surf->fence, 0);
-
+   int ret = context->decoder->fence_wait(context->decoder, fence, 0);
    mtx_unlock(&drv->mutex);
 
    if (ret)
@@ -1053,6 +1030,12 @@ vlVaHandleSurfaceAllocate(vlVaDriver *drv, vlVaSurface *surface,
    if (!surface->buffer)
       return VA_STATUS_ERROR_ALLOCATION_FAILED;
 
+   if (drv->pipe->screen->get_video_param(drv->pipe->screen,
+                                          PIPE_VIDEO_PROFILE_UNKNOWN,
+                                          PIPE_VIDEO_ENTRYPOINT_UNKNOWN,
+                                          PIPE_VIDEO_CAP_SKIP_CLEAR_SURFACE))
+      return VA_STATUS_SUCCESS;
+
    surfaces = surface->buffer->get_surfaces(surface->buffer);
    if (surfaces) {
       for (i = 0; i < VL_MAX_SURFACES; ++i) {
@@ -1438,6 +1421,20 @@ static VAProcColorStandardType vpp_output_color_standards[] = {
    VAProcColorStandardBT709
 };
 
+static VAProcColorStandardType vpp_input_color_standards_extends[] = {
+   VAProcColorStandardBT601,
+   VAProcColorStandardBT709,
+   VAProcColorStandardBT2020,
+   VAProcColorStandardExplicit
+};
+
+static VAProcColorStandardType vpp_output_color_standards_extends[] = {
+   VAProcColorStandardBT601,
+   VAProcColorStandardBT709,
+   VAProcColorStandardBT2020,
+   VAProcColorStandardExplicit
+};
+
 VAStatus
 vlVaQueryVideoProcPipelineCaps(VADriverContextP ctx, VAContextID context,
                                VABufferID *filters, unsigned int num_filters,
@@ -1458,10 +1455,6 @@ vlVaQueryVideoProcPipelineCaps(VADriverContextP ctx, VAContextID context,
    pipeline_cap->filter_flags = 0;
    pipeline_cap->num_forward_references = 0;
    pipeline_cap->num_backward_references = 0;
-   pipeline_cap->num_input_color_standards = ARRAY_SIZE(vpp_input_color_standards);
-   pipeline_cap->input_color_standards = vpp_input_color_standards;
-   pipeline_cap->num_output_color_standards = ARRAY_SIZE(vpp_output_color_standards);
-   pipeline_cap->output_color_standards = vpp_output_color_standards;
 
    struct pipe_screen *pscreen = VL_VA_PSCREEN(ctx);
    uint32_t pipe_orientation_flags = pscreen->get_video_param(pscreen,
@@ -1482,6 +1475,23 @@ vlVaQueryVideoProcPipelineCaps(VADriverContextP ctx, VAContextID context,
       pipeline_cap->mirror_flags |= VA_MIRROR_HORIZONTAL;
    if(pipe_orientation_flags & PIPE_VIDEO_VPP_FLIP_VERTICAL)
       pipeline_cap->mirror_flags |= VA_MIRROR_VERTICAL;
+
+   if (pscreen->get_video_param(pscreen, PIPE_VIDEO_PROFILE_UNKNOWN, PIPE_VIDEO_ENTRYPOINT_PROCESSING,
+                                PIPE_VIDEO_CAP_VPP_SUPPORT_HDR_INPUT)) {
+      pipeline_cap->num_input_color_standards = ARRAY_SIZE(vpp_input_color_standards_extends);
+      pipeline_cap->input_color_standards = vpp_input_color_standards_extends;
+   } else {
+      pipeline_cap->num_input_color_standards = ARRAY_SIZE(vpp_input_color_standards);
+      pipeline_cap->input_color_standards = vpp_input_color_standards;
+   }
+   if (pscreen->get_video_param(pscreen, PIPE_VIDEO_PROFILE_UNKNOWN, PIPE_VIDEO_ENTRYPOINT_PROCESSING,
+                                PIPE_VIDEO_CAP_VPP_SUPPORT_HDR_OUTPUT)) {
+      pipeline_cap->num_output_color_standards = ARRAY_SIZE(vpp_output_color_standards_extends);
+      pipeline_cap->output_color_standards = vpp_output_color_standards_extends;
+   } else {
+      pipeline_cap->num_output_color_standards = ARRAY_SIZE(vpp_output_color_standards);
+      pipeline_cap->output_color_standards = vpp_output_color_standards;
+   }
 
    pipeline_cap->max_input_width = pscreen->get_video_param(pscreen, PIPE_VIDEO_PROFILE_UNKNOWN,
                                                             PIPE_VIDEO_ENTRYPOINT_PROCESSING,

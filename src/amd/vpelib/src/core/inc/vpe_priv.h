@@ -51,7 +51,6 @@ extern "C" {
 #define VPE_MIN_VIEWPORT_SIZE                                                                      \
     2                      // chroma viewport size is half of it, thus need to be 2 for YUV420
                            // for simplication we just use 2 for all types
-#define MAX_VPE_CMD 256    // TODO Dynamic allocation
 
 #define MAX_LINE_SIZE 1024 // without 16 pixels for the seams
 #define MAX_LINE_CNT  4
@@ -263,12 +262,10 @@ struct vpe_priv {
     bool scale_yuv_matrix; // this is a flag that forces scaling the yuv->rgb matrix
                            //  when embedding the color adjustments
 
-#ifdef VPE_BUILD_1_1
     // collaborate sync data counter
     int32_t  collaborate_sync_index;
     uint16_t vpe_num_instance;
     bool     collaboration_mode;
-#endif
     enum vpe_expansion_mode expansion_mode;
 };
 

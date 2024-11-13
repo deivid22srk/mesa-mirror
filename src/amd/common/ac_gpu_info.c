@@ -8,6 +8,7 @@
 #include "ac_shader_util.h"
 #include "ac_debug.h"
 #include "ac_surface.h"
+#include "ac_fake_hw_db.h"
 
 #include "addrlib/src/amdgpu_asic_addr.h"
 #include "sid.h"
@@ -590,13 +591,10 @@ static void handle_env_var_force_family(struct radeon_info *info)
    if (!family)
       return;
 
-   for (unsigned i = CHIP_TAHITI; i < CHIP_LAST; i++) {
-      if (!strcmp(family, ac_get_llvm_processor_name(i))) {
-         /* Override family and gfx_level. */
-         info->family = i;
+   for (size_t i = 0; i < ARRAY_SIZE(ac_fake_hw_db); i++) {
+      if (!strcmp(family, ac_fake_hw_db[i].name)) {
+         get_radeon_info(info, &ac_fake_hw_db[i]);
          info->name = "NOOP";
-         info->gfx_level = ac_get_gfx_level(i);
-         info->family_id = ac_get_family_id(i);
          info->family_overridden = true;
          return;
       }
@@ -1092,6 +1090,12 @@ bool ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
    info->uses_kernel_cu_mask = false; /* Not implemented in the kernel. */
    info->has_graphics = info->ip[AMD_IP_GFX].num_queues > 0;
 
+   /* On GFX8, the TBA/TMA registers can be configured from the userspace.
+    * On GFX9+, they are privileged registers and they need to be configured
+    * from the kernel but it's not suppported yet.
+    */
+   info->has_trap_handler_support = info->gfx_level == GFX8;
+
    info->pa_sc_tile_steering_override = device_info.pa_sc_tile_steering_override;
    info->max_render_backends = device_info.num_rb_pipes;
    /* The value returned by the kernel driver was wrong. */
@@ -1191,7 +1195,8 @@ bool ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
    }
 
    info->mc_arb_ramcfg = amdinfo.mc_arb_ramcfg;
-   info->gb_addr_config = amdinfo.gb_addr_cfg;
+   if (!info->family_overridden)
+      info->gb_addr_config = amdinfo.gb_addr_cfg;
    if (info->gfx_level >= GFX9) {
       if (!info->has_graphics && info->family >= CHIP_GFX940)
          info->gb_addr_config = 0;
@@ -1234,8 +1239,14 @@ bool ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
    info->has_dcc_constant_encode =
       info->family == CHIP_RAVEN2 || info->family == CHIP_RENOIR || info->gfx_level >= GFX10;
 
-   /* TC-compat HTILE is only available for GFX8-GFX11.5. */
-   info->has_tc_compatible_htile = info->gfx_level >= GFX8 && info->gfx_level < GFX12;
+   /* TC-compat HTILE is only available on GFX8-GFX11.5.
+    *
+    * There are issues with TC-compatible HTILE on Tonga (and Iceland is the same design), and
+    * documented bug workarounds don't help. For example, this fails:
+    *   piglit/bin/tex-miplevel-selection 'texture()' 2DShadow -auto
+    */
+   info->has_tc_compatible_htile = info->gfx_level >= GFX8 && info->gfx_level < GFX12 &&
+                                   info->family != CHIP_TONGA && info->family != CHIP_ICELAND;
 
    info->has_etc_support = info->family == CHIP_STONEY || info->family == CHIP_VEGA10 ||
                            info->family == CHIP_RAVEN || info->family == CHIP_RAVEN2;
@@ -1442,7 +1453,9 @@ bool ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
    info->min_good_cu_per_sa =
       (info->num_cu / (info->num_se * info->max_sa_per_se * cu_group)) * cu_group;
 
-   memcpy(info->si_tile_mode_array, amdinfo.gb_tile_mode, sizeof(amdinfo.gb_tile_mode));
+   if (!info->family_overridden)
+      memcpy(info->si_tile_mode_array, amdinfo.gb_tile_mode, sizeof(amdinfo.gb_tile_mode));
+
    memcpy(info->cik_macrotile_mode_array, amdinfo.gb_macro_tile_mode,
           sizeof(amdinfo.gb_macro_tile_mode));
 
@@ -1672,7 +1685,7 @@ bool ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
          info->attribute_ring_size_per_se = 1024 * 1024;
          num_prim_exports = 16368; /* also includes gs_alloc_req */
          num_pos_exports = 16384;
-      } else if (info->l3_cache_size_mb) {
+      } else if (info->l3_cache_size_mb || info->family_overridden) {
          info->attribute_ring_size_per_se = 1400 * 1024;
       } else {
          assert(info->num_se == 1);
@@ -2010,6 +2023,7 @@ void ac_print_gpu_info(const struct radeon_info *info, FILE *f)
    }
 
    fprintf(f, "    has_tmz_support = %u\n", info->has_tmz_support);
+   fprintf(f, "    has_trap_handler_support = %u\n", info->has_trap_handler_support);
    for (unsigned i = 0; i < AMD_NUM_IP_TYPES; i++) {
       if (info->max_submitted_ibs[i]) {
          fprintf(f, "    IP %-7s max_submitted_ibs = %u\n", ac_get_ip_type_string(info, i),

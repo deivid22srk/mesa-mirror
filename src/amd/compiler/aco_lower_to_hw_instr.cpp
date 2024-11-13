@@ -2246,7 +2246,8 @@ lower_to_hw_instr(Program* program)
          }
 
          aco_ptr<Instruction> mov;
-         if (instr->isPseudo() && instr->opcode != aco_opcode::p_unit_test) {
+         if (instr->isPseudo() && instr->opcode != aco_opcode::p_unit_test &&
+             instr->opcode != aco_opcode::p_debug_info) {
             Pseudo_instruction* pi = &instr->pseudo();
 
             switch (instr->opcode) {
@@ -2331,7 +2332,7 @@ lower_to_hw_instr(Program* program)
             }
             case aco_opcode::p_exit_early_if: {
                /* don't bother with an early exit near the end of the program */
-               if ((block->instructions.size() - 1 - instr_idx) <= 4 &&
+               if ((block->instructions.size() - 1 - instr_idx) <= 5 &&
                    block->instructions.back()->opcode == aco_opcode::s_endpgm) {
                   unsigned null_exp_dest =
                      program->gfx_level >= GFX11 ? V_008DFC_SQ_EXP_MRT : V_008DFC_SQ_EXP_NULL;
@@ -2349,6 +2350,9 @@ lower_to_hw_instr(Program* program)
                      else if (instr2->opcode == aco_opcode::p_parallelcopy &&
                               instr2->definitions[0].isFixed() &&
                               instr2->definitions[0].physReg() == exec)
+                        continue;
+                     else if (instr2->opcode == aco_opcode::s_sendmsg &&
+                              instr2->salu().imm == sendmsg_dealloc_vgprs)
                         continue;
 
                      ignore_early_exit = false;
@@ -2373,6 +2377,12 @@ lower_to_hw_instr(Program* program)
                   }
                   block = &program->blocks[block_idx];
 
+                  /* sendmsg(dealloc_vgprs) releases scratch, so it isn't safe if there is an
+                   * in-progress scratch store. */
+                  wait_imm wait;
+                  if (should_dealloc_vgprs && uses_scratch(program))
+                     wait.vs = 0;
+
                   bld.reset(discard_block);
                   if (program->has_pops_overlapped_waves_wait &&
                       (program->gfx_level >= GFX11 || discard_sends_pops_done)) {
@@ -2381,15 +2391,15 @@ lower_to_hw_instr(Program* program)
                       * waitcnt insertion doesn't work in a discard early exit block.
                       */
                      if (program->gfx_level >= GFX10)
-                        bld.sopk(aco_opcode::s_waitcnt_vscnt, Operand(sgpr_null, s1), 0);
-                     wait_imm pops_exit_wait_imm;
-                     pops_exit_wait_imm.vm = 0;
+                        wait.vs = 0;
+                     wait.vm = 0;
                      if (program->has_smem_buffer_or_global_loads)
-                        pops_exit_wait_imm.lgkm = 0;
-                     bld.sopp(aco_opcode::s_waitcnt, pops_exit_wait_imm.pack(program->gfx_level));
+                        wait.lgkm = 0;
+                     wait.build_waitcnt(bld);
                   }
                   if (discard_sends_pops_done)
                      bld.sopp(aco_opcode::s_sendmsg, sendmsg_ordered_ps_done);
+
                   unsigned target = V_008DFC_SQ_EXP_NULL;
                   if (program->gfx_level >= GFX11)
                      target =
@@ -2397,10 +2407,11 @@ lower_to_hw_instr(Program* program)
                   if (program->stage == fragment_fs)
                      bld.exp(aco_opcode::exp, Operand(v1), Operand(v1), Operand(v1), Operand(v1), 0,
                              target, false, true, true);
-                  if (should_dealloc_vgprs) {
-                     bld.sopp(aco_opcode::s_nop, 0);
+
+                  wait.build_waitcnt(bld);
+                  if (should_dealloc_vgprs)
                      bld.sopp(aco_opcode::s_sendmsg, sendmsg_dealloc_vgprs);
-                  }
+
                   bld.sopp(aco_opcode::s_endpgm);
 
                   bld.reset(&ctx.instructions);
@@ -2534,7 +2545,11 @@ lower_to_hw_instr(Program* program)
                      bld.sop2(signext ? aco_opcode::s_bfe_i32 : aco_opcode::s_bfe_u32, dst,
                               instr->definitions[1], op, Operand::c32((bits << 16) | offset));
                   }
-               } else if (dst.regClass() == v1 && op.physReg().byte() == 0) {
+               } else if (dst.regClass() == v1) {
+                  if (op.physReg().byte()) {
+                     offset += op.physReg().byte() * 8;
+                     op = Operand(PhysReg(op.physReg().reg()), v1);
+                  }
                   assert(op.physReg().byte() == 0 && dst.physReg().byte() == 0);
                   if (offset == (32 - bits) && op.regClass() != s1) {
                      bld.vop2(signext ? aco_opcode::v_ashrrev_i32 : aco_opcode::v_lshrrev_b32, dst,
@@ -2555,7 +2570,7 @@ lower_to_hw_instr(Program* program)
 
                      uint8_t swiz[4] = {4, 5, 6, 7};
                      swiz[dst.physReg().byte()] = op_vgpr_byte;
-                     if (bits == 16)
+                     if (bits == 16 && dst.bytes() >= 2)
                         swiz[dst.physReg().byte() + 1] = op_vgpr_byte + 1;
                      for (unsigned i = bits / 8; i < dst.bytes(); i++) {
                         uint8_t ext = bperm_0;
@@ -2894,7 +2909,7 @@ lower_to_hw_instr(Program* program)
                              inst->isLDSDIR()) {
                      // TODO: GFX6-9 can use vskip
                      can_remove = prefer_remove;
-                  } else {
+                  } else if (inst->opcode != aco_opcode::p_debug_info) {
                      can_remove = false;
                      assert(false && "Pseudo instructions should be lowered by this point.");
                   }

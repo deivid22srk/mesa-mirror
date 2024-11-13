@@ -420,6 +420,7 @@ enum vpe_status vpe10_construct_resource(struct vpe_priv *vpe_priv, struct resou
     res->get_bufs_req                      = vpe10_get_bufs_req;
     res->check_bg_color_support            = vpe10_check_bg_color_support;
     res->check_mirror_rotation_support     = vpe10_check_mirror_rotation_support;
+    res->update_blnd_gamma                 = vpe10_update_blnd_gamma;
 
     return VPE_STATUS_OK;
 err:
@@ -561,6 +562,43 @@ void vpe10_calculate_dst_viewport_and_active(
     data->v_active = data->dst_viewport.height;
 }
 
+
+static uint16_t get_max_gap_num(
+    struct vpe_priv* vpe_priv, const struct vpe_build_param* params, uint32_t max_seg_width)
+{
+    const uint16_t num_multiple = vpe_priv->vpe_num_instance ? vpe_priv->vpe_num_instance : 1;
+    bool is_color_fill = (vpe_priv->num_streams == 1) && (vpe_priv->stream_ctx[0].stream_type == VPE_STREAM_TYPE_BG_GEN);
+
+    uint16_t max_gaps =
+        (uint16_t)(max((params->target_rect.width + max_seg_width - 1) / max_seg_width, 1));
+
+    /* If the stream width is less than max_seg_width - 1024, and it
+    * lies inside a max_seg_width window of the background, vpe needs
+    * an extra bg segment to store that.
+       1    2  3  4   5
+    |....|....|.**.|....|
+    |....|....|.**.|....|
+    |....|....|.**.|....|
+
+     (*: stream
+      .: background
+      |: 1k separator)
+
+    */
+
+    if (!is_color_fill) {
+        // full colorfillOnly case, no need to + 1 as the gap won't be seaprated by stream dst
+        // for non-colorfillOnly case, +1 for worst case the gap is separated by stream dst
+        max_gaps += 1;
+    }
+
+    if (max_gaps % num_multiple > 0) {
+        max_gaps += num_multiple - (max_gaps % num_multiple);
+    }
+
+    return max_gaps;
+}
+
 enum vpe_status vpe10_calculate_segments(
     struct vpe_priv *vpe_priv, const struct vpe_build_param *params)
 {
@@ -584,6 +622,9 @@ enum vpe_status vpe10_calculate_segments(
         stream_ctx = &vpe_priv->stream_ctx[stream_idx];
         src_rect   = &stream_ctx->stream.scaling_info.src_rect;
         dst_rect   = &stream_ctx->stream.scaling_info.dst_rect;
+
+        if (stream_ctx->stream_type == VPE_STREAM_TYPE_BG_GEN)
+            continue;
 
         if (src_rect->width < VPE_MIN_VIEWPORT_SIZE || src_rect->height < VPE_MIN_VIEWPORT_SIZE ||
             dst_rect->width < VPE_MIN_VIEWPORT_SIZE || dst_rect->height < VPE_MIN_VIEWPORT_SIZE) {
@@ -643,27 +684,16 @@ enum vpe_status vpe10_calculate_segments(
         }
     }
 
-    /* If the stream width is less than max_seg_width - 1024, and it
-    * lies inside a max_seg_width window of the background, vpe needs
-    * an extra bg segment to store that.
-       1    2  3  4   5
-    |....|....|.**.|....|
-    |....|....|.**.|....|
-    |....|....|.**.|....|
-
-     (*: stream
-      .: background
-      |: 1k separator)
-
-    */
     max_seg_width = vpe_priv->pub.caps->plane_caps.max_viewport_width;
-    max_gaps =
-        (uint16_t)(max((params->target_rect.width + max_seg_width - 1) / max_seg_width, 1) + 1);
+ 
+    max_gaps = get_max_gap_num(vpe_priv, params, max_seg_width);
+
     gaps = vpe_zalloc(sizeof(struct vpe_rect) * max_gaps);
     if (!gaps)
         return VPE_STATUS_NO_MEMORY;
 
     gaps_cnt = vpe_priv->resource.find_bg_gaps(vpe_priv, &(params->target_rect), gaps, max_gaps);
+
     if (gaps_cnt > 0)
         vpe_priv->resource.create_bg_segments(vpe_priv, gaps, gaps_cnt, VPE_CMD_OPS_BG);
 
@@ -932,9 +962,6 @@ enum vpe_status vpe10_populate_cmd_info(struct vpe_priv *vpe_priv)
         tm_enabled = stream_ctx->stream.tm_params.UID != 0 || stream_ctx->stream.tm_params.enable_3dlut;
 
         for (segment_idx = 0; segment_idx < stream_ctx->num_segments; segment_idx++) {
-            if (vpe_priv->vpe_cmd_vector->num_elements >= MAX_VPE_CMD) {
-                return VPE_STATUS_CMD_OVERFLOW_ERROR;
-            }
 
             cmd_info.inputs[0].stream_idx  = stream_idx;
             cmd_info.cd                    = (uint8_t)(stream_ctx->num_segments - segment_idx - 1);
@@ -1087,7 +1114,7 @@ void vpe10_create_stream_ops_config(struct vpe_priv *vpe_priv, uint32_t pipe_idx
 #define VPE10_GENERAL_VPE_DESC_SIZE                144   // 4 * (4 + (2 * MAX_NUM_SAVED_CONFIG))
 #define VPE10_GENERAL_EMB_USAGE_FRAME_SHARED       6000  // currently max 4804 is recorded
 #define VPE10_GENERAL_EMB_USAGE_3DLUT_FRAME_SHARED 40960 // currently max 35192 is recorded
-#define VPE10_GENERAL_EMB_USAGE_BG_SHARED          2400 // currently max 1772 + 92 + 72 = 1936 is recorded
+#define VPE10_GENERAL_EMB_USAGE_BG_SHARED          3600 // currently max 52 + 128 + 1356 +1020 +92 + 60 + 116 = 2824 is recorded
 #define VPE10_GENERAL_EMB_USAGE_SEG_NON_SHARED                                                     \
     240 // segment specific config + plane descripor size. currently max 92 + 72 = 164 is recorded.
 
@@ -1151,4 +1178,90 @@ enum vpe_status vpe10_check_mirror_rotation_support(const struct vpe_stream *str
         return VPE_STATUS_MIRROR_NOT_SUPPORTED;
 
     return VPE_STATUS_OK;
+}
+
+/* This function generates software points for the blnd gam programming block.
+   The logic for the blndgam/ogam programming sequence is a function of:
+   1. Output Range (Studio Full)
+   2. 3DLUT usage
+   3. Output format (HDR SDR)
+
+   SDR Out or studio range out
+      TM Case
+         BLNDGAM : NL -> NL*S + B
+         OGAM    : Bypass
+      Non TM Case
+         BLNDGAM : L -> NL*S + B
+         OGAM    : Bypass
+   Full range HDR Out
+      TM Case
+         BLNDGAM : NL -> L
+         OGAM    : L -> NL
+      Non TM Case
+         BLNDGAM : Bypass
+         OGAM    : L -> NL
+
+*/
+enum vpe_status vpe10_update_blnd_gamma(struct vpe_priv *vpe_priv,
+    const struct vpe_build_param *param, const struct vpe_stream *stream,
+    struct transfer_func *blnd_tf)
+{
+    struct output_ctx       *output_ctx;
+    struct vpe_color_space   tm_out_cs;
+    struct fixed31_32        x_scale       = vpe_fixpt_one;
+    struct fixed31_32        y_scale       = vpe_fixpt_one;
+    struct fixed31_32        y_bias        = vpe_fixpt_zero;
+    bool                     is_studio     = false;
+    bool                     can_bypass    = false;
+    bool                     lut3d_enabled = false;
+    enum color_space         cs            = COLOR_SPACE_2020_RGB_FULLRANGE;
+    enum color_transfer_func tf            = TRANSFER_FUNC_LINEAR;
+    enum vpe_status          status        = VPE_STATUS_OK;
+    const struct vpe_tonemap_params *tm_params     = &stream->tm_params;
+
+    is_studio = (param->dst_surface.cs.range == VPE_COLOR_RANGE_STUDIO);
+    output_ctx = &vpe_priv->output_ctx;
+    lut3d_enabled = tm_params->UID != 0 || tm_params->enable_3dlut;
+
+    if (stream->flags.geometric_scaling) {
+        vpe_color_update_degamma_tf(vpe_priv, tf, x_scale, y_scale, y_bias, true, blnd_tf);
+    } else {
+        if (is_studio) {
+
+            if (vpe_is_rgb8(param->dst_surface.format)) {
+                y_scale = STUDIO_RANGE_SCALE_8_BIT;
+                y_bias  = STUDIO_RANGE_FOOT_ROOM_8_BIT;
+            } else {
+                y_scale = STUDIO_RANGE_SCALE_10_BIT;
+                y_bias  = STUDIO_RANGE_FOOT_ROOM_10_BIT;
+            }
+        }
+        // If SDR out -> Blend should be NL
+        // If studio out -> No choice but to blend in NL
+        if (!vpe_is_HDR(output_ctx->tf) || (is_studio)) {
+            if (lut3d_enabled) {
+                tf = TRANSFER_FUNC_LINEAR;
+            } else {
+                tf = output_ctx->tf;
+            }
+
+            if (vpe_is_fp16(param->dst_surface.format)) {
+                y_scale = vpe_fixpt_mul_int(y_scale, CCCS_NORM);
+            }
+            vpe_color_update_regamma_tf(
+                vpe_priv, tf, x_scale, y_scale, y_bias, can_bypass, blnd_tf);
+        } else {
+
+            if (lut3d_enabled) {
+                vpe_color_build_tm_cs(tm_params, param->dst_surface, &tm_out_cs);
+                vpe_color_get_color_space_and_tf(&tm_out_cs, &cs, &tf);
+            } else {
+                can_bypass = true;
+            }
+
+            vpe_color_update_degamma_tf(
+                vpe_priv, tf, x_scale, y_scale, y_bias, can_bypass, blnd_tf);
+        }
+    }
+    return status;
 }

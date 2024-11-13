@@ -394,7 +394,7 @@ struct agx_batch {
    struct agx_tilebuffer_layout tilebuffer_layout;
 
    /* PIPE_CLEAR_* bitmask */
-   uint32_t clear, draw, load, resolve;
+   uint32_t clear, draw, load, resolve, feedback;
    bool initialized;
 
    uint64_t uploaded_clear_color[PIPE_MAX_COLOR_BUFS];
@@ -579,7 +579,9 @@ struct asahi_blit_key {
    enum pipe_format src_format, dst_format;
    bool array;
    bool aligned;
+   bool pad[2];
 };
+static_assert(sizeof(struct asahi_blit_key) == 12, "packed");
 
 DERIVE_HASH_TABLE(asahi_blit_key);
 
@@ -607,9 +609,9 @@ struct agx_oq_heap;
 
 struct agx_context {
    struct pipe_context base;
-   struct agx_compiled_shader *vs, *fs, *gs, *tcs, *tes;
+   struct agx_compiled_shader *vs, *fs, *gs, *tcs;
    struct {
-      struct agx_linked_shader *vs, *tcs, *tes, *gs, *fs;
+      struct agx_linked_shader *vs, *fs;
    } linked;
    uint32_t dirty;
 
@@ -689,7 +691,6 @@ struct agx_context {
    bool is_noop;
 
    bool in_tess;
-   bool in_generated_vdm;
 
    struct blitter_context *blitter;
    struct asahi_blitter compute_blitter;
@@ -845,6 +846,7 @@ void agx_launch_with_data(struct agx_batch *batch, const struct agx_grid *grid,
 
 void agx_launch_internal(struct agx_batch *batch, const struct agx_grid *grid,
                          struct agx_compiled_shader *cs,
+                         const struct agx_shader_info *info,
                          enum pipe_shader_type stage, uint32_t usc);
 
 void agx_launch(struct agx_batch *batch, const struct agx_grid *grid,
@@ -1243,3 +1245,6 @@ agx_texture_buffer_size_el(enum pipe_format format, uint32_t size)
 
    return MIN2(AGX_TEXTURE_BUFFER_MAX_SIZE, size / blocksize);
 }
+
+void agx_decompress_inplace(struct agx_batch *batch, struct pipe_surface *surf,
+                            const char *reason);

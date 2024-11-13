@@ -43,8 +43,13 @@ libagx_txs(constant struct agx_texture_packed *ptr, uint16_t lod,
       size.y = size.z;
 
    /* Adjust for LOD, do not adjust array size */
-   for (uint c = 0; c < (nr_comps - (uint)is_array); ++c)
-      size[c] = max(size[c] >> lod, 1u);
+   size.x = max(size.x >> lod, 1u);
+
+   if (nr_comps - (uint)is_array >= 2)
+      size.y = max(size.y >> lod, 1u);
+
+   if (nr_comps - (uint)is_array >= 3)
+      size.z = max(size.z >> lod, 1u);
 
    /* Cube maps have equal width and height, we save some instructions by only
     * reading one. Dead code elimination will remove the redundant instructions.
@@ -217,7 +222,12 @@ libagx_texture_load_rgb32(constant struct agx_texture_packed *ptr, uint coord,
                           bool is_float)
 {
    agx_unpack(NULL, ptr, TEXTURE, d);
-   constant uint3 *data = (constant uint3 *)(d.address + 12 * coord);
+
+   /* This is carefully written to let us do the * 3 with a 32-bit operation but
+    * still use the free 64-bit add-extend-shift for the rest.
+    */
+   uint64_t addr = d.address + ((uint64_t)(coord * 3)) * 4;
+   constant uint3 *data = (constant uint3 *)addr;
 
    return (uint4)(*data, is_float ? as_uint(1.0f) : 1);
 }

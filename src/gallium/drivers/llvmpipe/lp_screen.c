@@ -408,8 +408,7 @@ llvmpipe_get_shader_param(struct pipe_screen *screen,
    case PIPE_SHADER_COMPUTE:
       if ((lscreen->allow_cl) && param == PIPE_SHADER_CAP_SUPPORTED_IRS)
          return ((1 << PIPE_SHADER_IR_TGSI) |
-                 (1 << PIPE_SHADER_IR_NIR) |
-                 (1 << PIPE_SHADER_IR_NIR_SERIALIZED));
+                 (1 << PIPE_SHADER_IR_NIR));
       FALLTHROUGH;
    case PIPE_SHADER_MESH:
    case PIPE_SHADER_TASK:
@@ -939,8 +938,9 @@ llvmpipe_destroy_screen(struct pipe_screen *_screen)
 
    glsl_type_singleton_decref();
 
-#ifdef HAVE_LIBDRM
-   close(screen->udmabuf_fd);
+#if defined(HAVE_LIBDRM) && defined(HAVE_LINUX_UDMABUF_H)
+   if (screen->udmabuf_fd != -1)
+      close(screen->udmabuf_fd);
 #endif
 
 #if DETECT_OS_LINUX

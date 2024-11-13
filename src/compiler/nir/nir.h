@@ -1569,8 +1569,7 @@ typedef struct nir_op_info {
    uint8_t output_size;
 
    /**
-    * The type of vector that the instruction outputs. Note that the
-    * staurate modifier is only allowed on outputs with the float type.
+    * The type of vector that the instruction outputs.
     */
    nir_alu_type output_type;
 
@@ -3835,22 +3834,16 @@ typedef enum {
     */
    nir_io_vectorizer_ignores_types = BITFIELD_BIT(6),
 
-   /* Options affecting the GLSL compiler are below. */
+   /* Options affecting the GLSL compiler or Gallium are below. */
 
    /**
     * Lower load_deref/store_deref to load_input/store_output/etc. intrinsics.
-    * This is only affects GLSL compilation.
+    * This is only affects GLSL compilation and Gallium.
     */
-   nir_io_glsl_lower_derefs = BITFIELD_BIT(16),
+   nir_io_has_intrinsics = BITFIELD_BIT(16),
 
    /**
-    * Run nir_opt_varyings in the GLSL linker. If false, optimize varyings
-    * the old way and lower IO later.
-    *
-    * nir_io_lower_to_intrinsics must be set for this to take effect.
-    *
-    * TODO: remove this and default to enabled once we are sure that this
-    * codepath is solid.
+    * Run nir_opt_varyings in the GLSL linker.
     */
    nir_io_glsl_opt_varyings = BITFIELD_BIT(17),
 } nir_io_options;
@@ -4175,6 +4168,13 @@ typedef struct nir_shader_compiler_options {
    bool has_iadd3;
 
    /**
+    * Backend supports amul and would like them generated whenever
+    * possible. This is stronger than has_imul24 for amul, but does not imply
+    * support for imul24.
+    */
+   bool has_amul;
+
+   /**
     * Backend supports imul24, and would like to use it (when possible)
     * for address/offset calculation.  If true, driver should call
     * nir_lower_amul().  (If not set, amul will automatically be lowered
@@ -4327,6 +4327,12 @@ typedef struct nir_shader_compiler_options {
 
    bool driver_functions;
 
+   /**
+    * If true, the driver will call nir_lower_int64 itself and the frontend
+    * should not do so. This may enable better optimization around address
+    * modes.
+    */
+   bool late_lower_int64;
    nir_lower_int64_options lower_int64_options;
    nir_lower_doubles_options lower_doubles_options;
    nir_divergence_options divergence_analysis_options;
@@ -5078,6 +5084,7 @@ nir_def_replace(nir_def *def, nir_def *new_ssa)
 nir_component_mask_t nir_src_components_read(const nir_src *src);
 nir_component_mask_t nir_def_components_read(const nir_def *def);
 bool nir_def_all_uses_are_fsat(const nir_def *def);
+bool nir_def_all_uses_ignore_sign_bit(const nir_def *def);
 
 static inline int
 nir_def_last_component_read(nir_def *def)
@@ -5226,7 +5233,10 @@ char *nir_shader_as_str(nir_shader *nir, void *mem_ctx);
 char *nir_shader_as_str_annotated(nir_shader *nir, struct hash_table *annotations, void *mem_ctx);
 char *nir_instr_as_str(const nir_instr *instr, void *mem_ctx);
 
-char *nir_shader_gather_debug_info(nir_shader *shader, const char *filename);
+/** Adds debug information to the shader. The line numbers point to
+ * the corresponding lines in the printed NIR, starting first_line;
+ */
+char *nir_shader_gather_debug_info(nir_shader *shader, const char *filename, uint32_t first_line);
 
 /** Shallow clone of a single instruction. */
 nir_instr *nir_instr_clone(nir_shader *s, const nir_instr *orig);
@@ -6090,6 +6100,7 @@ nir_shader *nir_create_passthrough_gs(const nir_shader_compiler_options *options
 
 bool nir_lower_fragcolor(nir_shader *shader, unsigned max_cbufs);
 bool nir_lower_fragcoord_wtrans(nir_shader *shader);
+bool nir_opt_frag_coord_to_pixel_coord(nir_shader *shader);
 bool nir_lower_frag_coord_to_pixel_coord(nir_shader *shader);
 bool nir_lower_viewport_transform(nir_shader *shader);
 bool nir_lower_uniforms_to_ubo(nir_shader *shader, bool dword_packed, bool load_vec4);
@@ -6468,6 +6479,7 @@ enum nir_lower_non_uniform_access_type {
    nir_lower_non_uniform_texture_access = (1 << 2),
    nir_lower_non_uniform_image_access = (1 << 3),
    nir_lower_non_uniform_get_ssbo_size = (1 << 4),
+   nir_lower_non_uniform_access_type_count = 5,
 };
 
 /* Given the nir_src used for the resource, return the channels which might be non-uniform. */
@@ -6721,6 +6733,7 @@ void nir_divergence_analysis_impl(nir_function_impl *impl, nir_divergence_option
 void nir_divergence_analysis(nir_shader *shader);
 void nir_vertex_divergence_analysis(nir_shader *shader);
 bool nir_has_divergent_loop(nir_shader *shader);
+void nir_clear_divergence_info(nir_shader *nir);
 
 void
 nir_rewrite_uses_to_load_reg(struct nir_builder *b, nir_def *old,

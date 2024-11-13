@@ -44,20 +44,6 @@ static void radeon_enc_task_info(struct radeon_encoder *enc, bool need_feedback)
 
 static void radeon_enc_session_init(struct radeon_encoder *enc)
 {
-   if (u_reduce_video_profile(enc->base.profile) == PIPE_VIDEO_FORMAT_MPEG4_AVC) {
-      enc->enc_pic.session_init.encode_standard = RENCODE_ENCODE_STANDARD_H264;
-      enc->enc_pic.session_init.aligned_picture_width = align(enc->base.width, 16);
-   } else if (u_reduce_video_profile(enc->base.profile) == PIPE_VIDEO_FORMAT_HEVC) {
-      enc->enc_pic.session_init.encode_standard = RENCODE_ENCODE_STANDARD_HEVC;
-      enc->enc_pic.session_init.aligned_picture_width = align(enc->base.width, 64);
-   }
-   enc->enc_pic.session_init.aligned_picture_height = align(enc->base.height, 16);
-
-   enc->enc_pic.session_init.padding_width =
-      (enc->enc_pic.crop_left + enc->enc_pic.crop_right) * 2;
-   enc->enc_pic.session_init.padding_height =
-      (enc->enc_pic.crop_top + enc->enc_pic.crop_bottom) * 2;
-
    enc->enc_pic.session_init.display_remote = 0;
    enc->enc_pic.session_init.pre_encode_mode = enc->enc_pic.quality_modes.pre_encode_mode;
    enc->enc_pic.session_init.pre_encode_chroma_enabled = !!(enc->enc_pic.quality_modes.pre_encode_mode);
@@ -332,13 +318,6 @@ unsigned int radeon_enc_write_sps_hevc(struct radeon_encoder *enc, uint8_t *out)
       radeon_enc_code_ue(enc, sps->conf_win_right_offset);
       radeon_enc_code_ue(enc, sps->conf_win_top_offset);
       radeon_enc_code_ue(enc, sps->conf_win_bottom_offset);
-   } else if (pic->session_init.padding_width  != 0 ||
-              pic->session_init.padding_height != 0) {
-      radeon_enc_code_fixed_bits(enc, 0x1, 1);
-      radeon_enc_code_ue(enc, 0);
-      radeon_enc_code_ue(enc, pic->session_init.padding_width / 2);
-      radeon_enc_code_ue(enc, 0);
-      radeon_enc_code_ue(enc, pic->session_init.padding_height / 2);
    } else
       radeon_enc_code_fixed_bits(enc, 0x0, 1);
 
@@ -1250,10 +1229,8 @@ static void radeon_enc_encode_params(struct radeon_encoder *enc)
       enc->enc_pic.enc_params.pic_type = RENCODE_PICTURE_TYPE_I;
    }
 
-   if (enc->luma->meta_offset) {
-      RVID_ERR("DCC surfaces not supported.\n");
-      assert(false);
-   }
+   if (enc->luma->meta_offset)
+      RADEON_ENC_ERR("DCC surfaces not supported.\n");
 
    enc->enc_pic.enc_params.input_pic_luma_pitch = enc->luma->u.gfx9.surf_pitch;
    enc->enc_pic.enc_params.input_pic_chroma_pitch = enc->chroma ?

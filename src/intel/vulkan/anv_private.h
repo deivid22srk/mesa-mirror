@@ -1933,11 +1933,13 @@ struct anv_device {
      *
      * The size of the shadow buffer depends on the number of queries per
      * shader.
+     *
+     * We might need a buffer per queue family due to Wa_14022863161.
      */
-    struct anv_bo                              *ray_query_shadow_bos[16];
+    struct anv_bo                              *ray_query_shadow_bos[2][16];
     /** Ray query buffer used to communicated with HW unit.
      */
-    struct anv_bo                              *ray_query_bo;
+    struct anv_bo                              *ray_query_bo[2];
 
     struct anv_shader_bin                      *rt_trampoline;
     struct anv_shader_bin                      *rt_trivial_return;
@@ -1964,6 +1966,7 @@ struct anv_device {
 
     int                                         perf_fd; /* -1 if no opened */
     struct anv_queue                            *perf_queue;
+    struct intel_bind_timeline                  perf_timeline;
 
     struct intel_aux_map_context                *aux_map_ctx;
 
@@ -3034,7 +3037,7 @@ struct anv_descriptor_pool {
     */
    bool host_only;
 
-   char host_mem[0];
+   alignas(8) char host_mem[0];
 };
 
 bool
@@ -3386,6 +3389,9 @@ enum anv_pipe_bits {
 
    ANV_PIPE_TLB_INVALIDATE_BIT               = (1 << 18),
 
+   /* L3 Fabric Flush */
+   ANV_PIPE_L3_FABRIC_FLUSH_BIT              = (1 << 19),
+
    ANV_PIPE_CS_STALL_BIT                     = (1 << 20),
    ANV_PIPE_END_OF_PIPE_SYNC_BIT             = (1 << 21),
 
@@ -3408,8 +3414,6 @@ enum anv_pipe_bits {
     */
    ANV_PIPE_POST_SYNC_BIT                    = (1 << 24),
 
-   /* L3 Fabric Flush */
-   ANV_PIPE_L3_FABRIC_FLUSH_BIT              = (1 << 25),
 };
 
 /* These bits track the state of buffer writes for queries. They get cleared
@@ -3474,6 +3478,14 @@ enum anv_query_bits {
    ANV_PIPE_RENDER_TARGET_CACHE_FLUSH_BIT | \
    ANV_PIPE_TILE_CACHE_FLUSH_BIT | \
    ANV_PIPE_L3_FABRIC_FLUSH_BIT)
+
+#define ANV_PIPE_BARRIER_FLUSH_BITS ( \
+   ANV_PIPE_DEPTH_CACHE_FLUSH_BIT | \
+   ANV_PIPE_DATA_CACHE_FLUSH_BIT | \
+   ANV_PIPE_HDC_PIPELINE_FLUSH_BIT | \
+   ANV_PIPE_UNTYPED_DATAPORT_CACHE_FLUSH_BIT | \
+   ANV_PIPE_RENDER_TARGET_CACHE_FLUSH_BIT | \
+   ANV_PIPE_TILE_CACHE_FLUSH_BIT)
 
 #define ANV_PIPE_STALL_BITS ( \
    ANV_PIPE_STALL_AT_SCOREBOARD_BIT | \
@@ -4310,6 +4322,14 @@ anv_cmd_buffer_is_render_or_compute_queue(const struct anv_cmd_buffer *cmd_buffe
 {
    return anv_cmd_buffer_is_render_queue(cmd_buffer) ||
           anv_cmd_buffer_is_compute_queue(cmd_buffer);
+}
+
+static inline uint8_t
+anv_get_ray_query_bo_index(struct anv_cmd_buffer *cmd_buffer)
+{
+   if (intel_needs_workaround(cmd_buffer->device->isl_dev.info, 14022863161))
+      return anv_cmd_buffer_is_compute_queue(cmd_buffer) ? 1 : 0;
+   return 0;
 }
 
 static inline struct anv_address
@@ -6247,19 +6267,19 @@ struct anv_video_session_params {
 void
 anv_dump_pipe_bits(enum anv_pipe_bits bits, FILE *f);
 
+void
+anv_cmd_buffer_pending_pipe_debug(struct anv_cmd_buffer *cmd_buffer,
+                                  enum anv_pipe_bits bits,
+                                  const char* reason);
+
 static inline void
 anv_add_pending_pipe_bits(struct anv_cmd_buffer* cmd_buffer,
                           enum anv_pipe_bits bits,
                           const char* reason)
 {
    cmd_buffer->state.pending_pipe_bits |= bits;
-   if (INTEL_DEBUG(DEBUG_PIPE_CONTROL) && bits) {
-      fputs("pc: add ", stdout);
-      anv_dump_pipe_bits(bits, stdout);
-      fprintf(stdout, "reason: %s\n", reason);
-   }
-   if (cmd_buffer->batch.pc_reasons_count < ARRAY_SIZE(cmd_buffer->batch.pc_reasons)) {
-      cmd_buffer->batch.pc_reasons[cmd_buffer->batch.pc_reasons_count++] = reason;
+   if (INTEL_DEBUG(DEBUG_PIPE_CONTROL)) {
+      anv_cmd_buffer_pending_pipe_debug(cmd_buffer, bits, reason);
    }
 }
 

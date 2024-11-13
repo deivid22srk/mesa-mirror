@@ -114,7 +114,7 @@ agx_resource_debug(struct agx_resource *res, const char *msg)
 
    agx_msg(
       "%s%s %dx%dx%d %dL %d/%dM %dS M:%llx %s %s%s S:0x%llx LS:0x%llx CS:0x%llx "
-      "Base=0x%llx Size=0x%llx Meta=0x%llx/0x%llx (%s) %s%s%s%s%s%sfd:%d(%d) @ %p\n",
+      "Base=0x%llx Size=0x%llx Meta=0x%llx/0x%llx (%s) %s%s%s%s%s%sfd:%d(%d) B:%x @ %p\n",
       msg ?: "", util_format_short_name(res->base.format), res->base.width0,
       res->base.height0, res->base.depth0, res->base.array_size,
       res->base.last_level, res->layout.levels, res->layout.sample_count_sa,
@@ -135,7 +135,7 @@ agx_resource_debug(struct agx_resource *res, const char *msg)
       res->bo->flags & AGX_BO_WRITEBACK ? "WB " : "",
       res->bo->flags & AGX_BO_SHAREABLE ? "SA " : "",
       res->bo->flags & AGX_BO_READONLY ? "RO " : "", res->bo->prime_fd, ino,
-      res);
+      res->base.bind, res);
 }
 
 static void
@@ -196,6 +196,8 @@ agx_resource_from_handle(struct pipe_screen *pscreen,
 
    pipe_reference_init(&prsc->reference, 1);
    prsc->screen = pscreen;
+
+   prsc->bind |= PIPE_BIND_SHARED;
 
    rsc->bo = agx_bo_import(dev, whandle->handle);
    /* Sometimes an import can fail e.g. on an invalid buffer fd, out of
@@ -1854,6 +1856,8 @@ agx_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
       priority = 2;
    else if (flags & PIPE_CONTEXT_PRIORITY_HIGH)
       priority = 1;
+   else if (flags & PIPE_CONTEXT_PRIORITY_REALTIME)
+      priority = 0;
 
    ctx->queue_id = agx_create_command_queue(agx_device(screen),
                                             DRM_ASAHI_QUEUE_CAP_RENDER |
@@ -2203,7 +2207,7 @@ agx_get_param(struct pipe_screen *pscreen, enum pipe_cap param)
 
    case PIPE_CAP_CONTEXT_PRIORITY_MASK:
       return PIPE_CONTEXT_PRIORITY_LOW | PIPE_CONTEXT_PRIORITY_MEDIUM |
-             PIPE_CONTEXT_PRIORITY_HIGH;
+             PIPE_CONTEXT_PRIORITY_HIGH | PIPE_CONTEXT_PRIORITY_REALTIME;
 
    default:
       return u_pipe_screen_get_param_defaults(pscreen, param);
@@ -2368,6 +2372,8 @@ static int
 agx_get_compute_param(struct pipe_screen *pscreen, enum pipe_shader_ir ir_type,
                       enum pipe_compute_cap param, void *ret)
 {
+   struct agx_device *dev = agx_device(pscreen);
+
 #define RET(x)                                                                 \
    do {                                                                        \
       if (ret)                                                                 \
@@ -2414,10 +2420,10 @@ agx_get_compute_param(struct pipe_screen *pscreen, enum pipe_shader_ir ir_type,
       RET((uint64_t[]){4096});
 
    case PIPE_COMPUTE_CAP_MAX_CLOCK_FREQUENCY:
-      RET((uint32_t[]){800 /* MHz -- TODO */});
+      RET((uint32_t[]){dev->params.max_frequency_khz / 1000});
 
    case PIPE_COMPUTE_CAP_MAX_COMPUTE_UNITS:
-      RET((uint32_t[]){4 /* TODO */});
+      RET((uint32_t[]){agx_get_num_cores(dev)});
 
    case PIPE_COMPUTE_CAP_IMAGES_SUPPORTED:
       RET((uint32_t[]){1});
@@ -2641,7 +2647,8 @@ agx_get_cl_cts_version(struct pipe_screen *pscreen)
 {
    struct agx_device *dev = agx_device(pscreen);
 
-   /* https://www.khronos.org/conformance/adopters/conformant-products/opencl#submission_433 */
+   /* https://www.khronos.org/conformance/adopters/conformant-products/opencl#submission_433
+    */
    if (dev->params.gpu_generation < 15)
       return "v2024-08-08-00";
 
@@ -2672,10 +2679,6 @@ agx_screen_create(int fd, struct renderonly *ro,
    driParseConfigFiles(config->options, config->options_info, 0, "asahi", NULL,
                        NULL, NULL, 0, NULL, 0);
 
-   /* Forward no16 flag from driconf */
-   if (driQueryOptionb(config->options, "no_fp16"))
-      agx_screen->dev.debug |= AGX_DBG_NO16;
-
    agx_screen->dev.fd = fd;
    agx_screen->dev.ro = ro;
    u_rwlock_init(&agx_screen->destroy_lock);
@@ -2685,6 +2688,12 @@ agx_screen_create(int fd, struct renderonly *ro,
       ralloc_free(agx_screen);
       return NULL;
    }
+
+   /* Forward no16 flag from driconf. This must happen after opening the device,
+    * since agx_open_device sets debug.
+    */
+   if (driQueryOptionb(config->options, "no_fp16"))
+      agx_screen->dev.debug |= AGX_DBG_NO16;
 
    int ret =
       drmSyncobjCreate(agx_device(screen)->fd, 0, &agx_screen->flush_syncobj);

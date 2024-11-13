@@ -718,9 +718,8 @@ static int si_get_video_param(struct pipe_screen *screen, enum pipe_video_profil
          return (sscreen->info.vcn_ip_version >= VCN_1_0_0) ? 1 : 0;
 
       case PIPE_VIDEO_CAP_ENC_HEVC_FEATURE_FLAGS:
-         if ((sscreen->info.vcn_ip_version >= VCN_1_0_0) &&
-               (profile == PIPE_VIDEO_PROFILE_HEVC_MAIN ||
-             profile == PIPE_VIDEO_PROFILE_HEVC_MAIN_10)) {
+         if (profile == PIPE_VIDEO_PROFILE_HEVC_MAIN ||
+             profile == PIPE_VIDEO_PROFILE_HEVC_MAIN_10) {
             union pipe_h265_enc_cap_features pipe_features;
             pipe_features.value = 0;
 
@@ -741,9 +740,8 @@ static int si_get_video_param(struct pipe_screen *screen, enum pipe_video_profil
             return 0;
 
       case PIPE_VIDEO_CAP_ENC_HEVC_BLOCK_SIZES:
-         if (sscreen->info.vcn_ip_version >= VCN_1_0_0 &&
-             (profile == PIPE_VIDEO_PROFILE_HEVC_MAIN ||
-              profile == PIPE_VIDEO_PROFILE_HEVC_MAIN_10)) {
+         if (profile == PIPE_VIDEO_PROFILE_HEVC_MAIN ||
+             profile == PIPE_VIDEO_PROFILE_HEVC_MAIN_10) {
             union pipe_h265_enc_cap_block_sizes pipe_block_sizes;
             pipe_block_sizes.value = 0;
 
@@ -753,12 +751,16 @@ static int si_get_video_param(struct pipe_screen *screen, enum pipe_video_profil
             pipe_block_sizes.bits.log2_max_luma_transform_block_size_minus2 = 3;
             pipe_block_sizes.bits.log2_min_luma_transform_block_size_minus2 = 0;
 
+            if (sscreen->info.ip[AMD_IP_UVD_ENC].num_queues) {
+               pipe_block_sizes.bits.max_max_transform_hierarchy_depth_inter = 3;
+               pipe_block_sizes.bits.min_max_transform_hierarchy_depth_inter = 3;
+               pipe_block_sizes.bits.max_max_transform_hierarchy_depth_intra = 3;
+               pipe_block_sizes.bits.min_max_transform_hierarchy_depth_intra = 3;
+            }
+
             return pipe_block_sizes.value;
          } else
             return 0;
-
-      case PIPE_VIDEO_CAP_ENC_SUPPORTS_ASYNC_OPERATION:
-         return (sscreen->info.vcn_ip_version >= VCN_1_0_0) ? 1 : 0;
 
       case PIPE_VIDEO_CAP_ENC_MAX_SLICES_PER_FRAME:
          return (sscreen->info.vcn_ip_version >= VCN_1_0_0) ? 128 : 1;
@@ -1057,6 +1059,8 @@ static int si_get_video_param(struct pipe_screen *screen, enum pipe_video_profil
           sscreen->info.vcn_ip_version == VCN_4_0_3)
          return true;
       return false;
+   case PIPE_VIDEO_CAP_SKIP_CLEAR_SURFACE:
+      return sscreen->info.is_amdgpu && sscreen->info.drm_minor >= 59;
    default:
       return 0;
    }
@@ -1568,8 +1572,7 @@ void si_init_screen_get_functions(struct si_screen *sscreen)
     * when execution mode is rtz instead of rtne.
     */
    options->force_f2f16_rtz = true;
-   options->io_options |= (!has_mediump ? nir_io_mediump_is_32bit : 0) |
-                          nir_io_glsl_lower_derefs |
+   options->io_options |= (!has_mediump ? nir_io_mediump_is_32bit : 0) | nir_io_has_intrinsics |
                           (sscreen->options.optimize_io ? nir_io_glsl_opt_varyings : 0);
    options->lower_mediump_io = has_mediump ? si_lower_mediump_io : NULL;
    /* HW supports indirect indexing for: | Enabled in driver

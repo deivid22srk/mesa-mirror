@@ -5,6 +5,7 @@
 
 #include <stdio.h>
 #include <unistd.h>
+#include "drm/etnaviv_drmif.h"
 #include <sys/time.h>
 
 #include "util/u_inlines.h"
@@ -61,14 +62,42 @@ etna_ml_create_tensor(struct etna_ml_subgraph *subgraph, unsigned idx, unsigned 
    ML_DBG("created resource %p for tensor %d with size %d\n", res, idx, size);
 }
 
+struct etna_core_npu_info *
+etna_ml_get_core_info(struct etna_context *context) {
+   struct etna_screen *screen = context->screen;
+   struct etna_core_info *info = etna_gpu_get_core_info(screen->npu);
+   return &info->npu;
+}
+
 static bool
-needs_reshuffle(const struct pipe_ml_operation *poperation)
+needs_reshuffle(struct etna_ml_subgraph *subgraph, const struct pipe_ml_operation *poperation)
 {
+   struct pipe_context *context = subgraph->base.context;
+   struct etna_context *ctx = etna_context(context);
+   unsigned nn_core_version = ctx->screen->specs.nn_core_version;
    bool has_stride = poperation->conv.stride_x > 1 || poperation->conv.stride_y > 1;
    bool pointwise = poperation->conv.pointwise;
    unsigned input_width = poperation->input_tensor->dims[1];
 
-   return has_stride && !(poperation->conv.depthwise && (input_width > 5 || input_width < 3)) && !pointwise;
+   if (!has_stride)
+      return false;
+
+   if (nn_core_version < 8)
+      return !(poperation->conv.depthwise && (input_width > 5 || input_width < 3)) && !pointwise;
+   else {
+      unsigned input_channels = poperation->input_tensor->dims[3];
+
+      if (poperation->conv.depthwise)
+         return false;
+
+      if (poperation->conv.pointwise && input_width >= 3 && input_channels > 1)
+         return false;
+
+      if (poperation->conv.pointwise && poperation->conv.padding_same)
+         return false;
+
+      return true;
+   }
 }
 
 static void
@@ -122,7 +151,7 @@ lower_operations(struct etna_ml_subgraph *subgraph,
       switch(poperation->type) {
          case PIPE_ML_OPERATION_TYPE_CONVOLUTION: {
             unsigned input_tensor = poperation->input_tensor->index;
-            if (needs_reshuffle(poperation)) {
+            if (needs_reshuffle(subgraph, poperation)) {
                struct etna_operation *operation = calloc(1, sizeof(*operation));
                etna_ml_lower_reshuffle(subgraph, poperation, operation, &input_tensor);
                list_addtail(&operation->link, etna_operations);
@@ -237,7 +266,7 @@ etna_ml_subgraph_create(struct pipe_context *pcontext,
                         unsigned count)
 {
    struct etna_context *ctx = etna_context(pcontext);
-   unsigned nn_core_count = ctx->screen->info->npu.nn_core_count;
+   unsigned nn_core_count = etna_ml_get_core_info(ctx)->nn_core_count;
    struct etna_ml_subgraph *subgraph;
    struct list_head operations;
    unsigned tensor_count;
@@ -292,21 +321,29 @@ etna_ml_subgraph_create(struct pipe_context *pcontext,
 }
 
 static void
-dump_buffer(struct etna_bo *bo, char *name, int operation_nr)
+dump_buffer(const uint32_t *ptr, unsigned size, char *name, int operation_nr, int suboperation_nr)
 {
    char buffer[255];
 
-   uint32_t *map = etna_bo_map(bo);
-   snprintf(buffer, sizeof(buffer), "mesa-%s-%08u.bin", name, operation_nr);
-   ML_DBG("Dumping buffer from 0x%lx (0x%x) to %s\n", map, etna_bo_gpu_va(bo), buffer);
+   snprintf(buffer, sizeof(buffer), "mesa-%s-%03u-%03u.bin", name, operation_nr, suboperation_nr);
+
+   ML_DBG("Dumping buffer from 0x%lx to %s\n", ptr, buffer);
+
    FILE *f = fopen(buffer, "wb");
    assert(f);
-   fwrite(map, 1, etna_bo_size(bo), f);
+   fwrite(ptr, 1, size, f);
    if(ferror(f)) {
       ML_DBG("Error in writing to file: %s\n", strerror(errno));
    }
    fflush(f);
    fclose(f);
+}
+
+static void
+dump_bo(struct etna_bo *bo, char *name, int operation_nr, int suboperation_nr)
+{
+   const uint32_t *map = etna_bo_map(bo);
+   dump_buffer(map, etna_bo_size(bo), name, operation_nr, suboperation_nr);
 }
 
 static void
@@ -358,7 +395,7 @@ void
 etna_ml_subgraph_invoke(struct pipe_context *pctx, struct pipe_ml_subgraph *psubgraph, struct pipe_tensor *input)
 {
    struct etna_context *ctx = etna_context(pctx);
-   unsigned tp_core_count = ctx->screen->info->npu.tp_core_count;
+   unsigned tp_core_count = etna_ml_get_core_info(ctx)->tp_core_count;
    struct etna_ml_subgraph *subgraph = (struct etna_ml_subgraph *)(psubgraph);
    struct etna_cmd_stream *stream = ctx->stream;
    static bool is_initialized = false;
@@ -381,7 +418,6 @@ etna_ml_subgraph_invoke(struct pipe_context *pctx, struct pipe_ml_subgraph *psub
    }
 
    unsigned i = 0;
-   unsigned dump_id = 0;
    util_dynarray_foreach(&subgraph->operations, struct etna_vip_instruction, operation) {
       #if 0
       if (i == util_dynarray_num_elements(&subgraph->operations, struct etna_vip_instruction) - 1) {
@@ -402,14 +438,12 @@ etna_ml_subgraph_invoke(struct pipe_context *pctx, struct pipe_ml_subgraph *psub
          switch (operation->type) {
             case ETNA_JOB_TYPE_TP:
                for (unsigned j = 0; j < tp_core_count && operation->configs[j]; j++) {
-                  dump_buffer(operation->configs[j], "tp", dump_id);
-                  dump_id++;
+                  dump_bo(operation->configs[j], "tp", i, j);
                }
                break;
             case ETNA_JOB_TYPE_NN:
-               dump_buffer(operation->configs[0], "nn", dump_id);
-               dump_buffer(operation->coefficients, "compressed", dump_id);
-               dump_id++;
+               dump_bo(operation->configs[0], "nn", i, 0);
+               dump_bo(operation->coefficients, "compressed", i, 0);
                break;
             default:
                unreachable("Unsupported ML operation type");
@@ -449,7 +483,24 @@ etna_ml_subgraph_invoke(struct pipe_context *pctx, struct pipe_ml_subgraph *psub
       if (DBG_ENABLED(ETNA_DBG_NPU_NO_BATCHING)) {
          ML_DBG("Running operation %d - %d\n", i, operation->type);
          close_batch(pctx);
+
+         if (DBG_ENABLED(ETNA_DBG_DUMP_SHADERS))
+            dump_buffer(ctx->stream->buffer, ctx->stream->offset * 4, "cmd", i, 0);
+
          pctx->flush(pctx, NULL, 0);
+
+         if (DBG_ENABLED(ETNA_DBG_DUMP_SHADERS)) {
+            struct pipe_transfer *transfer = NULL;
+
+            pipe_buffer_map(pctx, operation->input, PIPE_MAP_READ, &transfer);
+            dump_bo(etna_resource(operation->input)->bo, "input", i, 0);
+            pipe_buffer_unmap(pctx, transfer);
+
+            pipe_buffer_map(pctx, operation->output, PIPE_MAP_READ, &transfer);
+            dump_bo(etna_resource(operation->output)->bo, "output", i, 0);
+            pipe_buffer_unmap(pctx, transfer);
+         }
+
          stream = ctx->stream;
       }
 
@@ -497,23 +548,6 @@ etna_ml_subgraph_read_outputs(struct pipe_context *context, struct pipe_ml_subgr
    for (int i = 0; i < outputs_count; i++) {
       struct pipe_resource *res = etna_ml_get_tensor(subgraph, output_idxs[i]);
       pipe_buffer_read(context, res, 0, pipe_buffer_size(res), outputs[i]);
-   }
-
-   if (DBG_ENABLED(ETNA_DBG_DUMP_SHADERS)) {
-      unsigned i = 0;
-      util_dynarray_foreach(&subgraph->operations, struct etna_vip_instruction, operation) {
-         struct pipe_transfer *transfer = NULL;
-
-         pipe_buffer_map(context, operation->input, PIPE_MAP_READ, &transfer);
-         dump_buffer(etna_resource(operation->input)->bo, "input", i);
-         pipe_buffer_unmap(context, transfer);
-
-         pipe_buffer_map(context, operation->output, PIPE_MAP_READ, &transfer);
-         dump_buffer(etna_resource(operation->output)->bo, "output", i);
-         pipe_buffer_unmap(context, transfer);
-
-         i++;
-      }
    }
 }
 

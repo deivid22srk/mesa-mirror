@@ -5736,11 +5736,6 @@ emit_load_frag_coord(isel_context* ctx, Temp dst, unsigned num_components)
       else
          vec->operands[i] = Operand(v1);
    }
-   if (G_0286CC_POS_W_FLOAT_ENA(ctx->program->config->spi_ps_input_ena)) {
-      assert(num_components == 4);
-      vec->operands[3] =
-         bld.vop1(aco_opcode::v_rcp_f32, bld.def(v1), get_arg(ctx, ctx->args->frag_pos[3]));
-   }
 
    for (Operand& op : vec->operands)
       op = op.isUndefined() ? Operand::zero() : op;
@@ -6906,24 +6901,25 @@ visit_load_global(isel_context* ctx, nir_intrinsic_instr* instr)
    info.align_offset = nir_intrinsic_align_offset(instr);
    info.sync = get_memory_sync_info(instr, storage_buffer, 0);
 
-   /* Don't expand global loads when they use MUBUF or SMEM.
-    * Global loads don't have the bounds checking that buffer loads have that
+   /* Global loads don't have the bounds checking that buffer loads have that
     * makes this safe.
     */
    unsigned align = nir_intrinsic_align(instr);
-   bool byte_align_for_smem_mubuf =
-      can_use_byte_align_for_global_load(num_components, component_size, align, false);
+   bool byte_align_for_vmem = can_use_byte_align_for_global_load(
+      num_components, component_size, align, ctx->options->gfx_level > GFX6);
+   bool byte_align_for_smem = can_use_byte_align_for_global_load(
+      num_components, component_size, align, false);
 
    unsigned access = nir_intrinsic_access(instr) | ACCESS_TYPE_LOAD;
    bool glc = access & (ACCESS_VOLATILE | ACCESS_COHERENT);
 
    /* VMEM stores don't update the SMEM cache and it's difficult to prove that
     * it's safe to use SMEM */
-   bool can_use_smem = (access & ACCESS_NON_WRITEABLE) && byte_align_for_smem_mubuf;
+   bool can_use_smem = (access & ACCESS_NON_WRITEABLE) && byte_align_for_smem;
    if (info.dst.type() == RegType::vgpr || (ctx->options->gfx_level < GFX8 && glc) ||
        !can_use_smem) {
       EmitLoadParameters params = global_load_params;
-      params.byte_align_loads = ctx->options->gfx_level > GFX6 || byte_align_for_smem_mubuf;
+      params.byte_align_loads = byte_align_for_vmem;
       info.cache = get_cache_flags(ctx, access);
       emit_load(ctx, bld, info, params);
    } else {
@@ -8362,6 +8358,12 @@ visit_intrinsic(isel_context* ctx, nir_intrinsic_instr* instr)
       emit_load_frag_coord(ctx, get_ssa_temp(ctx, &instr->def), 4);
       break;
    }
+   case nir_intrinsic_load_pixel_coord: {
+      Temp dst = get_ssa_temp(ctx, &instr->def);
+      bld.copy(Definition(dst), get_arg(ctx, ctx->args->pos_fixed_pt));
+      emit_split_vector(ctx, dst, 2);
+      break;
+   }
    case nir_intrinsic_load_frag_shading_rate:
       emit_load_frag_shading_rate(ctx, get_ssa_temp(ctx, &instr->def));
       break;
@@ -8542,18 +8544,9 @@ visit_intrinsic(isel_context* ctx, nir_intrinsic_instr* instr)
       Temp src = as_vgpr(ctx, get_ssa_temp(ctx, instr->src[0].ssa));
       Temp dst = get_ssa_temp(ctx, &instr->def);
 
-      bool only_used_by_abs = true;
-      nir_foreach_use (use, &instr->def) {
-         nir_instr* use_instr = nir_src_parent_instr(use);
-
-         if (use_instr->type != nir_instr_type_alu ||
-             nir_instr_as_alu(use_instr)->op != nir_op_fabs)
-            only_used_by_abs = false;
-      }
-
       uint16_t dpp_ctrl1, dpp_ctrl2;
       if (instr->intrinsic == nir_intrinsic_ddx_fine) {
-         if (only_used_by_abs) {
+         if (nir_def_all_uses_ignore_sign_bit(&instr->def)) {
             dpp_ctrl1 = dpp_quad_perm(1, 0, 3, 2);
             dpp_ctrl2 = dpp_quad_perm(0, 1, 2, 3);
          } else {
@@ -8561,7 +8554,7 @@ visit_intrinsic(isel_context* ctx, nir_intrinsic_instr* instr)
             dpp_ctrl2 = dpp_quad_perm(1, 1, 3, 3);
          }
       } else if (instr->intrinsic == nir_intrinsic_ddy_fine) {
-         if (only_used_by_abs) {
+         if (nir_def_all_uses_ignore_sign_bit(&instr->def)) {
             dpp_ctrl1 = dpp_quad_perm(2, 3, 0, 1);
             dpp_ctrl2 = dpp_quad_perm(0, 1, 2, 3);
          } else {
@@ -9200,6 +9193,10 @@ visit_intrinsic(isel_context* ctx, nir_intrinsic_instr* instr)
       ctx->cf_info.had_divergent_discard |= in_exec_divergent_or_in_loop(ctx);
       ctx->block->kind |= block_kind_uses_discard;
       ctx->program->needs_exact = true;
+      break;
+   }
+   case nir_intrinsic_debug_break: {
+      bld.sopp(aco_opcode::s_trap, 1u);
       break;
    }
    case nir_intrinsic_first_invocation: {
@@ -10538,6 +10535,30 @@ visit_jump(isel_context* ctx, nir_jump_instr* instr)
 }
 
 void
+visit_debug_info(isel_context* ctx, nir_debug_info_instr* instr)
+{
+   ac_shader_debug_info info;
+   memset(&info, 0, sizeof(info));
+
+   switch (instr->type) {
+   case nir_debug_info_src_loc:
+      info.type = ac_shader_debug_info_src_loc;
+      info.src_loc.file = strdup(nir_src_as_string(instr->src_loc.filename));
+      info.src_loc.line = instr->src_loc.line;
+      info.src_loc.column = instr->src_loc.column;
+      info.src_loc.spirv_offset = instr->src_loc.spirv_offset;
+      break;
+   default:
+      return;
+   }
+
+   Builder bld(ctx->program, ctx->block);
+   bld.pseudo(aco_opcode::p_debug_info, Operand::c32(ctx->program->debug_info.size()));
+
+   ctx->program->debug_info.push_back(info);
+}
+
+void
 visit_block(isel_context* ctx, nir_block* block)
 {
    if (ctx->block->kind & block_kind_top_level) {
@@ -10560,6 +10581,7 @@ visit_block(isel_context* ctx, nir_block* block)
       case nir_instr_type_undef: visit_undef(ctx, nir_instr_as_undef(instr)); break;
       case nir_instr_type_deref: break;
       case nir_instr_type_jump: visit_jump(ctx, nir_instr_as_jump(instr)); break;
+      case nir_instr_type_debug_info: visit_debug_info(ctx, nir_instr_as_debug_info(instr)); break;
       default: isel_err(instr, "Unknown NIR instr type");
       }
    }
@@ -12404,11 +12426,80 @@ select_program(Program* program, unsigned shader_count, struct nir_shader* const
 }
 
 void
-select_trap_handler_shader(Program* program, struct nir_shader* shader, ac_shader_config* config,
+dump_sgpr_to_mem(isel_context* ctx, Operand rsrc, Operand data, uint32_t offset)
+{
+   Builder bld(ctx->program, ctx->block);
+
+   ac_hw_cache_flags cache_glc;
+   cache_glc.value = ac_glc;
+
+   if (ctx->program->gfx_level >= GFX9) {
+      bld.copy(Definition(PhysReg{256}, v1) /* v0 */, data);
+
+      bld.mubuf(aco_opcode::buffer_store_dword, Operand(rsrc), Operand(v1), Operand::c32(0u),
+                Operand(PhysReg{256}, v1) /* v0 */, offset, false /* offen */, false /* idxen */,
+                /* addr64 */ false, /* disable_wqm */ false, cache_glc);
+   } else {
+      bld.smem(aco_opcode::s_buffer_store_dword, Operand(rsrc), Operand::c32(offset), data,
+               memory_sync_info(), cache_glc);
+   }
+}
+
+void
+save_or_restore_vgprs(isel_context* ctx, Operand rsrc, bool save)
+{
+   Builder bld(ctx->program, ctx->block);
+   uint32_t offset = offsetof(struct aco_trap_handler_layout, saved_vgprs[0]);
+
+   ac_hw_cache_flags cache_glc;
+   cache_glc.value = ac_glc;
+
+   PhysReg rsrc_word3(rsrc.physReg() + 3);
+
+   /* Set ADD_TID_ENABLE to enable thread indexing. */
+   bld.sop2(aco_opcode::s_or_b32, Definition(rsrc_word3, s1), bld.def(s1, scc),
+            Operand(rsrc_word3, s1), Operand::c32(1 << 23));
+
+   for (uint32_t i = 0; i < NUM_SAVED_VGPRS; i++) {
+      if (save) {
+         bld.mubuf(aco_opcode::buffer_store_dword, Operand(rsrc), Operand(v1), Operand::c32(0u),
+                   Operand(PhysReg{256 + i}, v1) /* v0 */, offset, false /* offen */,
+                   false /* idxen */,
+                   /* addr64 */ false, /* disable_wqm */ false, cache_glc);
+      } else {
+         bld.mubuf(aco_opcode::buffer_load_dword, Definition(PhysReg{256 + i}, v1), Operand(rsrc),
+                   Operand(v1), Operand::c32(0u), offset, false /* offen */, false /* idxen */,
+                   /* addr64 */ false, /* disable_wqm */ false, cache_glc);
+      }
+
+      offset += 256;
+   }
+
+   /* Clear ADD_TID_ENABLE. */
+   bld.sop2(aco_opcode::s_andn2_b32, Definition(rsrc_word3, s1), bld.def(s1, scc),
+            Operand(rsrc_word3, s1), Operand::c32(1 << 23));
+}
+
+void
+save_vgprs_to_mem(isel_context* ctx, Operand rsrc)
+{
+   save_or_restore_vgprs(ctx, rsrc, true);
+}
+
+void
+restore_vgprs_from_mem(isel_context* ctx, Operand rsrc)
+{
+   save_or_restore_vgprs(ctx, rsrc, false);
+}
+
+void
+select_trap_handler_shader(Program* program, ac_shader_config* config,
                            const struct aco_compiler_options* options,
                            const struct aco_shader_info* info, const struct ac_shader_args* args)
 {
-   assert(options->gfx_level == GFX8);
+   uint32_t offset = 0;
+
+   assert(options->gfx_level >= GFX8 && options->gfx_level <= GFX11);
 
    init_program(program, compute_cs, info, options->gfx_level, options->family, options->wgp_mode,
                 config);
@@ -12429,34 +12520,125 @@ select_trap_handler_shader(Program* program, struct nir_shader* shader, ac_shade
 
    Builder bld(ctx.program, ctx.block);
 
-   /* Load the buffer descriptor from TMA. */
-   bld.smem(aco_opcode::s_load_dwordx4, Definition(PhysReg{ttmp4}, s4), Operand(PhysReg{tma}, s2),
-            Operand::zero());
-
    ac_hw_cache_flags cache_glc;
    cache_glc.value = ac_glc;
 
-   /* Store TTMP0-TTMP1. */
-   bld.smem(aco_opcode::s_buffer_store_dwordx2, Operand(PhysReg{ttmp4}, s4), Operand::zero(),
-            Operand(PhysReg{ttmp0}, s2), memory_sync_info(), cache_glc);
+   const uint32_t ttmp0_idx = ctx.program->gfx_level >= GFX9 ? 108 : 112;
+   PhysReg ttmp0_reg{ttmp0_idx};
+   PhysReg ttmp1_reg{ttmp0_idx + 1};
+   PhysReg ttmp2_reg{ttmp0_idx + 2};
+   PhysReg ttmp3_reg{ttmp0_idx + 3};
+   PhysReg tma_rsrc{ttmp0_idx + 4}; /* s4 */
+   PhysReg save_wave_status{ttmp0_idx + 8};
+   PhysReg save_m0{ttmp0_idx + 9};
+   PhysReg save_exec_lo{ttmp0_idx + 10};
+   PhysReg save_exec_hi{ttmp0_idx + 11};
 
-   uint32_t hw_regs_idx[] = {
-      2, /* HW_REG_STATUS */
+   /* Save SQ_WAVE_STATUS because SCC needs to be restored. */
+   bld.sopk(aco_opcode::s_getreg_b32, Definition(save_wave_status, s1), ((32 - 1) << 11) | 2);
+
+   /* Save m0 and exec. */
+   bld.copy(Definition(save_m0, s1), Operand(m0, s1));
+   bld.copy(Definition(save_exec_lo, s1), Operand(exec_lo, s1));
+   bld.copy(Definition(save_exec_hi, s1), Operand(exec_hi, s1));
+
+   if (options->gfx_level < GFX11) {
+      /* Clear the current wave exception, this is required to re-enable VALU
+       * instructions in this wave. Seems to be only needed for float exceptions.
+       */
+      bld.vop1(aco_opcode::v_clrexcp);
+   }
+
+   offset = offsetof(struct aco_trap_handler_layout, ttmp0);
+
+   if (ctx.program->gfx_level >= GFX9) {
+      /* Get TMA. */
+      if (ctx.program->gfx_level >= GFX11) {
+         bld.sop1(aco_opcode::s_sendmsg_rtn_b32, Definition(ttmp2_reg, s1),
+                  Operand::c32(sendmsg_rtn_get_tma));
+      } else {
+         bld.sopk(aco_opcode::s_getreg_b32, Definition(ttmp2_reg, s1), ((32 - 1) << 11) | 18);
+      }
+
+      bld.sop2(aco_opcode::s_lshl_b32, Definition(ttmp2_reg, s1), Definition(scc, s1),
+               Operand(ttmp2_reg, s1), Operand::c32(8u));
+      bld.copy(Definition(ttmp3_reg, s1), Operand::c32((unsigned)ctx.options->address32_hi));
+
+      /* Load the buffer descriptor from TMA. */
+      bld.smem(aco_opcode::s_load_dwordx4, Definition(tma_rsrc, s4), Operand(ttmp2_reg, s2),
+               Operand::c32(0u));
+
+      /* Save VGPRS that needs to be restored. */
+      save_vgprs_to_mem(&ctx, Operand(tma_rsrc, s4));
+
+      /* Store TTMP0-TTMP1. */
+      bld.copy(Definition(PhysReg{256}, v2) /* v[0-1] */, Operand(ttmp0_reg, s2));
+
+      bld.mubuf(aco_opcode::buffer_store_dwordx2, Operand(tma_rsrc, s4), Operand(v1),
+                Operand::c32(0u), Operand(PhysReg{256}, v2) /* v[0-1] */, offset /* offset */,
+                false /* offen */, false /* idxen */, /* addr64 */ false,
+                /* disable_wqm */ false, cache_glc);
+   } else {
+      /* Load the buffer descriptor from TMA. */
+      bld.smem(aco_opcode::s_load_dwordx4, Definition(tma_rsrc, s4), Operand(PhysReg{tma_lo}, s2),
+               Operand::zero());
+
+      /* Store TTMP0-TTMP1. */
+      bld.smem(aco_opcode::s_buffer_store_dwordx2, Operand(tma_rsrc, s4), Operand::c32(offset),
+               Operand(ttmp0_reg, s2), memory_sync_info(), cache_glc);
+   }
+
+   /* Store some hardware registers. */
+   const uint32_t hw_regs_idx[] = {
+      1, /* HW_REG_MODE */
       3, /* HW_REG_TRAP_STS */
       4, /* HW_REG_HW_ID */
+      5, /* WH_REG_GPR_ALLOC */
+      6, /* WH_REG_LDS_ALLOC */
       7, /* HW_REG_IB_STS */
    };
 
-   /* Store some hardware registers. */
+   offset = offsetof(struct aco_trap_handler_layout, sq_wave_regs.status);
+
+   /* Store saved SQ_WAVE_STATUS which can change inside the trap. */
+   dump_sgpr_to_mem(&ctx, Operand(tma_rsrc, s4), Operand(save_wave_status, s1), offset);
+   offset += 4;
+
    for (unsigned i = 0; i < ARRAY_SIZE(hw_regs_idx); i++) {
       /* "((size - 1) << 11) | register" */
-      bld.sopk(aco_opcode::s_getreg_b32, Definition(PhysReg{ttmp8}, s1),
-               ((20 - 1) << 11) | hw_regs_idx[i]);
+      bld.sopk(aco_opcode::s_getreg_b32, Definition(ttmp0_reg, s1),
+               ((32 - 1) << 11) | hw_regs_idx[i]);
 
-      bld.smem(aco_opcode::s_buffer_store_dword, Operand(PhysReg{ttmp4}, s4),
-               Operand::c32(8u + i * 4), Operand(PhysReg{ttmp8}, s1), memory_sync_info(),
-               cache_glc);
+      dump_sgpr_to_mem(&ctx, Operand(tma_rsrc, s4), Operand(ttmp0_reg, s1), offset);
+      offset += 4;
    }
+
+   assert(offset == offsetof(struct aco_trap_handler_layout, m0));
+
+   /* Dump shader registers (m0, exec). */
+   dump_sgpr_to_mem(&ctx, Operand(tma_rsrc, s4), Operand(save_m0, s1), offset);
+   offset += 4;
+   dump_sgpr_to_mem(&ctx, Operand(tma_rsrc, s4), Operand(save_exec_lo, s1), offset);
+   offset += 4;
+   dump_sgpr_to_mem(&ctx, Operand(tma_rsrc, s4), Operand(save_exec_hi, s1), offset);
+   offset += 4;
+
+   assert(offset == offsetof(struct aco_trap_handler_layout, sgprs[0]));
+
+   /* Dump all SGPRs. */
+   for (uint32_t i = 0; i < program->dev.sgpr_limit; i++) {
+      dump_sgpr_to_mem(&ctx, Operand(tma_rsrc, s4), Operand(PhysReg{i}, s1), offset);
+      offset += 4;
+   }
+
+   if (ctx.program->gfx_level >= GFX9) {
+      /* Restore VGPRS. */
+      restore_vgprs_from_mem(&ctx, Operand(tma_rsrc, s4));
+   }
+
+   /* Restore SCC which is the first bit of SQ_WAVE_STATUS. */
+   bld.sopc(aco_opcode::s_bitcmp1_b32, bld.def(s1, scc), Operand(save_wave_status, s1),
+            Operand::c32(0u));
 
    program->config->float_mode = program->blocks[0].fp_mode.val;
 

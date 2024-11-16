@@ -15,6 +15,8 @@
 #include "genxml/cs_builder.h"
 
 #include "panvk_cmd_desc_state.h"
+#include "panvk_cmd_dispatch.h"
+#include "panvk_cmd_draw.h"
 #include "panvk_cmd_push_constant.h"
 #include "panvk_queue.h"
 
@@ -91,6 +93,8 @@ enum panvk_sb_ids {
 #define SB_ID(nm)       PANVK_SB_##nm
 #define SB_ITER(x)      (PANVK_SB_ITER_START + (x))
 #define SB_WAIT_ITER(x) BITFIELD_BIT(PANVK_SB_ITER_START + (x))
+#define SB_ALL_ITERS_MASK                                                      \
+   BITFIELD_RANGE(PANVK_SB_ITER_START, PANVK_SB_ITER_COUNT)
 #define SB_ALL_MASK     BITFIELD_MASK(8)
 
 static inline uint32_t
@@ -298,112 +302,14 @@ panvk_cs_reg_whitelist(frag_ctx, PANVK_CS_REG_RANGE(RUN_FRAGMENT_SR));
 panvk_cs_reg_whitelist(vt_ctx, PANVK_CS_REG_RANGE(RUN_IDVS_SR));
 #define cs_update_vt_ctx(__b) panvk_cs_reg_upd_ctx(__b, vt_ctx)
 
+panvk_cs_reg_whitelist(cmdbuf_regs, {PANVK_CS_REG_RUN_IDVS_SR_START,
+                                     PANVK_CS_REG_SCRATCH_END});
+#define cs_update_cmdbuf_regs(__b) panvk_cs_reg_upd_ctx(__b, cmdbuf_regs)
+
 struct panvk_tls_state {
    struct panfrost_ptr desc;
    struct pan_tls_info info;
    unsigned max_wg_count;
-};
-
-struct panvk_cmd_compute_state {
-   struct panvk_descriptor_state desc_state;
-   const struct panvk_shader *shader;
-   struct panvk_compute_sysvals sysvals;
-   mali_ptr push_uniforms;
-   struct {
-      struct panvk_shader_desc_state desc;
-   } cs;
-};
-
-struct panvk_attrib_buf {
-   mali_ptr address;
-   unsigned size;
-};
-
-struct panvk_resolve_attachment {
-   VkResolveModeFlagBits mode;
-   struct panvk_image_view *dst_iview;
-};
-
-struct panvk_rendering_state {
-   VkRenderingFlags flags;
-   uint32_t layer_count;
-
-   enum vk_rp_attachment_flags bound_attachments;
-   struct {
-      struct panvk_image_view *iviews[MAX_RTS];
-      VkFormat fmts[MAX_RTS];
-      uint8_t samples[MAX_RTS];
-      struct panvk_resolve_attachment resolve[MAX_RTS];
-   } color_attachments;
-
-   struct pan_image_view zs_pview;
-
-   struct {
-      struct panvk_image_view *iview;
-      VkFormat fmt;
-      struct panvk_resolve_attachment resolve;
-   } z_attachment, s_attachment;
-
-   struct {
-      struct pan_fb_info info;
-      bool crc_valid[MAX_RTS];
-   } fb;
-
-   struct panfrost_ptr fbds;
-   mali_ptr tiler;
-   bool dirty;
-};
-
-struct panvk_cmd_graphics_state {
-   struct panvk_descriptor_state desc_state;
-
-   struct {
-      struct vk_vertex_input_state vi;
-      struct vk_sample_locations_state sl;
-   } dynamic;
-
-   struct panvk_graphics_sysvals sysvals;
-
-   struct panvk_shader_link link;
-   bool linked;
-
-   struct {
-      const struct panvk_shader *shader;
-      struct panvk_shader_desc_state desc;
-      mali_ptr spd;
-   } fs;
-
-   struct {
-      const struct panvk_shader *shader;
-      struct panvk_shader_desc_state desc;
-      struct {
-         mali_ptr pos, var;
-      } spds;
-   } vs;
-
-   struct {
-      struct panvk_attrib_buf bufs[MAX_VBS];
-      unsigned count;
-      bool dirty;
-   } vb;
-
-   /* Index buffer */
-   struct {
-      struct panvk_buffer *buffer;
-      uint64_t offset;
-      uint8_t index_size;
-      uint32_t first_vertex, base_vertex, base_instance;
-      bool dirty;
-   } ib;
-
-   struct {
-      struct panvk_blend_info info;
-   } cb;
-
-   struct panvk_rendering_state render;
-
-   mali_ptr push_uniforms;
-   mali_ptr tsd;
 };
 
 struct panvk_cmd_buffer {

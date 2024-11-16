@@ -402,7 +402,8 @@ radv_dump_shader(struct radv_device *device, struct radv_pipeline *pipeline, str
    fprintf(f, "%s IR:\n%s\n", pdev->use_llvm ? "LLVM" : "ACO", shader->ir_string);
    fprintf(f, "DISASM:\n%s\n", shader->disasm_string);
 
-   radv_dump_shader_stats(device, pipeline, shader, stage, f);
+   if (pipeline)
+      radv_dump_shader_stats(device, pipeline, shader, stage, f);
 }
 
 static void
@@ -966,15 +967,10 @@ radv_trap_handler_finish(struct radv_device *device)
 }
 
 static void
-radv_dump_faulty_shader(struct radv_device *device, uint64_t faulty_pc, FILE *f)
+radv_dump_faulty_shader(const struct radv_device *device, const struct radv_shader *shader, uint64_t faulty_pc, FILE *f)
 {
-   struct radv_shader *shader;
    uint64_t start_addr, end_addr;
    uint32_t instr_offset;
-
-   shader = radv_find_shader(device, faulty_pc);
-   if (!shader)
-      return;
 
    start_addr = radv_shader_get_va(shader);
    start_addr &= ((1ull << 48) - 1);
@@ -1039,8 +1035,25 @@ radv_dump_sq_hw_regs(struct radv_device *device, const struct aco_trap_handler_l
    fprintf(f, "\n\n");
 }
 
+static uint32_t
+radv_get_vgpr_size(const struct radv_device *device, const struct aco_trap_handler_layout *layout)
+{
+   const struct radv_physical_device *pdev = radv_device_physical(device);
+   uint32_t vgpr_size;
+
+   if (pdev->info.gfx_level >= GFX11) {
+      vgpr_size = G_000414_VGPR_SIZE_GFX11(layout->sq_wave_regs.gpr_alloc);
+   } else if (pdev->info.gfx_level >= GFX10) {
+      vgpr_size = G_000414_VGPR_SIZE_GFX10(layout->sq_wave_regs.gpr_alloc);
+   } else {
+      vgpr_size = G_000054_VGPR_SIZE_GFX6(layout->sq_wave_regs.gpr_alloc);
+   }
+
+   return vgpr_size;
+}
+
 static void
-radv_dump_shader_regs(const struct aco_trap_handler_layout *layout, FILE *f)
+radv_dump_shader_regs(const struct radv_device *device, const struct aco_trap_handler_layout *layout, FILE *f)
 {
    fprintf(f, "\nShader registers:\n");
 
@@ -1053,6 +1066,31 @@ radv_dump_shader_regs(const struct aco_trap_handler_layout *layout, FILE *f)
       fprintf(f, "s[%d-%d] = { %08x, %08x, %08x, %08x }\n", i, i + 3, layout->sgprs[i], layout->sgprs[i + 1],
               layout->sgprs[i + 2], layout->sgprs[i + 3]);
    }
+   fprintf(f, "\n\n");
+
+   const uint32_t vgpr_size = radv_get_vgpr_size(device, layout);
+   const uint32_t num_vgprs = (vgpr_size + 1) * 4 /* 4-VGPR granularity */;
+   const uint64_t exec = layout->exec_lo | (uint64_t)layout->exec_hi << 32;
+
+   assert(num_vgprs < MAX_VGPRS);
+
+   fprintf(f, "VGPRS:\n");
+   fprintf(f, "             ");
+   for (uint32_t i = 0; i < 64; i++) {
+      const bool live = exec & BITFIELD64_BIT(i);
+
+      fprintf(f, live ? " t%02u     " : " (t%02u)   ", i);
+   }
+   fprintf(f, "\n");
+   for (uint32_t i = 0; i < num_vgprs; i++) {
+      fprintf(f, "    [%3u] = {", i);
+
+      for (uint32_t j = 0; j < 64; j++) {
+         fprintf(f, " %08x", layout->vgprs[i * 64 + j]);
+      }
+      fprintf(f, " }\n");
+   }
+
    fprintf(f, "\n\n");
 }
 
@@ -1099,7 +1137,7 @@ radv_check_trap_handler(struct radv_queue *queue)
 #endif
 
    radv_dump_sq_hw_regs(device, layout, f);
-   radv_dump_shader_regs(layout, f);
+   radv_dump_shader_regs(device, layout, f);
 
    uint32_t ttmp0 = layout->ttmp0;
    uint32_t ttmp1 = layout->ttmp1;
@@ -1118,9 +1156,27 @@ radv_check_trap_handler(struct radv_queue *queue)
 
    fprintf(f, "PC=0x%" PRIx64 ", trapID=%d, HT=%d, PC_rewind=%d\n", pc, trap_id, ht, pc_rewind);
 
-   radv_dump_faulty_shader(device, pc, f);
+   struct radv_shader *shader = radv_find_shader(device, pc);
+   if (shader) {
+      radv_dump_faulty_shader(device, shader, pc, f);
+   } else {
+      fprintf(stderr, "radv: Failed to find the faulty shader.\n");
+   }
 
    fclose(f);
+
+   if (shader) {
+      snprintf(dump_path, sizeof(dump_path), "%s/shader_dump.log", dump_dir);
+      f = fopen(dump_path, "w+");
+      if (!f) {
+         free(dump_dir);
+         return;
+      }
+
+      radv_dump_shader(device, NULL, shader, shader->info.stage, dump_dir, f);
+      fclose(f);
+   }
+
    free(dump_dir);
 
    fprintf(stderr, "radv: Trap handler report saved successfully!\n");

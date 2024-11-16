@@ -156,8 +156,18 @@ finish_cs(struct panvk_cmd_buffer *cmdbuf, uint32_t subqueue)
             /* Overwrite the sync error with the first error we encountered. */
             cs_store32(b, error, debug_sync_addr,
                        offsetof(struct panvk_cs_sync32, error));
-            cs_wait_slots(b, SB_ID(LS), false);
+            cs_wait_slot(b, SB_ID(LS), false);
          }
+      }
+   }
+
+   if ((instance->debug_flags & PANVK_DEBUG_CS) &&
+       cmdbuf->vk.level != VK_COMMAND_BUFFER_LEVEL_SECONDARY) {
+      cs_update_cmdbuf_regs(b) {
+         /* Poison all cmdbuf registers to make sure we don't inherit state from
+          * a previously executed cmdbuf. */
+         for (uint32_t i = 0; i <= PANVK_CS_REG_SCRATCH_END; i++)
+            cs_move32_to(b, cs_reg32(b, i), 0xdead | i << 24);
       }
    }
 
@@ -189,101 +199,102 @@ panvk_per_arch(EndCommandBuffer)(VkCommandBuffer commandBuffer)
    return vk_command_buffer_end(&cmdbuf->vk);
 }
 
-static bool
-src_stages_need_draw_flush(VkPipelineStageFlags2 stages)
+static VkPipelineStageFlags2
+get_subqueue_stages(enum panvk_subqueue_id subqueue)
 {
-   static const VkPipelineStageFlags2 draw_flush_stage_mask =
-      VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
-      VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
-      VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
-      VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
-      VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_BLIT_BIT |
-      VK_PIPELINE_STAGE_2_RESOLVE_BIT | VK_PIPELINE_STAGE_2_CLEAR_BIT;
-
-   return (stages & draw_flush_stage_mask) != 0;
-}
-
-static bool
-stages_cover_subqueue(enum panvk_subqueue_id subqueue,
-                      VkPipelineStageFlags2 stages)
-{
-   static const VkPipelineStageFlags2 queue_coverage[PANVK_SUBQUEUE_COUNT] = {
-      [PANVK_SUBQUEUE_VERTEX_TILER] =
-         VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT |
-         VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT |
-         VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT |
-         VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
-      [PANVK_SUBQUEUE_FRAGMENT] =
-         VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
-         VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
-         VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
-         VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
-         VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_BLIT_BIT |
-         VK_PIPELINE_STAGE_2_RESOLVE_BIT | VK_PIPELINE_STAGE_2_CLEAR_BIT,
-      [PANVK_SUBQUEUE_COMPUTE] =
-         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT,
-   };
-
-   return (stages & queue_coverage[subqueue]) != 0;
-}
-
-static uint32_t
-src_stages_to_subqueue_sb_mask(enum panvk_subqueue_id subqueue,
-                               VkPipelineStageFlags2 stages)
-{
-   if (!stages_cover_subqueue(subqueue, stages))
-      return 0;
-
-   /* Indirect draw buffers are read from the command stream, and load/store
-    * operations are synchronized with the LS scoreboad immediately after the
-    * read, so no need to wait in that case.
-    */
-   if (subqueue == PANVK_SUBQUEUE_VERTEX_TILER &&
-       stages == VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT)
-      return 0;
-
-   /* We need to wait for all previously submitted jobs, and given the
-    * iterator scoreboard is a moving target, we just wait for the
-    * whole dynamic scoreboard range. */
-   return BITFIELD_RANGE(PANVK_SB_ITER_START, PANVK_SB_ITER_COUNT);
+   switch (subqueue) {
+   case PANVK_SUBQUEUE_VERTEX_TILER:
+      return VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT |
+             VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT |
+             VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT |
+             VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
+   case PANVK_SUBQUEUE_FRAGMENT:
+      return VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+             VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+             VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
+             VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
+             VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_RESOLVE_BIT |
+             VK_PIPELINE_STAGE_2_BLIT_BIT | VK_PIPELINE_STAGE_2_CLEAR_BIT;
+   case PANVK_SUBQUEUE_COMPUTE:
+      return VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+             VK_PIPELINE_STAGE_2_COPY_BIT;
+   default:
+      unreachable("Invalid subqueue id");
+   }
 }
 
 static void
-collect_cache_flush_info(enum panvk_subqueue_id subqueue,
-                         struct panvk_cache_flush_info *cache_flush,
+add_execution_dependency(uint32_t wait_masks[static PANVK_SUBQUEUE_COUNT],
                          VkPipelineStageFlags2 src_stages,
-                         VkPipelineStageFlags2 dst_stages,
-                         VkAccessFlags2 src_access, VkAccessFlags2 dst_access)
+                         VkPipelineStageFlags2 dst_stages)
 {
-   static const VkAccessFlags2 dev_writes[PANVK_SUBQUEUE_COUNT] = {
-      [PANVK_SUBQUEUE_VERTEX_TILER] =
-         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
-      [PANVK_SUBQUEUE_FRAGMENT] =
-         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
-         VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
-         VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
-         VK_ACCESS_2_TRANSFER_WRITE_BIT,
-      [PANVK_SUBQUEUE_COMPUTE] =
-         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
-   };
-   static const VkAccessFlags2 dev_reads[PANVK_SUBQUEUE_COUNT] = {
-      [PANVK_SUBQUEUE_VERTEX_TILER] =
-         VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_INDEX_READ_BIT |
-         VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_2_UNIFORM_READ_BIT |
-         VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT |
-         VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
-      [PANVK_SUBQUEUE_FRAGMENT] =
-         VK_ACCESS_2_UNIFORM_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
-         VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
-         VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT |
-         VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
-      [PANVK_SUBQUEUE_COMPUTE] = VK_ACCESS_2_UNIFORM_READ_BIT |
-                                 VK_ACCESS_2_TRANSFER_READ_BIT |
-                                 VK_ACCESS_2_SHADER_SAMPLED_READ_BIT |
-                                 VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
-   };
+   /* convert stages to subqueues */
+   uint32_t src_subqueues = 0;
+   uint32_t dst_subqueues = 0;
+   for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
+      const VkPipelineStageFlags2 subqueue_stages = get_subqueue_stages(i);
+      if (src_stages & subqueue_stages)
+         src_subqueues |= BITFIELD_BIT(i);
+      if (dst_stages & subqueue_stages)
+         dst_subqueues |= BITFIELD_BIT(i);
+   }
 
+   const bool dst_host = dst_stages & VK_PIPELINE_STAGE_2_HOST_BIT;
+
+   /* nothing to wait */
+   if (!src_subqueues || (!dst_subqueues && !dst_host))
+      return;
+
+   for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
+      if (!(dst_subqueues & BITFIELD_BIT(i)))
+         continue;
+
+      /* each dst subqueue should wait for all src subqueues */
+      uint32_t wait_mask = src_subqueues;
+
+      switch (i) {
+      case PANVK_SUBQUEUE_VERTEX_TILER:
+         /* Indirect draw buffers are read from the command stream, and
+          * load/store operations are synchronized with the LS scoreboard
+          * immediately after the read, so no need to wait in that case.
+          */
+         if ((src_stages & get_subqueue_stages(i)) ==
+             VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT)
+            wait_mask &= ~BITFIELD_BIT(i);
+         break;
+      case PANVK_SUBQUEUE_FRAGMENT:
+         /* The fragment subqueue always waits for the tiler subqueue already.
+          * Explicit waits can be skipped.
+          */
+         wait_mask &= ~BITFIELD_BIT(PANVK_SUBQUEUE_VERTEX_TILER);
+         break;
+      default:
+         break;
+      }
+
+      wait_masks[i] |= wait_mask;
+   }
+
+   /* The host does not wait for src subqueues.  All src subqueues should
+    * self-wait instead.
+    *
+    * Also, our callers currently expect src subqueues to self-wait when there
+    * are dst subqueues.  Until that changes, make all src subqueues self-wait.
+    */
+   if (dst_host || dst_subqueues) {
+      for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
+         if (src_subqueues & BITFIELD_BIT(i))
+            wait_masks[i] |= BITFIELD_BIT(i);
+      }
+   }
+}
+
+static void
+add_memory_dependency(struct panvk_cache_flush_info *cache_flush,
+                      VkAccessFlags2 src_access, VkAccessFlags2 dst_access)
+{
    /* Note on the cache organization:
+    *
     * - L2 cache is unified, so all changes to this cache are automatically
     *   visible to all GPU sub-components (shader cores, tiler, ...). This
     *   means we only need to flush when the host (AKA CPU) is involved.
@@ -293,35 +304,87 @@ collect_cache_flush_info(enum panvk_subqueue_id subqueue,
     * - Other read-only L1 caches (like the ones in front of the texture unit)
     *   are not coherent with the LS or L2 caches, and thus need to be
     *   invalidated any time a write happens.
+    *
+    * Translating to the Vulkan memory model:
+    *
+    * - The device domain is the L2 cache.
+    * - An availability operation from device writes to the device domain is
+    *   nop.
+    * - A visibility operation from the device domain to device accesses that
+    *   are coherent with L2/LS is nop.
+    * - A visibility operation from the device domain to device accesses that
+    *   are incoherent with L2/LS invalidates the other RO L1 caches.
+    * - A host-to-device domain operation invalidates all caches.
+    * - A device-to-host domain operation flushes L2/LS.
     */
+   const VkAccessFlags2 ro_l1_access =
+      VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
+      VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+      VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
 
-#define ACCESS_HITS_RO_L1_CACHE                                                \
-   (VK_ACCESS_2_SHADER_SAMPLED_READ_BIT |                                      \
-    VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |                                    \
-    VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |                            \
-    VK_ACCESS_2_TRANSFER_READ_BIT)
-
-   if ((dev_writes[subqueue] & src_access) &&
-       (dev_reads[subqueue] & ACCESS_HITS_RO_L1_CACHE & dst_access))
+   /* visibility op */
+   if (dst_access & ro_l1_access)
       cache_flush->others |= true;
 
-   /* If the host wrote something, we need to clean/invalidate everything. */
-   if ((src_stages & VK_PIPELINE_STAGE_2_HOST_BIT) &&
-       (src_access & VK_ACCESS_2_HOST_WRITE_BIT) &&
-       ((dev_reads[subqueue] | dev_writes[subqueue]) & dst_access)) {
+   /* host-to-device domain op */
+   if (src_access & VK_ACCESS_2_HOST_WRITE_BIT) {
       cache_flush->l2 |= MALI_CS_FLUSH_MODE_CLEAN_AND_INVALIDATE;
       cache_flush->lsc |= MALI_CS_FLUSH_MODE_CLEAN_AND_INVALIDATE;
       cache_flush->others |= true;
    }
 
-   /* If the host needs to read something we wrote, we need to clean
-    * everything. */
-   if ((dst_stages & VK_PIPELINE_STAGE_2_HOST_BIT) &&
-       (dst_access & VK_ACCESS_2_HOST_READ_BIT) &&
-       (dev_writes[subqueue] & src_access)) {
+   /* device-to-host domain op */
+   if (dst_access & (VK_ACCESS_2_HOST_READ_BIT | VK_ACCESS_2_HOST_WRITE_BIT)) {
       cache_flush->l2 |= MALI_CS_FLUSH_MODE_CLEAN;
       cache_flush->lsc |= MALI_CS_FLUSH_MODE_CLEAN;
    }
+}
+
+static bool
+should_split_render_pass(const uint32_t wait_masks[static PANVK_SUBQUEUE_COUNT],
+                         VkAccessFlags2 src_access, VkAccessFlags2 dst_access)
+{
+   /* From the Vulkan 1.3.301 spec:
+    *
+    *    VUID-vkCmdPipelineBarrier-None-07892
+    *
+    *    "If vkCmdPipelineBarrier is called within a render pass instance, the
+    *    source and destination stage masks of any memory barriers must only
+    *    include graphics pipeline stages"
+    *
+    * We only consider the tiler and the fragment subqueues here.
+    */
+
+   /* split if the tiler subqueue waits for the fragment subqueue */
+   if (wait_masks[PANVK_SUBQUEUE_VERTEX_TILER] &
+       BITFIELD_BIT(PANVK_SUBQUEUE_FRAGMENT))
+      return true;
+
+   /* split if the fragment subqueue self-waits with a feedback loop, because
+    * we lower subpassLoad to texelFetch
+    */
+   if ((wait_masks[PANVK_SUBQUEUE_FRAGMENT] &
+        BITFIELD_BIT(PANVK_SUBQUEUE_FRAGMENT)) &&
+       (src_access & (VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                      VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT)) &&
+       (dst_access & VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT))
+      return true;
+
+   return false;
+}
+
+static void
+collect_cache_flush_info(enum panvk_subqueue_id subqueue,
+                         struct panvk_cache_flush_info *cache_flush,
+                         VkAccessFlags2 src_access, VkAccessFlags2 dst_access)
+{
+   /* limit access to the subqueue and host */
+   const VkPipelineStageFlags2 subqueue_stages =
+      get_subqueue_stages(subqueue) | VK_PIPELINE_STAGE_2_HOST_BIT;
+   src_access = vk_filter_src_access_flags2(subqueue_stages, src_access);
+   dst_access = vk_filter_dst_access_flags2(subqueue_stages, dst_access);
+
+   add_memory_dependency(cache_flush, src_access, dst_access);
 }
 
 static void
@@ -330,26 +393,41 @@ collect_cs_deps(struct panvk_cmd_buffer *cmdbuf,
                 VkPipelineStageFlags2 dst_stages, VkAccessFlags2 src_access,
                 VkAccessFlags2 dst_access, struct panvk_cs_deps *deps)
 {
-   if (src_stages_need_draw_flush(src_stages) && cmdbuf->state.gfx.render.tiler)
-      deps->needs_draw_flush = true;
+   uint32_t wait_masks[PANVK_SUBQUEUE_COUNT] = {0};
+   add_execution_dependency(wait_masks, src_stages, dst_stages);
 
-   uint32_t wait_subqueue_mask = 0;
-   for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
-      uint32_t sb_mask = src_stages_to_subqueue_sb_mask(i, src_stages);
-      if (!sb_mask)
-         continue;
+   /* within a render pass */
+   if (cmdbuf->state.gfx.render.tiler) {
+      if (should_split_render_pass(wait_masks, src_access, dst_access)) {
+         deps->needs_draw_flush = true;
+      } else {
+         /* skip the tiler subqueue self-wait because we use the same
+          * scoreboard slot for the idvs jobs
+          */
+         wait_masks[PANVK_SUBQUEUE_VERTEX_TILER] &=
+            ~BITFIELD_BIT(PANVK_SUBQUEUE_VERTEX_TILER);
 
-      deps->src[i].wait_sb_mask |= sb_mask;
-      collect_cache_flush_info(i, &deps->src[i].cache_flush, src_stages,
-                               dst_stages, src_access, dst_access);
-      wait_subqueue_mask |= BITFIELD_BIT(i);
+         /* skip the fragment subqueue self-wait because we emit the fragment
+          * job at the end of the render pass and there is nothing to wait yet
+          */
+         wait_masks[PANVK_SUBQUEUE_FRAGMENT] &=
+            ~BITFIELD_BIT(PANVK_SUBQUEUE_FRAGMENT);
+      }
    }
 
    for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
-      if (!stages_cover_subqueue(i, dst_stages))
-         continue;
+      if (wait_masks[i] & BITFIELD_BIT(i)) {
+         /* We need to self-wait for all previously submitted jobs, and given
+          * the iterator scoreboard is a moving target, we just wait for the
+          * whole dynamic scoreboard range.
+          */
+         deps->src[i].wait_sb_mask |= SB_ALL_ITERS_MASK;
+      }
 
-      deps->dst[i].wait_subqueue_mask |= wait_subqueue_mask;
+      collect_cache_flush_info(i, &deps->src[i].cache_flush, src_access,
+                               dst_access);
+
+      deps->dst[i].wait_subqueue_mask |= wait_masks[i];
    }
 }
 
@@ -404,12 +482,6 @@ panvk_per_arch(get_cs_deps)(struct panvk_cmd_buffer *cmdbuf,
       collect_cs_deps(cmdbuf, src_stages, dst_stages, src_access, dst_access,
                       out);
    }
-
-   /* The draw flush will add a vertex -> fragment dependency, so we can skip
-    * the one described in the deps. */
-   if (out->needs_draw_flush)
-      out->dst[PANVK_SUBQUEUE_FRAGMENT].wait_subqueue_mask &=
-         ~BITFIELD_BIT(PANVK_SUBQUEUE_VERTEX_TILER);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -435,13 +507,12 @@ panvk_per_arch(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
    }
 
    for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
-      if (!deps.src[i].wait_sb_mask)
-         continue;
 
       struct cs_builder *b = panvk_get_cs_builder(cmdbuf, i);
       struct panvk_cs_state *cs_state = &cmdbuf->state.cs[i];
 
-      cs_wait_slots(b, deps.src[i].wait_sb_mask, false);
+      if (deps.src[i].wait_sb_mask)
+         cs_wait_slots(b, deps.src[i].wait_sb_mask, false);
 
       struct panvk_cache_flush_info cache_flush = deps.src[i].cache_flush;
       if (cache_flush.l2 != MALI_CS_FLUSH_MODE_NONE ||
@@ -458,6 +529,8 @@ panvk_per_arch(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
       if (wait_subqueue_mask & BITFIELD_BIT(i)) {
          struct cs_index sync_addr = cs_scratch_reg64(b, 0);
          struct cs_index add_val = cs_scratch_reg64(b, 2);
+
+         assert(deps.src[i].wait_sb_mask);
 
          cs_load64_to(b, sync_addr, cs_subqueue_ctx_reg(b),
                       offsetof(struct panvk_cs_subqueue_context, syncobjs));
@@ -747,15 +820,8 @@ panvk_cmd_invalidate_state(struct panvk_cmd_buffer *cmdbuf)
    memset(&cmdbuf->state.gfx, 0, sizeof(cmdbuf->state.gfx));
    cmdbuf->state.gfx.render = render_save;
 
-   cmdbuf->state.gfx.fs.desc.res_table = 0;
-   cmdbuf->state.gfx.fs.spd = 0;
-   cmdbuf->state.gfx.vs.desc.res_table = 0;
-   cmdbuf->state.gfx.vs.spds.pos = 0;
-   cmdbuf->state.gfx.vs.spds.var = 0;
-   cmdbuf->state.gfx.vb.dirty = true;
-   cmdbuf->state.gfx.ib.dirty = true;
-
    vk_dynamic_graphics_state_dirty_all(&cmdbuf->vk.dynamic_graphics_state);
+   gfx_state_set_all_dirty(cmdbuf);
 }
 
 VKAPI_ATTR void VKAPI_CALL

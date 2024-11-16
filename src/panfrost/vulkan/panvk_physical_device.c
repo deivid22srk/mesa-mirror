@@ -254,16 +254,17 @@ get_features(const struct panvk_physical_device *device,
       .logicOp = true,
       .wideLines = true,
       .largePoints = true,
+      .samplerAnisotropy = true,
       .textureCompressionETC2 = true,
       .textureCompressionASTC_LDR = true,
-      .samplerAnisotropy = true,
       .shaderUniformBufferArrayDynamicIndexing = true,
       .shaderSampledImageArrayDynamicIndexing = true,
       .shaderStorageBufferArrayDynamicIndexing = true,
       .shaderStorageImageArrayDynamicIndexing = true,
+      .shaderInt64 = true,
 
       /* Vulkan 1.1 */
-      .storageBuffer16BitAccess = false,
+      .storageBuffer16BitAccess = true,
       .uniformAndStorageBuffer16BitAccess = true,
       .storagePushConstant16 = false,
       .storageInputOutput16 = false,
@@ -438,10 +439,18 @@ get_device_properties(const struct panvk_instance *instance,
        * requirements.
        */
       .maxPushConstantsSize = 128,
-      /* There's no HW limit here. Should we advertize something smaller? */
+      /* On our kernel drivers we're limited by the available memory rather
+       * than available allocations. This is better expressed through memory
+       * properties and budget queries, and by returning
+       * VK_ERROR_OUT_OF_DEVICE_MEMORY when applicable, rather than
+       * this limit.
+       */
       .maxMemoryAllocationCount = UINT32_MAX,
-      /* Again, no hardware limit, but most drivers seem to advertive 64k. */
-      .maxSamplerAllocationCount = 64 * 1024,
+      /* On Mali, VkSampler objects do not use any resources other than host
+       * memory and host address space, availability of which can change
+       * significantly over time.
+       */
+      .maxSamplerAllocationCount = UINT32_MAX,
       /* A cache line. */
       .bufferImageGranularity = 64,
       /* Sparse binding not supported yet. */

@@ -825,7 +825,8 @@ static nir_mem_access_size_align
 nak_mem_access_size_align(nir_intrinsic_op intrin,
                           uint8_t bytes, uint8_t bit_size,
                           uint32_t align_mul, uint32_t align_offset,
-                          bool offset_is_const, const void *cb_data)
+                          bool offset_is_const, enum gl_access_qualifier access,
+                          const void *cb_data)
 {
    const uint32_t align = nir_combined_align(align_mul, align_offset);
    assert(util_is_power_of_two_nonzero(align));
@@ -857,6 +858,7 @@ nak_mem_access_size_align(nir_intrinsic_op intrin,
             .bit_size = 32,
             .num_components = 1,
             .align = 4,
+            .shift = nir_mem_access_shift_method_scalar,
          };
       } else {
          assert(align == 1);
@@ -864,6 +866,7 @@ nak_mem_access_size_align(nir_intrinsic_op intrin,
             .bit_size = 8,
             .num_components = 1,
             .align = 1,
+            .shift = nir_mem_access_shift_method_scalar,
          };
       }
    } else if (chunk_bytes < 4) {
@@ -871,12 +874,14 @@ nak_mem_access_size_align(nir_intrinsic_op intrin,
          .bit_size = chunk_bytes * 8,
          .num_components = 1,
          .align = chunk_bytes,
+         .shift = nir_mem_access_shift_method_scalar,
       };
    } else {
       return (nir_mem_access_size_align) {
          .bit_size = 32,
          .num_components = chunk_bytes / 4,
          .align = chunk_bytes,
+         .shift = nir_mem_access_shift_method_scalar,
       };
    }
 }

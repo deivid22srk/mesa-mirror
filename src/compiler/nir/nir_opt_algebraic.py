@@ -1193,7 +1193,7 @@ for op in ['iand', 'ior', 'ixor']:
 
 # Integer sizes
 for s in [8, 16, 32, 64]:
-    last_shift_bit = int(math.log2(s)) - 1
+    amount_bits = int(math.log2(s))
 
     lower_umin = 'options->lower_umin'
     lower_umax = 'options->lower_umax'
@@ -1231,7 +1231,8 @@ for s in [8, 16, 32, 64]:
        (('ishl', 'a@{}'.format(s), ('iand', s - 1, b)), ('ishl', a, b)),
        (('ishr', 'a@{}'.format(s), ('iand', s - 1, b)), ('ishr', a, b)),
        (('ushr', 'a@{}'.format(s), ('iand', s - 1, b)), ('ushr', a, b)),
-       (('ushr', 'a@{}'.format(s), ('ishl(is_used_once)', ('iand', b, 1), last_shift_bit)), ('ushr', a, ('ishl', b, last_shift_bit))),
+       (('ushr', 'a@{}'.format(s), ('ishl(is_used_once)', ('iand', b, 1), amount_bits - 1)), ('ushr', a, ('ishl', b, amount_bits - 1))),
+       (('ushr', 'a@{}'.format(s), ('ishl(is_used_once)', ('iand', b, 3), amount_bits - 2)), ('ushr', a, ('ishl', b, amount_bits - 2))),
     ])
 
 optimizations.extend([
@@ -1508,6 +1509,12 @@ optimizations.extend([
    (('ishr', a, 0), a),
    (('ushr', 0, a), 0),
    (('ushr', a, 0), a),
+   (('bcsel', ('ieq', b, 0), a, ('ushr', a, b)), ('ushr', a, b)),
+   (('bcsel', ('ieq', b, 0), a, ('ishr', a, b)), ('ishr', a, b)),
+   (('bcsel', ('ieq', b, 0), a, ('ishl', a, b)), ('ishl', a, b)),
+   (('bcsel', ('ine', b, 0), ('ushr', a, b), a), ('ushr', a, b)),
+   (('bcsel', ('ine', b, 0), ('ishr', a, b), a), ('ishr', a, b)),
+   (('bcsel', ('ine', b, 0), ('ishl', a, b), a), ('ishl', a, b)),
    (('ior', ('ishl@16', a, b), ('ushr@16', a, ('iadd', 16, ('ineg', b)))), ('urol', a, b), 'options->has_rotate16'),
    (('ior', ('ishl@16', a, b), ('ushr@16', a, ('isub', 16, b))), ('urol', a, b), 'options->has_rotate16'),
    (('ior', ('ishl@32', a, b), ('ushr@32', a, ('iadd', 32, ('ineg', b)))), ('urol', a, b), 'options->has_rotate32'),

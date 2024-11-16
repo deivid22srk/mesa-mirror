@@ -375,6 +375,9 @@ radv_postprocess_nir(struct radv_device *device, const struct radv_graphics_stat
    };
    NIR_PASS(_, stage->nir, radv_nir_opt_tid_function, &tid_options);
 
+   nir_divergence_analysis(stage->nir);
+   NIR_PASS(_, stage->nir, ac_nir_flag_smem_for_loads, gfx_level, use_llvm, false);
+
    NIR_PASS(_, stage->nir, nir_lower_memory_model);
 
    nir_load_store_vectorize_options vectorize_opts = {
@@ -436,10 +439,7 @@ radv_postprocess_nir(struct radv_device *device, const struct radv_graphics_stat
       }
    }
 
-   NIR_PASS(
-      _, stage->nir, ac_nir_lower_subdword_loads,
-      (ac_nir_lower_subdword_options){.modes_1_comp = nir_var_mem_ubo | nir_var_mem_push_const,
-                                      .modes_N_comps = nir_var_mem_ubo | nir_var_mem_push_const | nir_var_mem_ssbo});
+   NIR_PASS(_, stage->nir, ac_nir_lower_mem_access_bit_sizes, gfx_level, use_llvm);
 
    progress = false;
    NIR_PASS(progress, stage->nir, nir_vk_lower_ycbcr_tex, ycbcr_conversion_lookup, &stage->layout);
@@ -562,9 +562,6 @@ radv_postprocess_nir(struct radv_device *device, const struct radv_graphics_stat
             &(nir_lower_idiv_options){
                .allow_fp16 = gfx_level >= GFX9,
             });
-
-   if (radv_use_llvm_for_stage(pdev, stage->stage))
-      NIR_PASS_V(stage->nir, nir_lower_io_to_scalar, nir_var_mem_global, NULL, NULL);
 
    NIR_PASS(_, stage->nir, ac_nir_lower_global_access);
    NIR_PASS_V(stage->nir, ac_nir_lower_intrinsics_to_args, gfx_level, radv_select_hw_stage(&stage->info, gfx_level),

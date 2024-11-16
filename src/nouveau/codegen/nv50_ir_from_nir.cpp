@@ -149,6 +149,7 @@ private:
                          uint32_t align_mul,
                          uint32_t align_offset,
                          bool offset_is_const,
+                         enum gl_access_qualifier access,
                          const void *cb_data);
 
    bool isFloatType(nir_alu_type);
@@ -1407,6 +1408,7 @@ Converter::getMemAccessSizeAlign(nir_intrinsic_op intrin,
                                  uint32_t align_mul,
                                  uint32_t align_offset,
                                  bool offset_is_const,
+                                 enum gl_access_qualifier access,
                                  const void *cb_data)
 {
    const Converter* converter = (Converter*) cb_data;
@@ -1437,6 +1439,7 @@ Converter::getMemAccessSizeAlign(nir_intrinsic_op intrin,
       .num_components = (uint8_t) (bytes / (bit_size / 8)),
       .bit_size = (uint8_t) bit_size,
       .align = (uint16_t) bytes,
+      .shift = nir_mem_access_shift_method_scalar,
    };
 }
 

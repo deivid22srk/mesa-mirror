@@ -2195,21 +2195,17 @@ void nir_rewrite_image_intrinsic(nir_intrinsic_instr *instr,
 static inline bool
 nir_intrinsic_can_reorder(nir_intrinsic_instr *instr)
 {
-   if (nir_intrinsic_has_access(instr) &&
-       nir_intrinsic_access(instr) & ACCESS_VOLATILE)
-      return false;
+   if (nir_intrinsic_has_access(instr)) {
+      enum gl_access_qualifier access = nir_intrinsic_access(instr);
+      if (access & ACCESS_VOLATILE)
+         return false;
+      if (access & ACCESS_CAN_REORDER)
+         return true;
+   }
 
    if (instr->intrinsic == nir_intrinsic_load_deref) {
       nir_deref_instr *deref = nir_src_as_deref(instr->src[0]);
-      return nir_deref_mode_is_in_set(deref, nir_var_read_only_modes) ||
-             (nir_intrinsic_access(instr) & ACCESS_CAN_REORDER);
-   } else if (instr->intrinsic == nir_intrinsic_load_ssbo ||
-              instr->intrinsic == nir_intrinsic_bindless_image_load ||
-              instr->intrinsic == nir_intrinsic_image_deref_load ||
-              instr->intrinsic == nir_intrinsic_image_load ||
-              instr->intrinsic == nir_intrinsic_ald_nv ||
-              instr->intrinsic == nir_intrinsic_load_sysval_nv) {
-      return nir_intrinsic_access(instr) & ACCESS_CAN_REORDER;
+      return nir_deref_mode_is_in_set(deref, nir_var_read_only_modes);
    } else {
       const nir_intrinsic_info *info =
          &nir_intrinsic_infos[instr->intrinsic];
@@ -5886,10 +5882,27 @@ bool nir_lower_explicit_io(nir_shader *shader,
                            nir_variable_mode modes,
                            nir_address_format);
 
+typedef enum {
+   /* Use open-coded funnel shifts for each component. */
+   nir_mem_access_shift_method_scalar,
+   /* Prefer to use 64-bit shifts to do the same with less instructions. Useful
+    * if 64-bit shifts are cheap.
+    */
+   nir_mem_access_shift_method_shift64,
+   /* If nir_op_alignbyte_amd can be used, this is the best option with just a
+    * single nir_op_alignbyte_amd for each 32-bit components.
+    */
+   nir_mem_access_shift_method_bytealign_amd,
+} nir_mem_access_shift_method;
+
 typedef struct {
    uint8_t num_components;
    uint8_t bit_size;
    uint16_t align;
+   /* If a load's alignment is increased, this specifies how the data should be
+    * shifted before converting to the original bit size.
+    */
+   nir_mem_access_shift_method shift;
 } nir_mem_access_size_align;
 
 /* clang-format off */
@@ -5900,6 +5913,7 @@ typedef nir_mem_access_size_align
                                         uint32_t align_mul,
                                         uint32_t align_offset,
                                         bool offset_is_const,
+                                        enum gl_access_qualifier,
                                         const void *cb_data);
 /* clang-format on */
 

@@ -6247,6 +6247,7 @@ lower_mem_access_bit_sizes_cb(nir_intrinsic_op intrin,
                               uint32_t align_mul,
                               uint32_t align_offset,
                               bool offset_is_const,
+                              enum gl_access_qualifier access,
                               const void *cb_data)
 {
    const struct lower_mem_bit_sizes_data *data = cb_data;
@@ -6263,6 +6264,7 @@ lower_mem_access_bit_sizes_cb(nir_intrinsic_op intrin,
          .align = closest_bit_size / 8,
          .bit_size = closest_bit_size,
          .num_components = DIV_ROUND_UP(MIN2(bytes, 16) * 8, closest_bit_size),
+         .shift = nir_mem_access_shift_method_scalar,
       };
    }
 
@@ -6277,6 +6279,7 @@ lower_mem_access_bit_sizes_cb(nir_intrinsic_op intrin,
          .align = min_bit_size / 8,
          .bit_size = min_bit_size,
          .num_components = MIN2(4, ideal_num_components),
+         .shift = nir_mem_access_shift_method_scalar,
       };
    }
 
@@ -6296,6 +6299,7 @@ lower_mem_access_bit_sizes_cb(nir_intrinsic_op intrin,
       .align = bit_size / 8,
       .bit_size = bit_size,
       .num_components = MIN2(4, num_components),
+      .shift = nir_mem_access_shift_method_scalar,
    };
 }
 

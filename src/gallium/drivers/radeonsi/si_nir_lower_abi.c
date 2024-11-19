@@ -371,7 +371,7 @@ static bool lower_intrinsic(nir_builder *b, nir_instr *instr, struct lower_abi_s
       nir_def *per_vtx_out_patch_size = NULL;
 
       if (stage == MESA_SHADER_TESS_CTRL) {
-         const unsigned num_hs_out = util_last_bit64(sel->info.outputs_written_before_tes_gs);
+         const unsigned num_hs_out = util_last_bit64(sel->info.tcs_outputs_written);
          const unsigned out_vtx_size = num_hs_out * 16;
          const unsigned out_vtx_per_patch = sel->info.base.tess.tcs_vertices_out;
          per_vtx_out_patch_size = nir_imm_int(b, out_vtx_size * out_vtx_per_patch);
@@ -738,7 +738,10 @@ static bool lower_intrinsic(nir_builder *b, nir_instr *instr, struct lower_abi_s
       if (shader->is_monolithic) {
          replacement = nir_imm_int(b, key->ge.opt.tes_prim_mode);
       } else {
-         replacement = ac_nir_unpack_arg(b, &args->ac, args->tcs_offchip_layout, 29, 2);
+         if (b->shader->info.tess._primitive_mode != TESS_PRIMITIVE_UNSPECIFIED)
+            replacement = nir_imm_int(b, b->shader->info.tess._primitive_mode);
+         else
+            replacement = ac_nir_unpack_arg(b, &args->ac, args->tcs_offchip_layout, 29, 2);
       }
       break;
    case nir_intrinsic_load_ring_gsvs_amd: {

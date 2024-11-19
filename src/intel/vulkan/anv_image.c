@@ -478,6 +478,7 @@ storage_image_format_supports_atomic(const struct intel_device_info *devinfo,
 static bool
 formats_ccs_e_compatible(const struct intel_device_info *devinfo,
                          VkImageCreateFlags create_flags,
+                         VkImageAspectFlagBits aspect,
                          enum isl_format format, VkImageTiling vk_tiling,
                          const VkImageFormatListCreateInfo *fmt_list)
 {
@@ -500,7 +501,7 @@ formats_ccs_e_compatible(const struct intel_device_info *devinfo,
 
       enum isl_format view_format =
          anv_get_isl_format(devinfo, fmt_list->pViewFormats[i],
-                            VK_IMAGE_ASPECT_COLOR_BIT, vk_tiling);
+                            aspect, vk_tiling);
 
       if (!isl_formats_are_ccs_e_compatible(devinfo, format, view_format))
          return false;
@@ -534,8 +535,8 @@ anv_formats_ccs_e_compatible(const struct intel_device_info *devinfo,
       enum isl_format format =
          anv_get_isl_format(devinfo, vk_format, aspect, vk_tiling);
 
-      if (!formats_ccs_e_compatible(devinfo, create_flags, format, vk_tiling,
-                                    fmt_list))
+      if (!formats_ccs_e_compatible(devinfo, create_flags, aspect,
+                                    format, vk_tiling, fmt_list))
          return false;
 
       if (vk_usage & VK_IMAGE_USAGE_STORAGE_BIT) {
@@ -648,8 +649,13 @@ add_aux_state_tracking_buffer(struct anv_device *device,
       assert(device->isl_dev.ss.clear_color_state_size == 32);
       clear_color_state_size = (image->num_view_formats - 1) * 64 + 32 - 8;
    } else {
+      /* When sampling or rendering with an sRGB format, HW expects the clear
+       * color to be in two different color spaces - sRGB in the former and
+       * linear in the latter. Allocate twice the space to support either
+       * access.
+       */
       assert(device->isl_dev.ss.clear_value_size == 16);
-      clear_color_state_size = image->num_view_formats * 16;
+      clear_color_state_size = image->num_view_formats * 16 * 2;
    }
 
    /* Clear color and fast clear type */
@@ -3456,26 +3462,6 @@ anv_layout_to_fast_clear_type(const struct intel_device_info * const devinfo,
    unreachable("Invalid isl_aux_state");
 }
 
-static bool
-isl_color_value_requires_conversion(union isl_color_value color,
-                                    const struct isl_surf *surf,
-                                    enum isl_format view_format,
-                                    struct isl_swizzle view_swizzle)
-{
-   if (surf->format == view_format && isl_swizzle_is_identity(view_swizzle))
-      return false;
-
-   uint32_t surf_pack[4] = { 0, 0, 0, 0 };
-   isl_color_value_pack(&color, surf->format, surf_pack);
-
-   uint32_t view_pack[4] = { 0, 0, 0, 0 };
-   union isl_color_value swiz_color =
-      isl_color_value_swizzle_inv(color, view_swizzle);
-   isl_color_value_pack(&swiz_color, view_format, view_pack);
-
-   return memcmp(surf_pack, view_pack, sizeof(surf_pack)) != 0;
-}
-
 bool
 anv_can_fast_clear_color(const struct anv_cmd_buffer *cmd_buffer,
                          const struct anv_image *image,
@@ -3483,7 +3469,6 @@ anv_can_fast_clear_color(const struct anv_cmd_buffer *cmd_buffer,
                          const struct VkClearRect *clear_rect,
                          VkImageLayout layout,
                          enum isl_format view_format,
-                         struct isl_swizzle view_swizzle,
                          union isl_color_value clear_color)
 {
    if (INTEL_DEBUG(DEBUG_NO_FAST_CLEAR))
@@ -3521,20 +3506,6 @@ anv_can_fast_clear_color(const struct anv_cmd_buffer *cmd_buffer,
        clear_rect->rect.extent.width != image->vk.extent.width ||
        clear_rect->rect.extent.height != image->vk.extent.height)
       return false;
-
-   /* If the clear color is one that would require non-trivial format
-    * conversion on resolve, we don't bother with the fast clear.  This
-    * shouldn't be common as most clear colors are 0/1 and the most common
-    * format re-interpretation is for sRGB.
-    */
-   if (isl_color_value_requires_conversion(clear_color,
-                                           &image->planes[0].primary_surface.isl,
-                                           view_format, view_swizzle)) {
-      anv_perf_warn(VK_LOG_OBJS(&image->vk.base),
-                    "Cannot fast-clear to colors which would require "
-                    "format conversion on resolve");
-      return false;
-   }
 
    /* We only allow fast clears to the first slice of an image (level 0,
     * layer 0) and only for the entire slice.  This guarantees us that, at
@@ -3580,21 +3551,6 @@ anv_can_fast_clear_color(const struct anv_cmd_buffer *cmd_buffer,
                     "Pitch not 512B-aligned. Slow clearing surface.");
       return false;
    }
-
-   /* Disable sRGB fast-clears for non-0/1 color values on Gfx9. For texturing
-    * and draw calls, HW expects the clear color to be in two different color
-    * spaces after sRGB fast-clears - sRGB in the former and linear in the
-    * latter. By limiting the allowable values to 0/1, both color space
-    * requirements are satisfied.
-    *
-    * Gfx11+ is fine as the fast clear generate 2 colors at the clear color
-    * address, raw & converted such that all fixed functions can find the
-    * value they need.
-    */
-   if (cmd_buffer->device->info->ver == 9 &&
-       isl_format_is_srgb(view_format) &&
-       !isl_color_value_is_zero_one(clear_color, view_format))
-      return false;
 
    /* Wa_16021232440: Disable fast clear when height is 16k */
    if (intel_needs_workaround(cmd_buffer->device->info, 16021232440) &&

@@ -501,7 +501,7 @@ v3d_tlb_blit(struct pipe_context *pctx, struct pipe_blit_info *info)
         bool msaa = (info->src.resource->nr_samples > 1 ||
                      info->dst.resource->nr_samples > 1);
 
-        bool double_buffer = V3D_DBG(DOUBLE_BUFFER) && !msaa;
+        bool double_buffer = false;
 
         uint32_t tile_width, tile_height, max_bpp;
         v3d_get_tile_buffer_size(devinfo, msaa, double_buffer,
@@ -530,8 +530,7 @@ v3d_tlb_blit(struct pipe_context *pctx, struct pipe_blit_info *info)
                                           src_surf);
         job->msaa = msaa;
         job->double_buffer = double_buffer;
-        job->tile_width = tile_width;
-        job->tile_height = tile_height;
+        job->can_use_double_buffer = !job->msaa && V3D_DBG(DOUBLE_BUFFER);
         job->internal_bpp = max_bpp;
         job->draw_min_x = info->dst.box.x;
         job->draw_min_y = info->dst.box.y;
@@ -547,10 +546,13 @@ v3d_tlb_blit(struct pipe_context *pctx, struct pipe_blit_info *info)
          */
         job->draw_width = MIN2(dst_surf->width, src_surf->width);
         job->draw_height = MIN2(dst_surf->height, src_surf->height);
-        job->draw_tiles_x = DIV_ROUND_UP(job->draw_width,
-                                         job->tile_width);
-        job->draw_tiles_y = DIV_ROUND_UP(job->draw_height,
-                                         job->tile_height);
+
+        job->tile_desc.width = tile_width;
+        job->tile_desc.height = tile_height;
+        job->tile_desc.draw_x = DIV_ROUND_UP(job->draw_width,
+                                             job->tile_desc.width);
+        job->tile_desc.draw_y = DIV_ROUND_UP(job->draw_height,
+                                             job->tile_desc.height);
 
         job->needs_flush = true;
         job->num_layers = info->dst.box.depth;

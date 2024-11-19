@@ -284,9 +284,9 @@ get_blorp_surf_for_anv_image(const struct anv_cmd_buffer *cmd_buffer,
                                           cmd_buffer->queue_family->queueFlags);
    }
 
+   const bool is_dest = usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT;
    isl_surf_usage_flags_t isl_usage =
-      get_usage_flag_for_cmd_buffer(cmd_buffer,
-                                    usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+      get_usage_flag_for_cmd_buffer(cmd_buffer, is_dest,
                                     anv_image_is_protected(image));
    const struct anv_surface *surface = &image->planes[plane].primary_surface;
    const struct anv_address address =
@@ -318,7 +318,8 @@ get_blorp_surf_for_anv_image(const struct anv_cmd_buffer *cmd_buffer,
       }
 
       const struct anv_address clear_color_addr =
-         anv_image_get_clear_color_addr(device, image, view_fmt, aspect);
+         anv_image_get_clear_color_addr(device, image, view_fmt, aspect,
+                                        !is_dest);
       blorp_surf->clear_color_addr = anv_to_blorp_address(clear_color_addr);
 
       if (aspect & VK_IMAGE_ASPECT_DEPTH_BIT)
@@ -1301,7 +1302,8 @@ exec_ccs_op(struct anv_cmd_buffer *cmd_buffer,
 
    struct blorp_surf surf;
    get_blorp_surf_for_anv_image(cmd_buffer, image, aspect,
-                                0, ANV_IMAGE_LAYOUT_EXPLICIT_AUX,
+                                VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                ANV_IMAGE_LAYOUT_EXPLICIT_AUX,
                                 image->planes[plane].aux_usage,
                                 format, &surf);
 
@@ -1366,7 +1368,8 @@ exec_mcs_op(struct anv_cmd_buffer *cmd_buffer,
 
    struct blorp_surf surf;
    get_blorp_surf_for_anv_image(cmd_buffer, image, aspect,
-                                0, ANV_IMAGE_LAYOUT_EXPLICIT_AUX,
+                                VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                ANV_IMAGE_LAYOUT_EXPLICIT_AUX,
                                 image->planes[0].aux_usage, format, &surf);
 
    /* Blorp will store the clear color for us if we provide the clear color
@@ -1455,7 +1458,7 @@ void anv_CmdClearColorImage(
 
          if (anv_can_fast_clear_color(cmd_buffer, image, level, &clear_rect,
                                       imageLayout, src_format.isl_format,
-                                      src_format.swizzle, clear_color)) {
+                                      clear_color)) {
             assert(level == 0);
             assert(clear_rect.baseArrayLayer == 0);
             if (image->vk.samples == 1) {
@@ -1471,6 +1474,7 @@ void anv_CmdClearColorImage(
             if (cmd_buffer->device->info->ver < 20) {
                anv_cmd_buffer_mark_image_fast_cleared(cmd_buffer, image,
                                                       src_format.isl_format,
+                                                      src_format.swizzle,
                                                       clear_color);
             }
 
@@ -1658,7 +1662,6 @@ can_fast_clear_color_att(struct anv_cmd_buffer *cmd_buffer,
                                    att->iview->vk.base_mip_level,
                                    pRects, att->layout,
                                    att->iview->planes[0].isl.format,
-                                   att->iview->planes[0].isl.swizzle,
                                    clear_color);
 }
 
@@ -1702,6 +1705,7 @@ clear_color_attachment(struct anv_cmd_buffer *cmd_buffer,
       if (cmd_buffer->device->info->ver < 20) {
          anv_cmd_buffer_mark_image_fast_cleared(cmd_buffer, iview->image,
                                                 iview->planes[0].isl.format,
+                                                iview->planes[0].isl.swizzle,
                                                 clear_color);
          anv_cmd_buffer_load_clear_color(cmd_buffer, att->surface_state.state,
                                          iview);

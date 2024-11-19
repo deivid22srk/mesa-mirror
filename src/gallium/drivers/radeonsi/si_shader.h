@@ -468,7 +468,6 @@ struct si_shader_info {
    union si_input_info input[PIPE_MAX_SHADER_INPUTS];
    uint8_t output_semantic[PIPE_MAX_SHADER_OUTPUTS];
    uint8_t output_usagemask[PIPE_MAX_SHADER_OUTPUTS];
-   uint8_t output_readmask[PIPE_MAX_SHADER_OUTPUTS];
    uint8_t output_streams[PIPE_MAX_SHADER_OUTPUTS];
    uint8_t output_type[PIPE_MAX_SHADER_OUTPUTS]; /* enum nir_alu_type */
 
@@ -480,7 +479,9 @@ struct si_shader_info {
    uint64_t inputs_read; /* "get_unique_index" bits */
    uint64_t tcs_vgpr_only_inputs; /* TCS inputs that are only in VGPRs, not LDS. */
 
-   uint64_t outputs_written_before_tes_gs; /* "get_unique_index" bits */
+   /* For VS before {TCS, TES, GS} and TES before GS. */
+   uint64_t ls_es_outputs_written;     /* "get_unique_index" bits */
+   uint64_t tcs_outputs_written;       /* "get_unique_index" bits */
    uint64_t outputs_written_before_ps; /* "get_unique_index" bits */
    uint32_t patch_outputs_written;     /* "get_unique_index_patch" bits */
 
@@ -779,7 +780,7 @@ struct si_shader_key_ge {
       unsigned same_patch_vertices:1;
 
       /* For TCS. */
-      unsigned tes_prim_mode : 3;
+      unsigned tes_prim_mode : 2;
       unsigned tes_reads_tess_factors : 1;
 
       unsigned inline_uniforms:1;
@@ -1066,7 +1067,7 @@ void si_lower_mediump_io(struct nir_shader *nir);
 bool si_alu_to_scalar_packed_math_filter(const struct nir_instr *instr, const void *data);
 void si_nir_opts(struct si_screen *sscreen, struct nir_shader *nir, bool first);
 void si_nir_late_opts(struct nir_shader *nir);
-char *si_finalize_nir(struct pipe_screen *screen, void *nirptr);
+char *si_finalize_nir(struct pipe_screen *screen, struct nir_shader *nir);
 
 /* si_state_shaders.cpp */
 unsigned si_shader_num_alloc_param_exports(struct si_shader *shader);

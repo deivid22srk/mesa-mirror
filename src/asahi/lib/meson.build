@@ -19,7 +19,6 @@ libasahi_lib_files = files(
   'agx_nir_lower_msaa.c',
   'agx_nir_lower_sample_intrinsics.c',
   'agx_nir_lower_tess.c',
-  'agx_nir_lower_texture.c',
   'agx_nir_lower_tilebuffer.c',
   'agx_nir_lower_uvs.c',
   'agx_nir_lower_vbo.c',
@@ -32,22 +31,6 @@ libasahi_lib_files = files(
 
 libasahi_decode_files = files(
   'decode.c',
-)
-
-libagx_shader_files = files(
-  'shaders/libagx.h',
-  'shaders/compression.cl',
-  'shaders/draws.cl',
-  'shaders/draws.h',
-  'shaders/geometry.cl',
-  'shaders/geometry.h',
-  'shaders/query.cl',
-  'shaders/query.h',
-  'shaders/tessellation.cl',
-  'shaders/tessellator.cl',
-  'shaders/tessellator.h',
-  'shaders/texture.cl',
-  'shaders/helper.cl',
 )
 
 libasahi_decode = static_library(
@@ -67,35 +50,11 @@ libasahi_decode_shared = shared_library(
   build_by_default : with_tools.contains('asahi'),
 )
 
-prepended_input_args = []
-foreach input_arg : libagx_shader_files
-  prepended_input_args += ['--in', input_arg]
-endforeach
-libagx_spv = custom_target(
-  'libagx.spv',
-  input : libagx_shader_files,
-  output : 'libagx.spv',
-  command : [
-    prog_mesa_clc,
-    prepended_input_args, '-o', '@OUTPUT@', '--',
-    '-cl-std=cl2.0', '-D__OPENCL_VERSION__=200',
-    '-I' + join_paths(meson.current_source_dir(), '.'),
-    '-I' + join_paths(meson.current_source_dir(), '../../'),
-    '-I' + join_paths(meson.current_source_dir(), 'shaders'),
-    '-I' + join_paths(meson.current_build_dir(), '../genxml'),
-    ],
-  env: ['MESA_SHADER_CACHE_DISABLE=true'],
-  depends : [prog_mesa_clc, agx_pack],
-)
-
 libagx_shaders = custom_target(
   'libagx_shaders.h',
   input : libagx_spv,
   output : 'libagx_shaders.h',
-  command : [
-    prog_asahi_clc, '--prefix', 'libagx_shaders',
-    '--in', libagx_spv, '-o', '@OUTPUT@'
-  ],
+  command : [prog_asahi_clc, libagx_spv, '@OUTPUT@'],
   env: ['MESA_SHADER_CACHE_DISABLE=true'],
   depends : [prog_asahi_clc],
 )
@@ -107,7 +66,7 @@ libasahi_lib = static_library(
   c_args : [no_override_init_args],
   gnu_symbol_visibility : 'hidden',
   link_with: [libasahi_decode, libvdrm],
-  dependencies: [dep_libdrm, dep_valgrind, idep_nir, idep_mesautil],
+  dependencies: [dep_libdrm, dep_valgrind, idep_nir, idep_mesautil, idep_libagx],
   build_by_default : false,
 )
 

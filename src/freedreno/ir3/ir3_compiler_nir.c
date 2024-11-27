@@ -2869,6 +2869,7 @@ emit_intrinsic(struct ir3_context *ctx, nir_intrinsic_instr *intr)
       break;
    case nir_intrinsic_load_sample_mask_in:
       if (!ctx->samp_mask_in) {
+         ctx->so->reads_smask = true;
          ctx->samp_mask_in =
             create_sysval_input(ctx, SYSTEM_VALUE_SAMPLE_MASK_IN, 0x1);
       }
@@ -2918,6 +2919,15 @@ emit_intrinsic(struct ir3_context *ctx, nir_intrinsic_instr *intr)
          }
       }
       break;
+   case nir_intrinsic_load_frag_shading_rate: {
+      if (!ctx->frag_shading_rate) {
+         ctx->so->reads_shading_rate = true;
+         ctx->frag_shading_rate =
+            create_sysval_input(ctx, SYSTEM_VALUE_FRAG_SHADING_RATE, 0x1);
+      }
+      dst[0] = ctx->frag_shading_rate;
+      break;
+   }
    case nir_intrinsic_load_base_workgroup_id:
       for (int i = 0; i < dest_components; i++) {
          dst[i] = create_driver_param(ctx, IR3_DP_CS(base_group_x) + i);
@@ -5025,6 +5035,9 @@ setup_output(struct ir3_context *ctx, nir_intrinsic_instr *intr)
       case VARYING_SLOT_VIEWPORT:
          so->writes_viewport = true;
          break;
+      case VARYING_SLOT_PRIMITIVE_SHADING_RATE:
+         so->writes_shading_rate = true;
+         break;
       case VARYING_SLOT_PRIMITIVE_ID:
       case VARYING_SLOT_GS_VERTEX_FLAGS_IR3:
          assert(ctx->so->type == MESA_SHADER_GEOMETRY);
@@ -5452,6 +5465,12 @@ ir3_compile_shader_nir(struct ir3_compiler *compiler,
       so->local_size[1] = ctx->s->info.workgroup_size[1];
       so->local_size[2] = ctx->s->info.workgroup_size[2];
       so->local_size_variable = ctx->s->info.workgroup_size_variable;
+   }
+
+   if (so->type == MESA_SHADER_FRAGMENT && so->reads_shading_rate &&
+       !so->reads_smask &&
+       compiler->reading_shading_rate_requires_smask_quirk) {
+      create_sysval_input(ctx, SYSTEM_VALUE_SAMPLE_MASK_IN, 0x1);
    }
 
    /* Vertex shaders in a tessellation or geometry pipeline treat END as a

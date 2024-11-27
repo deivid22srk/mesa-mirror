@@ -23,7 +23,6 @@
 
 #include "vk_util.h"
 
-#include "v3dv_debug.h"
 #include "v3dv_private.h"
 
 #include "common/v3d_debug.h"
@@ -41,24 +40,6 @@
 
 static VkResult
 compute_vpm_config(struct v3dv_pipeline *pipeline);
-
-void
-v3dv_print_v3d_key(struct v3d_key *key,
-                   uint32_t v3d_key_size)
-{
-   struct mesa_sha1 ctx;
-   unsigned char sha1[20];
-   char sha1buf[41];
-
-   _mesa_sha1_init(&ctx);
-
-   _mesa_sha1_update(&ctx, key, v3d_key_size);
-
-   _mesa_sha1_final(&ctx, sha1);
-   _mesa_sha1_format(sha1buf, sha1);
-
-   fprintf(stderr, "key %p: %s\n", key, sha1buf);
-}
 
 static void
 pipeline_compute_sha1_from_nir(struct v3dv_pipeline_stage *p_stage)
@@ -1454,13 +1435,13 @@ upload_assembly(struct v3dv_pipeline *pipeline)
    struct v3dv_bo *bo = v3dv_bo_alloc(pipeline->device, total_size,
                                       "pipeline shader assembly", true);
    if (!bo) {
-      fprintf(stderr, "failed to allocate memory for shader\n");
+      mesa_loge("failed to allocate memory for shader\n");
       return false;
    }
 
    bool ok = v3dv_bo_map(pipeline->device, bo, total_size);
    if (!ok) {
-      fprintf(stderr, "failed to map source shader buffer\n");
+      mesa_loge("failed to map source shader buffer\n");
       return false;
    }
 
@@ -1678,9 +1659,9 @@ pipeline_compile_shader_variant(struct v3dv_pipeline_stage *p_stage,
    struct v3dv_shader_variant *variant = NULL;
 
    if (!qpu_insts) {
-      fprintf(stderr, "Failed to compile %s prog %d NIR to VIR\n",
-              broadcom_shader_stage_name(p_stage->stage),
-              p_stage->program_id);
+      mesa_loge("Failed to compile %s prog %d NIR to VIR\n",
+                broadcom_shader_stage_name(p_stage->stage),
+                p_stage->program_id);
       *out_vk_result = VK_ERROR_UNKNOWN;
    } else {
       variant =

@@ -301,14 +301,17 @@ cs_to_reg_tuple(struct cs_index idx, ASSERTED unsigned expected_size)
 }
 
 static inline unsigned
-cs_src_tuple(struct cs_builder *b, struct cs_index src, ASSERTED unsigned count)
+cs_src_tuple(struct cs_builder *b, struct cs_index src, ASSERTED unsigned count,
+             uint16_t mask)
 {
    unsigned reg = cs_to_reg_tuple(src, count);
 
    if (unlikely(b->conf.reg_perm)) {
       for (unsigned i = reg; i < reg + count; i++) {
-         assert((b->conf.reg_perm(b, i) & CS_REG_RD) ||
-                !"Trying to read a restricted register");
+         if (mask & BITFIELD_BIT(i - reg)) {
+            assert((b->conf.reg_perm(b, i) & CS_REG_RD) ||
+                   !"Trying to read a restricted register");
+         }
       }
    }
 
@@ -316,7 +319,8 @@ cs_src_tuple(struct cs_builder *b, struct cs_index src, ASSERTED unsigned count)
 
    if (unlikely(ls_tracker)) {
       for (unsigned i = reg; i < reg + count; i++) {
-         if (BITSET_TEST(ls_tracker->pending_loads, i))
+         if ((mask & BITFIELD_BIT(i - reg)) &&
+             BITSET_TEST(ls_tracker->pending_loads, i))
             assert(!"register used as a source before flushing loads\n");
       }
    }
@@ -327,24 +331,27 @@ cs_src_tuple(struct cs_builder *b, struct cs_index src, ASSERTED unsigned count)
 static inline unsigned
 cs_src32(struct cs_builder *b, struct cs_index src)
 {
-   return cs_src_tuple(b, src, 1);
+   return cs_src_tuple(b, src, 1, BITFIELD_MASK(1));
 }
 
 static inline unsigned
 cs_src64(struct cs_builder *b, struct cs_index src)
 {
-   return cs_src_tuple(b, src, 2);
+   return cs_src_tuple(b, src, 2, BITFIELD_MASK(2));
 }
 
 static inline unsigned
-cs_dst_tuple(struct cs_builder *b, struct cs_index dst, ASSERTED unsigned count)
+cs_dst_tuple(struct cs_builder *b, struct cs_index dst, ASSERTED unsigned count,
+             uint16_t mask)
 {
    unsigned reg = cs_to_reg_tuple(dst, count);
 
    if (unlikely(b->conf.reg_perm)) {
       for (unsigned i = reg; i < reg + count; i++) {
-         assert((b->conf.reg_perm(b, i) & CS_REG_WR) ||
-                !"Trying to write a restricted register");
+         if (mask & BITFIELD_BIT(i - reg)) {
+            assert((b->conf.reg_perm(b, i) & CS_REG_WR) ||
+                   !"Trying to write a restricted register");
+         }
       }
    }
 
@@ -352,15 +359,18 @@ cs_dst_tuple(struct cs_builder *b, struct cs_index dst, ASSERTED unsigned count)
 
    if (unlikely(ls_tracker)) {
       for (unsigned i = reg; i < reg + count; i++) {
-         if (BITSET_TEST(ls_tracker->pending_stores, i))
+         if ((mask & BITFIELD_BIT(i - reg)) &&
+             BITSET_TEST(ls_tracker->pending_stores, i))
             assert(
                !"register reused as a destination before flushing stores\n");
       }
    }
 
    if (unlikely(b->conf.dirty_tracker)) {
-      for (unsigned i = reg; i < reg + count; i++)
-         BITSET_SET(b->conf.dirty_tracker->regs, i);
+      for (unsigned i = reg; i < reg + count; i++) {
+         if (mask & BITFIELD_BIT(i - reg))
+            BITSET_SET(b->conf.dirty_tracker->regs, i);
+      }
    }
 
    return reg;
@@ -369,13 +379,13 @@ cs_dst_tuple(struct cs_builder *b, struct cs_index dst, ASSERTED unsigned count)
 static inline unsigned
 cs_dst32(struct cs_builder *b, struct cs_index dst)
 {
-   return cs_dst_tuple(b, dst, 1);
+   return cs_dst_tuple(b, dst, 1, BITFIELD_MASK(1));
 }
 
 static inline unsigned
 cs_dst64(struct cs_builder *b, struct cs_index dst)
 {
-   return cs_dst_tuple(b, dst, 2);
+   return cs_dst_tuple(b, dst, 2, BITFIELD_MASK(2));
 }
 
 static inline struct cs_index
@@ -956,7 +966,6 @@ cs_loop_conditional_continue(struct cs_builder *b, struct cs_loop *loop,
                              enum mali_cs_condition cond, struct cs_index val)
 {
    cs_flush_pending_if(b);
-   assert(cs_cur_block(b) == &loop->block);
    cs_branch_label(b, &loop->start, cond, val);
    cs_loop_diverge_ls_update(b, loop);
 }
@@ -966,7 +975,6 @@ cs_loop_conditional_break(struct cs_builder *b, struct cs_loop *loop,
                           enum mali_cs_condition cond, struct cs_index val)
 {
    cs_flush_pending_if(b);
-   assert(cs_cur_block(b) == &loop->block);
    cs_branch_label(b, &loop->end, cond, val);
    cs_loop_diverge_ls_update(b, loop);
 }
@@ -1204,7 +1212,7 @@ cs_load_to(struct cs_builder *b, struct cs_index dest, struct cs_index address,
            unsigned mask, int offset)
 {
    unsigned count = util_last_bit(mask);
-   unsigned base_reg = cs_dst_tuple(b, dest, count);
+   unsigned base_reg = cs_dst_tuple(b, dest, count, mask);
 
    cs_emit(b, LOAD_MULTIPLE, I) {
       I.base_register = base_reg;
@@ -1240,7 +1248,7 @@ cs_store(struct cs_builder *b, struct cs_index data, struct cs_index address,
          unsigned mask, int offset)
 {
    unsigned count = util_last_bit(mask);
-   unsigned base_reg = cs_src_tuple(b, data, count);
+   unsigned base_reg = cs_src_tuple(b, data, count, mask);
 
    cs_emit(b, STORE_MULTIPLE, I) {
       I.base_register = base_reg;
@@ -1505,7 +1513,8 @@ cs_trace_point(struct cs_builder *b, struct cs_index regs,
                struct cs_async_op async)
 {
    cs_emit(b, TRACE_POINT, I) {
-      I.base_register = cs_src_tuple(b, regs, regs.size);
+      I.base_register =
+         cs_src_tuple(b, regs, regs.size, BITFIELD_MASK(regs.size));
       I.register_count = regs.size;
       cs_apply_async(I, async);
    }
@@ -1663,24 +1672,31 @@ cs_nop(struct cs_builder *b)
    cs_emit(b, NOP, I) {};
 }
 
+struct cs_exception_handler_ctx {
+   struct cs_index ctx_reg;
+   unsigned dump_addr_offset;
+   uint8_t ls_sb_slot;
+};
+
 struct cs_exception_handler {
    struct cs_block block;
    struct cs_dirty_tracker dirty;
-   uint64_t backup_addr;
-   uint8_t sb_slot;
+   struct cs_exception_handler_ctx ctx;
+   unsigned dump_size;
+   uint64_t address;
+   uint32_t length;
 };
 
 static inline struct cs_exception_handler *
 cs_exception_handler_start(struct cs_builder *b,
                            struct cs_exception_handler *handler,
-                           uint64_t backup_addr, uint8_t sb_slot)
+                           struct cs_exception_handler_ctx ctx)
 {
    assert(cs_cur_block(b) == NULL);
    assert(b->conf.dirty_tracker == NULL);
 
    *handler = (struct cs_exception_handler){
-      .backup_addr = backup_addr,
-      .sb_slot = sb_slot,
+      .ctx = ctx,
    };
 
    cs_block_start(b, &handler->block);
@@ -1741,18 +1757,31 @@ cs_exception_handler_end(struct cs_builder *b,
       last = pos + range;
    }
 
+   handler->dump_size = BITSET_COUNT(handler->dirty.regs) * sizeof(uint32_t);
+
    /* Make sure the current chunk is able to accommodate the block
     * instructions as well as the preamble and postamble.
     * Adding 4 instructions (2x wait_slot and the move for the address) as
     * the move might actually be translated to two MOVE32 instructions. */
-   if (!cs_reserve_instrs(b, num_instrs + (num_ranges * 2) + 4))
+   num_instrs += (num_ranges * 2) + 4;
+
+   /* Align things on a cache-line in case the buffer contains more than one
+    * exception handler (64 bytes = 8 instructions). */
+   uint32_t padded_num_instrs = ALIGN_POT(num_instrs, 8);
+
+   if (!cs_reserve_instrs(b, padded_num_instrs))
       return;
+
+   handler->address =
+      b->cur_chunk.buffer.gpu + (b->cur_chunk.pos * sizeof(uint64_t));
 
    /* Preamble: backup modified registers */
    if (num_ranges > 0) {
       unsigned offset = 0;
 
-      cs_move64_to(b, addr_reg, handler->backup_addr);
+      cs_load64_to(b, addr_reg, handler->ctx.ctx_reg,
+                   handler->ctx.dump_addr_offset);
+      cs_wait_slot(b, handler->ctx.ls_sb_slot, false);
 
       for (unsigned i = 0; i < num_ranges; ++i) {
          unsigned reg_count = util_bitcount(masks[i]);
@@ -1761,7 +1790,7 @@ cs_exception_handler_end(struct cs_builder *b,
          offset += reg_count * 4;
       }
 
-      cs_wait_slot(b, handler->sb_slot, false);
+      cs_wait_slot(b, handler->ctx.ls_sb_slot, false);
    }
 
    /* Now that the preamble is emitted, we can flush the instructions we have in
@@ -1772,6 +1801,10 @@ cs_exception_handler_end(struct cs_builder *b,
    if (num_ranges > 0) {
       unsigned offset = 0;
 
+      cs_load64_to(b, addr_reg, handler->ctx.ctx_reg,
+                   handler->ctx.dump_addr_offset);
+      cs_wait_slot(b, handler->ctx.ls_sb_slot, false);
+
       for (unsigned i = 0; i < num_ranges; ++i) {
          unsigned reg_count = util_bitcount(masks[i]);
 
@@ -1779,6 +1812,18 @@ cs_exception_handler_end(struct cs_builder *b,
          offset += reg_count * 4;
       }
 
-      cs_wait_slot(b, handler->sb_slot, false);
+      cs_wait_slot(b, handler->ctx.ls_sb_slot, false);
    }
+
+   /* Fill the rest of the buffer with NOPs. */
+   for (; num_instrs < padded_num_instrs; num_instrs++)
+      cs_nop(b);
+
+   handler->length = padded_num_instrs;
 }
+
+#define cs_exception_handler_def(__b, __handler, __ctx)                        \
+   for (struct cs_exception_handler *__ehandler =                              \
+           cs_exception_handler_start(__b, __handler, __ctx);                  \
+        __ehandler != NULL;                                                    \
+        cs_exception_handler_end(__b, __handler), __ehandler = NULL)

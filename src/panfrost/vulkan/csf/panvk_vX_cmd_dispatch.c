@@ -51,7 +51,8 @@ prepare_driver_set(struct panvk_cmd_buffer *cmdbuf)
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
 
    /* Dummy sampler always comes first. */
-   pan_pack(&descs[0], SAMPLER, _) {
+   pan_pack(&descs[0], SAMPLER, cfg) {
+      cfg.clamp_integer_array_indices = false;
    }
 
    panvk_per_arch(cmd_fill_dyn_bufs)(desc_state, cs,
@@ -245,6 +246,9 @@ cmd_dispatch(struct panvk_cmd_buffer *cmdbuf, struct panvk_dispatch_info *info)
    }
 
    struct panvk_compute_sysvals *sysvals = &cmdbuf->state.compute.sysvals;
+   sysvals->base.x = info->baseGroupX;
+   sysvals->base.y = info->baseGroupY;
+   sysvals->base.z = info->baseGroupZ;
    /* If indirect, sysvals->num_work_groups will be written by the CS */
    if (!indirect) {
       sysvals->num_work_groups.x = info->direct.groupCountX;

@@ -109,14 +109,38 @@ fill_operation(struct teflon_delegate *delegate, TfLiteContext *tf_context, TfLi
    switch(node_registration->builtin_code) {
       case kTfLiteBuiltinConv2d:
       case kTfLiteBuiltinDepthwiseConv2d: {
-         TfLiteConvParams* params = (TfLiteConvParams*)node->builtin_data;
          operation->type = PIPE_ML_OPERATION_TYPE_CONVOLUTION;
          operation->conv.weight_tensor = &tensors[node->inputs->data[1]];
          operation->conv.bias_tensor = &tensors[node->inputs->data[2]];
-         operation->conv.stride_x = params->stride_width;
-         operation->conv.stride_y = params->stride_height;
-         operation->conv.padding_same = params->padding == kTfLitePaddingSame;
-         operation->conv.depthwise = node_registration->builtin_code == kTfLiteBuiltinDepthwiseConv2d;
+         if (node_registration->builtin_code == kTfLiteBuiltinConv2d) {
+            TfLiteConvParams* params = (TfLiteConvParams*)node->builtin_data;
+
+            assert(params->activation == kTfLiteActNone ||
+                   params->activation == kTfLiteActRelu);
+            if (node_registration->version >= 2) {
+               assert(params->dilation_width_factor == 1);
+               assert(params->dilation_height_factor == 1);
+            }
+            operation->conv.stride_x = params->stride_width;
+            operation->conv.stride_y = params->stride_height;
+            operation->conv.padding_same = params->padding == kTfLitePaddingSame;
+            operation->conv.depthwise = false;
+            operation->conv.relu = params->activation == kTfLiteActRelu;
+         } else {
+            TfLiteDepthwiseConvParams* params = (TfLiteDepthwiseConvParams*)node->builtin_data;
+
+            assert(params->activation == kTfLiteActNone ||
+                   params->activation == kTfLiteActRelu);
+            if (node_registration->version >= 2) {
+               assert(params->dilation_width_factor == 1);
+               assert(params->dilation_height_factor == 1);
+            }
+            operation->conv.stride_x = params->stride_width;
+            operation->conv.stride_y = params->stride_height;
+            operation->conv.padding_same = params->padding == kTfLitePaddingSame;
+            operation->conv.depthwise = true;
+            operation->conv.relu = params->activation == kTfLiteActRelu;
+         }
          operation->conv.pointwise = operation->conv.weight_tensor->dims[1] == 1 && \
                                      operation->conv.weight_tensor->dims[2] == 1;
          break;
@@ -367,8 +391,32 @@ PrepareDelegate(TfLiteContext *context, TfLiteDelegate *delegate)
           context, node_index, &node, &registration));
 
       switch(registration->builtin_code) {
-         case kTfLiteBuiltinConv2d:
-         case kTfLiteBuiltinDepthwiseConv2d:
+         case kTfLiteBuiltinConv2d: {
+            TfLiteConvParams* params = (TfLiteConvParams*)node->builtin_data;
+
+            // Dilation not yet implemented
+            if ((params->activation == kTfLiteActNone ||
+                 params->activation == kTfLiteActRelu) &&
+                (registration->version < 2 ||
+                 (params->dilation_width_factor == 1 &&
+                  params->dilation_height_factor == 1))) {
+               supported = true;
+            }
+            break;
+         }
+         case kTfLiteBuiltinDepthwiseConv2d: {
+            TfLiteDepthwiseConvParams* params = (TfLiteDepthwiseConvParams*)node->builtin_data;
+
+            // Dilation not yet implemented
+            if ((params->activation == kTfLiteActNone ||
+                 params->activation == kTfLiteActRelu) &&
+                (registration->version < 2 ||
+                 (params->dilation_width_factor == 1 &&
+                  params->dilation_height_factor == 1))) {
+               supported = true;
+            }
+            break;
+         }
          case kTfLiteBuiltinAdd:
             supported = true;
             break;

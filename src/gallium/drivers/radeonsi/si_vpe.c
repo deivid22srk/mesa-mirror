@@ -543,14 +543,12 @@ si_vpe_set_surface_info(struct vpe_video_processor *vpeproc,
    /* Set up surface pitch, plane address, color space */
    si_vpe_set_plane_info(vpeproc, process_properties, surfaces, which_surface, surface_info);
 
-   /* VAAPI does not provide swizzle info right now.
-    * Swizzle mode is strongly releated to hardware DMA design,
-    * intel-vaapi-driver/i965_drv_video.c also does not handle swizzle information,
-    * maybe this is the reason why it is not currently supported.
-    *
-    * Just default to linear or none temporarily.
-    */
-   surface_info->swizzle               = VPE_SW_LINEAR;
+   struct si_texture *tex = (struct si_texture *)surfaces[0]->texture;
+   surface_info->swizzle               = tex->surface.u.gfx9.swizzle_mode;
+
+   /* DCC not supported */
+   if (tex->surface.meta_offset)
+      return VPE_STATUS_NOT_SUPPORTED;
 
    struct vpe_plane_dcc_param *dcc_param = &surface_info->dcc;
    dcc_param->enable                   = false;
@@ -726,7 +724,7 @@ si_vpe_cs_add_surface_buffer(struct vpe_video_processor *vpeproc,
    }
 }
 
-static void
+static int
 si_vpe_processor_process_frame(struct pipe_video_codec *codec,
                                struct pipe_video_buffer *input_texture,
                                const struct pipe_vpp_desc *process_properties)
@@ -747,7 +745,7 @@ si_vpe_processor_process_frame(struct pipe_video_codec *codec,
    src_surfaces = input_texture->get_surfaces(input_texture);
    if (!src_surfaces || !src_surfaces[0]) {
       SIVPE_ERR("Get source surface failed\n");
-      return;
+      return 1;
    }
    vpeproc->src_surfaces = src_surfaces;
 
@@ -756,27 +754,29 @@ si_vpe_processor_process_frame(struct pipe_video_codec *codec,
    build_param->num_streams = 1;
    if (build_param->num_streams > VPE_STREAM_MAX_NUM) {
       SIVPE_ERR("Can only suppport %d stream(s) now\n", VPE_STREAM_MAX_NUM);
-      return;
+      return 1;
    }
 
    if (!build_param->streams) {
       SIVPE_ERR("Streams structure is not allocated\n");
-      return;
+      return 1;
    }
 
-   si_vpe_set_surface_info(vpeproc,
-                           process_properties,
-                           vpeproc->src_surfaces,
-                           USE_SRC_SURFACE, 
-                           &build_param->streams[0].surface_info);
+   if (si_vpe_set_surface_info(vpeproc,
+                               process_properties,
+                               vpeproc->src_surfaces,
+                               USE_SRC_SURFACE,
+                               &build_param->streams[0].surface_info) != VPE_STATUS_OK)
+      return 1;
 
    si_vpe_set_stream(process_properties, &build_param->streams[0]);
 
-   si_vpe_set_surface_info(vpeproc,
-                           process_properties,
-                           vpeproc->dst_surfaces,
-                           USE_DST_SURFACE, 
-                           &build_param->dst_surface);
+   if (si_vpe_set_surface_info(vpeproc,
+                               process_properties,
+                               vpeproc->dst_surfaces,
+                               USE_DST_SURFACE,
+                               &build_param->dst_surface) != VPE_STATUS_OK)
+      return 1;
 
    if (process_properties->background_color) {
       build_param->target_rect.x = 0;
@@ -854,7 +854,7 @@ si_vpe_processor_process_frame(struct pipe_video_codec *codec,
                                                  PIPE_MAP_WRITE | RADEON_MAP_TEMPORARY);
    if (!vpe_ptr) {
       SIVPE_ERR("Mapping Embbuf failed\n");
-      return;
+      return 1;
    }
    vpeproc->vpe_build_bufs->emb_buf.cpu_va = (uintptr_t)vpe_ptr;
    vpeproc->vpe_build_bufs->emb_buf.gpu_va = vpeproc->ws->buffer_get_virtual_address(emb_buf->res->buf);
@@ -990,12 +990,12 @@ si_vpe_processor_process_frame(struct pipe_video_codec *codec,
    si_vpe_cs_add_surface_buffer(vpeproc, vpeproc->dst_surfaces, RADEON_USAGE_WRITE);
 
    SIVPE_DBG(vpeproc->log_level, "Success\n");
-   return;
+   return 0;
 
 fail:
    vpeproc->ws->buffer_unmap(vpeproc->ws, emb_buf->res->buf);
    SIVPE_ERR("Failed\n");
-   return;
+   return 1;
 }
 
 static int

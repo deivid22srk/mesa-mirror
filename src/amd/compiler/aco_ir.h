@@ -1712,8 +1712,7 @@ struct Export_instruction : public Instruction {
 static_assert(sizeof(Export_instruction) == sizeof(Instruction) + 4, "Unexpected padding");
 
 struct Pseudo_instruction : public Instruction {
-   PhysReg scratch_sgpr; /* might not be valid if it's not needed */
-   bool tmp_in_scc;
+   PhysReg scratch_sgpr;   /* might not be valid if it's not needed */
    bool needs_scratch_reg; /* if scratch_sgpr/scc can be written, initialized by RA. */
 };
 static_assert(sizeof(Pseudo_instruction) == sizeof(Instruction) + 4, "Unexpected padding");
@@ -1987,10 +1986,6 @@ struct Block {
    uint16_t divergent_if_logical_depth = 0;
    uint16_t uniform_if_depth = 0;
 
-   /* this information is needed for predecessors to blocks with phis when
-    * moving out of ssa */
-   bool scc_live_out = false;
-
    Block() : index(0) {}
 };
 
@@ -2160,6 +2155,8 @@ public:
    /* For shader part with previous shader part that has lds access. */
    bool pending_lds_access = false;
 
+   bool should_repair_ssa = false;
+
    struct {
       monotonic_buffer_resource memory;
       /* live-in temps per block */
@@ -2243,6 +2240,7 @@ void select_ps_prolog(Program* program, void* pinfo, ac_shader_config* config,
                       const struct aco_compiler_options* options,
                       const struct aco_shader_info* info, const struct ac_shader_args* args);
 
+bool repair_ssa(Program* program);
 void lower_phis(Program* program);
 void lower_subdword(Program* program);
 void calc_min_waves(Program* program);

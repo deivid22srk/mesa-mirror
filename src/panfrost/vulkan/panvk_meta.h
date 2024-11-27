@@ -16,6 +16,8 @@ enum panvk_meta_object_key_type {
    PANVK_META_OBJECT_KEY_BLEND_SHADER = VK_META_OBJECT_KEY_DRIVER_OFFSET,
    PANVK_META_OBJECT_KEY_COPY_DESC_SHADER,
    PANVK_META_OBJECT_KEY_FB_PRELOAD_SHADER,
+   PANVK_META_OBJECT_KEY_CLEAR_QUERY_POOL_PIPELINE,
+   PANVK_META_OBJECT_KEY_COPY_QUERY_POOL_RESULTS_OQ_PIPELINE,
 };
 
 static inline VkFormat
@@ -46,7 +48,7 @@ panvk_meta_get_uint_format_for_blk_size(unsigned blk_sz)
 static inline struct vk_meta_copy_image_properties
 panvk_meta_copy_get_image_properties(struct panvk_image *img)
 {
-   uint64_t mod = img->pimage.layout.modifier;
+   uint64_t mod = img->vk.drm_format_mod;
    enum pipe_format pfmt = vk_format_to_pipe_format(img->vk.format);
    unsigned blk_sz = util_format_get_blocksize(pfmt);
    struct vk_meta_copy_image_properties props = {0};

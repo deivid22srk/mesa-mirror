@@ -13,6 +13,7 @@
 #include "panvk_macros.h"
 #include "panvk_queue.h"
 
+#include "util/bitscan.h"
 #include "vk_drm_syncobj.h"
 #include "vk_log.h"
 
@@ -187,6 +188,15 @@ init_subqueue(struct panvk_queue *queue, enum panvk_subqueue_id subqueue)
    unsigned debug = instance->debug_flags;
    struct panvk_cs_sync64 *syncobjs = panvk_priv_mem_host_addr(queue->syncobjs);
 
+   if (debug & PANVK_DEBUG_TRACE) {
+      subq->reg_file =
+         vk_zalloc(&dev->vk.alloc, sizeof(uint32_t) * 256, sizeof(uint64_t),
+                   VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
+      if (!subq->reg_file)
+         return panvk_errorf(dev->vk.physical, VK_ERROR_OUT_OF_HOST_MEMORY,
+                             "Failed to allocate reg file cache");
+   }
+
    struct panvk_pool_alloc_info alloc_info = {
       .size = sizeof(struct panvk_cs_subqueue_context),
       .alignment = 64,
@@ -204,6 +214,8 @@ init_subqueue(struct panvk_queue *queue, enum panvk_subqueue_id subqueue)
       .syncobjs = panvk_priv_mem_dev_addr(queue->syncobjs),
       .debug_syncobjs = panvk_priv_mem_dev_addr(queue->debug_syncobjs),
       .iter_sb = 0,
+      .tiler_oom_ctx.reg_dump_addr =
+         panvk_priv_mem_dev_addr(queue->tiler_oom_regs_save),
    };
 
    /* We use the geometry buffer for our temporary CS buffer. */
@@ -290,10 +302,9 @@ init_subqueue(struct panvk_queue *queue, enum panvk_subqueue_id subqueue)
                           "SyncobjWait failed: %m");
 
    if (debug & PANVK_DEBUG_TRACE) {
-      uint32_t regs[256] = {0};
-
       pandecode_cs(dev->debug.decode_ctx, qsubmit.stream_addr,
-                   qsubmit.stream_size, phys_dev->kmod.props.gpu_prod_id, regs);
+                   qsubmit.stream_size, phys_dev->kmod.props.gpu_prod_id,
+                   subq->reg_file);
       pandecode_next_frame(dev->debug.decode_ctx);
    }
 
@@ -303,11 +314,16 @@ init_subqueue(struct panvk_queue *queue, enum panvk_subqueue_id subqueue)
 static void
 cleanup_queue(struct panvk_queue *queue)
 {
-   for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++)
+   struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
+
+   for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
       panvk_pool_free_mem(&queue->subqueues[i].context);
+      vk_free(&dev->vk.alloc, queue->subqueues[i].reg_file);
+   }
 
    finish_render_desc_ringbuf(queue);
 
+   panvk_pool_free_mem(&queue->tiler_oom_regs_save);
    panvk_pool_free_mem(&queue->debug_syncobjs);
    panvk_pool_free_mem(&queue->syncobjs);
 }
@@ -341,6 +357,16 @@ init_queue(struct panvk_queue *queue)
                                "Failed to allocate subqueue sync objects");
          goto err_cleanup_queue;
       }
+   }
+
+   alloc_info.size = dev->tiler_oom.dump_region_size;
+   alloc_info.alignment = sizeof(uint32_t);
+   queue->tiler_oom_regs_save =
+      panvk_pool_alloc_mem(&dev->mempools.rw, alloc_info);
+   if (!panvk_priv_mem_host_addr(queue->tiler_oom_regs_save)) {
+      result = panvk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                            "Failed to allocate tiler oom register save area");
+      goto err_cleanup_queue;
    }
 
    result = init_render_desc_ringbuf(queue);
@@ -493,210 +519,331 @@ cleanup_tiler(struct panvk_queue *queue)
    panvk_pool_free_mem(&tiler_heap->desc);
 }
 
-static VkResult
-panvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
+struct panvk_queue_submit {
+   const struct panvk_instance *instance;
+   const struct panvk_physical_device *phys_dev;
+   struct panvk_device *dev;
+   struct panvk_queue *queue;
+
+   bool force_sync;
+
+   uint32_t used_queue_mask;
+
+   uint32_t qsubmit_count;
+   bool needs_waits;
+   bool needs_signals;
+
+   struct drm_panthor_queue_submit *qsubmits;
+   struct drm_panthor_sync_op *wait_ops;
+   struct drm_panthor_sync_op *signal_ops;
+};
+
+struct panvk_queue_submit_stack_storage {
+   struct drm_panthor_queue_submit qsubmits[8];
+   struct drm_panthor_sync_op syncops[8];
+};
+
+static void
+panvk_queue_submit_init(struct panvk_queue_submit *submit,
+                        struct vk_queue *vk_queue)
 {
-   struct panvk_queue *queue = container_of(vk_queue, struct panvk_queue, vk);
-   struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
-   const struct panvk_physical_device *phys_dev =
-      to_panvk_physical_device(queue->vk.base.device->physical);
-   VkResult result = VK_SUCCESS;
-   int ret;
+   struct vk_device *vk_dev = vk_queue->base.device;
 
-   if (vk_queue_is_lost(&queue->vk))
-      return VK_ERROR_DEVICE_LOST;
+   *submit = (struct panvk_queue_submit){
+      .instance = to_panvk_instance(vk_dev->physical->instance),
+      .phys_dev = to_panvk_physical_device(vk_dev->physical),
+      .dev = to_panvk_device(vk_dev),
+      .queue = container_of(vk_queue, struct panvk_queue, vk),
+   };
 
-   struct panvk_instance *instance =
-      to_panvk_instance(dev->vk.physical->instance);
-   unsigned debug = instance->debug_flags;
-   bool force_sync = debug & (PANVK_DEBUG_TRACE | PANVK_DEBUG_SYNC);
-   uint32_t qsubmit_count = 0;
-   uint32_t used_queue_mask = 0;
-   for (uint32_t i = 0; i < submit->command_buffer_count; i++) {
-      struct panvk_cmd_buffer *cmdbuf =
-         container_of(submit->command_buffers[i], struct panvk_cmd_buffer, vk);
+   submit->force_sync =
+      submit->instance->debug_flags & (PANVK_DEBUG_TRACE | PANVK_DEBUG_SYNC);
+}
+
+static void
+panvk_queue_submit_init_storage(
+   struct panvk_queue_submit *submit, const struct vk_queue_submit *vk_submit,
+   struct panvk_queue_submit_stack_storage *stack_storage)
+{
+   for (uint32_t i = 0; i < vk_submit->command_buffer_count; i++) {
+      struct panvk_cmd_buffer *cmdbuf = container_of(
+         vk_submit->command_buffers[i], struct panvk_cmd_buffer, vk);
 
       for (uint32_t j = 0; j < ARRAY_SIZE(cmdbuf->state.cs); j++) {
-         assert(cs_is_valid(&cmdbuf->state.cs[j].builder));
-         if (!cs_is_empty(&cmdbuf->state.cs[j].builder)) {
-            used_queue_mask |= BITFIELD_BIT(j);
-            qsubmit_count++;
-         }
+         struct cs_builder *b = panvk_get_cs_builder(cmdbuf, j);
+         assert(cs_is_valid(b));
+         if (cs_is_empty(b))
+            continue;
+
+         submit->used_queue_mask |= BITFIELD_BIT(j);
+         submit->qsubmit_count++;
       }
    }
 
    /* Synchronize all subqueues if we have no command buffer submitted. */
-   if (!qsubmit_count)
-      used_queue_mask = BITFIELD_MASK(PANVK_SUBQUEUE_COUNT);
+   if (!submit->qsubmit_count)
+      submit->used_queue_mask = BITFIELD_MASK(PANVK_SUBQUEUE_COUNT);
+
+   uint32_t syncop_count = 0;
+
+   submit->needs_waits = vk_submit->wait_count > 0;
+   submit->needs_signals = vk_submit->signal_count > 0 || submit->force_sync;
 
    /* We add sync-only queue submits to place our wait/signal operations. */
-   if (submit->wait_count > 0)
-      qsubmit_count += util_bitcount(used_queue_mask);
-
-   if (submit->signal_count > 0 || force_sync)
-      qsubmit_count += util_bitcount(used_queue_mask);
-
-   uint32_t syncop_count = submit->wait_count + util_bitcount(used_queue_mask);
-
-   STACK_ARRAY(struct drm_panthor_queue_submit, qsubmits, qsubmit_count);
-   STACK_ARRAY(struct drm_panthor_sync_op, syncops, syncop_count);
-   struct drm_panthor_sync_op *wait_ops = syncops;
-   struct drm_panthor_sync_op *signal_ops = syncops + submit->wait_count;
-
-   qsubmit_count = 0;
-   if (submit->wait_count) {
-      for (uint32_t i = 0; i < submit->wait_count; i++) {
-         assert(vk_sync_type_is_drm_syncobj(submit->waits[i].sync->type));
-         struct vk_drm_syncobj *syncobj =
-            vk_sync_as_drm_syncobj(submit->waits[i].sync);
-
-         wait_ops[i] = (struct drm_panthor_sync_op){
-            .flags = (submit->waits[i].sync->flags & VK_SYNC_IS_TIMELINE
-                         ? DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_TIMELINE_SYNCOBJ
-                         : DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_SYNCOBJ) |
-                     DRM_PANTHOR_SYNC_OP_WAIT,
-            .handle = syncobj->syncobj,
-            .timeline_value = submit->waits[i].wait_value,
-         };
-      }
-
-      for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
-         if (used_queue_mask & BITFIELD_BIT(i)) {
-            qsubmits[qsubmit_count++] = (struct drm_panthor_queue_submit){
-               .queue_index = i,
-               .syncs = DRM_PANTHOR_OBJ_ARRAY(submit->wait_count, wait_ops),
-            };
-         }
-      }
+   if (submit->needs_waits) {
+      submit->qsubmit_count += util_bitcount(submit->used_queue_mask);
+      syncop_count += vk_submit->wait_count;
+   }
+   if (submit->needs_signals) {
+      submit->qsubmit_count += util_bitcount(submit->used_queue_mask);
+      syncop_count += util_bitcount(submit->used_queue_mask);
    }
 
-   for (uint32_t i = 0; i < submit->command_buffer_count; i++) {
-      struct panvk_cmd_buffer *cmdbuf =
-         container_of(submit->command_buffers[i], struct panvk_cmd_buffer, vk);
+   submit->qsubmits =
+      submit->qsubmit_count <= ARRAY_SIZE(stack_storage->qsubmits)
+         ? stack_storage->qsubmits
+         : malloc(sizeof(*submit->qsubmits) * submit->qsubmit_count);
+
+   submit->wait_ops = syncop_count <= ARRAY_SIZE(stack_storage->syncops)
+                         ? stack_storage->syncops
+                         : malloc(sizeof(*submit->wait_ops) * syncop_count);
+   submit->signal_ops = submit->wait_ops + vk_submit->wait_count;
+
+   /* reset so that we can initialize submit->qsubmits incrementally */
+   submit->qsubmit_count = 0;
+}
+
+static void
+panvk_queue_submit_cleanup_storage(
+   struct panvk_queue_submit *submit,
+   const struct panvk_queue_submit_stack_storage *stack_storage)
+{
+   if (submit->qsubmits != stack_storage->qsubmits)
+      free(submit->qsubmits);
+   if (submit->wait_ops != stack_storage->syncops)
+      free(submit->wait_ops);
+}
+
+static void
+panvk_queue_submit_init_waits(struct panvk_queue_submit *submit,
+                              const struct vk_queue_submit *vk_submit)
+{
+   if (!submit->needs_waits)
+      return;
+
+   for (uint32_t i = 0; i < vk_submit->wait_count; i++) {
+      const struct vk_sync_wait *wait = &vk_submit->waits[i];
+      const struct vk_drm_syncobj *syncobj = vk_sync_as_drm_syncobj(wait->sync);
+      assert(syncobj);
+
+      submit->wait_ops[i] = (struct drm_panthor_sync_op){
+         .flags = (syncobj->base.flags & VK_SYNC_IS_TIMELINE
+                      ? DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_TIMELINE_SYNCOBJ
+                      : DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_SYNCOBJ) |
+                  DRM_PANTHOR_SYNC_OP_WAIT,
+         .handle = syncobj->syncobj,
+         .timeline_value = wait->wait_value,
+      };
+   }
+
+   u_foreach_bit(i, submit->used_queue_mask) {
+      submit->qsubmits[submit->qsubmit_count++] =
+         (struct drm_panthor_queue_submit){
+            .queue_index = i,
+            .syncs =
+               DRM_PANTHOR_OBJ_ARRAY(vk_submit->wait_count, submit->wait_ops),
+         };
+   }
+}
+
+static void
+panvk_queue_submit_init_cmdbufs(struct panvk_queue_submit *submit,
+                                const struct vk_queue_submit *vk_submit)
+{
+   for (uint32_t i = 0; i < vk_submit->command_buffer_count; i++) {
+      struct panvk_cmd_buffer *cmdbuf = container_of(
+         vk_submit->command_buffers[i], struct panvk_cmd_buffer, vk);
 
       for (uint32_t j = 0; j < ARRAY_SIZE(cmdbuf->state.cs); j++) {
-         if (cs_is_empty(&cmdbuf->state.cs[j].builder))
+         struct cs_builder *b = panvk_get_cs_builder(cmdbuf, j);
+         if (cs_is_empty(b))
             continue;
 
-         qsubmits[qsubmit_count++] = (struct drm_panthor_queue_submit){
-            .queue_index = j,
-            .stream_size = cs_root_chunk_size(&cmdbuf->state.cs[j].builder),
-            .stream_addr = cs_root_chunk_gpu_addr(&cmdbuf->state.cs[j].builder),
-            .latest_flush = cmdbuf->flush_id,
+         submit->qsubmits[submit->qsubmit_count++] =
+            (struct drm_panthor_queue_submit){
+               .queue_index = j,
+               .stream_size = cs_root_chunk_size(b),
+               .stream_addr = cs_root_chunk_gpu_addr(b),
+               .latest_flush = cmdbuf->flush_id,
+            };
+      }
+   }
+}
+
+static void
+panvk_queue_submit_init_signals(struct panvk_queue_submit *submit,
+                                const struct vk_queue_submit *vk_submit)
+{
+   struct panvk_queue *queue = submit->queue;
+
+   if (!submit->needs_signals)
+      return;
+
+   uint32_t signal_op = 0;
+   u_foreach_bit(i, submit->used_queue_mask) {
+      submit->signal_ops[signal_op] = (struct drm_panthor_sync_op){
+         .flags = DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_TIMELINE_SYNCOBJ |
+                  DRM_PANTHOR_SYNC_OP_SIGNAL,
+         .handle = queue->syncobj_handle,
+         .timeline_value = signal_op + 1,
+      };
+
+      submit->qsubmits[submit->qsubmit_count++] =
+         (struct drm_panthor_queue_submit){
+            .queue_index = i,
+            .syncs = DRM_PANTHOR_OBJ_ARRAY(1, &submit->signal_ops[signal_op++]),
          };
-      }
    }
 
-   if (submit->signal_count || force_sync) {
-      uint32_t signal_op = 0;
-      for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
-         if (used_queue_mask & BITFIELD_BIT(i)) {
-            signal_ops[signal_op] = (struct drm_panthor_sync_op){
-               .flags = DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_TIMELINE_SYNCOBJ |
-                        DRM_PANTHOR_SYNC_OP_SIGNAL,
-               .handle = queue->syncobj_handle,
-               .timeline_value = signal_op + 1,
-            };
-
-            qsubmits[qsubmit_count++] = (struct drm_panthor_queue_submit){
-               .queue_index = i,
-               .syncs = DRM_PANTHOR_OBJ_ARRAY(1, &signal_ops[signal_op++]),
-            };
-         }
-      }
-   }
-
-   if (force_sync) {
+   if (submit->force_sync) {
       struct panvk_cs_sync32 *debug_syncs =
          panvk_priv_mem_host_addr(queue->debug_syncobjs);
 
       assert(debug_syncs);
       memset(debug_syncs, 0, sizeof(*debug_syncs) * PANVK_SUBQUEUE_COUNT);
    }
+}
+
+static VkResult
+panvk_queue_submit_ioctl(struct panvk_queue_submit *submit)
+{
+   const struct panvk_device *dev = submit->dev;
+   struct panvk_queue *queue = submit->queue;
+   int ret;
 
    struct drm_panthor_group_submit gsubmit = {
       .group_handle = queue->group_handle,
-      .queue_submits = DRM_PANTHOR_OBJ_ARRAY(qsubmit_count, qsubmits),
+      .queue_submits =
+         DRM_PANTHOR_OBJ_ARRAY(submit->qsubmit_count, submit->qsubmits),
    };
 
    ret = drmIoctl(dev->vk.drm_fd, DRM_IOCTL_PANTHOR_GROUP_SUBMIT, &gsubmit);
-   if (ret) {
-      result = vk_queue_set_lost(&queue->vk, "GROUP_SUBMIT: %m");
-      goto out;
+   if (ret)
+      return vk_queue_set_lost(&queue->vk, "GROUP_SUBMIT: %m");
+
+   return VK_SUCCESS;
+}
+
+static void
+panvk_queue_submit_process_signals(struct panvk_queue_submit *submit,
+                                   const struct vk_queue_submit *vk_submit)
+{
+   struct panvk_device *dev = submit->dev;
+   struct panvk_queue *queue = submit->queue;
+   int ret;
+
+   if (!submit->needs_signals)
+      return;
+
+   if (submit->force_sync) {
+      uint64_t point = util_bitcount(submit->used_queue_mask);
+      ret = drmSyncobjTimelineWait(dev->vk.drm_fd, &queue->syncobj_handle,
+                                   &point, 1, INT64_MAX,
+                                   DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL);
+      assert(!ret);
    }
 
-   if (submit->signal_count || force_sync) {
-      if (force_sync) {
-         uint64_t point = util_bitcount(used_queue_mask);
-         ret = drmSyncobjTimelineWait(dev->vk.drm_fd, &queue->syncobj_handle,
-                                      &point, 1, INT64_MAX,
-                                      DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL);
-         assert(!ret);
-      }
+   for (uint32_t i = 0; i < vk_submit->signal_count; i++) {
+      const struct vk_sync_signal *signal = &vk_submit->signals[i];
+      const struct vk_drm_syncobj *syncobj =
+         vk_sync_as_drm_syncobj(signal->sync);
+      assert(syncobj);
 
-      for (uint32_t i = 0; i < submit->signal_count; i++) {
-         assert(vk_sync_type_is_drm_syncobj(submit->signals[i].sync->type));
-         struct vk_drm_syncobj *syncobj =
-            vk_sync_as_drm_syncobj(submit->signals[i].sync);
-
-         drmSyncobjTransfer(dev->vk.drm_fd, syncobj->syncobj,
-                            submit->signals[i].signal_value,
-                            queue->syncobj_handle, 0, 0);
-      }
-
-      drmSyncobjReset(dev->vk.drm_fd, &queue->syncobj_handle, 1);
+      drmSyncobjTransfer(dev->vk.drm_fd, syncobj->syncobj, signal->signal_value,
+                         queue->syncobj_handle, 0, 0);
    }
 
-   if (debug & PANVK_DEBUG_TRACE) {
-      for (uint32_t i = 0; i < qsubmit_count; i++) {
-         if (!qsubmits[i].stream_size)
+   drmSyncobjReset(dev->vk.drm_fd, &queue->syncobj_handle, 1);
+}
+
+static void
+panvk_queue_submit_process_debug(const struct panvk_queue_submit *submit)
+{
+   const struct panvk_instance *instance = submit->instance;
+   struct panvk_queue *queue = submit->queue;
+   struct pandecode_context *decode_ctx = submit->dev->debug.decode_ctx;
+
+   if (instance->debug_flags & PANVK_DEBUG_TRACE) {
+      const struct pan_kmod_dev_props *props = &submit->phys_dev->kmod.props;
+
+      for (uint32_t i = 0; i < submit->qsubmit_count; i++) {
+         const struct drm_panthor_queue_submit *qsubmit = &submit->qsubmits[i];
+         if (!qsubmit->stream_size)
             continue;
 
-         uint32_t subqueue = qsubmits[i].queue_index;
-         uint32_t regs[256] = {0};
-         uint64_t ctx =
-            panvk_priv_mem_dev_addr(queue->subqueues[subqueue].context);
+         uint32_t subqueue = qsubmit->queue_index;
 
-         regs[PANVK_CS_REG_SUBQUEUE_CTX_START] = ctx;
-         regs[PANVK_CS_REG_SUBQUEUE_CTX_START + 1] = ctx >> 32;
+         simple_mtx_lock(&decode_ctx->lock);
+         pandecode_dump_file_open(decode_ctx);
+         pandecode_log(decode_ctx, "CS%d\n", subqueue);
+         simple_mtx_unlock(&decode_ctx->lock);
 
-         simple_mtx_lock(&dev->debug.decode_ctx->lock);
-         pandecode_dump_file_open(dev->debug.decode_ctx);
-         pandecode_log(dev->debug.decode_ctx, "CS%d\n",
-                       qsubmits[i].queue_index);
-         simple_mtx_unlock(&dev->debug.decode_ctx->lock);
-         pandecode_cs(dev->debug.decode_ctx, qsubmits[i].stream_addr,
-                      qsubmits[i].stream_size, phys_dev->kmod.props.gpu_prod_id,
-                      regs);
+         pandecode_cs(decode_ctx, qsubmit->stream_addr, qsubmit->stream_size,
+                      props->gpu_prod_id, queue->subqueues[subqueue].reg_file);
       }
    }
 
-   if (debug & PANVK_DEBUG_DUMP)
-      pandecode_dump_mappings(dev->debug.decode_ctx);
+   if (instance->debug_flags & PANVK_DEBUG_DUMP)
+      pandecode_dump_mappings(decode_ctx);
 
-   if (force_sync) {
+   if (instance->debug_flags & PANVK_DEBUG_TRACE)
+      pandecode_next_frame(decode_ctx);
+
+   /* validate last after the command streams are dumped */
+   if (submit->force_sync) {
       struct panvk_cs_sync32 *debug_syncs =
          panvk_priv_mem_host_addr(queue->debug_syncobjs);
       uint32_t debug_sync_points[PANVK_SUBQUEUE_COUNT] = {0};
 
-      for (uint32_t i = 0; i < qsubmit_count; i++) {
-         if (qsubmits[i].stream_size)
-            debug_sync_points[qsubmits[i].queue_index]++;
+      for (uint32_t i = 0; i < submit->qsubmit_count; i++) {
+         const struct drm_panthor_queue_submit *qsubmit = &submit->qsubmits[i];
+         if (qsubmit->stream_size)
+            debug_sync_points[qsubmit->queue_index]++;
       }
 
       for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
          if (debug_syncs[i].seqno != debug_sync_points[i] ||
              debug_syncs[i].error != 0)
-            assert(!"Incomplete job or timeout\n");
+            vk_queue_set_lost(&queue->vk, "Incomplete job or timeout");
       }
    }
+}
 
-   if (debug & PANVK_DEBUG_TRACE)
-      pandecode_next_frame(dev->debug.decode_ctx);
+static VkResult
+panvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *vk_submit)
+{
+   struct panvk_queue_submit_stack_storage stack_storage;
+   struct panvk_queue_submit submit;
+   VkResult result = VK_SUCCESS;
+
+   if (vk_queue_is_lost(vk_queue))
+      return VK_ERROR_DEVICE_LOST;
+
+   panvk_queue_submit_init(&submit, vk_queue);
+   panvk_queue_submit_init_storage(&submit, vk_submit, &stack_storage);
+   panvk_queue_submit_init_waits(&submit, vk_submit);
+   panvk_queue_submit_init_cmdbufs(&submit, vk_submit);
+   panvk_queue_submit_init_signals(&submit, vk_submit);
+
+   result = panvk_queue_submit_ioctl(&submit);
+   if (result != VK_SUCCESS)
+      goto out;
+
+   panvk_queue_submit_process_signals(&submit, vk_submit);
+   panvk_queue_submit_process_debug(&submit);
 
 out:
-   STACK_ARRAY_FINISH(syncops);
-   STACK_ARRAY_FINISH(qsubmits);
+   panvk_queue_submit_cleanup_storage(&submit, &stack_storage);
    return result;
 }
 
@@ -778,4 +925,24 @@ panvk_per_arch(queue_finish)(struct panvk_queue *queue)
    cleanup_tiler(queue);
    drmSyncobjDestroy(dev->vk.drm_fd, queue->syncobj_handle);
    vk_queue_finish(&queue->vk);
+}
+
+VkResult
+panvk_per_arch(queue_check_status)(struct panvk_queue *queue)
+{
+   struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
+   struct drm_panthor_group_get_state state = {
+      .group_handle = queue->group_handle,
+   };
+
+   int ret =
+      drmIoctl(dev->vk.drm_fd, DRM_IOCTL_PANTHOR_GROUP_GET_STATE, &state);
+   if (!ret && !state.state)
+      return VK_SUCCESS;
+
+   vk_queue_set_lost(&queue->vk,
+                     "group state: err=%d, state=0x%x, fatal_queues=0x%x", ret,
+                     state.state, state.fatal_queues);
+
+   return VK_ERROR_DEVICE_LOST;
 }

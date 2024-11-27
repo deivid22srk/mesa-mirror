@@ -44,7 +44,7 @@
 extern "C" {
 #endif
 
-#define PAN_MODIFIER_COUNT 12
+#define PAN_MODIFIER_COUNT 14
 extern uint64_t pan_best_modifiers[PAN_MODIFIER_COUNT];
 
 struct pan_image_slice_layout {
@@ -112,7 +112,7 @@ struct pan_image_layout {
    struct pan_image_slice_layout slices[MAX_MIP_LEVELS];
 
    uint64_t data_size;
-   unsigned array_stride;
+   uint64_t array_stride;
 };
 
 struct pan_image_mem {
@@ -242,6 +242,9 @@ panfrost_format_supports_afbc(unsigned arch, enum pipe_format format)
 
 bool panfrost_afbc_can_ytr(enum pipe_format format);
 
+bool panfrost_afbc_can_split(unsigned arch, enum pipe_format format,
+                             uint64_t modifier);
+
 bool panfrost_afbc_can_pack(enum pipe_format format);
 
 /*
@@ -271,6 +274,8 @@ unsigned panfrost_afbc_superblock_width(uint64_t modifier);
 
 unsigned panfrost_afbc_superblock_height(uint64_t modifier);
 
+struct pan_block_size panfrost_afbc_renderblock_size(uint64_t modifier);
+
 bool panfrost_afbc_is_wide(uint64_t modifier);
 
 struct pan_block_size panfrost_afbc_subblock_size(uint64_t modifier);
@@ -281,7 +286,7 @@ uint32_t pan_afbc_stride_blocks(uint64_t modifier, uint32_t row_stride_bytes);
 
 uint32_t pan_slice_align(uint64_t modifier);
 
-uint32_t pan_afbc_body_align(uint64_t modifier);
+uint32_t pan_afbc_body_align(unsigned arch, uint64_t modifier);
 
 /* AFRC */
 
@@ -346,6 +351,9 @@ uint32_t panfrost_afrc_get_rate(enum pipe_format format, uint64_t modifier);
 
 struct pan_block_size panfrost_block_size(uint64_t modifier,
                                           enum pipe_format format);
+
+struct pan_block_size panfrost_renderblock_size(uint64_t modifier,
+                                                enum pipe_format format);
 
 #ifdef PAN_ARCH
 unsigned GENX(panfrost_estimate_texture_payload_size)(

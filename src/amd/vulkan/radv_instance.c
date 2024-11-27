@@ -39,7 +39,7 @@ static const struct debug_control radv_debug_options[] = {{"nofastclears", RADV_
                                                           {"spirv", RADV_DEBUG_DUMP_SPIRV},
                                                           {"zerovram", RADV_DEBUG_ZERO_VRAM},
                                                           {"syncshaders", RADV_DEBUG_SYNC_SHADERS},
-                                                          {"preoptir", RADV_DEBUG_PREOPTIR},
+                                                          {"preoptir", RADV_DEBUG_DUMP_PREOPT_IR},
                                                           {"nodynamicbounds", RADV_DEBUG_NO_DYNAMIC_BOUNDS},
                                                           {"info", RADV_DEBUG_INFO},
                                                           {"startup", RADV_DEBUG_STARTUP},
@@ -74,13 +74,28 @@ static const struct debug_control radv_debug_options[] = {{"nofastclears", RADV_
                                                           {"psocachestats", RADV_DEBUG_PSO_CACHE_STATS},
                                                           {"nirdebuginfo", RADV_DEBUG_NIR_DEBUG_INFO},
                                                           {"dump_trap_handler", RADV_DEBUG_DUMP_TRAP_HANDLER},
+                                                          {"vs", RADV_DEBUG_DUMP_VS},
+                                                          {"tcs", RADV_DEBUG_DUMP_TCS},
+                                                          {"tes", RADV_DEBUG_DUMP_TES},
+                                                          {"gs", RADV_DEBUG_DUMP_GS},
+                                                          {"ps", RADV_DEBUG_DUMP_PS},
+                                                          {"task", RADV_DEBUG_DUMP_TASK},
+                                                          {"mesh", RADV_DEBUG_DUMP_MESH},
+                                                          {"cs", RADV_DEBUG_DUMP_CS},
+                                                          {"nir", RADV_DEBUG_DUMP_NIR},
+                                                          {"asm", RADV_DEBUG_DUMP_ASM},
+                                                          {"ir", RADV_DEBUG_DUMP_BACKEND_IR},
                                                           {NULL, 0}};
 
 const char *
 radv_get_debug_option_name(int id)
 {
-   assert(id < ARRAY_SIZE(radv_debug_options) - 1);
-   return radv_debug_options[id].string;
+   assert(id < ARRAY_SIZE(radv_debug_options));
+   for (uint32_t i = 0; i < ARRAY_SIZE(radv_debug_options); i++) {
+      if (radv_debug_options[i].flag == (1ull << id))
+         return radv_debug_options[i].string;
+   }
+   return NULL;
 }
 
 static const struct debug_control radv_perftest_options[] = {{"localbos", RADV_PERFTEST_LOCAL_BOS},
@@ -113,8 +128,12 @@ static const struct debug_control radv_trap_excp_options[] = {
 const char *
 radv_get_perftest_option_name(int id)
 {
-   assert(id < ARRAY_SIZE(radv_perftest_options) - 1);
-   return radv_perftest_options[id].string;
+   assert(id < ARRAY_SIZE(radv_perftest_options));
+   for (uint32_t i = 0; i < ARRAY_SIZE(radv_perftest_options); i++) {
+      if (radv_perftest_options[i].flag == (1ull << id))
+         return radv_perftest_options[i].string;
+   }
+   return NULL;
 }
 
 static const struct debug_control trace_options[] = {
@@ -154,6 +173,7 @@ static const driOptionDescription radv_dri_options[] = {
       DRI_CONF_RADV_SPLIT_FMA(false)
       DRI_CONF_RADV_DISABLE_TC_COMPAT_HTILE_GENERAL(false)
       DRI_CONF_RADV_DISABLE_DCC(false)
+      DRI_CONF_RADV_DISABLE_DCC_MIPS(false)
       DRI_CONF_RADV_DISABLE_ANISO_SINGLE_LEVEL(false)
       DRI_CONF_RADV_DISABLE_TRUNC_COORD(false)
       DRI_CONF_RADV_DISABLE_SINKING_LOAD_INPUT_FS(false)
@@ -264,6 +284,8 @@ radv_init_dri_options(struct radv_instance *instance)
 
    instance->drirc.vk_require_etc2 = driQueryOptionb(&instance->drirc.options, "vk_require_etc2");
    instance->drirc.vk_require_astc = driQueryOptionb(&instance->drirc.options, "vk_require_astc");
+
+   instance->drirc.disable_dcc_mips = driQueryOptionb(&instance->drirc.options, "radv_disable_dcc_mips");
 }
 
 static const struct vk_instance_extension_table radv_instance_extensions_supported = {
@@ -355,6 +377,25 @@ radv_CreateInstance(const VkInstanceCreateInfo *pCreateInfo, const VkAllocationC
    instance->perftest_flags = parse_debug_string(getenv("RADV_PERFTEST"), radv_perftest_options);
    instance->trap_excp_flags = parse_debug_string(getenv("RADV_TRAP_HANDLER_EXCP"), radv_trap_excp_options);
    instance->profile_pstate = radv_parse_pstate(debug_get_option("RADV_PROFILE_PSTATE", "peak"));
+
+   const uint64_t shader_stage_flags = RADV_DEBUG_DUMP_VS | RADV_DEBUG_DUMP_TCS | RADV_DEBUG_DUMP_TES |
+                                       RADV_DEBUG_DUMP_GS | RADV_DEBUG_DUMP_PS | RADV_DEBUG_DUMP_TASK |
+                                       RADV_DEBUG_DUMP_MESH | RADV_DEBUG_DUMP_CS;
+
+   const uint64_t compilation_stage_flags = RADV_DEBUG_DUMP_SPIRV | RADV_DEBUG_DUMP_NIR | RADV_DEBUG_DUMP_PREOPT_IR |
+                                            RADV_DEBUG_DUMP_BACKEND_IR | RADV_DEBUG_DUMP_ASM;
+
+   if ((instance->debug_flags & shader_stage_flags) && !(instance->debug_flags & compilation_stage_flags)) {
+      /* When shader stages are specified but compilation stages aren't:
+       * use a default set of compilation stages.
+       */
+      instance->debug_flags |= RADV_DEBUG_DUMP_NIR | RADV_DEBUG_DUMP_BACKEND_IR | RADV_DEBUG_DUMP_ASM;
+   } else if (!(instance->debug_flags & shader_stage_flags) && (instance->debug_flags & compilation_stage_flags)) {
+      /* When compilation stages are specified but shader stages aren't:
+       * dump all shader stages.
+       */
+      instance->debug_flags |= shader_stage_flags;
+   }
 
    /* When RADV_FORCE_FAMILY is set, the driver creates a null
     * device that allows to test the compiler without having an

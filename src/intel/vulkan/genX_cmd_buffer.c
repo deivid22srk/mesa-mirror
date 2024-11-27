@@ -2584,12 +2584,12 @@ genX(batch_emit_pipe_control_write)(struct anv_batch *batch,
 /* Set preemption on/off. */
 void
 genX(batch_set_preemption)(struct anv_batch *batch,
-                           const struct intel_device_info *devinfo,
+                           struct anv_device *device,
                            uint32_t current_pipeline,
                            bool value)
 {
 #if INTEL_WA_16013994831_GFX_VER
-   if (!intel_needs_workaround(devinfo, 16013994831))
+   if (!intel_needs_workaround(device->info, 16013994831))
       return;
 
    anv_batch_write_reg(batch, GENX(CS_CHICKEN1), cc1) {
@@ -2598,7 +2598,7 @@ genX(batch_set_preemption)(struct anv_batch *batch,
    }
 
    /* Wa_16013994831 - we need to insert CS_STALL and 250 noops. */
-   genx_batch_emit_pipe_control(batch, devinfo, current_pipeline,
+   genx_batch_emit_pipe_control(batch, device->info, current_pipeline,
                                 ANV_PIPE_CS_STALL_BIT);
 
    for (unsigned i = 0; i < 250; i++)
@@ -2613,7 +2613,7 @@ genX(cmd_buffer_set_preemption)(struct anv_cmd_buffer *cmd_buffer, bool value)
    if (cmd_buffer->state.gfx.object_preemption == value)
       return;
 
-   genX(batch_set_preemption)(&cmd_buffer->batch, cmd_buffer->device->info,
+   genX(batch_set_preemption)(&cmd_buffer->batch, cmd_buffer->device,
                               cmd_buffer->state.current_pipeline,
                               value);
    cmd_buffer->state.gfx.object_preemption = value;
@@ -3623,8 +3623,8 @@ genX(CmdExecuteCommands)(
          container->perf_query_pool = secondary->perf_query_pool;
 
 #if INTEL_NEEDS_WA_1808121037
-      if (secondary->state.depth_reg_mode != ANV_DEPTH_REG_MODE_UNKNOWN)
-         container->state.depth_reg_mode = secondary->state.depth_reg_mode;
+      if (secondary->state.gfx.depth_reg_mode != ANV_DEPTH_REG_MODE_UNKNOWN)
+         container->state.gfx.depth_reg_mode = secondary->state.gfx.depth_reg_mode;
 #endif
 
       container->state.gfx.viewport_set |= secondary->state.gfx.viewport_set;
@@ -4842,7 +4842,7 @@ genX(cmd_buffer_emit_gfx12_depth_wa)(struct anv_cmd_buffer *cmd_buffer,
    const bool is_d16_1x_msaa = surf->format == ISL_FORMAT_R16_UNORM &&
                                surf->samples == 1;
 
-   switch (cmd_buffer->state.depth_reg_mode) {
+   switch (cmd_buffer->state.gfx.depth_reg_mode) {
    case ANV_DEPTH_REG_MODE_HW_DEFAULT:
       if (!is_d16_1x_msaa)
          return;
@@ -4876,7 +4876,7 @@ genX(cmd_buffer_emit_gfx12_depth_wa)(struct anv_cmd_buffer *cmd_buffer,
       reg.HIZPlaneOptimizationdisablebitMask = true;
    }
 
-   cmd_buffer->state.depth_reg_mode =
+   cmd_buffer->state.gfx.depth_reg_mode =
       is_d16_1x_msaa ? ANV_DEPTH_REG_MODE_D16_1X_MSAA :
                        ANV_DEPTH_REG_MODE_HW_DEFAULT;
 #endif
@@ -5175,7 +5175,7 @@ cmd_buffer_emit_depth_stencil(struct anv_cmd_buffer *cmd_buffer)
    if (info.depth_surf)
       genX(cmd_buffer_emit_gfx12_depth_wa)(cmd_buffer, info.depth_surf);
 
-   cmd_buffer->state.hiz_enabled = isl_aux_usage_has_hiz(info.hiz_usage);
+   cmd_buffer->state.gfx.hiz_enabled = isl_aux_usage_has_hiz(info.hiz_usage);
 }
 
 static void

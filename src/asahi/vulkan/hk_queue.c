@@ -121,7 +121,8 @@ asahi_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
    static_assert(sizeof(c->zls_ctrl) == sizeof(cs->cr.zls_control));
    memcpy(&c->zls_ctrl, &cs->cr.zls_control, sizeof(cs->cr.zls_control));
 
-   c->depth_dimensions = (cs->cr.width - 1) | ((cs->cr.height - 1) << 15);
+   c->depth_dimensions =
+      (cs->cr.zls_width - 1) | ((cs->cr.zls_height - 1) << 15);
 
    c->depth_buffer_load = cs->cr.depth.buffer;
    c->depth_buffer_store = cs->cr.depth.buffer;
@@ -156,6 +157,10 @@ asahi_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
    c->stencil_meta_buffer_partial_stride = cs->cr.stencil.meta_stride;
 
    c->iogpu_unk_214 = cs->cr.iogpu_unk_214;
+
+   if (cs->cr.dbias_is_int == U_TRISTATE_YES) {
+      c->iogpu_unk_214 |= 0x40000;
+   }
 
    if (dev->dev.debug & AGX_DBG_NOCLUSTER) {
       c->flags |= ASAHI_RENDER_NO_VERTEX_CLUSTERING;

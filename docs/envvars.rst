@@ -1395,7 +1395,7 @@ RADV driver environment variables
    ``novrsflatshading``
       disable VRS for flat shading (only on GFX10.3+)
    ``preoptir``
-      dump LLVM IR before any optimizations
+      Dump backend IR (ACO or LLVM) before any optimizations.
    ``prologs``
       dump vertex shader prologs
    ``psocachestats``
@@ -1416,6 +1416,28 @@ RADV driver environment variables
       synchronize shaders after all draws/dispatches
    ``zerovram``
       initialize all memory allocated in VRAM as zero
+   ``vs``
+      Dump vertex shaders.
+   ``tcs``
+      Dump tessellation control shaders.
+   ``tes``
+      Dump tessellation evaluation shaders.
+   ``gs``
+      Dump geometry shaders.
+   ``ps``
+      Dump fragment shaders.
+   ``task``
+      Dump task shaders.
+   ``mesh``
+      Dump mesh shaders.
+   ``cs``
+      Dump compute (and ray tracing) shaders.
+   ``nir``
+      Dump NIR for selected shader stages.
+   ``ir``
+      Dump backend IR (ACO or LLVM) for selected shader stages.
+   ``asm``
+      Dump shader disassembly for selected shader stages.
 
 .. envvar:: RADV_FORCE_FAMILY
 

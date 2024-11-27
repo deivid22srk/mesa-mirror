@@ -265,6 +265,9 @@ tu_physical_device_get_format_properties(
    if (vk_format == VK_FORMAT_D32_SFLOAT_S8_UINT)
       linear = 0;
 
+   if (vk_format == VK_FORMAT_R8_UINT)
+      optimal |= VK_FORMAT_FEATURE_2_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
+
 end:
    out_properties->linearTilingFeatures = linear;
    out_properties->optimalTilingFeatures = optimal;
@@ -317,7 +320,7 @@ tu_GetPhysicalDeviceFormatProperties2(
       if (pFormatProperties->formatProperties.optimalTilingFeatures &&
           tiling_possible(format) &&
           ubwc_possible(NULL, format, VK_IMAGE_TYPE_2D, 0, 0,
-                        physical_device->info, VK_SAMPLE_COUNT_1_BIT,
+                        physical_device->info, VK_SAMPLE_COUNT_1_BIT, 1,
                         false)) {
          vk_outarray_append_typed(VkDrmFormatModifierPropertiesEXT, &out, mod_props) {
             mod_props->drmFormatModifier = DRM_FORMAT_MOD_QCOM_COMPRESSED;
@@ -395,7 +398,7 @@ tu_get_image_format_properties(
 
          if (!ubwc_possible(NULL, info->format, info->type, info->usage,
                             info->usage, physical_device->info, sampleCounts,
-                            false)) {
+                            1, false)) {
             return VK_ERROR_FORMAT_NOT_SUPPORTED;
          }
 
@@ -509,6 +512,14 @@ tu_get_image_format_properties(
       if (!(format_feature_flags &
             (VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT |
              VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT))) {
+         return tu_image_unsupported_format(pImageFormatProperties);
+      }
+   }
+
+   if (image_usage &
+       VK_IMAGE_USAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR) {
+      if (!(format_feature_flags &
+            VK_FORMAT_FEATURE_2_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR)) {
          return tu_image_unsupported_format(pImageFormatProperties);
       }
    }
@@ -757,7 +768,7 @@ tu_GetPhysicalDeviceImageFormatProperties2(
          !ubwc_possible(NULL, base_info->format, base_info->type,
                         (base_info->usage & ~VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT),
                         (base_info->usage & ~VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT),
-                        physical_device->info, VK_SAMPLE_COUNT_1_BIT,
+                        physical_device->info, VK_SAMPLE_COUNT_1_BIT, 1,
                         physical_device->info->a6xx.has_z24uint_s8uint));
    }
 

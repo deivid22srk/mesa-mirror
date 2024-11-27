@@ -1148,10 +1148,24 @@ nir_instr_move(nir_cursor cursor, nir_instr *instr)
    /* If the cursor happens to refer to this instruction (either before or
     * after), don't do anything.
     */
-   if ((cursor.option == nir_cursor_before_instr ||
-        cursor.option == nir_cursor_after_instr) &&
-       cursor.instr == instr)
-      return false;
+   switch (cursor.option) {
+   case nir_cursor_before_instr:
+      if (cursor.instr == instr || nir_instr_prev(cursor.instr) == instr)
+         return false;
+      break;
+   case nir_cursor_after_instr:
+      if (cursor.instr == instr || nir_instr_next(cursor.instr) == instr)
+         return false;
+      break;
+   case nir_cursor_before_block:
+      if (cursor.block == instr->block && nir_instr_is_first(instr))
+         return false;
+      break;
+   case nir_cursor_after_block:
+      if (cursor.block == instr->block && nir_instr_is_last(instr))
+         return false;
+      break;
+   }
 
    nir_instr_remove(instr);
    nir_instr_insert(cursor, instr);
@@ -1351,9 +1365,11 @@ nir_instr_def(nir_instr *instr)
    case nir_instr_type_undef:
       return &nir_instr_as_undef(instr)->def;
 
+   case nir_instr_type_debug_info:
+      return &nir_instr_as_debug_info(instr)->def;
+
    case nir_instr_type_call:
    case nir_instr_type_jump:
-   case nir_instr_type_debug_info:
       return NULL;
    }
 
@@ -2240,6 +2256,8 @@ nir_intrinsic_from_system_value(gl_system_value val)
       return nir_intrinsic_load_vertex_id;
    case SYSTEM_VALUE_INSTANCE_ID:
       return nir_intrinsic_load_instance_id;
+   case SYSTEM_VALUE_INSTANCE_INDEX:
+      return nir_intrinsic_load_instance_index;
    case SYSTEM_VALUE_DRAW_ID:
       return nir_intrinsic_load_draw_id;
    case SYSTEM_VALUE_BASE_INSTANCE:
@@ -2407,6 +2425,8 @@ nir_system_value_from_intrinsic(nir_intrinsic_op intrin)
       return SYSTEM_VALUE_VERTEX_ID;
    case nir_intrinsic_load_instance_id:
       return SYSTEM_VALUE_INSTANCE_ID;
+   case nir_intrinsic_load_instance_index:
+      return SYSTEM_VALUE_INSTANCE_INDEX;
    case nir_intrinsic_load_draw_id:
       return SYSTEM_VALUE_DRAW_ID;
    case nir_intrinsic_load_base_instance:

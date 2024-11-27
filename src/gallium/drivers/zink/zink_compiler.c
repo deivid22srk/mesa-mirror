@@ -1338,7 +1338,7 @@ zink_screen_init_compiler(struct zink_screen *screen)
 {
    static const struct nir_shader_compiler_options
    default_options = {
-      .io_options = nir_io_has_intrinsics,
+      .io_options = nir_io_has_intrinsics | nir_io_separate_clip_cull_distance_arrays,
       .lower_ffma16 = true,
       .lower_ffma32 = true,
       .lower_ffma64 = true,
@@ -1383,7 +1383,6 @@ zink_screen_init_compiler(struct zink_screen *screen)
       .support_indirect_inputs = BITFIELD_MASK(MESA_SHADER_COMPUTE),
       .support_indirect_outputs = BITFIELD_MASK(MESA_SHADER_COMPUTE),
       .max_unroll_iterations = 0,
-      .use_interpolated_input_intrinsics = true,
    };
 
    screen->nir_options = default_options;
@@ -1402,8 +1401,6 @@ zink_screen_init_compiler(struct zink_screen *screen)
    }
 
    if (screen->driver_compiler_workarounds.io_opt) {
-      screen->nir_options.io_options |= nir_io_glsl_opt_varyings;
-
       switch (zink_driverid(screen)) {
       case VK_DRIVER_ID_MESA_RADV:
       case VK_DRIVER_ID_AMD_OPEN_SOURCE:
@@ -1416,6 +1413,8 @@ zink_screen_init_compiler(struct zink_screen *screen)
          screen->nir_options.varying_expression_max_cost = amd_varying_expression_max_cost;
          screen->nir_options.varying_estimate_instr_cost = amd_varying_estimate_instr_cost;
       }
+   } else {
+      screen->nir_options.io_options |= nir_io_dont_optimize;
    }
 
    /*

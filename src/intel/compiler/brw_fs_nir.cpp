@@ -3580,8 +3580,8 @@ emit_non_coherent_fb_read(nir_to_brw_state &ntb, const fs_builder &bld, const br
     * shouldn't be necessary to recompile based on whether the framebuffer is
     * CMS or UMS.
     */
-   assert(wm_key->multisample_fbo == BRW_ALWAYS ||
-          wm_key->multisample_fbo == BRW_NEVER);
+   assert(wm_key->multisample_fbo == INTEL_ALWAYS ||
+          wm_key->multisample_fbo == INTEL_NEVER);
    if (wm_key->multisample_fbo &&
        ntb.system_values[SYSTEM_VALUE_SAMPLE_ID].file == BAD_FILE)
       ntb.system_values[SYSTEM_VALUE_SAMPLE_ID] = emit_sampleid_setup(ntb);
@@ -3807,7 +3807,7 @@ emit_samplepos_setup(nir_to_brw_state &ntb)
    const fs_builder abld = bld.annotate("compute sample position");
    brw_reg pos = abld.vgrf(BRW_TYPE_F, 2);
 
-   if (wm_prog_data->persample_dispatch == BRW_NEVER) {
+   if (wm_prog_data->persample_dispatch == INTEL_NEVER) {
       /* From ARB_sample_shading specification:
        * "When rendering to a non-multisample buffer, or if multisample
        *  rasterization is disabled, gl_SamplePosition will always be
@@ -3842,7 +3842,7 @@ emit_samplepos_setup(nir_to_brw_state &ntb)
       abld.MUL(offset(pos, abld, i), tmp_f, brw_imm_f(1 / 16.0f));
    }
 
-   if (wm_prog_data->persample_dispatch == BRW_SOMETIMES) {
+   if (wm_prog_data->persample_dispatch == INTEL_SOMETIMES) {
       check_dynamic_msaa_flag(abld, wm_prog_data,
                               INTEL_MSAA_FLAG_PERSAMPLE_DISPATCH);
       for (unsigned i = 0; i < 2; i++) {
@@ -3869,7 +3869,7 @@ emit_sampleid_setup(nir_to_brw_state &ntb)
    const fs_builder abld = bld.annotate("compute sample id");
    brw_reg sample_id = abld.vgrf(BRW_TYPE_UD);
 
-   assert(key->multisample_fbo != BRW_NEVER);
+   assert(key->multisample_fbo != INTEL_NEVER);
 
    /* Sample ID comes in as 4-bit numbers in g1.0:
     *
@@ -3916,7 +3916,7 @@ emit_sampleid_setup(nir_to_brw_state &ntb)
 
    abld.AND(sample_id, tmp, brw_imm_w(0xf));
 
-   if (key->multisample_fbo == BRW_SOMETIMES) {
+   if (key->multisample_fbo == INTEL_SOMETIMES) {
       check_dynamic_msaa_flag(abld, wm_prog_data,
                               INTEL_MSAA_FLAG_MULTISAMPLE_FBO);
       set_predicate(BRW_PREDICATE_NORMAL,
@@ -3936,12 +3936,12 @@ emit_samplemaskin_setup(nir_to_brw_state &ntb)
    struct brw_wm_prog_data *wm_prog_data = brw_wm_prog_data(s.prog_data);
 
    /* The HW doesn't provide us with expected values. */
-   assert(wm_prog_data->coarse_pixel_dispatch != BRW_ALWAYS);
+   assert(wm_prog_data->coarse_pixel_dispatch != INTEL_ALWAYS);
 
    brw_reg coverage_mask =
       fetch_payload_reg(bld, s.fs_payload().sample_mask_in_reg, BRW_TYPE_UD);
 
-   if (wm_prog_data->persample_dispatch == BRW_NEVER)
+   if (wm_prog_data->persample_dispatch == INTEL_NEVER)
       return coverage_mask;
 
    /* gl_SampleMaskIn[] comes from two sources: the input coverage mask,
@@ -3963,7 +3963,7 @@ emit_samplemaskin_setup(nir_to_brw_state &ntb)
    brw_reg enabled_mask = abld.SHL(one, ntb.system_values[SYSTEM_VALUE_SAMPLE_ID]);
    brw_reg mask = abld.AND(enabled_mask, coverage_mask);
 
-   if (wm_prog_data->persample_dispatch == BRW_ALWAYS)
+   if (wm_prog_data->persample_dispatch == INTEL_ALWAYS)
       return mask;
 
    check_dynamic_msaa_flag(abld, wm_prog_data,
@@ -3987,7 +3987,7 @@ emit_shading_rate_setup(nir_to_brw_state &ntb)
    /* Coarse pixel shading size fields overlap with other fields of not in
     * coarse pixel dispatch mode, so report 0 when that's not the case.
     */
-   if (wm_prog_data->coarse_pixel_dispatch == BRW_NEVER)
+   if (wm_prog_data->coarse_pixel_dispatch == INTEL_NEVER)
       return brw_imm_ud(0);
 
    const fs_builder abld = bld.annotate("compute fragment shading rate");
@@ -4008,7 +4008,7 @@ emit_shading_rate_setup(nir_to_brw_state &ntb)
 
    brw_reg rate = abld.OR(abld.SHL(int_rate_x, brw_imm_ud(2)), int_rate_y);
 
-   if (wm_prog_data->coarse_pixel_dispatch == BRW_ALWAYS)
+   if (wm_prog_data->coarse_pixel_dispatch == INTEL_ALWAYS)
       return rate;
 
    check_dynamic_msaa_flag(abld, wm_prog_data,
@@ -4347,7 +4347,7 @@ fs_nir_emit_fs_intrinsic(nir_to_brw_state &ntb,
    case nir_intrinsic_load_barycentric_centroid:
    case nir_intrinsic_load_barycentric_sample: {
       /* Use the delta_xy values computed from the payload */
-      enum brw_barycentric_mode bary = brw_barycentric_mode(
+      enum intel_barycentric_mode bary = brw_barycentric_mode(
          reinterpret_cast<const brw_wm_prog_key *>(s.key), instr);
       const brw_reg srcs[] = { offset(s.delta_xy[bary], bld, 0),
                               offset(s.delta_xy[bary], bld, 1) };
@@ -4379,7 +4379,7 @@ fs_nir_emit_fs_intrinsic(nir_to_brw_state &ntb,
 
          brw_reg flag_reg;
          struct brw_wm_prog_key *wm_prog_key = (struct brw_wm_prog_key *) s.key;
-         if (wm_prog_key->multisample_fbo == BRW_SOMETIMES) {
+         if (wm_prog_key->multisample_fbo == INTEL_SOMETIMES) {
             struct brw_wm_prog_data *wm_prog_data = brw_wm_prog_data(s.prog_data);
 
             check_dynamic_msaa_flag(bld.exec_all().group(8, 0),
@@ -4455,7 +4455,7 @@ fs_nir_emit_fs_intrinsic(nir_to_brw_state &ntb,
          dst_xy = retype(get_nir_src(ntb, instr->src[0]), BRW_TYPE_F);
       } else {
          /* Use the delta_xy values computed from the payload */
-         enum brw_barycentric_mode bary = brw_barycentric_mode(
+         enum intel_barycentric_mode bary = brw_barycentric_mode(
             reinterpret_cast<const brw_wm_prog_key *>(s.key), bary_intrinsic);
          dst_xy = s.delta_xy[bary];
       }
@@ -6627,25 +6627,8 @@ fs_nir_emit_intrinsic(nir_to_brw_state &ntb,
          dest.type = BRW_TYPE_UD;
       }
 
-      /* Implement a fast-path for ballot(true). */
-      if (nir_src_is_const(instr->src[0]) &&
-          nir_src_as_bool(instr->src[0])) {
-         brw_reg tmp = bld.vgrf(BRW_TYPE_UD);
-         bld.exec_all().emit(SHADER_OPCODE_LOAD_LIVE_CHANNELS, tmp);
-         bld.MOV(dest, brw_reg(component(tmp, 0)));
-         break;
-      }
-
-      const brw_reg value = retype(get_nir_src(ntb, instr->src[0]),
-                                  BRW_TYPE_UD);
-      struct brw_reg flag = brw_flag_reg(0, 0);
-
-      if (s.dispatch_width == 32)
-         flag.type = BRW_TYPE_UD;
-
-      bld.exec_all().group(1, 0).MOV(flag, retype(brw_imm_ud(0u), flag.type));
-      bld.CMP(bld.null_reg_ud(), value, brw_imm_ud(0u), BRW_CONDITIONAL_NZ);
-      bld.MOV(dest, flag);
+      const brw_reg value = get_nir_src(ntb, instr->src[0]);
+      bld.emit(SHADER_OPCODE_BALLOT, dest, value);
       break;
    }
 
@@ -6716,61 +6699,21 @@ fs_nir_emit_intrinsic(nir_to_brw_state &ntb,
       break;
    }
 
-   case nir_intrinsic_quad_swap_horizontal: {
-      const brw_reg value = get_nir_src(ntb, instr->src[0]);
-      const brw_reg tmp = bld.vgrf(value.type);
-
-      const fs_builder ubld = bld.exec_all().group(s.dispatch_width / 2, 0);
-
-      const brw_reg src_left = horiz_stride(value, 2);
-      const brw_reg src_right = horiz_stride(horiz_offset(value, 1), 2);
-      const brw_reg tmp_left = horiz_stride(tmp, 2);
-      const brw_reg tmp_right = horiz_stride(horiz_offset(tmp, 1), 2);
-
-      ubld.MOV(tmp_left, src_right);
-      ubld.MOV(tmp_right, src_left);
-
-      bld.MOV(retype(dest, value.type), tmp);
-      break;
-   }
-
-   case nir_intrinsic_quad_swap_vertical: {
-      const brw_reg value = get_nir_src(ntb, instr->src[0]);
-      if (nir_src_bit_size(instr->src[0]) == 32) {
-         /* For 32-bit, we can use a SIMD4x2 instruction to do this easily */
-         const brw_reg tmp = bld.vgrf(value.type);
-         const fs_builder ubld = bld.exec_all();
-         ubld.emit(SHADER_OPCODE_QUAD_SWIZZLE, tmp, value,
-                   brw_imm_ud(BRW_SWIZZLE4(2,3,0,1)));
-         bld.MOV(retype(dest, value.type), tmp);
-      } else {
-         /* For larger data types, we have to either emit dispatch_width many
-          * MOVs or else fall back to doing indirects.
-          */
-         brw_reg idx = bld.vgrf(BRW_TYPE_W);
-         bld.XOR(idx, bld.LOAD_SUBGROUP_INVOCATION(), brw_imm_w(0x2));
-         bld.emit(SHADER_OPCODE_SHUFFLE, retype(dest, value.type), value, idx);
-      }
-      break;
-   }
-
+   case nir_intrinsic_quad_swap_horizontal:
+   case nir_intrinsic_quad_swap_vertical:
    case nir_intrinsic_quad_swap_diagonal: {
       const brw_reg value = get_nir_src(ntb, instr->src[0]);
-      if (nir_src_bit_size(instr->src[0]) == 32) {
-         /* For 32-bit, we can use a SIMD4x2 instruction to do this easily */
-         const brw_reg tmp = bld.vgrf(value.type);
-         const fs_builder ubld = bld.exec_all();
-         ubld.emit(SHADER_OPCODE_QUAD_SWIZZLE, tmp, value,
-                   brw_imm_ud(BRW_SWIZZLE4(3,2,1,0)));
-         bld.MOV(retype(dest, value.type), tmp);
-      } else {
-         /* For larger data types, we have to either emit dispatch_width many
-          * MOVs or else fall back to doing indirects.
-          */
-         brw_reg idx = bld.vgrf(BRW_TYPE_W);
-         bld.XOR(idx, bld.LOAD_SUBGROUP_INVOCATION(), brw_imm_w(0x3));
-         bld.emit(SHADER_OPCODE_SHUFFLE, retype(dest, value.type), value, idx);
+
+      enum brw_swap_direction dir;
+      switch (instr->intrinsic) {
+      case nir_intrinsic_quad_swap_horizontal: dir = BRW_SWAP_HORIZONTAL; break;
+      case nir_intrinsic_quad_swap_vertical:   dir = BRW_SWAP_VERTICAL;   break;
+      case nir_intrinsic_quad_swap_diagonal:   dir = BRW_SWAP_DIAGONAL;   break;
+      default: unreachable("invalid quad swap");
       }
+
+      bld.emit(SHADER_OPCODE_QUAD_SWAP, retype(dest, value.type),
+               value, brw_imm_ud(dir));
       break;
    }
 

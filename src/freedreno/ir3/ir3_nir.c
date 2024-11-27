@@ -752,7 +752,8 @@ ir3_nir_post_finalize(struct ir3_shader *shader)
    MESA_TRACE_FUNC();
 
    NIR_PASS_V(s, nir_lower_io, nir_var_shader_in | nir_var_shader_out,
-              ir3_glsl_type_size, nir_lower_io_lower_64bit_to_32);
+              ir3_glsl_type_size, nir_lower_io_lower_64bit_to_32 |
+              nir_lower_io_use_interpolated_input_intrinsics);
 
    if (s->info.stage == MESA_SHADER_FRAGMENT) {
       /* NOTE: lower load_barycentric_at_sample first, since it
@@ -763,6 +764,11 @@ ir3_nir_post_finalize(struct ir3_shader *shader)
       NIR_PASS_V(s, ir3_nir_move_varying_inputs);
       NIR_PASS_V(s, nir_lower_fb_read);
       NIR_PASS_V(s, ir3_nir_lower_layer_id);
+      NIR_PASS_V(s, ir3_nir_lower_frag_shading_rate);
+   }
+
+   if (s->info.stage == MESA_SHADER_VERTEX || s->info.stage == MESA_SHADER_GEOMETRY) {
+      NIR_PASS_V(s, ir3_nir_lower_primitive_shading_rate);
    }
 
    if (compiler->gen >= 6 && s->info.stage == MESA_SHADER_FRAGMENT &&
@@ -1066,7 +1072,7 @@ ir3_nir_lower_variant(struct ir3_shader_variant *so,
       progress |= OPT(s, nir_lower_clip_vs, so->key.ucp_enables, false, true, NULL);
    } else if (s->info.stage == MESA_SHADER_FRAGMENT) {
       if (so->key.ucp_enables && !so->compiler->has_clip_cull)
-         progress |= OPT(s, nir_lower_clip_fs, so->key.ucp_enables, true);
+         progress |= OPT(s, nir_lower_clip_fs, so->key.ucp_enables, true, true);
    }
 
    /* Move large constant variables to the constants attached to the NIR

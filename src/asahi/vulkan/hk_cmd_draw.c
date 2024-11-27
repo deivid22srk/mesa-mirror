@@ -29,12 +29,11 @@
 #include "hk_shader.h"
 
 #include "asahi/genxml/agx_pack.h"
-#include "asahi/lib/libagx_shaders.h"
-#include "asahi/lib/shaders/draws.h"
-#include "asahi/lib/shaders/geometry.h"
-#include "shaders/query.h"
-#include "shaders/tessellator.h"
-#include "util/bitpack_helpers.h"
+#include "asahi/libagx/draws.h"
+#include "asahi/libagx/geometry.h"
+#include "asahi/libagx/libagx.h"
+#include "asahi/libagx/query.h"
+#include "asahi/libagx/tessellator.h"
 #include "util/blend.h"
 #include "util/format/format_utils.h"
 #include "util/format/u_formats.h"
@@ -521,7 +520,7 @@ is_aligned(unsigned x, unsigned pot_alignment)
 
 static void
 hk_merge_render_iview(struct hk_rendering_state *render,
-                      struct hk_image_view *iview)
+                      struct hk_image_view *iview, bool zls)
 {
    if (iview) {
       unsigned samples = iview->vk.image->samples;
@@ -539,6 +538,11 @@ hk_merge_render_iview(struct hk_rendering_state *render,
        */
       render->cr.width = MAX2(render->cr.width, width);
       render->cr.height = MAX2(render->cr.height, height);
+
+      if (zls) {
+         render->cr.zls_width = width;
+         render->cr.zls_height = height;
+      }
    }
 }
 
@@ -630,11 +634,11 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
    hk_attachment_init(&render->stencil_att, pRenderingInfo->pStencilAttachment);
 
    for (uint32_t i = 0; i < render->color_att_count; i++) {
-      hk_merge_render_iview(render, render->color_att[i].iview);
+      hk_merge_render_iview(render, render->color_att[i].iview, false);
    }
 
-   hk_merge_render_iview(render,
-                         render->depth_att.iview ?: render->stencil_att.iview);
+   hk_merge_render_iview(
+      render, render->depth_att.iview ?: render->stencil_att.iview, true);
 
    /* Infer for attachmentless. samples is inferred at draw-time. */
    render->cr.width =
@@ -642,6 +646,11 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
 
    render->cr.height = MAX2(render->cr.height,
                             render->area.offset.y + render->area.extent.height);
+
+   if (!render->cr.zls_width) {
+      render->cr.zls_width = render->cr.width;
+      render->cr.zls_height = render->cr.height;
+   }
 
    render->cr.layers = layer_count;
 
@@ -755,7 +764,6 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
 
       if (z_layout->format == PIPE_FORMAT_Z16_UNORM) {
          render->cr.isp_bgobjdepth = _mesa_float_to_unorm(clear_depth, 16);
-         render->cr.iogpu_unk_214 |= 0x40000;
       } else {
          render->cr.isp_bgobjdepth = fui(clear_depth);
       }
@@ -893,7 +901,8 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
                   hk_meta_kernel(dev, agx_nir_decompress, &key, sizeof(key));
 
                uint32_t usc = hk_upload_usc_words_kernel(cmd, s, &data.gpu, 8);
-               hk_dispatch_with_usc(dev, cs, s, usc, grid, hk_grid(32, 1, 1));
+               hk_dispatch_with_usc(dev, cs, &s->b.info, usc, grid,
+                                    hk_grid(32, 1, 1));
             }
          }
       }
@@ -1480,8 +1489,8 @@ hk_draw_without_restart(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
    uint64_t params = hk_pool_upload(cmd, &ia, sizeof(ia), 8);
    uint32_t usc = hk_upload_usc_words_kernel(cmd, s, &params, sizeof(params));
-   hk_dispatch_with_usc(dev, cs, s, usc, hk_grid(1024 * draw_count, 1, 1),
-                        hk_grid(1024, 1, 1));
+   hk_dispatch_with_usc(dev, cs, &s->b.info, usc,
+                        hk_grid(1024 * draw_count, 1, 1), hk_grid(1024, 1, 1));
 
    struct hk_addr_range out_index = {
       .addr = dev->heap->va->addr,
@@ -1538,7 +1547,7 @@ hk_launch_gs_prerast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       uint64_t push = hk_upload_gsi_params(cmd, draw);
       uint32_t usc = hk_upload_usc_words_kernel(cmd, gsi, &push, sizeof(push));
 
-      hk_dispatch_with_usc(dev, cs, gsi, usc, hk_grid(1, 1, 1),
+      hk_dispatch_with_usc(dev, cs, &gsi->b.info, usc, hk_grid(1, 1, 1),
                            hk_grid(1, 1, 1));
 
       uint64_t geometry_params = desc->root.draw.geometry_params;
@@ -1554,7 +1563,7 @@ hk_launch_gs_prerast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
    /* Launch the vertex shader first */
    hk_reserve_scratch(cmd, cs, vs);
-   hk_dispatch_with_usc(dev, cs, vs,
+   hk_dispatch_with_usc(dev, cs, &vs->b.info,
                         hk_upload_usc_words(cmd, vs,
                                             vs->info.stage == MESA_SHADER_VERTEX
                                                ? gfx->linked[MESA_SHADER_VERTEX]
@@ -1630,7 +1639,7 @@ hk_launch_tess(struct hk_cmd_buffer *cmd, struct hk_cs *cs, struct hk_draw draw)
       uint32_t usc =
          hk_upload_usc_words_kernel(cmd, tsi, &state, sizeof(state));
 
-      hk_dispatch_with_usc(dev, cs, tsi, usc, hk_grid(1, 1, 1),
+      hk_dispatch_with_usc(dev, cs, &tsi->b.info, usc, hk_grid(1, 1, 1),
                            hk_grid(1, 1, 1));
 
       uint32_t grid_stride = sizeof(uint32_t) * 6;
@@ -1659,7 +1668,7 @@ hk_launch_tess(struct hk_cmd_buffer *cmd, struct hk_cs *cs, struct hk_draw draw)
          uint64_t push = hk_pool_upload(cmd, &args, sizeof(args), 8);
          uint32_t usc = hk_upload_usc_words_kernel(cmd, s, &push, sizeof(push));
 
-         hk_dispatch_with_usc(dev, cs, s, usc, hk_grid(1, 1, 1),
+         hk_dispatch_with_usc(dev, cs, &s->b.info, usc, hk_grid(1, 1, 1),
                               hk_grid(1, 1, 1));
       }
    }
@@ -1669,13 +1678,13 @@ hk_launch_tess(struct hk_cmd_buffer *cmd, struct hk_cs *cs, struct hk_draw draw)
    hk_reserve_scratch(cmd, cs, tcs);
 
    hk_dispatch_with_usc(
-      dev, cs, vs,
+      dev, cs, &vs->b.info,
       hk_upload_usc_words(cmd, vs, gfx->linked[MESA_SHADER_VERTEX]), grid_vs,
       hk_grid(64, 1, 1));
 
    hk_dispatch_with_usc(
-      dev, cs, tcs, hk_upload_usc_words(cmd, tcs, tcs->only_linked), grid_tcs,
-      hk_grid(tcs->info.tess.tcs_output_patch_size, 1, 1));
+      dev, cs, &tcs->b.info, hk_upload_usc_words(cmd, tcs, tcs->only_linked),
+      grid_tcs, hk_grid(tcs->info.tess.tcs_output_patch_size, 1, 1));
 
    struct agx_tessellator_key key = {
       .prim = info.mode,
@@ -1688,7 +1697,7 @@ hk_launch_tess(struct hk_cmd_buffer *cmd, struct hk_cs *cs, struct hk_draw draw)
          hk_meta_kernel(dev, agx_nir_tessellate, &key, sizeof(key));
 
       hk_dispatch_with_usc(
-         dev, cs, tess,
+         dev, cs, &tess->b.info,
          hk_upload_usc_words_kernel(cmd, tess, &state, sizeof(state)),
          grid_tess, hk_grid(64, 1, 1));
    }
@@ -1699,7 +1708,7 @@ hk_launch_tess(struct hk_cmd_buffer *cmd, struct hk_cs *cs, struct hk_draw draw)
          hk_meta_kernel(dev, agx_nir_prefix_sum_tess, NULL, 0);
 
       hk_dispatch_with_usc(
-         dev, cs, sum,
+         dev, cs, &sum->b.info,
          hk_upload_usc_words_kernel(cmd, sum, &state, sizeof(state)),
          hk_grid(1024, 1, 1), hk_grid(1024, 1, 1));
    }
@@ -1712,7 +1721,7 @@ hk_launch_tess(struct hk_cmd_buffer *cmd, struct hk_cs *cs, struct hk_draw draw)
          hk_meta_kernel(dev, agx_nir_tessellate, &key, sizeof(key));
 
       hk_dispatch_with_usc(
-         dev, cs, tess,
+         dev, cs, &tess->b.info,
          hk_upload_usc_words_kernel(cmd, tess, &state, sizeof(state)),
          grid_tess, hk_grid(64, 1, 1));
    }
@@ -1751,12 +1760,18 @@ hk_flush_shaders(struct hk_cmd_buffer *cmd)
    if (cmd->state.gfx.shaders_dirty == 0)
       return;
 
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   struct hk_descriptor_state *desc = &cmd->state.gfx.descriptors;
+   desc->root_dirty = true;
+
    /* Geometry shading overrides the restart index, reemit on rebind */
    if (IS_SHADER_DIRTY(GEOMETRY)) {
+      struct hk_api_shader *gs = gfx->shaders[MESA_SHADER_GEOMETRY];
+
       cmd->state.gfx.dirty |= HK_DIRTY_INDEX;
+      desc->root.draw.api_gs = gs && !gs->is_passthrough;
    }
 
-   struct hk_graphics_state *gfx = &cmd->state.gfx;
    struct hk_shader *hw_vs = hk_bound_hw_vs(gfx);
    struct hk_api_shader *fs = gfx->shaders[MESA_SHADER_FRAGMENT];
 
@@ -1767,9 +1782,6 @@ hk_flush_shaders(struct hk_cmd_buffer *cmd)
    agx_assign_uvs(&gfx->linked_varyings, &hw_vs->info.uvs,
                   fs ? hk_only_variant(fs)->info.fs.interp.flat : 0,
                   fs ? hk_only_variant(fs)->info.fs.interp.linear : 0);
-
-   struct hk_descriptor_state *desc = &cmd->state.gfx.descriptors;
-   desc->root_dirty = true;
 
    for (unsigned i = 0; i < VARYING_SLOT_MAX; ++i) {
       desc->root.draw.uvs_index[i] = gfx->linked_varyings.slots[i];
@@ -2577,6 +2589,22 @@ hk_flush_ppp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
    agx_ppp_fini(out, &ppp);
 }
 
+/*
+ * Based somewhat on the calculation in the PowerVR driver, and mostly trial &
+ * error to pass CTS. This is a mess.
+ */
+static float
+hk_depth_bias_factor(VkFormat format, bool exact, bool force_unorm)
+{
+   if (format == VK_FORMAT_D16_UNORM) {
+      return exact ? (1 << 16) : (1 << 15);
+   } else if (force_unorm) {
+      return exact ? (1ull << 24) : (1ull << 23);
+   } else {
+      return 1.0;
+   }
+}
+
 static void
 hk_flush_dynamic_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                        uint32_t draw_id, struct hk_draw draw)
@@ -2943,12 +2971,16 @@ hk_flush_dynamic_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    /* With attachmentless rendering, we don't know the sample count until draw
     * time, so we do a late tilebuffer fix up. But with rasterizer discard,
     * rasterization_samples might be 0.
+    *
+    * Note that we ignore dyn->ms.rasterization_samples when we do have a sample
+    * count from an attachment. In Vulkan, these have to match anyway, but DX12
+    * drivers are robust against this scenarios and vkd3d-proton will go out of
+    * spec here. No reason we can't be robust here too.
     */
-   if (dyn->ms.rasterization_samples &&
-       gfx->render.tilebuffer.nr_samples != dyn->ms.rasterization_samples) {
+   if (dyn->ms.rasterization_samples && !gfx->render.tilebuffer.nr_samples) {
+      agx_tilebuffer_set_samples(&gfx->render.tilebuffer,
+                                 dyn->ms.rasterization_samples);
 
-      unsigned nr_samples = MAX2(dyn->ms.rasterization_samples, 1);
-      agx_tilebuffer_set_samples(&gfx->render.tilebuffer, nr_samples);
       cs->tib = gfx->render.tilebuffer;
    }
 
@@ -3118,15 +3150,17 @@ hk_flush_dynamic_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       void *ptr =
          util_dynarray_grow_bytes(&cs->depth_bias, 1, AGX_DEPTH_BIAS_LENGTH);
 
+      bool exact = dyn->rs.depth_bias.exact;
+      bool force_unorm =
+         dyn->rs.depth_bias.representation ==
+         VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORCE_UNORM_EXT;
+
       agx_pack(ptr, DEPTH_BIAS, cfg) {
-         cfg.depth_bias = dyn->rs.depth_bias.constant;
          cfg.slope_scale = dyn->rs.depth_bias.slope;
          cfg.clamp = dyn->rs.depth_bias.clamp;
-
-         /* Value from the PowerVR driver. */
-         if (render->depth_att.vk_format == VK_FORMAT_D16_UNORM) {
-            cfg.depth_bias /= (1 << 15);
-         }
+         cfg.depth_bias = dyn->rs.depth_bias.constant;
+         cfg.depth_bias /= hk_depth_bias_factor(render->depth_att.vk_format,
+                                                exact, force_unorm);
       }
    }
 
@@ -3274,15 +3308,46 @@ static struct hk_cs *
 hk_flush_gfx_state(struct hk_cmd_buffer *cmd, uint32_t draw_id,
                    struct hk_draw draw)
 {
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   struct hk_descriptor_state *desc = &gfx->descriptors;
+
    struct hk_cs *cs = hk_cmd_buffer_get_cs(cmd, false /* compute */);
+   const struct vk_dynamic_graphics_state *dyn =
+      &cmd->vk.dynamic_graphics_state;
+
    if (!cs)
       return NULL;
 
-   hk_ensure_cs_has_space(cmd, cs, 0x2000 /* TODO */);
+   /* Annoyingly,
+    * VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORCE_UNORM_EXT is
+    * render pass state on Imaginapple but draw state in Vulkan. In practice,
+    * Proton never changes it within a render pass, but we technically need to
+    * handle the switch regardless. Do so early since `cs` will be invalidated
+    * if we need to split the render pass to switch representation mid-frame.
+    */
+   if (IS_DIRTY(RS_DEPTH_BIAS_FACTORS)) {
+      bool dbias_is_int =
+         (dyn->rs.depth_bias.representation ==
+          VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORCE_UNORM_EXT) ||
+         (gfx->render.depth_att.vk_format == VK_FORMAT_D16_UNORM);
 
-   struct hk_graphics_state *gfx = &cmd->state.gfx;
-   struct hk_descriptor_state *desc = &gfx->descriptors;
-   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+      /* Attempt to set dbias_is_int per the draw requirement. If this fails,
+       * flush the control stream and set it on the new control stream.
+       */
+      bool succ = u_tristate_set(&cs->cr.dbias_is_int, dbias_is_int);
+      if (!succ) {
+         perf_debug(dev, "Splitting control stream due to depth bias");
+
+         hk_cmd_buffer_end_graphics(cmd);
+         cs = hk_cmd_buffer_get_cs(cmd, false /* compute */);
+
+         succ = u_tristate_set(&cs->cr.dbias_is_int, dbias_is_int);
+         assert(succ && "can always set tri-state on a new control stream");
+      }
+   }
+
+   hk_ensure_cs_has_space(cmd, cs, 0x2000 /* TODO */);
 
 #ifndef NDEBUG
    if (unlikely(dev->dev.debug & AGX_DBG_DIRTY)) {
@@ -3442,7 +3507,7 @@ hk_ia_update(struct hk_cmd_buffer *cmd, struct hk_cs *cs, struct hk_draw draw,
    uint64_t push = hk_pool_upload(cmd, &args, sizeof(args), 8);
    uint32_t usc = hk_upload_usc_words_kernel(cmd, s, &push, sizeof(push));
 
-   hk_dispatch_with_usc(dev, cs, s, usc, hk_grid(wg_size, 1, 1),
+   hk_dispatch_with_usc(dev, cs, &s->b.info, usc, hk_grid(wg_size, 1, 1),
                         hk_grid(wg_size, 1, 1));
 }
 
@@ -3804,7 +3869,7 @@ hk_draw_indirect_count(VkCommandBuffer commandBuffer, VkBuffer _buffer,
    uint64_t push_ = hk_pool_upload(cmd, &push, sizeof(push), 8);
    uint32_t usc = hk_upload_usc_words_kernel(cmd, s, &push_, sizeof(push_));
 
-   hk_dispatch_with_usc(dev, cs, s, usc, hk_grid(maxDrawCount, 1, 1),
+   hk_dispatch_with_usc(dev, cs, &s->b.info, usc, hk_grid(maxDrawCount, 1, 1),
                         hk_grid(1, 1, 1));
 
    if (indexed) {
@@ -3937,7 +4002,7 @@ hk_begin_end_xfb(VkCommandBuffer commandBuffer, uint32_t firstCounterBuffer,
       uint64_t push = hk_pool_upload(cmd, &params, sizeof(params), 8);
       uint32_t usc = hk_upload_usc_words_kernel(cmd, s, &push, sizeof(push));
 
-      hk_dispatch_with_usc(dev, cs, s, usc, hk_grid(copies, 1, 1),
+      hk_dispatch_with_usc(dev, cs, &s->b.info, usc, hk_grid(copies, 1, 1),
                            hk_grid(copies, 1, 1));
    }
 }

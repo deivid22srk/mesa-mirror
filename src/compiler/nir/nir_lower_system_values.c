@@ -101,6 +101,22 @@ lower_system_value_instr(nir_builder *b, nir_instr *instr, void *_state)
          return NULL;
       }
 
+   case nir_intrinsic_load_instance_id:
+      if (b->shader->options->supports_instance_index) {
+         return nir_isub(b, nir_load_instance_index(b),
+                         nir_load_base_instance(b));
+      } else {
+         return NULL;
+      }
+
+   case nir_intrinsic_load_instance_index:
+      if (!b->shader->options->supports_instance_index) {
+         return nir_iadd(b, nir_load_instance_id(b),
+                         nir_load_base_instance(b));
+      } else {
+         return NULL;
+      }
+
    case nir_intrinsic_load_helper_invocation:
       if (b->shader->options->lower_helper_invocation) {
          return nir_build_lowered_load_helper_invocation(b);
@@ -199,9 +215,19 @@ lower_system_value_instr(nir_builder *b, nir_instr *instr, void *_state)
       nir_variable *var = deref->var;
 
       switch (var->data.location) {
+      case SYSTEM_VALUE_INSTANCE_ID:
+         if (b->shader->options->supports_instance_index) {
+            return nir_isub(b, nir_load_instance_index(b),
+                            nir_load_base_instance(b));
+         }
+         break;
+
       case SYSTEM_VALUE_INSTANCE_INDEX:
-         return nir_iadd(b, nir_load_instance_id(b),
-                         nir_load_base_instance(b));
+         if (!b->shader->options->supports_instance_index) {
+            return nir_iadd(b, nir_load_instance_id(b),
+                            nir_load_base_instance(b));
+         }
+         break;
 
       case SYSTEM_VALUE_GLOBAL_INVOCATION_ID: {
          return nir_iadd(b, nir_load_global_invocation_id(b, bit_size),
@@ -693,6 +719,8 @@ lower_compute_system_value_instr(nir_builder *b,
                                                  base_group_id),
                                      nir_u2uN(b, group_size, bit_size)),
                          nir_u2uN(b, local_id, bit_size));
+      } else if (options && options->global_id_is_32bit && bit_size > 32) {
+         return nir_u2uN(b, nir_load_global_invocation_id(b, 32), bit_size);
       } else {
          return NULL;
       }

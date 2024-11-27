@@ -110,79 +110,84 @@ csf_oom_handler_init(struct panfrost_context *ctx)
       .capacity = panfrost_bo_size(cs_bo) / sizeof(uint64_t),
    };
    struct cs_builder b;
-   struct cs_exception_handler handler;
    const struct cs_builder_conf conf = {
       .nr_registers = 96,
       .nr_kernel_registers = 4,
       .reg_perm = (dev->debug & PAN_DBG_CS) ? csf_reg_perm_cb : NULL,
    };
    cs_builder_init(&b, &conf, queue);
-   cs_exception_handler_start(&b, &handler, reg_save_bo->ptr.gpu, 0);
 
-   struct cs_index tiler_oom_ctx = cs_reg64(&b, TILER_OOM_CTX_REG);
-   struct cs_index counter = cs_reg32(&b, 47);
-   struct cs_index zero = cs_reg64(&b, 48);
-   struct cs_index flush_id = cs_reg32(&b, 48);
-   struct cs_index tiler_ctx = cs_reg64(&b, 50);
-   struct cs_index completed_top = cs_reg64(&b, 52);
-   struct cs_index completed_bottom = cs_reg64(&b, 54);
-   struct cs_index completed_chunks = cs_reg_tuple(&b, 52, 4);
+   struct cs_exception_handler_ctx handler_ctx = {
+      .ctx_reg = cs_reg64(&b, TILER_OOM_CTX_REG),
+      .dump_addr_offset = offsetof(struct pan_csf_tiler_oom_ctx, dump_addr),
+      .ls_sb_slot = 0,
+   };
+   struct cs_exception_handler handler;
 
-   /* Use different framebuffer descriptor depending on whether incremental
-    * rendering has already been triggered */
-   cs_load32_to(&b, counter, tiler_oom_ctx, FIELD_OFFSET(counter));
-   cs_wait_slot(&b, 0, false);
-   cs_if(&b, MALI_CS_CONDITION_GREATER, counter) {
-      cs_load64_to(&b, cs_reg64(&b, 40), tiler_oom_ctx, FBD_OFFSET(MIDDLE));
+   cs_exception_handler_def(&b, &handler, handler_ctx) {
+      struct cs_index tiler_oom_ctx = cs_reg64(&b, TILER_OOM_CTX_REG);
+      struct cs_index counter = cs_reg32(&b, 47);
+      struct cs_index zero = cs_reg64(&b, 48);
+      struct cs_index flush_id = cs_reg32(&b, 48);
+      struct cs_index tiler_ctx = cs_reg64(&b, 50);
+      struct cs_index completed_top = cs_reg64(&b, 52);
+      struct cs_index completed_bottom = cs_reg64(&b, 54);
+      struct cs_index completed_chunks = cs_reg_tuple(&b, 52, 4);
+
+      /* Use different framebuffer descriptor depending on whether incremental
+       * rendering has already been triggered */
+      cs_load32_to(&b, counter, tiler_oom_ctx, FIELD_OFFSET(counter));
+      cs_wait_slot(&b, 0, false);
+      cs_if(&b, MALI_CS_CONDITION_GREATER, counter) {
+         cs_load64_to(&b, cs_reg64(&b, 40), tiler_oom_ctx, FBD_OFFSET(MIDDLE));
+      }
+      cs_else(&b) {
+         cs_load64_to(&b, cs_reg64(&b, 40), tiler_oom_ctx, FBD_OFFSET(FIRST));
+      }
+
+      cs_load32_to(&b, cs_reg32(&b, 42), tiler_oom_ctx, FIELD_OFFSET(bbox_min));
+      cs_load32_to(&b, cs_reg32(&b, 43), tiler_oom_ctx, FIELD_OFFSET(bbox_max));
+      cs_move64_to(&b, cs_reg64(&b, 44), 0);
+      cs_move32_to(&b, cs_reg32(&b, 46), 0);
+      cs_wait_slot(&b, 0, false);
+
+      /* Run the fragment job and wait */
+      cs_set_scoreboard_entry(&b, 3, 0);
+      cs_run_fragment(&b, false, MALI_TILE_RENDER_ORDER_Z_ORDER, false);
+      cs_wait_slot(&b, 3, false);
+
+      /* Increment counter */
+      cs_add32(&b, counter, counter, 1);
+      cs_store32(&b, counter, tiler_oom_ctx, FIELD_OFFSET(counter));
+
+      /* Load completed chunks */
+      cs_load64_to(&b, tiler_ctx, tiler_oom_ctx, FIELD_OFFSET(tiler_desc));
+      cs_wait_slot(&b, 0, false);
+      cs_load_to(&b, completed_chunks, tiler_ctx, BITFIELD_MASK(4), 10 * 4);
+      cs_wait_slot(&b, 0, false);
+
+      cs_finish_fragment(&b, false, completed_top, completed_bottom, cs_now());
+
+      /* Zero out polygon list, completed_top and completed_bottom */
+      cs_move64_to(&b, zero, 0);
+      cs_store64(&b, zero, tiler_ctx, 0);
+      cs_store64(&b, zero, tiler_ctx, 10 * 4);
+      cs_store64(&b, zero, tiler_ctx, 12 * 4);
+
+      /* We need to flush the texture caches so future preloads see the new
+       * content. */
+      cs_flush_caches(&b, MALI_CS_FLUSH_MODE_NONE, MALI_CS_FLUSH_MODE_NONE,
+                      true, flush_id, cs_defer(0, 0));
+
+      cs_wait_slot(&b, 0, false);
+
+      cs_set_scoreboard_entry(&b, 2, 0);
    }
-   cs_else(&b) {
-      cs_load64_to(&b, cs_reg64(&b, 40), tiler_oom_ctx, FBD_OFFSET(FIRST));
-   }
-
-   cs_load32_to(&b, cs_reg32(&b, 42), tiler_oom_ctx, FIELD_OFFSET(bbox_min));
-   cs_load32_to(&b, cs_reg32(&b, 43), tiler_oom_ctx, FIELD_OFFSET(bbox_max));
-   cs_move64_to(&b, cs_reg64(&b, 44), 0);
-   cs_move32_to(&b, cs_reg32(&b, 46), 0);
-   cs_wait_slot(&b, 0, false);
-
-   /* Run the fragment job and wait */
-   cs_set_scoreboard_entry(&b, 3, 0);
-   cs_run_fragment(&b, false, MALI_TILE_RENDER_ORDER_Z_ORDER, false);
-   cs_wait_slot(&b, 3, false);
-
-   /* Increment counter */
-   cs_add32(&b, counter, counter, 1);
-   cs_store32(&b, counter, tiler_oom_ctx, FIELD_OFFSET(counter));
-
-   /* Load completed chunks */
-   cs_load64_to(&b, tiler_ctx, tiler_oom_ctx, FIELD_OFFSET(tiler_desc));
-   cs_wait_slot(&b, 0, false);
-   cs_load_to(&b, completed_chunks, tiler_ctx, BITFIELD_MASK(4), 10 * 4);
-   cs_wait_slot(&b, 0, false);
-
-   cs_finish_fragment(&b, false, completed_top, completed_bottom, cs_now());
-
-   /* Zero out polygon list, completed_top and completed_bottom */
-   cs_move64_to(&b, zero, 0);
-   cs_store64(&b, zero, tiler_ctx, 0);
-   cs_store64(&b, zero, tiler_ctx, 10 * 4);
-   cs_store64(&b, zero, tiler_ctx, 12 * 4);
-
-   /* We need to flush the texture caches so future preloads see the new
-    * content. */
-   cs_flush_caches(&b, MALI_CS_FLUSH_MODE_NONE, MALI_CS_FLUSH_MODE_NONE, true,
-                   flush_id, cs_defer(0, 0));
-
-   cs_wait_slot(&b, 0, false);
-
-   cs_set_scoreboard_entry(&b, 2, 0);
-
-   cs_exception_handler_end(&b, &handler);
 
    assert(cs_is_valid(&b));
    cs_finish(&b);
    ctx->csf.tiler_oom_handler.cs_bo = cs_bo;
-   ctx->csf.tiler_oom_handler.length = b.root_chunk.size * 8;
+   ctx->csf.tiler_oom_handler.length = handler.length * sizeof(uint64_t);
    ctx->csf.tiler_oom_handler.save_bo = reg_save_bo;
 }
 
@@ -612,6 +617,68 @@ out_free_syncops:
    return ret;
 }
 
+static mali_ptr
+csf_get_tiler_desc(struct panfrost_batch *batch)
+{
+   if (batch->tiler_ctx.valhall.desc)
+      return batch->tiler_ctx.valhall.desc;
+
+   struct panfrost_ptr t =
+      pan_pool_alloc_desc(&batch->pool.base, TILER_CONTEXT);
+
+   batch->csf.pending_tiler_desc = t.cpu;
+   batch->tiler_ctx.valhall.desc = t.gpu;
+   return batch->tiler_ctx.valhall.desc;
+}
+
+static void
+csf_emit_tiler_desc(struct panfrost_batch *batch, const struct pan_fb_info *fb)
+{
+   struct panfrost_context *ctx = batch->ctx;
+   struct panfrost_device *dev = pan_device(ctx->base.screen);
+
+   if (!batch->csf.pending_tiler_desc)
+      return;
+
+   pan_pack(batch->csf.pending_tiler_desc, TILER_CONTEXT, tiler) {
+      unsigned max_levels = dev->tiler_features.max_levels;
+      assert(max_levels >= 2);
+
+      /* TODO: Select hierarchy mask more effectively */
+      tiler.hierarchy_mask = (max_levels >= 8) ? 0xFF : 0x28;
+
+      /* For large framebuffers, disable the smallest bin size to
+       * avoid pathological tiler memory usage. Required to avoid OOM
+       * on dEQP-GLES31.functional.fbo.no_attachments.maximums.all on
+       * Mali-G57.
+       */
+      if (MAX2(batch->key.width, batch->key.height) >= 4096)
+         tiler.hierarchy_mask &= ~1;
+
+      /* For effective tile size larger than 16x16, disable first level */
+      if (fb->tile_size > 16 * 16)
+         tiler.hierarchy_mask &= ~1;
+
+      tiler.fb_width = batch->key.width;
+      tiler.fb_height = batch->key.height;
+      tiler.heap = batch->ctx->csf.heap.desc_bo->ptr.gpu;
+      tiler.sample_pattern =
+         pan_sample_pattern(util_framebuffer_get_num_samples(&batch->key));
+      tiler.first_provoking_vertex =
+         batch->first_provoking_vertex == U_TRISTATE_YES;
+      tiler.geometry_buffer = ctx->csf.tmp_geom_bo->ptr.gpu;
+      tiler.geometry_buffer_size = ctx->csf.tmp_geom_bo->kmod_bo->size;
+   }
+
+   batch->csf.pending_tiler_desc = 0;
+}
+
+void
+GENX(csf_prepare_tiler)(struct panfrost_batch *batch, struct pan_fb_info *fb)
+{
+   csf_emit_tiler_desc(batch, fb);
+}
+
 void
 GENX(csf_preload_fb)(struct panfrost_batch *batch, struct pan_fb_info *fb)
 {
@@ -929,47 +996,6 @@ GENX(csf_launch_xfb)(struct panfrost_batch *batch,
    cs_run_compute(b, 1, MALI_TASK_AXIS_Z, false, cs_shader_res_sel(0, 0, 0, 0));
 }
 
-static mali_ptr
-csf_get_tiler_desc(struct panfrost_batch *batch)
-{
-   struct panfrost_context *ctx = batch->ctx;
-   struct panfrost_device *dev = pan_device(ctx->base.screen);
-
-   if (batch->tiler_ctx.valhall.desc)
-      return batch->tiler_ctx.valhall.desc;
-
-   struct panfrost_ptr t =
-      pan_pool_alloc_desc(&batch->pool.base, TILER_CONTEXT);
-   pan_pack(t.cpu, TILER_CONTEXT, tiler) {
-      unsigned max_levels = dev->tiler_features.max_levels;
-      assert(max_levels >= 2);
-
-      /* TODO: Select hierarchy mask more effectively */
-      tiler.hierarchy_mask = (max_levels >= 8) ? 0xFF : 0x28;
-
-      /* For large framebuffers, disable the smallest bin size to
-       * avoid pathological tiler memory usage. Required to avoid OOM
-       * on dEQP-GLES31.functional.fbo.no_attachments.maximums.all on
-       * Mali-G57.
-       */
-      if (MAX2(batch->key.width, batch->key.height) >= 4096)
-         tiler.hierarchy_mask &= ~1;
-
-      tiler.fb_width = batch->key.width;
-      tiler.fb_height = batch->key.height;
-      tiler.heap = batch->ctx->csf.heap.desc_bo->ptr.gpu;
-      tiler.sample_pattern =
-         pan_sample_pattern(util_framebuffer_get_num_samples(&batch->key));
-      tiler.first_provoking_vertex =
-         pan_tristate_get(batch->first_provoking_vertex);
-      tiler.geometry_buffer = ctx->csf.tmp_geom_bo->ptr.gpu;
-      tiler.geometry_buffer_size = ctx->csf.tmp_geom_bo->kmod_bo->size;
-   }
-
-   batch->tiler_ctx.valhall.desc = t.gpu;
-   return batch->tiler_ctx.valhall.desc;
-}
-
 static void
 emit_tiler_oom_context(struct cs_builder *b, struct panfrost_batch *batch)
 {
@@ -983,6 +1009,7 @@ emit_tiler_oom_context(struct cs_builder *b, struct panfrost_batch *batch)
    ctx->counter = 0;
    ctx->bbox_min = (batch->miny << 16) | batch->minx;
    ctx->bbox_max = ((batch->maxy - 1) << 16) | (batch->maxx - 1);
+   ctx->dump_addr = batch->ctx->csf.tiler_oom_handler.save_bo->ptr.gpu;
 
    for (unsigned i = 0; i < PAN_INCREMENTAL_RENDERING_PASS_COUNT; ++i)
       ctx->fbds[i] = alloc_fbd(batch);

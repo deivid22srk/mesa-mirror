@@ -95,7 +95,7 @@ unsigned si_determine_wave_size(struct si_screen *sscreen, struct si_shader *sha
     */
    if (stage <= MESA_SHADER_GEOMETRY &&
        (sscreen->info.gfx_level == GFX10 || sscreen->info.gfx_level == GFX10_3) &&
-       !(sscreen->info.gfx_level == GFX10 && shader->key.ge.opt.ngg_culling))
+       !(sscreen->info.gfx_level == GFX10 && si_shader_culling_enabled(shader)))
       return 32;
 
    /* Divergent loops in Wave64 can end up having too many iterations in one half of the wave
@@ -147,8 +147,7 @@ void si_get_ir_cache_key(struct si_shader_selector *sel, bool ngg, bool es,
    /* bit gap */
    if (wave_size == 32)
       shader_variant_flags |= 1 << 2;
-   if (sel->screen->options.optimize_io)
-      shader_variant_flags |= 1 << 3;
+   /* bit gap */
    /* use_ngg_culling disables NGG passthrough for non-culling shaders to reduce context
     * rolls, which can be changed with AMD_DEBUG=nonggc or AMD_DEBUG=nggc.
     */
@@ -1186,7 +1185,7 @@ bool gfx10_is_ngg_passthrough(struct si_shader *shader)
     *
     * NGG passthrough still allows the use of LDS.
     */
-   return sel->stage != MESA_SHADER_GEOMETRY && !shader->key.ge.opt.ngg_culling;
+   return sel->stage != MESA_SHADER_GEOMETRY && !si_shader_culling_enabled(shader);
 }
 
 template <enum si_has_tess HAS_TESS>
@@ -1352,7 +1351,8 @@ static void gfx12_emit_shader_ngg(struct si_context *sctx, unsigned index)
                              shader->ngg.spi_shader_pgm_rsrc4_gs);
 }
 
-unsigned si_get_input_prim(const struct si_shader_selector *gs, const union si_shader_key *key)
+unsigned si_get_input_prim(const struct si_shader_selector *gs, const union si_shader_key *key,
+                           bool return_unknown)
 {
    if (gs->stage == MESA_SHADER_GEOMETRY)
       return gs->info.base.gs.input_primitive;
@@ -1365,10 +1365,56 @@ unsigned si_get_input_prim(const struct si_shader_selector *gs, const union si_s
       return MESA_PRIM_TRIANGLES;
    }
 
-   if (key->ge.opt.ngg_culling & SI_NGG_CULL_LINES)
+   assert(gs->stage == MESA_SHADER_VERTEX);
+
+   if (key->ge.opt.ngg_culling & SI_NGG_CULL_VS_LINES)
       return MESA_PRIM_LINES;
 
-   return MESA_PRIM_TRIANGLES; /* worst case for all callers */
+   if (return_unknown)
+      return MESA_PRIM_UNKNOWN;
+   else
+      return MESA_PRIM_TRIANGLES; /* worst case for all callers */
+}
+
+/* Return a simplified primitive type, e.g. don't return *_STRIP and *_FAN.
+ * This returns MESA_PRIM_UNKNOWN if the primitive type is not known at compile time.
+ */
+unsigned si_get_output_prim_simplified(const struct si_shader_selector *sel,
+                                       const union si_shader_key *key)
+{
+   if (sel->stage == MESA_SHADER_GEOMETRY) {
+      if (util_rast_prim_is_triangles(sel->info.base.gs.output_primitive))
+         return MESA_PRIM_TRIANGLES;
+      else if (util_prim_is_lines(sel->info.base.gs.output_primitive))
+         return MESA_PRIM_LINES;
+      else
+         return MESA_PRIM_POINTS;
+   }
+
+   if (sel->stage == MESA_SHADER_VERTEX && sel->info.base.vs.blit_sgprs_amd)
+      return SI_PRIM_RECTANGLE_LIST;
+
+   /* It's the same as the input primitive type for VS and TES. */
+   return si_get_input_prim(sel, key, true);
+}
+
+unsigned si_get_num_vertices_per_output_prim(struct si_shader *shader)
+{
+   unsigned prim = si_get_output_prim_simplified(shader->selector, &shader->key);
+
+   switch (prim) {
+   case MESA_PRIM_TRIANGLES:
+   case SI_PRIM_RECTANGLE_LIST:
+      return 3;
+   case MESA_PRIM_LINES:
+      return 2;
+   case MESA_PRIM_POINTS:
+      return 1;
+   case MESA_PRIM_UNKNOWN:
+      return 0;
+   default:
+      unreachable("unexpected prim type");
+   }
 }
 
 static unsigned si_get_vs_out_cntl(const struct si_shader_selector *sel,
@@ -1437,7 +1483,7 @@ static void gfx10_shader_ngg(struct si_screen *sscreen, struct si_shader *shader
    bool es_enable_prim_id = shader->key.ge.mono.u.vs_export_prim_id || es_info->uses_primid;
    unsigned gs_num_invocations = gs_sel->stage == MESA_SHADER_GEOMETRY ?
                                     CLAMP(gs_info->base.gs.invocations, 1, 32) : 0;
-   unsigned input_prim = si_get_input_prim(gs_sel, &shader->key);
+   unsigned input_prim = si_get_input_prim(gs_sel, &shader->key, false);
    bool break_wave_at_eoi = false;
 
    struct si_pm4_state *pm4 = si_get_shader_pm4_state(shader, NULL);
@@ -1501,7 +1547,7 @@ static void gfx10_shader_ngg(struct si_screen *sscreen, struct si_shader *shader
        * for the GL_LINE polygon mode to skip rendering lines on inner edges.
        */
       if (gs_info->uses_invocationid ||
-          (gfx10_edgeflags_have_effect(shader) && !gfx10_is_ngg_passthrough(shader)))
+          (gfx10_has_variable_edgeflags(shader) && !gfx10_is_ngg_passthrough(shader)))
          gs_vgpr_comp_cnt = 3; /* VGPR3 contains InvocationID, edge flags. */
       else if ((gs_stage == MESA_SHADER_GEOMETRY && gs_info->uses_primid) ||
                (gs_stage == MESA_SHADER_VERTEX && shader->key.ge.mono.u.vs_export_prim_id))
@@ -1577,14 +1623,14 @@ static void gfx10_shader_ngg(struct si_screen *sscreen, struct si_shader *shader
    } else {
       unsigned late_alloc_wave64, cu_mask;
 
-      ac_compute_late_alloc(&sscreen->info, true, shader->key.ge.opt.ngg_culling,
+      ac_compute_late_alloc(&sscreen->info, true, si_shader_culling_enabled(shader),
                             shader->config.scratch_bytes_per_wave > 0,
                             &late_alloc_wave64, &cu_mask);
 
       /* Oversubscribe PC. This improves performance when there are too many varyings. */
       unsigned oversub_pc_lines, oversub_pc_factor = 1;
 
-      if (shader->key.ge.opt.ngg_culling) {
+      if (si_shader_culling_enabled(shader)) {
          /* Be more aggressive with NGG culling. */
          if (shader->info.nr_param_exports > 4)
             oversub_pc_factor = 4;
@@ -1990,12 +2036,15 @@ static void si_shader_ps(struct si_screen *sscreen, struct si_shader *shader)
 {
    struct si_shader_info *info = &shader->selector->info;
    const unsigned input_ena = shader->config.spi_ps_input_ena;
+   /* At least one of these is required to be set. */
+   ASSERTED unsigned num_required_vgpr_inputs =
+      G_0286CC_PERSP_SAMPLE_ENA(input_ena) + G_0286CC_PERSP_CENTER_ENA(input_ena) +
+      G_0286CC_PERSP_CENTROID_ENA(input_ena) + G_0286CC_PERSP_PULL_MODEL_ENA(input_ena) +
+      G_0286CC_LINEAR_SAMPLE_ENA(input_ena) + G_0286CC_LINEAR_CENTER_ENA(input_ena) +
+      G_0286CC_LINEAR_CENTROID_ENA(input_ena) + G_0286CC_LINE_STIPPLE_TEX_ENA(input_ena);
 
    /* we need to enable at least one of them, otherwise we hang the GPU */
-   assert(G_0286CC_PERSP_SAMPLE_ENA(input_ena) || G_0286CC_PERSP_CENTER_ENA(input_ena) ||
-          G_0286CC_PERSP_CENTROID_ENA(input_ena) || G_0286CC_PERSP_PULL_MODEL_ENA(input_ena) ||
-          G_0286CC_LINEAR_SAMPLE_ENA(input_ena) || G_0286CC_LINEAR_CENTER_ENA(input_ena) ||
-          G_0286CC_LINEAR_CENTROID_ENA(input_ena) || G_0286CC_LINE_STIPPLE_TEX_ENA(input_ena));
+   assert(num_required_vgpr_inputs > 0);
    /* POS_W_FLOAT_ENA requires one of the perspective weights. */
    assert(!G_0286CC_POS_W_FLOAT_ENA(input_ena) || G_0286CC_PERSP_SAMPLE_ENA(input_ena) ||
           G_0286CC_PERSP_CENTER_ENA(input_ena) || G_0286CC_PERSP_CENTROID_ENA(input_ena) ||
@@ -2006,13 +2055,13 @@ static void si_shader_ps(struct si_screen *sscreen, struct si_shader *shader)
           (G_0286CC_PERSP_CENTER_ENA(input_ena) && G_0286CC_PERSP_CENTROID_ENA(input_ena)));
    assert(!shader->key.ps.part.prolog.bc_optimize_for_linear ||
           (G_0286CC_LINEAR_CENTER_ENA(input_ena) && G_0286CC_LINEAR_CENTROID_ENA(input_ena)));
-   assert(!shader->key.ps.part.prolog.force_persp_center_interp ||
+   assert(!shader->key.ps.part.prolog.force_persp_center_interp || num_required_vgpr_inputs == 1 ||
           (!G_0286CC_PERSP_SAMPLE_ENA(input_ena) && !G_0286CC_PERSP_CENTROID_ENA(input_ena)));
-   assert(!shader->key.ps.part.prolog.force_linear_center_interp ||
+   assert(!shader->key.ps.part.prolog.force_linear_center_interp || num_required_vgpr_inputs == 1 ||
           (!G_0286CC_LINEAR_SAMPLE_ENA(input_ena) && !G_0286CC_LINEAR_CENTROID_ENA(input_ena)));
-   assert(!shader->key.ps.part.prolog.force_persp_sample_interp ||
+   assert(!shader->key.ps.part.prolog.force_persp_sample_interp || num_required_vgpr_inputs == 1 ||
           (!G_0286CC_PERSP_CENTER_ENA(input_ena) && !G_0286CC_PERSP_CENTROID_ENA(input_ena)));
-   assert(!shader->key.ps.part.prolog.force_linear_sample_interp ||
+   assert(!shader->key.ps.part.prolog.force_linear_sample_interp || num_required_vgpr_inputs == 1 ||
           (!G_0286CC_LINEAR_CENTER_ENA(input_ena) && !G_0286CC_LINEAR_CENTROID_ENA(input_ena)));
 
    /* color_two_side always enables FRONT_FACE. Since st/mesa disables two-side colors if the back
@@ -2445,8 +2494,7 @@ void si_vs_ps_key_update_rast_prim_smooth_stipple(struct si_context *sctx)
       ps_key->ps.part.prolog.poly_stipple = rs->poly_stipple_enable;
       ps_key->ps.mono.poly_line_smoothing = rs->poly_smooth && sctx->framebuffer.nr_samples <= 1;
       ps_key->ps.mono.point_smoothing = 0;
-      ps_key->ps.opt.force_front_face_input = rs->force_front_face_input &&
-                                              ps->info.uses_frontface;
+      ps_key->ps.opt.force_front_face_input = ps->info.uses_frontface ? rs->force_front_face_input : 0;
    }
 
    if (vs_key->ge.opt.kill_pointsize != old_kill_pointsize ||

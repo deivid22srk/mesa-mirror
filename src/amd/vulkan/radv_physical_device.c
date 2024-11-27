@@ -34,8 +34,8 @@ typedef void *drmDevicePtr;
 #include <io.h>
 #else
 #include <amdgpu.h>
-#include <xf86drm.h>
 #include "drm-uapi/amdgpu_drm.h"
+#include "util/os_drm.h"
 #include "winsys/amdgpu/radv_amdgpu_winsys_public.h"
 #endif
 #include "winsys/null/radv_null_winsys_public.h"
@@ -151,6 +151,7 @@ radv_get_conformance_version(const struct radv_physical_device *pdev)
       switch (pdev->info.family) {
       case CHIP_TAHITI:
       case CHIP_PITCAIRN:
+      case CHIP_VERDE:
       case CHIP_OLAND:
       case CHIP_BONAIRE:
          conformance_version = (VkConformanceVersion){
@@ -757,11 +758,6 @@ radv_physical_device_get_supported_extensions(const struct radv_physical_device 
       .INTEL_shader_integer_functions2 = true,
       .MESA_image_alignment_control = pdev->info.gfx_level >= GFX9 && pdev->info.gfx_level <= GFX11_5,
       .NV_compute_shader_derivatives = true,
-      /* Undocumented extension purely for vkd3d-proton. This check is to prevent anyone else from
-       * using it.
-       */
-      .VALVE_descriptor_set_host_mapping =
-         pdev->vk.instance->app_info.engine_name && strcmp(pdev->vk.instance->app_info.engine_name, "vkd3d") == 0,
       .VALVE_mutable_descriptor_type = true,
    };
    *out_ext = ext;
@@ -1102,9 +1098,6 @@ radv_physical_device_get_features(const struct radv_physical_device *pdev, struc
       .multiviewMeshShader = taskmesh_en,
       .primitiveFragmentShadingRateMeshShader = taskmesh_en,
       .meshShaderQueries = false,
-
-      /* VK_VALVE_descriptor_set_host_mapping */
-      .descriptorSetHostMapping = true,
 
       /* VK_EXT_depth_clip_control */
       .depthClipControl = true,
@@ -2083,7 +2076,7 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
                                            .return_size = sizeof(accel_working),
                                            .query = AMDGPU_INFO_ACCEL_WORKING};
 
-         if (drmCommandWrite(master_fd, DRM_AMDGPU_INFO, &request, sizeof(struct drm_amdgpu_info)) < 0 ||
+         if (drm_ioctl_write(master_fd, DRM_AMDGPU_INFO, &request, sizeof(struct drm_amdgpu_info)) < 0 ||
              !accel_working) {
             close(master_fd);
             master_fd = -1;

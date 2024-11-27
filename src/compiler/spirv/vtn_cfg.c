@@ -108,6 +108,7 @@ function_parameter_decoration_cb(struct vtn_builder *b, struct vtn_value *val,
          case SpvFunctionParameterAttributeNoAlias:
          case SpvFunctionParameterAttributeSext:
          case SpvFunctionParameterAttributeZext:
+         case SpvFunctionParameterAttributeSret:
             break;
 
          case SpvFunctionParameterAttributeByVal:
@@ -280,7 +281,7 @@ vtn_cfg_handle_prepass_instruction(struct vtn_builder *b, SpvOp opcode,
       func->is_exported = b->func->linkage == SpvLinkageTypeExport;
 
       func->num_params = num_params;
-      func->params = ralloc_array(b->shader, nir_parameter, num_params);
+      func->params = rzalloc_array(b->shader, nir_parameter, num_params);
 
       unsigned idx = 0;
       if (func_type->return_type->base_type != vtn_base_type_void) {
@@ -341,6 +342,8 @@ vtn_cfg_handle_prepass_instruction(struct vtn_builder *b, SpvOp opcode,
       struct vtn_type *type = vtn_get_type(b, w[1]);
       struct vtn_ssa_value *ssa = vtn_create_ssa_value(b, type->type);
       struct vtn_value *val = vtn_untyped_value(b, w[2]);
+
+      b->func->nir_func->params[b->func_param_idx].name = val->name;
 
       vtn_foreach_decoration(b, val, function_parameter_decoration_cb, &arg_info);
       vtn_ssa_value_load_function_param(b, ssa, type, &arg_info, &b->func_param_idx);

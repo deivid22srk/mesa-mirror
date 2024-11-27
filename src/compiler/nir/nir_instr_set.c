@@ -58,6 +58,14 @@ instr_can_rewrite(const nir_instr *instr)
           * CSE is inclined to without a problem.
           */
          return true;
+      case nir_intrinsic_terminate:
+      case nir_intrinsic_terminate_if:
+      case nir_intrinsic_demote:
+      case nir_intrinsic_demote_if:
+         /* If a terminate/demote dominates another with the same source,
+          * the second won't affect additional invocations.
+          */
+         return true;
       default:
          return nir_intrinsic_can_reorder(intr);
       }
@@ -740,29 +748,6 @@ nir_instrs_equal(const nir_instr *instr1, const nir_instr *instr2)
    unreachable("All cases in the above switch should return");
 }
 
-static nir_def *
-nir_instr_get_def_def(nir_instr *instr)
-{
-   switch (instr->type) {
-   case nir_instr_type_alu:
-      return &nir_instr_as_alu(instr)->def;
-   case nir_instr_type_deref:
-      return &nir_instr_as_deref(instr)->def;
-   case nir_instr_type_load_const:
-      return &nir_instr_as_load_const(instr)->def;
-   case nir_instr_type_phi:
-      return &nir_instr_as_phi(instr)->def;
-   case nir_instr_type_intrinsic:
-      return &nir_instr_as_intrinsic(instr)->def;
-   case nir_instr_type_tex:
-      return &nir_instr_as_tex(instr)->def;
-   case nir_instr_type_debug_info:
-      return &nir_instr_as_debug_info(instr)->def;
-   default:
-      unreachable("We never ask for any of these");
-   }
-}
-
 static bool
 cmp_func(const void *data1, const void *data2)
 {
@@ -796,8 +781,8 @@ nir_instr_set_add_or_rewrite(struct set *instr_set, nir_instr *instr,
 
    if (!cond_function || cond_function(match, instr)) {
       /* rewrite instruction if condition is matched */
-      nir_def *def = nir_instr_get_def_def(instr);
-      nir_def *new_def = nir_instr_get_def_def(match);
+      nir_def *def = nir_instr_def(instr);
+      nir_def *new_def = nir_instr_def(match);
 
       /* It's safe to replace an exact instruction with an inexact one as
        * long as we make it exact.  If we got here, the two instructions are
@@ -809,7 +794,9 @@ nir_instr_set_add_or_rewrite(struct set *instr_set, nir_instr *instr,
          nir_instr_as_alu(match)->fp_fast_math |= nir_instr_as_alu(instr)->fp_fast_math;
       }
 
-      nir_def_rewrite_uses(def, new_def);
+      assert(!def == !new_def);
+      if (def)
+         nir_def_rewrite_uses(def, new_def);
 
       return match;
    } else {

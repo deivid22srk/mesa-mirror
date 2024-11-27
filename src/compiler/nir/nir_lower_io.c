@@ -320,7 +320,7 @@ emit_load(struct lower_io_state *state,
    switch (mode) {
    case nir_var_shader_in:
       if (nir->info.stage == MESA_SHADER_FRAGMENT &&
-          nir->options->use_interpolated_input_intrinsics &&
+          state->options & nir_lower_io_use_interpolated_input_intrinsics &&
           var->data.interpolation != INTERP_MODE_FLAT &&
           !var->data.per_primitive) {
          if (var->data.interpolation == INTERP_MODE_EXPLICIT ||
@@ -389,6 +389,10 @@ emit_load(struct lower_io_state *state,
       semantics.location = var->data.location;
       semantics.num_slots = get_number_of_slots(state, var);
       semantics.fb_fetch_output = var->data.fb_fetch_output;
+      if (semantics.fb_fetch_output) {
+         semantics.fb_fetch_output_coherent =
+            !!(var->data.access & ACCESS_COHERENT);
+      }
       semantics.medium_precision = is_medium_precision(b->shader, var);
       semantics.high_dvec2 = high_dvec2;
       /* "per_vertex" is misnamed. It means "explicit interpolation with
@@ -704,7 +708,7 @@ nir_lower_io_block(nir_block *block,
       case nir_intrinsic_interp_deref_at_offset:
       case nir_intrinsic_interp_deref_at_vertex:
          /* We can optionally lower these to load_interpolated_input */
-         if (options->use_interpolated_input_intrinsics ||
+         if (state->options & nir_lower_io_use_interpolated_input_intrinsics ||
              options->lower_interpolate_at)
             break;
          FALLTHROUGH;
@@ -3302,8 +3306,9 @@ nir_lower_io_passes(nir_shader *nir, bool renumber_vs_inputs)
     */
    NIR_PASS_V(nir, nir_lower_io, nir_var_shader_out | nir_var_shader_in,
               type_size_vec4,
-              renumber_vs_inputs ? nir_lower_io_lower_64bit_to_32_new :
-                                   nir_lower_io_lower_64bit_to_32);
+              (renumber_vs_inputs ? nir_lower_io_lower_64bit_to_32_new :
+                                    nir_lower_io_lower_64bit_to_32) |
+              nir_lower_io_use_interpolated_input_intrinsics);
 
    /* nir_io_add_const_offset_to_base needs actual constants. */
    NIR_PASS_V(nir, nir_opt_constant_folding);

@@ -328,10 +328,13 @@ enum
    MAX_SI_VS_BLIT_SGPRS = 10, /* +1 for the attribute ring address */
 };
 
-#define SI_NGG_CULL_TRIANGLES                (1 << 0)   /* this implies W, view.xy, and small prim culling */
-#define SI_NGG_CULL_BACK_FACE                (1 << 1)   /* back faces */
-#define SI_NGG_CULL_FRONT_FACE               (1 << 2)   /* front faces */
-#define SI_NGG_CULL_LINES                    (1 << 3)   /* the primitive type is lines */
+/* The following two are only set for vertex shaders that cull.
+ * TES and GS get the primitive type from shader_info.
+ */
+#define SI_NGG_CULL_VS_TRIANGLES             (1 << 0)   /* this implies W, view.xy, and small prim culling */
+#define SI_NGG_CULL_VS_LINES                 (1 << 1)   /* this implies W and view.xy culling */
+#define SI_NGG_CULL_BACK_FACE                (1 << 2)   /* back faces */
+#define SI_NGG_CULL_FRONT_FACE               (1 << 3)   /* front faces */
 #define SI_NGG_CULL_SMALL_LINES_DIAMOND_EXIT (1 << 4)   /* cull small lines according to the diamond exit rule */
 #define SI_NGG_CULL_CLIP_PLANE_ENABLE(enable) (((enable) & 0xff) << 5)
 #define SI_NGG_CULL_GET_CLIP_PLANE_ENABLE(x)  (((x) >> 5) & 0xff)
@@ -1077,6 +1080,8 @@ void gfx9_get_gs_info(struct si_shader_selector *es, struct si_shader_selector *
 bool gfx10_is_ngg_passthrough(struct si_shader *shader);
 unsigned si_shader_lshs_vertex_stride(struct si_shader *ls);
 bool si_should_clear_lds(struct si_screen *sscreen, const struct nir_shader *shader);
+unsigned si_get_output_prim_simplified(const struct si_shader_selector *sel,
+                                       const union si_shader_key *key);
 
 /* Inline helpers. */
 
@@ -1114,19 +1119,17 @@ static inline bool si_shader_uses_bindless_images(struct si_shader_selector *sel
    return selector ? selector->info.uses_bindless_images : false;
 }
 
-static inline bool gfx10_edgeflags_have_effect(struct si_shader *shader)
+static inline bool gfx10_has_variable_edgeflags(struct si_shader *shader)
 {
-   if (shader->selector->stage == MESA_SHADER_VERTEX &&
-       !shader->selector->info.base.vs.blit_sgprs_amd &&
-       !(shader->key.ge.opt.ngg_culling & SI_NGG_CULL_LINES))
-      return true;
+   unsigned output_prim = si_get_output_prim_simplified(shader->selector, &shader->key);
 
-   return false;
+   return shader->selector->stage == MESA_SHADER_VERTEX &&
+          (output_prim == MESA_PRIM_TRIANGLES || output_prim == MESA_PRIM_UNKNOWN);
 }
 
 static inline bool gfx10_ngg_writes_user_edgeflags(struct si_shader *shader)
 {
-   return gfx10_edgeflags_have_effect(shader) &&
+   return gfx10_has_variable_edgeflags(shader) &&
           shader->selector->info.writes_edgeflag;
 }
 
@@ -1145,6 +1148,19 @@ static inline bool si_shader_uses_discard(struct si_shader *shader)
           shader->key.ps.part.prolog.poly_stipple ||
           shader->key.ps.mono.point_smoothing ||
           shader->key.ps.part.epilog.alpha_func != PIPE_FUNC_ALWAYS;
+}
+
+static inline bool si_shader_culling_enabled(struct si_shader *shader)
+{
+   if (shader->key.ge.opt.ngg_culling)
+      return true;
+
+   unsigned output_prim = si_get_output_prim_simplified(shader->selector, &shader->key);
+
+   /* This enables NGG culling for non-monolithic TES and GS. */
+   return shader->key.ge.as_ngg && !shader->key.ge.as_es &&
+          shader->selector->ngg_cull_vert_threshold == 0 &&
+          (output_prim == MESA_PRIM_TRIANGLES || output_prim == MESA_PRIM_LINES);
 }
 
 #ifdef __cplusplus

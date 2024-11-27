@@ -364,7 +364,13 @@ panvk_hash_graphics_state(struct vk_physical_device *device,
    struct mesa_blake3 blake3_ctx;
    _mesa_blake3_init(&blake3_ctx);
 
-   /* We don't need to do anything here yet */
+   /* This doesn't impact the shader compile but it does go in the
+    * panvk_shader and gets [de]serialized along with the binary so
+    * we need to hash it.
+    */
+   bool sample_shading_enable = state->ms && state->ms->sample_shading_enable;
+   _mesa_blake3_update(&blake3_ctx, &sample_shading_enable,
+                       sizeof(sample_shading_enable));
 
    _mesa_blake3_final(&blake3_ctx, blake3_out);
 }
@@ -530,7 +536,10 @@ panvk_lower_nir(struct panvk_device *dev, nir_shader *nir,
 
    pan_shader_preprocess(nir, compile_input->gpu_id);
 
-   if (stage == MESA_SHADER_VERTEX)
+   /* since valhall, panvk_per_arch(nir_lower_descriptors) separates the
+    * driver set and the user sets, and does not need pan_lower_image_index
+    */
+   if (PAN_ARCH < 9 && stage == MESA_SHADER_VERTEX)
       NIR_PASS_V(nir, pan_lower_image_index, MAX_VS_ATTRIBS);
 
    NIR_PASS_V(nir, nir_shader_instructions_pass, panvk_lower_sysvals,
@@ -845,6 +854,10 @@ panvk_compile_shader(struct panvk_device *dev,
       panvk_shader_destroy(&dev->vk, &shader->vk, pAllocator);
       return result;
    }
+
+   if (info->stage == MESA_SHADER_FRAGMENT && state != NULL &&
+       state->ms != NULL && state->ms->sample_shading_enable)
+      shader->info.fs.sample_shading = true;
 
    *shader_out = &shader->vk;
 

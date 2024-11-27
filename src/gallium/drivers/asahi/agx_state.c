@@ -9,22 +9,22 @@
 #include <errno.h>
 #include <stdio.h>
 #include "asahi/compiler/agx_compile.h"
+#include "asahi/compiler/agx_nir.h"
 #include "asahi/genxml/agx_pack.h"
 #include "asahi/layout/layout.h"
 #include "asahi/lib/agx_abi.h"
 #include "asahi/lib/agx_helpers.h"
-#include "asahi/lib/agx_nir_passes.h"
 #include "asahi/lib/agx_ppp.h"
 #include "asahi/lib/agx_usc.h"
-#include "asahi/lib/shaders/compression.h"
-#include "asahi/lib/shaders/tessellator.h"
+#include "asahi/libagx/compression.h"
+#include "asahi/libagx/query.h"
+#include "asahi/libagx/tessellator.h"
 #include "compiler/nir/nir.h"
 #include "compiler/nir/nir_serialize.h"
 #include "compiler/shader_enums.h"
 #include "gallium/auxiliary/nir/pipe_nir.h"
 #include "gallium/auxiliary/nir/tgsi_to_nir.h"
 #include "gallium/auxiliary/tgsi/tgsi_from_mesa.h"
-#include "gallium/auxiliary/util/u_blend.h"
 #include "gallium/auxiliary/util/u_draw.h"
 #include "gallium/auxiliary/util/u_framebuffer.h"
 #include "gallium/auxiliary/util/u_helpers.h"
@@ -34,7 +34,6 @@
 #include "pipe/p_defines.h"
 #include "pipe/p_screen.h"
 #include "pipe/p_state.h"
-#include "shaders/query.h"
 #include "util/bitscan.h"
 #include "util/bitset.h"
 #include "util/blend.h"
@@ -42,17 +41,13 @@
 #include "util/compiler.h"
 #include "util/format/u_format.h"
 #include "util/format/u_formats.h"
-#include "util/format_srgb.h"
 #include "util/half_float.h"
 #include "util/hash_table.h"
 #include "util/macros.h"
 #include "util/ralloc.h"
-#include "util/u_dump.h"
 #include "util/u_inlines.h"
 #include "util/u_math.h"
 #include "util/u_memory.h"
-#include "util/u_prim.h"
-#include "util/u_resource.h"
 #include "util/u_transfer.h"
 #include "util/u_upload_mgr.h"
 #include "agx_bg_eot.h"
@@ -68,7 +63,6 @@
 #include "nir_builder_opcodes.h"
 #include "nir_intrinsics.h"
 #include "nir_intrinsics_indices.h"
-#include "nir_lower_blend.h"
 #include "nir_xfb_info.h"
 #include "pool.h"
 
@@ -1473,15 +1467,6 @@ agx_nir_lower_clip_m1_1(nir_builder *b, nir_intrinsic_instr *intr,
    return true;
 }
 
-static nir_def *
-nir_channel_or_undef(nir_builder *b, nir_def *def, signed int channel)
-{
-   if (channel >= 0 && channel < def->num_components)
-      return nir_channel(b, def, channel);
-   else
-      return nir_undef(b, 1, def->bit_size);
-}
-
 /*
  * To implement point sprites, we'll replace TEX0...7 with point coordinate
  * reads as required. However, the .zw needs to read back 0.0/1.0. This pass
@@ -1841,7 +1826,9 @@ agx_shader_initialize(struct agx_device *dev, struct agx_uncompiled_shader *so,
    so->info.nr_bindful_images = BITSET_LAST_BIT(nir->info.images_used);
 
    NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in | nir_var_shader_out,
-            glsl_type_size, nir_lower_io_lower_64bit_to_32);
+            glsl_type_size,
+            nir_lower_io_lower_64bit_to_32 |
+               nir_lower_io_use_interpolated_input_intrinsics);
 
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       struct agx_interp_info interp = agx_gather_interp_info(nir);
@@ -1888,7 +1875,7 @@ agx_shader_initialize(struct agx_device *dev, struct agx_uncompiled_shader *so,
          .callback = agx_mem_vectorize_cb,
       });
 
-   NIR_PASS(_, nir, agx_nir_lower_texture, true);
+   NIR_PASS(_, nir, agx_nir_lower_texture);
    NIR_PASS(_, nir, nir_lower_ssbo, NULL);
 
    agx_preprocess_nir(nir, dev->libagx);
@@ -2657,7 +2644,7 @@ agx_build_meta_shader_internal(struct agx_context *ctx,
                nir_address_format_62bit_generic);
 
       agx_preprocess_nir(b.shader, NULL);
-      NIR_PASS(_, b.shader, agx_nir_lower_texture, true);
+      NIR_PASS(_, b.shader, agx_nir_lower_texture);
       NIR_PASS(_, b.shader, agx_nir_lower_multisampled_image_store);
    }
 

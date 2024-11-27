@@ -22,9 +22,11 @@ use spirv::SpirvKernelInfo;
 use std::cmp;
 use std::collections::HashMap;
 use std::convert::TryInto;
+use std::ffi::CStr;
 use std::fmt::Debug;
 use std::fmt::Display;
 use std::ops::Index;
+use std::ops::Not;
 use std::os::raw::c_void;
 use std::ptr;
 use std::slice;
@@ -58,8 +60,10 @@ pub enum KernelArgType {
 
 impl KernelArgType {
     fn deserialize(blob: &mut blob_reader) -> Option<Self> {
-        Some(match unsafe { blob_read_uint8(blob) } {
+        // SAFETY: we get 0 on an overrun, but we verify that later and act accordingly.
+        let res = match unsafe { blob_read_uint8(blob) } {
             0 => {
+                // SAFETY: same here
                 let size = unsafe { blob_read_uint16(blob) };
                 KernelArgType::Constant(size)
             }
@@ -71,7 +75,9 @@ impl KernelArgType {
             6 => KernelArgType::MemConstant,
             7 => KernelArgType::MemLocal,
             _ => return None,
-        })
+        };
+
+        blob.overrun.not().then_some(res)
     }
 
     fn serialize(&self, blob: &mut blob) {
@@ -192,24 +198,24 @@ impl KernelArg {
     }
 
     fn deserialize(blob: &mut blob_reader) -> Option<Vec<Self>> {
-        unsafe {
-            let len = blob_read_uint16(blob) as usize;
-            let mut res = Vec::with_capacity(len);
+        // SAFETY: we check the overrun status, blob_read returns 0 in such a case.
+        let len = unsafe { blob_read_uint16(blob) } as usize;
+        let mut res = Vec::with_capacity(len);
 
-            for _ in 0..len {
-                let spirv = spirv::SPIRVKernelArg::deserialize(blob)?;
-                let dead = blob_read_uint8(blob) != 0;
-                let kind = KernelArgType::deserialize(blob)?;
+        for _ in 0..len {
+            let spirv = spirv::SPIRVKernelArg::deserialize(blob)?;
+            // SAFETY: we check the overrun status
+            let dead = unsafe { blob_read_uint8(blob) } != 0;
+            let kind = KernelArgType::deserialize(blob)?;
 
-                res.push(Self {
-                    spirv: spirv,
-                    kind: kind,
-                    dead: dead,
-                });
-            }
-
-            Some(res)
+            res.push(Self {
+                spirv: spirv,
+                kind: kind,
+                dead: dead,
+            });
         }
+
+        blob.overrun.not().then_some(res)
     }
 }
 
@@ -1080,18 +1086,16 @@ impl SPIRVToNirResult {
         let args = KernelArg::deserialize(&mut reader)?;
         let default_build = CompilationResult::deserialize(&mut reader, d)?;
 
+        // SAFETY: on overrun this returns 0
         let optimized = match unsafe { blob_read_uint8(&mut reader) } {
             0 => None,
             _ => Some(CompilationResult::deserialize(&mut reader, d)?),
         };
 
-        Some(SPIRVToNirResult::new(
-            d,
-            kernel_info,
-            args,
-            default_build,
-            optimized,
-        ))
+        reader
+            .overrun
+            .not()
+            .then(|| SPIRVToNirResult::new(d, kernel_info, args, default_build, optimized))
     }
 
     // we can't use Self here as the nir shader might be compiled to a cso already and we can't
@@ -1689,12 +1693,14 @@ impl Kernel {
         self.kernel_info.subgroup_size
     }
 
-    pub fn arg_name(&self, idx: cl_uint) -> &String {
-        &self.kernel_info.args[idx as usize].spirv.name
+    pub fn arg_name(&self, idx: cl_uint) -> Option<&CStr> {
+        let name = &self.kernel_info.args[idx as usize].spirv.name;
+        name.is_empty().not().then_some(name)
     }
 
-    pub fn arg_type_name(&self, idx: cl_uint) -> &String {
-        &self.kernel_info.args[idx as usize].spirv.type_name
+    pub fn arg_type_name(&self, idx: cl_uint) -> Option<&CStr> {
+        let type_name = &self.kernel_info.args[idx as usize].spirv.type_name;
+        type_name.is_empty().not().then_some(type_name)
     }
 
     pub fn priv_mem_size(&self, dev: &Device) -> cl_ulong {

@@ -1,8 +1,5 @@
 /*
- * Copyright © 2019 Raspberry Pi Ltd
- *
- * based in part on radv_debug.h which is:
- * Copyright © 2017 Google.
+ * Copyright © 2024 Mauro Rossi <issor.oruam@gmail.com>
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -24,12 +21,20 @@
  * IN THE SOFTWARE.
  */
 
-#ifndef V3DV_DEBUG_H
-#define V3DV_DEBUG_H
+#ifndef NVK_ANDROID_H
+#define NVK_ANDROID_H
 
-#include "v3dv_private.h"
+#include "util/detect_os.h"
 
-void
-v3dv_print_v3d_key(struct v3d_key *key, uint32_t v3d_key_size);
-
+#if DETECT_OS_ANDROID
+extern VkFormat
+vk_format_from_android(unsigned android_format, unsigned android_usage);
+#else
+static inline VkFormat
+vk_format_from_android(unsigned android_format, unsigned android_usage)
+{
+   return VK_FORMAT_UNDEFINED;
+}
 #endif
+
+#endif /* NVK_ANDROID_H */

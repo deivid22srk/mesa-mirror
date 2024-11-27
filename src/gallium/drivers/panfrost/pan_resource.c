@@ -391,6 +391,7 @@ panfrost_should_pack_afbc(struct panfrost_device *dev,
    return panfrost_afbc_can_pack(prsrc->base.format) && panfrost_is_2d(prsrc) &&
           drm_is_afbc(prsrc->image.layout.modifier) &&
           (prsrc->image.layout.modifier & AFBC_FORMAT_MOD_SPARSE) &&
+          !(prsrc->image.layout.modifier & AFBC_FORMAT_MOD_SPLIT) &&
           (prsrc->base.bind & ~valid_binding) == 0 &&
           !prsrc->modifier_constant && prsrc->base.array_size == 1 &&
           prsrc->base.width0 >= 32 && prsrc->base.height0 >= 32 ;
@@ -762,7 +763,7 @@ panfrost_resource_create_with_modifier(struct pipe_screen *screen,
    if (dev->ro && (template->bind & PIPE_BIND_SCANOUT)) {
       struct winsys_handle handle;
       struct pan_block_size blocksize =
-         panfrost_block_size(modifier, template->format);
+         panfrost_renderblock_size(modifier, template->format);
 
       /* Block-based texture formats are only used for texture
        * compression (not framebuffer compression!), which doesn't
@@ -1651,7 +1652,7 @@ panfrost_pack_afbc(struct panfrost_context *ctx,
          dst_slice->afbc.nr_blocks = dst_stride * dst_height;
          dst_slice->afbc.header_size =
             ALIGN_POT(dst_stride * dst_height * AFBC_HEADER_BYTES_PER_TILE,
-                      pan_afbc_body_align(dst_modifier));
+                      pan_afbc_body_align(dev->arch, dst_modifier));
          dst_slice->afbc.body_size = offset;
          dst_slice->afbc.surface_stride = dst_slice->afbc.header_size + offset;
 

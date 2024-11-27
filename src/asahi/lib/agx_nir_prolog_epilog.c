@@ -8,9 +8,9 @@
 #include "util/format/u_formats.h"
 #include "agx_abi.h"
 #include "agx_linker.h"
+#include "agx_nir.h"
 #include "agx_nir_lower_gs.h"
 #include "agx_nir_lower_vbo.h"
-#include "agx_nir_passes.h"
 #include "agx_pack.h"
 #include "agx_tilebuffer.h"
 #include "nir.h"
@@ -436,7 +436,7 @@ agx_nir_fs_epilog(nir_builder *b, const void *key_)
    unsigned rt_spill = key->link.rt_spill_base;
    NIR_PASS(_, b->shader, agx_nir_lower_tilebuffer, &tib, colormasks, &rt_spill,
             write_samples, &force_translucent);
-   NIR_PASS(_, b->shader, agx_nir_lower_texture, false);
+   NIR_PASS(_, b->shader, agx_nir_lower_texture);
    NIR_PASS(_, b->shader, agx_nir_lower_multisampled_image_store);
 
    /* If the API shader runs once per sample, then the epilog runs once per

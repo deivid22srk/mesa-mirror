@@ -7168,6 +7168,16 @@ spirv_to_nir(const uint32_t *words, size_t word_count,
    return shader;
 }
 
+static void
+print_func_param(FILE *fp, nir_function *func, unsigned p)
+{
+   if (func->params[p].name) {
+      fputs(func->params[p].name, fp);
+   } else {
+      fprintf(fp, "arg%u\n", p);
+   }
+}
+
 static bool
 func_to_nir_builder(FILE *fp, struct vtn_function *func)
 {
@@ -7190,9 +7200,9 @@ func_to_nir_builder(FILE *fp, struct vtn_function *func)
    fprintf(fp, "static inline %s\n", returns ? "nir_def *": "void");
    fprintf(fp, "%s(nir_builder *b", nir_func->name);
 
-   /* TODO: Can we recover parameter names? */
    for (unsigned i = first_param; i < nir_func->num_params; ++i) {
-      fprintf(fp, ", nir_def *arg%u", i);
+      fprintf(fp, ", nir_def *");
+      print_func_param(fp, nir_func, i);
    }
 
    fprintf(fp, ")\n{\n");
@@ -7202,11 +7212,17 @@ func_to_nir_builder(FILE *fp, struct vtn_function *func)
     */
    for (unsigned i = first_param; i < nir_func->num_params; ++i) {
       nir_parameter *param = &nir_func->params[i];
-      fprintf(fp, "   assert(arg%u->bit_size == %u);\n", i, param->bit_size);
-      fprintf(fp, "   assert(arg%u->num_components == %u);\n", i,
-              param->num_components);
-      fprintf(fp, "\n");
+
+      fprintf(fp, "   assert(");
+      print_func_param(fp, nir_func, i);
+      fprintf(fp, "->bit_size == %u);\n", param->bit_size);
+
+      fprintf(fp, "   assert(");
+      print_func_param(fp, nir_func, i);
+      fprintf(fp, "->num_components == %u);\n", param->num_components);
    }
+
+   fprintf(fp, "\n");
 
    /* Find the function to call. If not found, create a prototype */
    fprintf(fp, "   nir_function *func = nir_shader_get_function_for_name(b->shader, \"%s\");\n",
@@ -7216,14 +7232,23 @@ func_to_nir_builder(FILE *fp, struct vtn_function *func)
    fprintf(fp, "      func = nir_function_create(b->shader, \"%s\");\n",
            nir_func->name);
    fprintf(fp, "      func->num_params = %u;\n", nir_func->num_params);
-   fprintf(fp, "      func->params = ralloc_array(b->shader, nir_parameter, func->num_params);\n");
+   fprintf(fp, "      func->params = rzalloc_array(b->shader, nir_parameter, func->num_params);\n");
 
    for (unsigned i = 0; i < nir_func->num_params; ++i) {
+      nir_parameter param = nir_func->params[i];
+
       fprintf(fp, "\n");
-      fprintf(fp, "      func->params[%u].bit_size = %u;\n", i,
-              nir_func->params[i].bit_size);
+      fprintf(fp, "      func->params[%u].bit_size = %u;\n", i, param.bit_size);
       fprintf(fp, "      func->params[%u].num_components = %u;\n", i,
-              nir_func->params[i].num_components);
+              param.num_components);
+
+      if (returns && i == 0) {
+         fprintf(fp, "      func->params[%u].is_return = true;\n", i);
+      }
+
+      if (param.name) {
+         fprintf(fp, "      func->params[%u].name = \"%s\";\n", i, param.name);
+      }
    }
 
    fprintf(fp, "   }\n\n");
@@ -7259,8 +7284,10 @@ func_to_nir_builder(FILE *fp, struct vtn_function *func)
    if (returns)
       fprintf(fp, ", &deref->def");
 
-   for (unsigned i = first_param; i < nir_func->num_params; ++i)
-      fprintf(fp, ", arg%u", i);
+   for (unsigned i = first_param; i < nir_func->num_params; ++i) {
+      fprintf(fp, ", ");
+      print_func_param(fp, nir_func, i);
+   }
 
    fprintf(fp, ");\n");
 

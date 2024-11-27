@@ -29,6 +29,7 @@
 #include <sys/sysinfo.h>
 #include <unistd.h>
 #include <xf86drm.h>
+#include <xf86drmMode.h>
 
 #ifdef MAJOR_IN_MKDEV
 #include <sys/mkdev.h>
@@ -590,22 +591,22 @@ v3dv_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
          instance->default_pipeline_cache_enabled = false;
          instance->meta_cache_enabled = false;
       } else {
-         fprintf(stderr, "Wrong value for envvar V3DV_ENABLE_PIPELINE_CACHE. "
-                 "Allowed values are: full, no-default-cache, no-meta-cache, off\n");
+         mesa_loge("Wrong value for envvar V3DV_ENABLE_PIPELINE_CACHE. "
+                   "Allowed values are: full, no-default-cache, no-meta-cache, off\n");
       }
    }
 
    if (instance->pipeline_cache_enabled == false) {
-      fprintf(stderr, "WARNING: v3dv pipeline cache is disabled. Performance "
-              "can be affected negatively\n");
+      mesa_logw("v3dv pipeline cache is disabled. Performance "
+                "can be affected negatively\n");
    }
    if (instance->default_pipeline_cache_enabled == false) {
-      fprintf(stderr, "WARNING: default v3dv pipeline cache is disabled. "
-              "Performance can be affected negatively\n");
+      mesa_logw("default v3dv pipeline cache is disabled. "
+                "Performance can be affected negatively\n");
    }
    if (instance->meta_cache_enabled == false) {
-      fprintf(stderr, "WARNING: custom pipeline cache for meta operations are disabled. "
-              "Performance can be affected negatively\n");
+      mesa_logw("custom pipeline cache for meta operations are disabled. "
+                "Performance can be affected negatively\n");
    }
 
 
@@ -1315,17 +1316,7 @@ create_physical_device(struct v3dv_instance *instance,
 #endif
 
    device->render_fd = render_fd;
-   if (instance->vk.enabled_extensions.KHR_display ||
-       instance->vk.enabled_extensions.KHR_xcb_surface ||
-       instance->vk.enabled_extensions.KHR_xlib_surface ||
-       instance->vk.enabled_extensions.KHR_wayland_surface ||
-       instance->vk.enabled_extensions.EXT_acquire_drm_display) {
-      device->display_fd = primary_fd;
-   } else {
-      close(primary_fd);
-      device->display_fd = -1;
-      primary_fd = -1;
-   }
+   device->display_fd = primary_fd;
 
    if (!v3d_get_device_info(device->render_fd, &device->devinfo, &v3dv_ioctl)) {
       result = vk_errorf(instance, VK_ERROR_INITIALIZATION_FAILED,
@@ -1447,7 +1438,7 @@ try_device(const char *path, int *fd, const char *target)
 
    *fd = open(path, O_RDWR | O_CLOEXEC);
    if (*fd < 0) {
-      fprintf(stderr, "Opening %s failed: %s\n", path, strerror(errno));
+      mesa_loge("Opening %s failed: %s\n", path, strerror(errno));
       return false;
    }
 
@@ -1456,7 +1447,7 @@ try_device(const char *path, int *fd, const char *target)
 
    version = drmGetVersion(*fd);
    if (!version) {
-      fprintf(stderr, "Retrieving device version failed: %s\n", strerror(errno));
+      mesa_loge("Retrieving device version failed: %s\n", strerror(errno));
       goto fail;
    }
 
@@ -1473,10 +1464,76 @@ fail:
    return false;
 }
 
+static void
+try_display_device(struct v3dv_instance *instance, const char *path,
+                   int32_t *fd)
+{
+   bool khr_display = instance->vk.enabled_extensions.KHR_display ||
+      instance->vk.enabled_extensions.EXT_acquire_drm_display;
+   *fd = open(path, O_RDWR | O_CLOEXEC);
+   if (*fd < 0) {
+      mesa_loge("Opening %s failed: %s\n", path, strerror(errno));
+      return;
+   }
+
+   /* The display driver must have KMS capabilities */
+   if (!drmIsKMS(*fd))
+      goto fail;
+
+   /* If using VK_KHR_display, we require the fd to have a connected output.
+    * We need to use this strategy because Raspberry Pi 5 can load different
+    * drivers for different types of connectors and the one with a connected
+    * output may not be vc4, which unlike Raspberry Pi 4, doesn't drive the
+    * DSI output for example.
+    */
+   if (!khr_display) {
+      if (instance->vk.enabled_extensions.KHR_xcb_surface ||
+          instance->vk.enabled_extensions.KHR_xlib_surface ||
+          instance->vk.enabled_extensions.KHR_wayland_surface)
+         return;
+      else
+         goto fail;
+   }
+
+   /* If the display device isn't the DRM master, we can't get its resources */
+   if (!drmIsMaster(*fd))
+      goto fail;
+
+   drmModeResPtr mode_res = drmModeGetResources(*fd);
+   if (!mode_res) {
+      mesa_loge("Failed to get DRM mode resources: %s\n", strerror(errno));
+      goto fail;
+   }
+
+   drmModeConnection connection = DRM_MODE_DISCONNECTED;
+
+   /* Only use a display device if there is at least one connected connector */
+   for (int c = 0; c < mode_res->count_connectors && connection == DRM_MODE_DISCONNECTED; c++) {
+      drmModeConnectorPtr connector = drmModeGetConnector(*fd, mode_res->connectors[c]);
+
+      if (!connector)
+         continue;
+
+      connection = connector->connection;
+      drmModeFreeConnector(connector);
+   }
+
+   drmModeFreeResources(mode_res);
+
+   if (connection == DRM_MODE_DISCONNECTED)
+      goto fail;
+
+   return;
+
+fail:
+   close(*fd);
+   *fd = -1;
+}
+
 /* This driver hook is expected to return VK_SUCCESS (unless a memory
  * allocation error happened) if no compatible device is found. If a
  * compatible device is found, it may return an error code if device
- * inialization failed.
+ * initialization failed.
  */
 static VkResult
 enumerate_devices(struct vk_instance *vk_instance)
@@ -1509,12 +1566,10 @@ enumerate_devices(struct vk_instance *vk_instance)
       }
 #else
       /* On actual hardware, we should have a gpu device (v3d) and a display
-       * device (vc4). We will need to use the display device to allocate WSI
-       * buffers and share them with the render node via prime, but that is a
-       * privileged operation so we need t have an authenticated display fd
-       * and for that we need the display server to provide the it (with DRI3),
-       * so here we only check that the device is present but we don't try to
-       * open it.
+       * device. We will need to use the display device to allocate WSI
+       * buffers and share them with the render node via prime. We want to
+       * allocate the display buffer on the WSI device as the display device
+       * may not have a MMU (this is true at least on Raspberry Pi 4).
        */
       if (devices[i]->bustype != DRM_BUS_PLATFORM)
          continue;
@@ -1522,7 +1577,7 @@ enumerate_devices(struct vk_instance *vk_instance)
       if ((devices[i]->available_nodes & 1 << DRM_NODE_RENDER))
          try_device(devices[i]->nodes[DRM_NODE_RENDER], &render_fd, "v3d");
       if ((devices[i]->available_nodes & 1 << DRM_NODE_PRIMARY))
-         try_device(devices[i]->nodes[DRM_NODE_PRIMARY], &primary_fd, "vc4");
+         try_display_device(instance, devices[i]->nodes[DRM_NODE_PRIMARY], &primary_fd);
 #endif
 
       if (render_fd >= 0 && primary_fd >= 0)
@@ -1530,7 +1585,7 @@ enumerate_devices(struct vk_instance *vk_instance)
    }
 
    if (render_fd < 0)
-      result = VK_ERROR_INITIALIZATION_FAILED;
+      result = VK_ERROR_INCOMPATIBLE_DRIVER;
    else
       result = create_physical_device(instance, render_fd, primary_fd);
 
@@ -1925,7 +1980,7 @@ device_free_wsi_dumb(int32_t display_fd, int32_t dumb_handle)
       .handle = dumb_handle,
    };
    if (v3dv_ioctl(display_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy_dumb)) {
-      fprintf(stderr, "destroy dumb object %d: %s\n", dumb_handle, strerror(errno));
+      mesa_loge("destroy dumb object %d: %s\n", dumb_handle, strerror(errno));
    }
 }
 
@@ -2180,6 +2235,9 @@ v3dv_AllocateMemory(VkDevice _device,
           * according to VkExternalImageFormatProperties, so it must be
           * fd or dmabuf, which don't have special requirements for us.
           */
+         break;
+      case VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID:
+         /* This case is handled in the common code */
          break;
       default:
          vk_debug_ignored_stype(ext->sType);

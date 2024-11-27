@@ -3001,7 +3001,8 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, unsigned *preamble_size)
 
    NIR_PASS(_, nir, nir_opt_load_store_vectorize,
             &(const nir_load_store_vectorize_options){
-               .modes = nir_var_mem_global | nir_var_mem_constant,
+               .modes = nir_var_mem_global | nir_var_mem_constant |
+                        nir_var_shader_temp,
                .callback = agx_mem_vectorize_cb,
             });
    NIR_PASS(_, nir, nir_lower_pack);
@@ -3883,6 +3884,10 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
       info->early_fragment_tests = nir->info.fs.early_fragment_tests;
    } else if (nir->info.stage == MESA_SHADER_COMPUTE) {
       info->imageblock_stride = nir->info.cs.image_block_size_per_thread_agx;
+
+      for (unsigned i = 0; i < 3; ++i) {
+         info->workgroup_size[i] = nir->info.workgroup_size[i];
+      }
    }
 
    out->binary = binary.data;

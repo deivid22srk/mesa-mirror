@@ -45,6 +45,7 @@
 #include "pan_props.h"
 #include "pan_samples.h"
 
+#include "util/bitscan.h"
 #include "vk_descriptor_update_template.h"
 #include "vk_format.h"
 #include "vk_synchronization.h"
@@ -161,8 +162,14 @@ finish_cs(struct panvk_cmd_buffer *cmdbuf, uint32_t subqueue)
       }
    }
 
+   /* If this is a secondary command buffer, we don't poison the reg file to
+    * preserve the render pass context. We also don't poison the reg file if the
+    * last render pass was suspended. In practice we could preserve only the
+    * registers that matter, but this is a debug feature so let's keep things
+    * simple with this all-or-nothing approach. */
    if ((instance->debug_flags & PANVK_DEBUG_CS) &&
-       cmdbuf->vk.level != VK_COMMAND_BUFFER_LEVEL_SECONDARY) {
+       cmdbuf->vk.level != VK_COMMAND_BUFFER_LEVEL_SECONDARY &&
+       !(cmdbuf->state.gfx.render.flags & VK_RENDERING_SUSPENDING_BIT)) {
       cs_update_cmdbuf_regs(b) {
          /* Poison all cmdbuf registers to make sure we don't inherit state from
           * a previously executed cmdbuf. */
@@ -245,10 +252,7 @@ add_execution_dependency(uint32_t wait_masks[static PANVK_SUBQUEUE_COUNT],
    if (!src_subqueues || (!dst_subqueues && !dst_host))
       return;
 
-   for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
-      if (!(dst_subqueues & BITFIELD_BIT(i)))
-         continue;
-
+   u_foreach_bit(i, dst_subqueues) {
       /* each dst subqueue should wait for all src subqueues */
       uint32_t wait_mask = src_subqueues;
 
@@ -282,10 +286,8 @@ add_execution_dependency(uint32_t wait_masks[static PANVK_SUBQUEUE_COUNT],
     * are dst subqueues.  Until that changes, make all src subqueues self-wait.
     */
    if (dst_host || dst_subqueues) {
-      for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
-         if (src_subqueues & BITFIELD_BIT(i))
-            wait_masks[i] |= BITFIELD_BIT(i);
-      }
+      u_foreach_bit(i, src_subqueues)
+         wait_masks[i] |= BITFIELD_BIT(i);
    }
 }
 
@@ -469,8 +471,8 @@ normalize_dependency(VkPipelineStageFlags2 *src_stages,
       break;
    }
 
-   *src_stages = vk_expand_pipeline_stage_flags2(*src_stages);
-   *dst_stages = vk_expand_pipeline_stage_flags2(*dst_stages);
+   *src_stages = vk_expand_src_stage_flags2(*src_stages);
+   *dst_stages = vk_expand_dst_stage_flags2(*dst_stages);
 
    *src_access = vk_filter_src_access_flags2(*src_stages, *src_access);
    *dst_access = vk_filter_dst_access_flags2(*dst_stages, *dst_access);
@@ -585,14 +587,8 @@ panvk_per_arch(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
    }
 
    for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
-      if (!deps.dst[i].wait_subqueue_mask)
-         continue;
-
       struct cs_builder *b = panvk_get_cs_builder(cmdbuf, i);
-      for (uint32_t j = 0; j < PANVK_SUBQUEUE_COUNT; j++) {
-         if (!(deps.dst[i].wait_subqueue_mask & BITFIELD_BIT(j)))
-            continue;
-
+      u_foreach_bit(j, deps.dst[i].wait_subqueue_mask) {
          struct panvk_cs_state *cs_state = &cmdbuf->state.cs[j];
          struct cs_index sync_addr = cs_scratch_reg64(b, 0);
          struct cs_index wait_val = cs_scratch_reg64(b, 2);
@@ -901,6 +897,23 @@ panvk_per_arch(CmdExecuteCommands)(VkCommandBuffer commandBuffer,
             cs_move32_to(prim_b, size, cs_root_chunk_size(sec_b));
             cs_call(prim_b, addr, size);
          }
+      }
+
+      /* We need to propagate the suspending state of the secondary command
+       * buffer if we want to avoid poisoning the reg file when the secondary
+       * command buffer suspended the render pass. */
+      if (secondary->state.gfx.render.flags & VK_RENDERING_SUSPENDING_BIT)
+         primary->state.gfx.render.flags = secondary->state.gfx.render.flags;
+
+      /* If the render context we passed to the secondary command buffer got
+       * invalidated, reset the FB/tiler descs and treat things as if we
+       * suspended the render pass, since those descriptors have been
+       * re-emitted by the secondary command buffer already. */
+      if (secondary->state.gfx.render.invalidate_inherited_ctx) {
+         memset(&primary->state.gfx.render.fbds, 0,
+                sizeof(primary->state.gfx.render.fbds));
+         primary->state.gfx.render.tiler = 0;
+         primary->state.gfx.render.flags |= VK_RENDERING_RESUMING_BIT;
       }
    }
 

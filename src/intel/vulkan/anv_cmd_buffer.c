@@ -562,8 +562,6 @@ anv_cmd_buffer_flush_pipeline_state(struct anv_cmd_buffer *cmd_buffer,
 
    diff_fix_state(CLIP,                     partial.clip);
    diff_fix_state(SF,                       partial.sf);
-   diff_fix_state(RASTER,                   partial.raster);
-   diff_fix_state(MULTISAMPLE,              partial.ms);
    diff_fix_state(WM,                       partial.wm);
    diff_fix_state(STREAMOUT,                partial.so);
    diff_fix_state(GS,                       partial.gs);
@@ -591,11 +589,6 @@ anv_cmd_buffer_flush_pipeline_state(struct anv_cmd_buffer *cmd_buffer,
       assert_empty(final.clip_mesh);
       assert_empty(final.sbe_mesh);
    }
-
-   /* States that should never vary between pipelines, but can be affected by
-    * blorp etc...
-    */
-   assert_identical(VF_STATISTICS,            final.vf_statistics);
 
    /* States that can vary in length */
    diff_var_state(VF_SGVS_INSTANCING,       final.vf_sgvs_instancing);

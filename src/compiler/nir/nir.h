@@ -46,6 +46,7 @@
 #include "util/set.h"
 #include "util/u_math.h"
 #include "util/u_printf.h"
+#include "nir_defines.h"
 #define XXH_INLINE_ALL
 #include <stdio.h>
 #include "util/xxhash.h"
@@ -1259,53 +1260,6 @@ typedef struct nir_alu_src {
    uint8_t swizzle[NIR_MAX_VEC_COMPONENTS];
 } nir_alu_src;
 
-/** NIR sized and unsized types
- *
- * The values in this enum are carefully chosen so that the sized type is
- * just the unsized type OR the number of bits.
- */
-/* clang-format off */
-typedef enum ENUM_PACKED {
-   nir_type_invalid =   0, /* Not a valid type */
-   nir_type_int =       2,
-   nir_type_uint =      4,
-   nir_type_bool =      6,
-   nir_type_float =     128,
-   nir_type_bool1 =     1  | nir_type_bool,
-   nir_type_bool8 =     8  | nir_type_bool,
-   nir_type_bool16 =    16 | nir_type_bool,
-   nir_type_bool32 =    32 | nir_type_bool,
-   nir_type_int1 =      1  | nir_type_int,
-   nir_type_int8 =      8  | nir_type_int,
-   nir_type_int16 =     16 | nir_type_int,
-   nir_type_int32 =     32 | nir_type_int,
-   nir_type_int64 =     64 | nir_type_int,
-   nir_type_uint1 =     1  | nir_type_uint,
-   nir_type_uint8 =     8  | nir_type_uint,
-   nir_type_uint16 =    16 | nir_type_uint,
-   nir_type_uint32 =    32 | nir_type_uint,
-   nir_type_uint64 =    64 | nir_type_uint,
-   nir_type_float16 =   16 | nir_type_float,
-   nir_type_float32 =   32 | nir_type_float,
-   nir_type_float64 =   64 | nir_type_float,
-} nir_alu_type;
-/* clang-format on */
-
-#define NIR_ALU_TYPE_SIZE_MASK      0x79
-#define NIR_ALU_TYPE_BASE_TYPE_MASK 0x86
-
-static inline unsigned
-nir_alu_type_get_type_size(nir_alu_type type)
-{
-   return type & NIR_ALU_TYPE_SIZE_MASK;
-}
-
-static inline nir_alu_type
-nir_alu_type_get_base_type(nir_alu_type type)
-{
-   return (nir_alu_type)(type & NIR_ALU_TYPE_BASE_TYPE_MASK);
-}
-
 nir_alu_type
 nir_get_nir_type_for_glsl_base_type(enum glsl_base_type base_type);
 
@@ -2025,6 +1979,7 @@ typedef struct nir_io_semantics {
    unsigned num_slots : 6; /* max 32, may be pessimistic with const indexing */
    unsigned dual_source_blend_index : 1;
    unsigned fb_fetch_output : 1;  /* for GL_KHR_blend_equation_advanced */
+   unsigned fb_fetch_output_coherent : 1;
    unsigned gs_streams : 8;       /* xxyyzzww: 2-bit stream index for each component */
    unsigned medium_precision : 1; /* GLSL mediump qualifier */
    unsigned per_view : 1;
@@ -2042,7 +1997,6 @@ typedef struct nir_io_semantics {
    unsigned no_sysval_output : 1; /* whether this system value output has no
                                      effect due to current pipeline states */
    unsigned interp_explicit_strict : 1; /* preserve original vertex order */
-   unsigned _pad : 1;
 } nir_io_semantics;
 
 /* Transform feedback info for 2 outputs. nir_intrinsic_store_output contains
@@ -3650,6 +3604,9 @@ typedef struct {
 
    /* The type of the function param */
    const struct glsl_type *type;
+
+   /* Name if known, null if unknown */
+   const char *name;
 } nir_parameter;
 
 typedef struct nir_function {
@@ -3859,9 +3816,21 @@ typedef enum {
    nir_io_has_intrinsics = BITFIELD_BIT(16),
 
    /**
-    * Run nir_opt_varyings in the GLSL linker.
+    * Don't run nir_opt_varyings and nir_opt_vectorize_io.
+    *
+    * This option is deprecated and is a hack. DO NOT USE.
+    * Use MESA_GLSL_DISABLE_IO_OPT=1 instead.
     */
-   nir_io_glsl_opt_varyings = BITFIELD_BIT(17),
+   nir_io_dont_optimize = BITFIELD_BIT(17),
+
+   /**
+    * Whether clip and cull distance arrays should be separate. If this is not
+    * set, cull distances will be moved into VARYING_SLOT_CLIP_DISTn after clip
+    * distances, and shader_info::clip_distance_array_size will be the index
+    * of the first cull distance. nir_lower_clip_cull_distance_arrays does
+    * that.
+    */
+   nir_io_separate_clip_cull_distance_arrays = BITFIELD_BIT(18),
 } nir_io_options;
 
 typedef enum {
@@ -4034,6 +4003,15 @@ typedef struct nir_shader_compiler_options {
    bool lower_base_vertex;
 
    /**
+    * Whether the driver wants to work with instance_index instead of
+    * instance_id.
+    *
+    * When set, instance_id will be lowered to instance_index - base_instance.
+    * Otherwise, instance_index will be lowered to instance_id + base_instance.
+    */
+   bool supports_instance_index;
+
+   /**
     * If enabled, gl_HelperInvocation will be lowered as:
     *
     *   !((1 << sample_id) & sample_mask_in))
@@ -4153,19 +4131,11 @@ typedef struct nir_shader_compiler_options {
    bool unify_interfaces;
 
    /**
-    * Should nir_lower_io() create load_interpolated_input intrinsics?
-    *
-    * If not, it generates regular load_input intrinsics and interpolation
-    * information must be inferred from the list of input nir_variables.
-    */
-   bool use_interpolated_input_intrinsics;
-
-   /**
     * Whether nir_lower_io() will lower interpolateAt functions to
     * load_interpolated_input intrinsics.
     *
-    * Unlike use_interpolated_input_intrinsics this will only lower these
-    * functions and leave input load intrinsics untouched.
+    * Unlike nir_lower_io_use_interpolated_input_intrinsics this will only
+    * lower these functions and leave input load intrinsics untouched.
     */
    bool lower_interpolate_at;
 
@@ -4596,6 +4566,7 @@ nir_shader_get_function_for_name(const nir_shader *shader, const char *name)
  */
 void nir_remove_non_entrypoints(nir_shader *shader);
 void nir_remove_non_exported(nir_shader *shader);
+void nir_fixup_is_exported(nir_shader *shader);
 
 nir_shader *nir_shader_create(void *mem_ctx,
                               gl_shader_stage stage,
@@ -5732,6 +5703,14 @@ typedef enum {
     * dvec4 can be DCE'd independently without affecting the other half.
     */
    nir_lower_io_lower_64bit_to_32_new = (1 << 2),
+
+   /**
+    * Should nir_lower_io() create load_interpolated_input intrinsics?
+    *
+    * If not, it generates regular load_input intrinsics and interpolation
+    * information must be inferred from the list of input nir_variables.
+    */
+   nir_lower_io_use_interpolated_input_intrinsics = (1 << 3),
 } nir_lower_io_options;
 bool nir_lower_io(nir_shader *shader,
                   nir_variable_mode modes,
@@ -6196,6 +6175,7 @@ typedef struct nir_lower_compute_system_values_options {
    bool lower_local_invocation_index : 1;
    bool lower_cs_local_id_to_index : 1;
    bool lower_workgroup_id_to_index : 1;
+   bool global_id_is_32bit : 1;
    /* At shader execution time, check if WorkGroupId should be 1D
     * and compute it quickly. Fall back to slow computation if not.
     */
@@ -6558,7 +6538,7 @@ bool nir_lower_clip_gs(nir_shader *shader, unsigned ucp_enables,
                        bool use_clipdist_array,
                        const gl_state_index16 clipplane_state_tokens[][STATE_LENGTH]);
 bool nir_lower_clip_fs(nir_shader *shader, unsigned ucp_enables,
-                       bool use_clipdist_array);
+                       bool use_clipdist_array, bool use_load_interp);
 
 bool nir_lower_clip_cull_distance_to_vec4s(nir_shader *shader);
 bool nir_lower_clip_cull_distance_arrays(nir_shader *nir);

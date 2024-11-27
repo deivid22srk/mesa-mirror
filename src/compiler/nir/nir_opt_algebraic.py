@@ -1327,7 +1327,8 @@ optimizations.extend([
    # negative.
    (('bcsel', ('ilt', a, 0), ('ineg', ('ishr', a, b)), ('ishr', a, b)),
     ('iabs', ('ishr', a, b))),
-   (('iabs', ('ishr', ('iabs', a), b)), ('ishr', ('iabs', a), b)),
+   (('iabs', ('ishr', ('iabs', a), b)), ('ushr', ('iabs', a), b)),
+   (('iabs', ('ushr', ('iabs', a), b)), ('ushr', ('iabs', a), b)),
 
    (('fabs', ('slt', a, b)), ('slt', a, b)),
    (('fabs', ('sge', a, b)), ('sge', a, b)),
@@ -1975,6 +1976,12 @@ optimizations.extend([
 
    (('u2f32', ('u2u64', 'a@32')), ('u2f32', a)),
 
+   # UINT32_MAX < a just checks the high half of a 64-bit value. This occurs
+   # when lowering convert_uint_sat(ulong). Although the replacement is more
+   # instructions, it replaces a 64-bit instruction with a 32-bit instruction
+   # and a move that will likely be coalesced.
+   (('ult', 0xffffffff, 'a@64'), ('ine', ('unpack_64_2x32_split_y', a), 0)),
+
    # Redundant trip through 8-bit
    (('i2i16', ('u2u8', ('iand', 'a@16', 1))), ('iand', 'a@16', 1)),
    (('u2u16', ('u2u8', ('iand', 'a@16', 1))), ('iand', 'a@16', 1)),
@@ -1986,8 +1993,11 @@ optimizations.extend([
    (('bcsel', a, ('b2i16', 'b@1'), ('b2i16', 'c@1')), ('b2i16', ('bcsel', a, b, c))),
 
    # Lowered pack followed by lowered unpack, for the high bits
-   (('u2u32', ('ushr', ('ior', ('ishl', a, 32), ('u2u64', b)), 32)), ('u2u32', a)),
-   (('u2u16', ('ushr', ('ior', ('ishl', a, 16), ('u2u32', b)), 16)), ('u2u16', a)),
+   (('u2u32', ('ushr', ('ior', ('ishl', a, 32), ('u2u64', 'b@8')), 32)), ('u2u32', a)),
+   (('u2u32', ('ushr', ('ior', ('ishl', a, 32), ('u2u64', 'b@16')), 32)), ('u2u32', a)),
+   (('u2u32', ('ushr', ('ior', ('ishl', a, 32), ('u2u64', 'b@32')), 32)), ('u2u32', a)),
+   (('u2u16', ('ushr', ('ior', ('ishl', a, 16), ('u2u32', 'b@8')), 16)), ('u2u16', a)),
+   (('u2u16', ('ushr', ('ior', ('ishl', a, 16), ('u2u32', 'b@16')), 16)), ('u2u16', a)),
 ])
 
 # After the ('extract_u8', a, 0) pattern, above, triggers, there will be
@@ -2144,8 +2154,10 @@ optimizations.extend([
    (('fabs', ('bcsel(is_used_once)', b, a, ('fneg', a))), ('fabs', a)),
    (('~bcsel', ('flt', a, 0.0), ('fneg', a), a), ('fabs', a)),
 
-   (('bcsel', a, ('bcsel', b, c, d), d), ('bcsel', ('iand', a, b), c, d)),
-   (('bcsel', a, b, ('bcsel', c, b, d)), ('bcsel', ('ior', a, c), b, d)),
+   (('bcsel', a, ('bcsel(is_used_once)', b, c, d), d), ('bcsel', ('iand', a, b), c, d)),
+   (('bcsel', a, ('bcsel(is_used_once)', b, d, c), d), ('bcsel', ('iand', a, ('inot', b)), c, d)),
+   (('bcsel', a, b, ('bcsel(is_used_once)', c, b, d)), ('bcsel', ('ior', a, c), b, d)),
+   (('bcsel', a, b, ('bcsel(is_used_once)', c, d, b)), ('bcsel', ('iand', c, ('inot', a)), d, b)),
 
    # Misc. lowering
    (('fmod', a, b), ('fsub', a, ('fmul', b, ('ffloor', ('fdiv', a, b)))), 'options->lower_fmod'),

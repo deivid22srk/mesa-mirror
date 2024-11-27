@@ -20,9 +20,12 @@
 
 #include "libagx.h"
 #define assert(x)
-#define FILE_TYPE void
-#define CONSTANT_ constant
-#define GLOBAL_   global
+#define FILE_TYPE          void
+#define CONSTANT_          constant
+#define GLOBAL_            global
+#define BITFIELD64_MASK(x) ((x == 64) ? ~0ul : ((1ul << x) - 1))
+#define IS_POT(v)          (((v) & ((v) - 1)) == 0)
+#define IS_POT_NONZERO(v)  ((v) != 0 && IS_POT(v))
 
 static uint64_t
 util_bitpack_uint(uint64_t v, uint32_t start, uint32_t end)
@@ -34,7 +37,7 @@ static uint64_t
 util_bitpack_sint(int64_t v, uint32_t start, uint32_t end)
 {
    const int bits = end - start + 1;
-   const uint64_t mask = (bits == 64) ? ~((uint64_t)0) : (1ull << bits) - 1;
+   const uint64_t mask = BITFIELD64_MASK(bits);
    return (v & mask) << start;
 }
 
@@ -157,7 +160,7 @@ __gen_to_groups(uint32_t value, uint32_t group_size, uint32_t length)
    uint32_t groups = DIV_ROUND_UP(value, group_size);
 
    /* The 0 encoding means "all" */
-   if (groups == (1ull << length))
+   if (groups == ((uint64_t)1) << length)
       return 0;
 
    /* Otherwise it's encoded as the identity */

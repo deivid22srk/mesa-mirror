@@ -303,6 +303,10 @@ brw_instruction_name(const struct brw_isa_info *isa, enum opcode op)
       return "vote_all";
    case SHADER_OPCODE_VOTE_EQUAL:
       return "vote_equal";
+   case SHADER_OPCODE_BALLOT:
+      return "ballot";
+   case SHADER_OPCODE_QUAD_SWAP:
+      return "quad_swap";
    }
 
    unreachable("not reached");
@@ -417,6 +421,9 @@ brw_print_instruction_to_file(const fs_visitor &s, const fs_inst *inst, FILE *fi
       fprintf(file, "(EOT) ");
    }
 
+   const bool is_send = inst->opcode == BRW_OPCODE_SEND ||
+                        inst->opcode == SHADER_OPCODE_SEND;
+
    switch (inst->dst.file) {
    case VGRF:
       if (defs && defs->get(inst->dst))
@@ -473,9 +480,11 @@ brw_print_instruction_to_file(const fs_visitor &s, const fs_inst *inst, FILE *fi
               inst->dst.offset % reg_size);
    }
 
-   if (inst->dst.stride != 1)
-      fprintf(file, "<%u>", inst->dst.stride);
-   fprintf(file, ":%s", brw_reg_type_to_letters(inst->dst.type));
+   if (!is_send) {
+      if (inst->dst.stride != 1)
+         fprintf(file, "<%u>", inst->dst.stride);
+      fprintf(file, ":%s", brw_reg_type_to_letters(inst->dst.type));
+   }
 
    for (int i = 0; i < inst->sources; i++) {
       if (inst->opcode == SHADER_OPCODE_MEMORY_LOAD_LOGICAL ||
@@ -596,18 +605,35 @@ brw_print_instruction_to_file(const fs_visitor &s, const fs_inst *inst, FILE *fi
       if (inst->src[i].abs)
          fprintf(file, "|");
 
-      if (inst->src[i].file != IMM) {
+      /* Just print register numbers for payload sources. */
+      const bool omit_src_type_and_region = is_send && i >= 2;
+
+      if (inst->src[i].file != IMM && !omit_src_type_and_region) {
          unsigned stride;
          if (inst->src[i].file == ARF || inst->src[i].file == FIXED_GRF) {
-            unsigned hstride = inst->src[i].hstride;
-            stride = (hstride == 0 ? 0 : (1 << (hstride - 1)));
+            fprintf(file, "<%u,%u,%u>", inst->src[i].vstride == 0 ? 0 : (1 << (inst->src[i].vstride - 1)),
+                                        1 << inst->src[i].width,
+                                        inst->src[i].hstride == 0 ? 0 : (1 << (inst->src[i].hstride - 1)));
          } else {
             stride = inst->src[i].stride;
+            if (stride != 1)
+               fprintf(file, "<%u>", stride);
          }
-         if (stride != 1)
-            fprintf(file, "<%u>", stride);
 
          fprintf(file, ":%s", brw_reg_type_to_letters(inst->src[i].type));
+      }
+
+      if (inst->opcode == SHADER_OPCODE_QUAD_SWAP && i == 1) {
+         assert(inst->src[i].file == IMM);
+         const char *name = NULL;
+         switch (inst->src[i].ud) {
+         case BRW_SWAP_HORIZONTAL: name = "horizontal"; break;
+         case BRW_SWAP_VERTICAL:   name = "vertical";   break;
+         case BRW_SWAP_DIAGONAL:   name = "diagonal";   break;
+         default:
+            unreachable("invalid brw_swap_direction");
+         }
+         fprintf(file, " (%s)", name);
       }
    }
 
@@ -622,7 +648,7 @@ brw_print_instruction_to_file(const fs_visitor &s, const fs_inst *inst, FILE *fi
    if (inst->has_no_mask_send_params)
       fprintf(file, "NoMaskParams ");
 
-   if (inst->sched.pipe != TGL_PIPE_NONE) {
+   if (inst->sched.regdist || inst->sched.mode) {
       fprintf(file, "{ ");
       brw_print_swsb(file, s.devinfo, inst->sched);
       fprintf(file, " } ");
@@ -635,9 +661,6 @@ brw_print_instruction_to_file(const fs_visitor &s, const fs_inst *inst, FILE *fi
 void
 brw_print_swsb(FILE *f, const struct intel_device_info *devinfo, const tgl_swsb swsb)
 {
-   if (swsb.pipe == TGL_PIPE_NONE)
-      return;
-
    if (swsb.regdist) {
       fprintf(f, "%s@%d",
               (devinfo && devinfo->verx10 < 125 ? "" :

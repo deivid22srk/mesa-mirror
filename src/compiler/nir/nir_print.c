@@ -837,8 +837,10 @@ print_var_decl(nir_variable *var, print_state *state)
    const char *const per_view = (var->data.per_view) ? "per_view " : "";
    const char *const per_primitive = (var->data.per_primitive) ? "per_primitive " : "";
    const char *const ray_query = (var->data.ray_query) ? "ray_query " : "";
-   fprintf(fp, "%s%s%s%s%s%s%s%s%s %s ",
-           bindless, cent, samp, patch, inv, per_view, per_primitive, ray_query,
+   const char *const fb_fetch = var->data.fb_fetch_output ? "fb_fetch_output " : "";
+   fprintf(fp, "%s%s%s%s%s%s%s%s%s%s %s ",
+           bindless, cent, samp, patch, inv, per_view, per_primitive,
+           ray_query, fb_fetch,
            get_variable_mode_str(var->data.mode, false),
            glsl_interp_mode_name(var->data.interpolation));
 
@@ -1393,6 +1395,9 @@ print_intrinsic_instr(nir_intrinsic_instr *instr, print_state *state)
          if (io.fb_fetch_output)
             fprintf(fp, " fbfetch");
 
+         if (io.fb_fetch_output_coherent)
+            fprintf(fp, " coherent");
+
          if (io.per_view)
             fprintf(fp, " perview");
 
@@ -1902,6 +1907,9 @@ print_call_instr(nir_call_instr *instr, print_state *state)
       if (i != 0)
          fprintf(fp, ", ");
 
+      if (instr->callee->params[i].name)
+         fprintf(fp, "%s ", instr->callee->params[i].name);
+
       print_src(&instr->params[i], state, nir_type_invalid);
    }
 }
@@ -2310,12 +2318,34 @@ print_function(nir_function *function, print_state *state)
 {
    FILE *fp = state->fp;
 
+   fprintf(fp, "decl_function %s (", function->name);
+
+   for (unsigned i = 0; i < function->num_params; ++i) {
+      if (i != 0) {
+         fprintf(fp, ", ");
+      }
+
+      nir_parameter param = function->params[i];
+
+      fprintf(fp, "%u", param.bit_size);
+      if (param.num_components != 1) {
+         fprintf(fp, "x%u", param.num_components);
+      }
+
+      if (param.name) {
+         fprintf(fp, " %s", param.name);
+      } else if (param.is_return) {
+         fprintf(fp, " return");
+      }
+   }
+
+   fprintf(fp, ")");
+
    /* clang-format off */
-   fprintf(fp, "decl_function %s (%d params)%s%s", function->name,
-           function->num_params,
-           function->dont_inline ? " (noinline)" :
-           function->should_inline ? " (inline)" : "",
-           function->is_exported ? " (exported)" : "");
+   fprintf(fp, "%s%s%s", function->dont_inline ? " (noinline)" :
+                       function->should_inline ? " (inline)" : "",
+                       function->is_exported ? " (exported)" : "",
+                       function->is_entrypoint ? " (entrypoint)" : "");
    /* clang-format on */
 
    fprintf(fp, "\n");

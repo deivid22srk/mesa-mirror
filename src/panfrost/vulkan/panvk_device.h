@@ -42,6 +42,12 @@ struct panvk_device {
    struct panvk_priv_bo *tiler_heap;
    struct panvk_priv_bo *sample_positions;
 
+   struct {
+      struct panvk_priv_bo *handlers_bo;
+      uint32_t handler_stride;
+      uint32_t dump_region_size;
+   } tiler_oom;
+
    struct vk_meta_device meta;
 
    struct {
@@ -90,6 +96,12 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
 
 void panvk_per_arch(destroy_device)(struct panvk_device *device,
                                     const VkAllocationCallbacks *pAllocator);
+
+#if PAN_ARCH >= 10
+VkResult panvk_per_arch(device_check_status)(struct vk_device *vk_dev);
+
+VkResult panvk_per_arch(init_tiler_oom)(struct panvk_device *device);
+#endif
 #endif
 
 #endif

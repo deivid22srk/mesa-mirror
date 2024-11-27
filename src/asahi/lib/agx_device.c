@@ -570,8 +570,7 @@ agx_open_device(void *memctx, struct agx_device *dev)
 
    glsl_type_singleton_init_or_ref();
    struct blob_reader blob;
-   blob_reader_init(&blob, (void *)libagx_shaders_nir,
-                    sizeof(libagx_shaders_nir));
+   blob_reader_init(&blob, (void *)libagx_nir, sizeof(libagx_nir));
    dev->libagx = nir_deserialize(memctx, &agx_nir_options, &blob);
 
    dev->helper = agx_build_helper(dev);
@@ -813,10 +812,12 @@ agx_get_num_cores(const struct agx_device *dev)
 struct agx_device_key
 agx_gather_device_key(struct agx_device *dev)
 {
+   bool g13x_coh = (dev->params.gpu_generation == 13 &&
+                    dev->params.num_clusters_total > 1) ||
+                   dev->params.num_dies > 1;
+
    return (struct agx_device_key){
-      .needs_g13x_coherency = (dev->params.gpu_generation == 13 &&
-                               dev->params.num_clusters_total > 1) ||
-                              dev->params.num_dies > 1,
+      .needs_g13x_coherency = u_tristate_make(g13x_coh),
       .soft_fault = agx_has_soft_fault(dev),
    };
 }

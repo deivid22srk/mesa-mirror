@@ -41,11 +41,10 @@ si_fill_aco_options(struct si_screen *screen, gl_shader_stage stage,
                     struct aco_compiler_options *options,
                     struct util_debug_callback *debug)
 {
-   options->dump_shader =
-      si_can_dump_shader(screen, stage, SI_DUMP_ACO_IR) ||
-      si_can_dump_shader(screen, stage, SI_DUMP_ASM) ||
-      screen->options.debug_disassembly;
+   options->dump_ir = si_can_dump_shader(screen, stage, SI_DUMP_ACO_IR);
    options->dump_preoptir = si_can_dump_shader(screen, stage, SI_DUMP_INIT_ACO_IR);
+   options->record_asm = si_can_dump_shader(screen, stage, SI_DUMP_ASM) ||
+                         screen->options.debug_disassembly;
    options->record_ir = screen->record_llvm_ir;
    options->is_opengl = true;
 
@@ -81,7 +80,7 @@ si_fill_aco_shader_info(struct si_shader *shader, struct aco_shader_info *info,
    info->hw_stage = si_select_hw_stage(stage, key, gfx_level);
 
    if (stage <= MESA_SHADER_GEOMETRY && key->ge.as_ngg && !key->ge.as_es) {
-      info->has_ngg_culling = key->ge.opt.ngg_culling;
+      info->has_ngg_culling = si_shader_culling_enabled(shader);
       info->has_ngg_early_prim_export = gfx10_ngg_export_prim_early(shader);
    }
 

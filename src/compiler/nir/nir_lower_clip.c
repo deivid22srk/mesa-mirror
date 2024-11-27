@@ -101,7 +101,7 @@ store_clipdist_output(nir_builder *b, nir_variable *out, int location, int locat
    unsigned num_slots = b->shader->info.clip_distance_array_size;
    nir_io_semantics semantics = {
       .location = location,
-      .num_slots = num_slots,
+      .num_slots = b->shader->options->compact_arrays ? num_slots : 1,
    };
 
    if (location == VARYING_SLOT_CLIP_DIST1 || location_offset)
@@ -122,7 +122,7 @@ store_clipdist_output(nir_builder *b, nir_variable *out, int location, int locat
 
 static void
 load_clipdist_input(nir_builder *b, nir_variable *in, int location_offset,
-                    nir_def **val)
+                    nir_def **val, bool use_load_interp)
 {
    nir_io_semantics semantics = {
       .location = in->data.location,
@@ -130,7 +130,7 @@ load_clipdist_input(nir_builder *b, nir_variable *in, int location_offset,
    };
 
    nir_def *load;
-   if (b->shader->options->use_interpolated_input_intrinsics) {
+   if (use_load_interp) {
       /* TODO: use sample when per-sample shading? */
       nir_def *barycentric = nir_load_barycentric(
          b, nir_intrinsic_load_barycentric_pixel, INTERP_MODE_NONE);
@@ -160,58 +160,54 @@ load_clipdist_input(nir_builder *b, nir_variable *in, int location_offset,
 static nir_def *
 find_output(nir_builder *b, unsigned location)
 {
-   nir_def *def = NULL;
-   nir_def *components[4] = {NULL};
-   nir_instr *first = NULL;
-   unsigned found = 0;
+   nir_def *comp[4] = {NULL};
+   nir_instr *last_comp = NULL;
+
    nir_foreach_function_impl(impl, b->shader) {
-      nir_foreach_block_reverse(block, impl) {
-         nir_def *new_def = NULL;
-         nir_foreach_instr_reverse(instr, block) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr_safe(instr, block) {
             if (instr->type != nir_instr_type_intrinsic)
                continue;
-            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-            if ((intr->intrinsic == nir_intrinsic_store_output ||
-               intr->intrinsic == nir_intrinsic_store_per_vertex_output ||
-               intr->intrinsic == nir_intrinsic_store_per_primitive_output) &&
-               nir_intrinsic_io_semantics(intr).location == location) {
-               assert(nir_src_is_const(*nir_get_io_offset_src(intr)));
 
-               int wrmask = nir_intrinsic_write_mask(intr);
-               if (intr->num_components == 4 && wrmask == 0xf) {
-                  new_def = intr->src[0].ssa;
-               } else {
-                  int c = nir_intrinsic_component(intr);
-                  assert(intr->num_components == 1 && wrmask == 0x1);
-                  assert(!components[c]);
-                  components[c] = intr->src[0].ssa;
-                  if (!first)
-                     first = &intr->instr;
-                  found++;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+
+            if ((intr->intrinsic == nir_intrinsic_store_output ||
+                 intr->intrinsic == nir_intrinsic_store_per_vertex_output ||
+                 intr->intrinsic == nir_intrinsic_store_per_primitive_output) &&
+                nir_intrinsic_io_semantics(intr).location == location) {
+               assert(nir_src_is_const(*nir_get_io_offset_src(intr)));
+               unsigned component = nir_intrinsic_component(intr);
+               unsigned wrmask = nir_intrinsic_write_mask(intr);
+
+               u_foreach_bit(i, wrmask) {
+                  unsigned index = component + i;
+
+                  /* Each component should be written only once. */
+                  assert(!comp[index]);
+                  b->cursor = nir_before_instr(&intr->instr);
+                  comp[index] = nir_channel(b, intr->src[0].ssa, i);
+                  last_comp = comp[index]->parent_instr;
                }
+
+               /* Remove it because it's going to be replaced by CLIP_DIST. */
+               if (location == VARYING_SLOT_CLIP_VERTEX)
+                  nir_instr_remove(instr);
             }
          }
-         assert(!(new_def && def));
-         if (!def)
-            def = new_def;
-#if !MESA_DEBUG
-         /* for debug builds, scan entire shader to assert
-          * if output is written multiple times.  For release
-          * builds just assume all is well and bail when we
-          * find first:
-          */
-         if (def || found == 4)
-            break;
-#endif
       }
    }
-   assert(def || found == 4);
-   if (found) {
-      b->cursor = nir_after_instr(first);
-      def = nir_vec(b, components, 4);
+
+   if (!last_comp)
+      return NULL;
+
+   b->cursor = nir_after_instr(last_comp);
+
+   for (unsigned i = 0; i < 4; i++) {
+      if (!comp[i])
+         comp[i] = nir_undef(b, 1, 32);
    }
 
-   return def;
+   return nir_vec(b, comp, 4);
 }
 
 static bool
@@ -329,14 +325,13 @@ lower_clip_outputs(nir_builder *b, nir_variable *position,
          if (ucp_enables & 0xf0)
             nir_store_var(b, out[1], nir_vec(b, &clipdist[4], 4), 0xf);
       } else if (use_clipdist_array) {
-         /* always emit first half of array */
-
+         /* Always emit the first vec4. */
          store_clipdist_output(b, out[0], VARYING_SLOT_CLIP_DIST0, 0, &clipdist[0], use_clipdist_array);
          if (ucp_enables & 0xf0)
             store_clipdist_output(b, out[0], VARYING_SLOT_CLIP_DIST0, 1, &clipdist[4], use_clipdist_array);
       } else {
-         if (ucp_enables & 0x0f)
-            store_clipdist_output(b, out[0], VARYING_SLOT_CLIP_DIST0, 0, &clipdist[0], use_clipdist_array);
+         /* Always emit the first vec4. */
+         store_clipdist_output(b, out[0], VARYING_SLOT_CLIP_DIST0, 0, &clipdist[0], use_clipdist_array);
          if (ucp_enables & 0xf0)
             store_clipdist_output(b, out[1], VARYING_SLOT_CLIP_DIST1, 0, &clipdist[4], use_clipdist_array);
       }
@@ -473,21 +468,21 @@ nir_lower_clip_gs(nir_shader *shader, unsigned ucp_enables,
 
 static void
 lower_clip_fs(nir_function_impl *impl, unsigned ucp_enables,
-              nir_variable **in, bool use_clipdist_array)
+              nir_variable **in, bool use_clipdist_array, bool use_load_interp)
 {
    nir_def *clipdist[MAX_CLIP_PLANES];
    nir_builder b = nir_builder_at(nir_before_impl(impl));
 
    if (!use_clipdist_array) {
       if (ucp_enables & 0x0f)
-         load_clipdist_input(&b, in[0], 0, &clipdist[0]);
+         load_clipdist_input(&b, in[0], 0, &clipdist[0], use_load_interp);
       if (ucp_enables & 0xf0)
-         load_clipdist_input(&b, in[1], 0, &clipdist[4]);
+         load_clipdist_input(&b, in[1], 0, &clipdist[4], use_load_interp);
    } else {
       if (ucp_enables & 0x0f)
-         load_clipdist_input(&b, in[0], 0, &clipdist[0]);
+         load_clipdist_input(&b, in[0], 0, &clipdist[0], use_load_interp);
       if (ucp_enables & 0xf0)
-         load_clipdist_input(&b, in[0], 1, &clipdist[4]);
+         load_clipdist_input(&b, in[0], 1, &clipdist[4], use_load_interp);
    }
    b.shader->info.inputs_read |= update_mask(ucp_enables);
 
@@ -533,7 +528,7 @@ fs_has_clip_dist_input_var(nir_shader *shader, nir_variable **io_vars,
  */
 bool
 nir_lower_clip_fs(nir_shader *shader, unsigned ucp_enables,
-                  bool use_clipdist_array)
+                  bool use_clipdist_array, bool use_load_interp)
 {
    nir_variable *in[2] = { 0 };
 
@@ -553,8 +548,10 @@ nir_lower_clip_fs(nir_shader *shader, unsigned ucp_enables,
       assert(use_clipdist_array);
 
    nir_foreach_function_with_impl(function, impl, shader) {
-      if (!strcmp(function->name, "main"))
-         lower_clip_fs(impl, ucp_enables, in, use_clipdist_array);
+      if (!strcmp(function->name, "main")) {
+         lower_clip_fs(impl, ucp_enables, in, use_clipdist_array,
+                       use_load_interp);
+      }
    }
 
    return true;

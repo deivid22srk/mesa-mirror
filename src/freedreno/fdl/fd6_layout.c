@@ -11,6 +11,10 @@
 
 #include "freedreno_layout.h"
 
+#include "adreno_pm4.xml.h"
+#include "adreno_common.xml.h"
+#include "a6xx.xml.h"
+
 static bool
 is_r8g8(const struct fdl_layout *layout)
 {
@@ -101,10 +105,11 @@ fdl6_tile_alignment(struct fdl_layout *layout, uint32_t *heightalign)
  *  piglit/bin/texelFetch fs sampler3D 100x100x8
  */
 bool
-fdl6_layout(struct fdl_layout *layout, enum pipe_format format,
-            uint32_t nr_samples, uint32_t width0, uint32_t height0,
-            uint32_t depth0, uint32_t mip_levels, uint32_t array_size,
-            bool is_3d, struct fdl_explicit_layout *explicit_layout)
+fdl6_layout(struct fdl_layout *layout, const struct fd_dev_info *info,
+            enum pipe_format format, uint32_t nr_samples, uint32_t width0,
+            uint32_t height0, uint32_t depth0, uint32_t mip_levels,
+            uint32_t array_size, bool is_3d,
+            struct fdl_explicit_layout *explicit_layout)
 {
    uint32_t offset = 0, heightalign;
    uint32_t ubwc_blockwidth, ubwc_blockheight;
@@ -125,10 +130,27 @@ fdl6_layout(struct fdl_layout *layout, enum pipe_format format,
 
    fdl6_get_ubwc_blockwidth(layout, &ubwc_blockwidth, &ubwc_blockheight);
 
-   if (depth0 > 1 || ubwc_blockwidth == 0)
+   /* For simplicity support UBWC only for 3D images without mipmaps,
+    * most d3d11 games don't use mipmaps for 3D images.
+    */
+   if (depth0 > 1 && mip_levels > 1)
       layout->ubwc = false;
 
-   if (layout->ubwc || util_format_is_depth_or_stencil(format))
+   if (ubwc_blockwidth == 0)
+      layout->ubwc = false;
+
+   if (width0 < FDL_MIN_UBWC_WIDTH) {
+      layout->ubwc = false;
+      /* Linear D/S is not supported by HW. */
+      if (!util_format_is_depth_or_stencil(format))
+         layout->tile_mode = TILE6_LINEAR;
+   }
+
+   /* Linear D/S is not supported by HW. */
+   if (util_format_is_depth_or_stencil(format))
+      layout->tile_all = true;
+
+   if (layout->ubwc && !info->a6xx.has_ubwc_linear_mipmap_fallback)
       layout->tile_all = true;
 
    /* in layer_first layout, the level (slice) contains just one
@@ -196,7 +218,7 @@ fdl6_layout(struct fdl_layout *layout, enum pipe_format format,
       uint32_t depth = u_minify(depth0, level);
       struct fdl_slice *slice = &layout->slices[level];
       struct fdl_slice *ubwc_slice = &layout->ubwc_slices[level];
-      uint32_t tile_mode = fdl_tile_mode(layout, level);
+      enum a6xx_tile_mode tile_mode = fdl_tile_mode(layout, level);
       uint32_t pitch = fdl_pitch(layout, level);
       uint32_t height = u_minify(height0, level);
 
@@ -253,7 +275,7 @@ fdl6_layout(struct fdl_layout *layout, enum pipe_format format,
 
       layout->size += slice->size0 * depth * layers_in_level;
 
-      if (layout->ubwc) {
+      if (layout->ubwc && tile_mode != TILE6_LINEAR) {
          /* with UBWC every level is aligned to 4K */
          layout->size = align64(layout->size, 4096);
 
@@ -279,9 +301,10 @@ fdl6_layout(struct fdl_layout *layout, enum pipe_format format,
     * independently.
     */
    if (layout->ubwc) {
+      assert(!(depth0 > 1 && mip_levels > 1));
       for (uint32_t level = 0; level < mip_levels; level++)
-         layout->slices[level].offset += layout->ubwc_layer_size * array_size;
-      layout->size += layout->ubwc_layer_size * array_size;
+         layout->slices[level].offset += layout->ubwc_layer_size * array_size * depth0;
+      layout->size += layout->ubwc_layer_size * array_size * depth0;
    }
 
    /* include explicit offset in size */

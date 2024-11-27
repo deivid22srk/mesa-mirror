@@ -84,6 +84,13 @@ struct hk_root_descriptor_table {
          uint16_t provoking;
          uint16_t _pad4;
 
+         /* True if there is an API geometry shader. If false, there may still
+          * be a geometry shader in use (notably for transform feedback) but it
+          * should not contribute to pipeline statistics.
+          */
+         uint16_t api_gs;
+         uint16_t _pad5;
+
          /* Mapping from varying slots written by the last vertex stage to UVS
           * indices. This mapping must be compatible with the fragment shader.
           */
@@ -139,12 +146,14 @@ struct hk_bg_eot {
 
 struct hk_render_registers {
    uint32_t width, height, layers;
+   uint32_t zls_width, zls_height;
    uint32_t isp_bgobjdepth;
    uint32_t isp_bgobjvals;
    struct agx_zls_control_packed zls_control, zls_control_partial;
    uint32_t iogpu_unk_214;
    uint32_t depth_dimensions;
    bool process_empty_tiles;
+   enum u_tristate dbias_is_int;
 
    struct {
       uint32_t dimensions;
@@ -301,6 +310,9 @@ enum hk_cs_type {
 
 struct hk_cs {
    struct list_head node;
+
+   /* Parent command buffer. Convenience. */
+   struct hk_cmd_buffer *cmd;
 
    /* Data master */
    enum hk_cs_type type;
@@ -513,6 +525,7 @@ hk_cmd_buffer_get_cs_general(struct hk_cmd_buffer *cmd, struct hk_cs **ptr,
       /* Allocate hk_cs for the new stream */
       struct hk_cs *cs = malloc(sizeof(*cs));
       *cs = (struct hk_cs){
+         .cmd = cmd,
          .type = compute ? HK_CS_CDM : HK_CS_VDM,
          .addr = root.gpu,
          .start = root.cpu,
@@ -764,7 +777,7 @@ hk_grid_indirect_local(uint64_t ptr)
 }
 
 void hk_dispatch_with_usc(struct hk_device *dev, struct hk_cs *cs,
-                          struct hk_shader *s, uint32_t usc,
+                          struct agx_shader_info *info, uint32_t usc,
                           struct hk_grid grid, struct hk_grid local_size);
 
 static inline void
@@ -776,7 +789,7 @@ hk_dispatch_with_local_size(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    uint32_t usc = hk_upload_usc_words(cmd, s, s->only_linked);
 
    hk_reserve_scratch(cmd, cs, s);
-   hk_dispatch_with_usc(dev, cs, s, usc, grid, local_size);
+   hk_dispatch_with_usc(dev, cs, &s->b.info, usc, grid, local_size);
 }
 
 static inline void
@@ -786,8 +799,8 @@ hk_dispatch(struct hk_cmd_buffer *cmd, struct hk_cs *cs, struct hk_shader *s,
    assert(s->info.stage == MESA_SHADER_COMPUTE);
 
    struct hk_grid local_size =
-      hk_grid(s->info.cs.local_size[0], s->info.cs.local_size[1],
-              s->info.cs.local_size[2]);
+      hk_grid(s->b.info.workgroup_size[0], s->b.info.workgroup_size[1],
+              s->b.info.workgroup_size[2]);
 
    if (!grid.indirect) {
       grid.count[0] *= local_size.count[0];

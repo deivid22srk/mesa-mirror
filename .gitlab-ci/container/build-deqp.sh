@@ -10,12 +10,19 @@
 
 set -uex -o pipefail
 
+# shellcheck disable=SC2153
+deqp_api=${DEQP_API,,}
+
+uncollapsed_section_start deqp-$deqp_api "Building dEQP $DEQP_API"
+
 # See `deqp_build_targets` below for which release is used to produce which
 # binary. Unless this comment has bitrotten:
+# - the commit from the main branch produces the deqp tools,
 # - the VK release produces `deqp-vk`,
 # - the GL release produces `glcts`, and
 # - the GLES release produces `deqp-gles*` and `deqp-egl`
 
+DEQP_MAIN_COMMIT=e9a562cfdc4d05044e8465525a79e97016b7b324
 DEQP_VK_VERSION=1.3.10.0
 DEQP_GL_VERSION=4.6.5.0
 DEQP_GLES_VERSION=3.2.11.0
@@ -83,55 +90,73 @@ git config --global user.name "Mesa CI"
 
 # shellcheck disable=SC2153
 case "${DEQP_API}" in
+  tools) DEQP_VERSION="$DEQP_MAIN_COMMIT";;
   VK) DEQP_VERSION="vulkan-cts-$DEQP_VK_VERSION";;
   GL) DEQP_VERSION="opengl-cts-$DEQP_GL_VERSION";;
   GLES) DEQP_VERSION="opengl-es-cts-$DEQP_GLES_VERSION";;
+  *) echo "Unexpected DEQP_API value: $DEQP_API"; exit 1;;
 esac
 
-git clone \
-    https://github.com/KhronosGroup/VK-GL-CTS.git \
-    -b $DEQP_VERSION \
-    --depth 1 \
-    /VK-GL-CTS
+mkdir -p /VK-GL-CTS
 pushd /VK-GL-CTS
+[ -e .git ] || {
+  git init
+  git remote add origin https://github.com/KhronosGroup/VK-GL-CTS.git
+}
+git fetch --depth 1 origin "$DEQP_VERSION"
+git checkout FETCH_HEAD
+DEQP_COMMIT=$(git rev-parse FETCH_HEAD)
 
-mkdir -p /deqp
+if [ "$DEQP_VERSION" = "$DEQP_MAIN_COMMIT" ]; then
+  git fetch origin main
+  if ! git merge-base --is-ancestor "$DEQP_MAIN_COMMIT" origin/main; then
+    echo "VK-GL-CTS commit $DEQP_MAIN_COMMIT is not a commit from the main branch."
+    exit 1
+  fi
+fi
 
-# shellcheck disable=SC2153
-deqp_api=${DEQP_API,,}
+mkdir -p /deqp-$deqp_api
 
-cts_commits_to_backport="${deqp_api}_cts_commits_to_backport[@]"
-for commit in "${!cts_commits_to_backport}"
-do
-  PATCH_URL="https://github.com/KhronosGroup/VK-GL-CTS/commit/$commit.patch"
-  echo "Apply patch to ${DEQP_API} CTS from $PATCH_URL"
-  curl -L --retry 4 -f --retry-all-errors --retry-delay 60 $PATCH_URL | \
-    GIT_COMMITTER_DATE=$(date -d@0) git am -
-done
+if [ "$DEQP_API" = tools ]; then
+  commit_desc=$(git show --no-patch --format='commit %h on %ci' --abbrev=10 "$DEQP_COMMIT")
+  echo "dEQP main at $commit_desc" > /deqp-$deqp_api/version
+else
+  cts_commits_to_backport="${deqp_api}_cts_commits_to_backport[@]"
+  for commit in "${!cts_commits_to_backport}"
+  do
+    PATCH_URL="https://github.com/KhronosGroup/VK-GL-CTS/commit/$commit.patch"
+    echo "Apply patch to ${DEQP_API} CTS from $PATCH_URL"
+    curl -L --retry 4 -f --retry-all-errors --retry-delay 60 $PATCH_URL | \
+      GIT_COMMITTER_DATE=$(date -d@0) git am -
+  done
 
-cts_patch_files="${deqp_api}_cts_patch_files[@]"
-for patch in "${!cts_patch_files}"
-do
-  echo "Apply patch to ${DEQP_API} CTS from $patch"
-  GIT_COMMITTER_DATE=$(date -d@0) git am < $OLDPWD/.gitlab-ci/container/patches/$patch
-done
+  cts_patch_files="${deqp_api}_cts_patch_files[@]"
+  for patch in "${!cts_patch_files}"
+  do
+    echo "Apply patch to ${DEQP_API} CTS from $patch"
+    GIT_COMMITTER_DATE=$(date -d@0) git am < $OLDPWD/.gitlab-ci/container/patches/$patch
+  done
 
-{
-  echo "dEQP base version $DEQP_VERSION"
-  echo "The following local patches are applied on top:"
-  git log --reverse --oneline $DEQP_VERSION.. --format='- %s'
-} > /deqp/version-$deqp_api
+  {
+    echo "dEQP base version $DEQP_VERSION"
+    echo "The following local patches are applied on top:"
+    git log --reverse --oneline "$DEQP_COMMIT".. --format='- %s'
+  } > /deqp-$deqp_api/version
+fi
 
 # --insecure is due to SSL cert failures hitting sourceforge for zlib and
 # libpng (sigh).  The archives get their checksums checked anyway, and git
 # always goes through ssh or https.
 python3 external/fetch_sources.py --insecure
 
-# Save the testlog stylesheets:
-cp doc/testlog-stylesheet/testlog.{css,xsl} /deqp
+if [[ "$DEQP_API" = tools ]]; then
+  # Save the testlog stylesheets:
+  cp doc/testlog-stylesheet/testlog.{css,xsl} /deqp-$deqp_api
+fi
+
 popd
 
-pushd /deqp
+pushd /deqp-$deqp_api
 
 if [ "${DEQP_API}" = 'GLES' ]; then
   if [ "${DEQP_TARGET}" = 'android' ]; then
@@ -139,8 +164,8 @@ if [ "${DEQP_API}" = 'GLES' ]; then
         -DDEQP_TARGET=android \
         -DCMAKE_BUILD_TYPE=Release \
         ${EXTRA_CMAKE_ARGS:-}
-    mold --run ninja modules/egl/deqp-egl
-    mv /deqp/modules/egl/deqp-egl /deqp/modules/egl/deqp-egl-android
+    ninja modules/egl/deqp-egl
+    mv /deqp-$deqp_api/modules/egl/deqp-egl{,-android}
   else
     # When including EGL/X11 testing, do that build first and save off its
     # deqp-egl binary.
@@ -148,15 +173,15 @@ if [ "${DEQP_API}" = 'GLES' ]; then
         -DDEQP_TARGET=x11_egl_glx \
         -DCMAKE_BUILD_TYPE=Release \
         ${EXTRA_CMAKE_ARGS:-}
-    mold --run ninja modules/egl/deqp-egl
-    mv /deqp/modules/egl/deqp-egl /deqp/modules/egl/deqp-egl-x11
+    ninja modules/egl/deqp-egl
+    mv /deqp-$deqp_api/modules/egl/deqp-egl{,-x11}
 
     cmake -S /VK-GL-CTS -B . -G Ninja \
         -DDEQP_TARGET=wayland \
         -DCMAKE_BUILD_TYPE=Release \
         ${EXTRA_CMAKE_ARGS:-}
-    mold --run ninja modules/egl/deqp-egl
-    mv /deqp/modules/egl/deqp-egl /deqp/modules/egl/deqp-egl-wayland
+    ninja modules/egl/deqp-egl
+    mv /deqp-$deqp_api/modules/egl/deqp-egl{,-wayland}
   fi
 fi
 
@@ -182,80 +207,82 @@ case "${DEQP_API}" in
     ;;
   GLES)
     deqp_build_targets+=(deqp-gles{2,3,31})
+    deqp_build_targets+=(glcts)  # needed for gles*-khr tests
     # deqp-egl also comes from this build, but it is handled separately above.
     ;;
+  tools)
+    deqp_build_targets+=(testlog-to-xml)
+    deqp_build_targets+=(testlog-to-csv)
+    deqp_build_targets+=(testlog-to-junit)
+    ;;
 esac
-if [ "${DEQP_TARGET}" != 'android' ]; then
-  deqp_build_targets+=(testlog-to-xml)
-  deqp_build_targets+=(testlog-to-csv)
-  deqp_build_targets+=(testlog-to-junit)
-fi
 
-mold --run ninja "${deqp_build_targets[@]}"
+ninja "${deqp_build_targets[@]}"
 
-if [ "${DEQP_TARGET}" != 'android' ]; then
+if [ "${DEQP_TARGET}" != 'android' ] && [ "$DEQP_API" != tools ]; then
     # Copy out the mustpass lists we want.
-    mkdir -p /deqp/mustpass
+    mkdir -p /deqp-$deqp_api/mustpass
 
     if [ "${DEQP_API}" = 'VK' ]; then
         for mustpass in $(< /VK-GL-CTS/external/vulkancts/mustpass/main/vk-default.txt) ; do
             cat /VK-GL-CTS/external/vulkancts/mustpass/main/$mustpass \
-                >> /deqp/mustpass/vk-main.txt
+                >> /deqp-$deqp_api/mustpass/vk-main.txt
         done
     fi
 
     if [ "${DEQP_API}" = 'GL' ]; then
         cp \
             /VK-GL-CTS/external/openglcts/data/gl_cts/data/mustpass/gl/khronos_mustpass/main/*-main.txt \
-            /deqp/mustpass/
+            /deqp-$deqp_api/mustpass/
         cp \
             /VK-GL-CTS/external/openglcts/data/gl_cts/data/mustpass/gl/khronos_mustpass_single/main/*-single.txt \
-            /deqp/mustpass/
+            /deqp-$deqp_api/mustpass/
     fi
 
     if [ "${DEQP_API}" = 'GLES' ]; then
         cp \
             /VK-GL-CTS/external/openglcts/data/gl_cts/data/mustpass/gles/aosp_mustpass/main/*.txt \
-            /deqp/mustpass/
+            /deqp-$deqp_api/mustpass/
         cp \
             /VK-GL-CTS/external/openglcts/data/gl_cts/data/mustpass/egl/aosp_mustpass/main/egl-main.txt \
-            /deqp/mustpass/
+            /deqp-$deqp_api/mustpass/
         cp \
             /VK-GL-CTS/external/openglcts/data/gl_cts/data/mustpass/gles/khronos_mustpass/main/*-main.txt \
-            /deqp/mustpass/
+            /deqp-$deqp_api/mustpass/
     fi
 
-    # Save *some* executor utils, but otherwise strip things down
-    # to reduct deqp build size:
-    mkdir /deqp/executor.save
-    cp /deqp/executor/testlog-to-* /deqp/executor.save
-    rm -rf /deqp/executor
-    mv /deqp/executor.save /deqp/executor
+    # Compress the caselists, since Vulkan's in particular are gigantic; higher
+    # compression levels provide no real measurable benefit.
+    zstd -1 --rm /deqp-$deqp_api/mustpass/*.txt
 fi
 
-# Compress the caselists, since Vulkan's in particular are gigantic; higher
-# compression levels provide no real measurable benefit.
-zstd -1 --rm /deqp/mustpass/*.txt
+if [ "$DEQP_API" = tools ]; then
+    # Save *some* executor utils, but otherwise strip things down
+    # to reduct deqp build size:
+    mv /deqp-tools/executor/testlog-to-* /deqp-tools
+    rm -rf /deqp-tools/executor
+fi
 
 # Remove other mustpass files, since we saved off the ones we wanted to conventient locations above.
-rm -rf /deqp/external/**/mustpass/
-rm -rf /deqp/external/vulkancts/modules/vulkan/vk-main*
-rm -rf /deqp/external/vulkancts/modules/vulkan/vk-default
+rm -rf /deqp-$deqp_api/external/**/mustpass/
+rm -rf /deqp-$deqp_api/external/vulkancts/modules/vulkan/vk-main*
+rm -rf /deqp-$deqp_api/external/vulkancts/modules/vulkan/vk-default
 
-rm -rf /deqp/external/openglcts/modules/cts-runner
-rm -rf /deqp/modules/internal
-rm -rf /deqp/execserver
-rm -rf /deqp/framework
+rm -rf /deqp-$deqp_api/external/openglcts/modules/cts-runner
+rm -rf /deqp-$deqp_api/modules/internal
+rm -rf /deqp-$deqp_api/execserver
+rm -rf /deqp-$deqp_api/framework
 find . -depth \( -iname '*cmake*' -o -name '*ninja*' -o -name '*.o' -o -name '*.a' \) -exec rm -rf {} \;
 if [ "${DEQP_API}" = 'VK' ]; then
   ${STRIP_CMD:-strip} external/vulkancts/modules/vulkan/deqp-vk
 fi
-if [ "${DEQP_API}" = 'GL' ]; then
+if [ "${DEQP_API}" = 'GL' ] || [ "${DEQP_API}" = 'GLES' ]; then
   ${STRIP_CMD:-strip} external/openglcts/modules/glcts
 fi
 if [ "${DEQP_API}" = 'GLES' ]; then
   ${STRIP_CMD:-strip} modules/*/deqp-*
 fi
 du -sh ./*
-rm -rf /VK-GL-CTS
 popd
+
+section_end deqp-$deqp_api

@@ -1610,8 +1610,13 @@ r3d_setup(struct tu_cmd_buffer *cmd,
    tu_cs_emit_regs(cs, A6XX_GRAS_LRZ_CNTL(0));
    tu_cs_emit_regs(cs, A6XX_RB_LRZ_CNTL(0));
 
-   if (CHIP >= A7XX)
+   if (CHIP >= A7XX) {
       tu_cs_emit_regs(cs, A7XX_GRAS_LRZ_DEPTH_BUFFER_INFO());
+
+      tu_cs_emit_regs(cs, A6XX_RB_FSR_CONFIG());
+      tu_cs_emit_regs(cs, A7XX_SP_FSR_CONFIG());
+      tu_cs_emit_regs(cs, A7XX_GRAS_FSR_CONFIG());
+   }
 
    tu_cs_emit_write_reg(cs, REG_A6XX_GRAS_SC_CNTL,
                         A6XX_GRAS_SC_CNTL_CCUSINGLECACHELINESIZE(2));
@@ -2898,6 +2903,7 @@ tu_copy_image_to_image(struct tu_cmd_buffer *cmd,
          vk_image_subresource_layer_count(&src_image->vk,
                                           &info->srcSubresource);
       fdl6_layout(&staging_layout,
+                  &cmd->device->physical_device->dev_info,
                   src_format,
                   src_image->layout[0].nr_samples,
                   extent.width,
@@ -3751,7 +3757,8 @@ tu_CmdClearColorImage(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(tu_image, image, image_h);
 
-   if (use_generic_clear_for_image_clear(cmd, image)) {
+   bool use_generic_clear = use_generic_clear_for_image_clear(cmd, image);
+   if (use_generic_clear) {
       /* Generic clear doesn't go through CCU (or other caches). */
       cmd->state.cache.flush_bits |=
          TU_CMD_FLAG_CCU_INVALIDATE_COLOR | TU_CMD_FLAG_WAIT_FOR_IDLE;
@@ -3766,6 +3773,13 @@ tu_CmdClearColorImage(VkCommandBuffer commandBuffer,
    }
 
    tu_emit_resolve_group<CHIP>(cmd, &cmd->cs, &resolve_group);
+   if (use_generic_clear) {
+      /* This will emit CCU_RESOLVE_CLEAN which will ensure any future resolves
+       * proceed only after the just-emitted generic clears are complete.
+       */
+      cmd->state.cache.flush_bits |= TU_CMD_FLAG_BLIT_CACHE_CLEAN;
+      tu_emit_cache_flush<CHIP>(cmd);
+   }
 }
 TU_GENX(tu_CmdClearColorImage);
 
@@ -3781,7 +3795,8 @@ tu_CmdClearDepthStencilImage(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(tu_image, image, image_h);
 
-   if (use_generic_clear_for_image_clear(cmd, image)) {
+   bool use_generic_clear = use_generic_clear_for_image_clear(cmd, image);
+   if (use_generic_clear) {
       /* Generic clear doesn't go through CCU (or other caches). */
       cmd->state.cache.flush_bits |= TU_CMD_FLAG_CCU_INVALIDATE_COLOR |
                                      TU_CMD_FLAG_CCU_INVALIDATE_DEPTH |
@@ -3813,6 +3828,13 @@ tu_CmdClearDepthStencilImage(VkCommandBuffer commandBuffer,
    }
 
    tu_emit_resolve_group<CHIP>(cmd, &cmd->cs, &resolve_group);
+   if (use_generic_clear) {
+      /* This will emit CCU_RESOLVE_CLEAN which will ensure any future resolves
+       * proceed only after the just-emitted generic clears are complete.
+       */
+      cmd->state.cache.flush_bits |= TU_CMD_FLAG_BLIT_CACHE_CLEAN;
+      tu_emit_cache_flush<CHIP>(cmd);
+   }
 
    tu_lrz_clear_depth_image<CHIP>(cmd, image, pDepthStencil, rangeCount, pRanges);
 }

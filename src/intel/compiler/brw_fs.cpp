@@ -249,6 +249,9 @@ fs_inst::is_control_source(unsigned arg) const
              arg != MEMORY_LOGICAL_DATA0 &&
              arg != MEMORY_LOGICAL_DATA1;
 
+   case SHADER_OPCODE_QUAD_SWAP:
+      return arg == 1;
+
    default:
       return false;
    }
@@ -324,6 +327,8 @@ fs_inst::can_do_source_mods(const struct intel_device_info *devinfo) const
    case SHADER_OPCODE_VOTE_ANY:
    case SHADER_OPCODE_VOTE_ALL:
    case SHADER_OPCODE_VOTE_EQUAL:
+   case SHADER_OPCODE_BALLOT:
+   case SHADER_OPCODE_QUAD_SWAP:
       return false;
    default:
       return true;
@@ -840,7 +845,7 @@ fs_visitor::import_uniforms(fs_visitor *v)
    this->uniforms = v->uniforms;
 }
 
-enum brw_barycentric_mode
+enum intel_barycentric_mode
 brw_barycentric_mode(const struct brw_wm_prog_key *key,
                      nir_intrinsic_instr *intr)
 {
@@ -858,16 +863,16 @@ brw_barycentric_mode(const struct brw_wm_prog_key *key,
        * interpolation. We'll dynamically remap things so that the FS thread
        * payload is not affected.
        */
-      bary = key->persample_interp == BRW_SOMETIMES ?
-             BRW_BARYCENTRIC_PERSPECTIVE_SAMPLE :
-             BRW_BARYCENTRIC_PERSPECTIVE_PIXEL;
+      bary = key->persample_interp == INTEL_SOMETIMES ?
+             INTEL_BARYCENTRIC_PERSPECTIVE_SAMPLE :
+             INTEL_BARYCENTRIC_PERSPECTIVE_PIXEL;
       break;
    case nir_intrinsic_load_barycentric_centroid:
-      bary = BRW_BARYCENTRIC_PERSPECTIVE_CENTROID;
+      bary = INTEL_BARYCENTRIC_PERSPECTIVE_CENTROID;
       break;
    case nir_intrinsic_load_barycentric_sample:
    case nir_intrinsic_load_barycentric_at_sample:
-      bary = BRW_BARYCENTRIC_PERSPECTIVE_SAMPLE;
+      bary = INTEL_BARYCENTRIC_PERSPECTIVE_SAMPLE;
       break;
    default:
       unreachable("invalid intrinsic");
@@ -876,7 +881,7 @@ brw_barycentric_mode(const struct brw_wm_prog_key *key,
    if (mode == INTERP_MODE_NOPERSPECTIVE)
       bary += 3;
 
-   return (enum brw_barycentric_mode) bary;
+   return (enum intel_barycentric_mode) bary;
 }
 
 /**
@@ -1604,6 +1609,8 @@ brw_allocate_registers(fs_visitor &s, bool allow_spilling)
       return;
 
    brw_fs_lower_scoreboard(s);
+
+   s.debug_optimizer(nir, "scoreboard", 96, 4);
 }
 
 /**
@@ -1841,4 +1848,3 @@ namespace brw {
       inst->conditional_mod = BRW_CONDITIONAL_NZ;
    }
 }
-

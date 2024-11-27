@@ -139,8 +139,6 @@ save_reg_writes(pr_opt_ctx& ctx, aco_ptr<Instruction>& instr)
                 ctx.instr_idx_by_regs[ctx.current_block->index].begin() + r + dw_size, idx);
    }
    if (instr->isPseudo() && instr->pseudo().needs_scratch_reg) {
-      if (!instr->pseudo().tmp_in_scc)
-         ctx.instr_idx_by_regs[ctx.current_block->index][scc] = overwritten_unknown_instr;
       ctx.instr_idx_by_regs[ctx.current_block->index][instr->pseudo().scratch_sgpr] =
          overwritten_unknown_instr;
    }
@@ -866,12 +864,6 @@ optimize_postRA(Program* program)
 
       for (aco_ptr<Instruction>& instr : block.instructions)
          process_instruction(ctx, instr);
-
-      /* SCC might get overwritten by copies or swaps from parallelcopies
-       * inserted by SSA-elimination for linear phis.
-       */
-      if (!block.scc_live_out)
-         ctx.instr_idx_by_regs[block.index][scc] = overwritten_unknown_instr;
    }
 
    /* Cleanup pass

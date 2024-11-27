@@ -1175,7 +1175,7 @@ v3d_nir_lower_fs_late(struct v3d_compile *c)
          * are using.
          */
         if (c->key->ucp_enables)
-                NIR_PASS(_, c->s, nir_lower_clip_fs, c->key->ucp_enables, true);
+                NIR_PASS(_, c->s, nir_lower_clip_fs, c->key->ucp_enables, true, false);
 
         NIR_PASS_V(c->s, nir_lower_io_to_scalar, nir_var_shader_in, NULL, NULL);
 }
@@ -2522,4 +2522,24 @@ v3d_compute_vpm_config(struct v3d_device_info *devinfo,
    }
 
    return true;
+}
+
+static inline uint32_t
+compute_prog_score(struct v3d_prog_data *p, uint32_t qpu_size)
+{
+        const uint32_t inst_count = qpu_size / sizeof(uint64_t);
+        const uint32_t tmu_count = p->tmu_count + p->tmu_spills + p->tmu_fills;
+        return inst_count + 4 * tmu_count;
+}
+
+void
+v3d_update_double_buffer_score(uint32_t vertex_count,
+                               uint32_t vs_qpu_size,
+                               uint32_t fs_qpu_size,
+                               struct v3d_prog_data *vs,
+                               struct v3d_prog_data *fs,
+                               struct v3d_double_buffer_score *score)
+{
+        score->geom += vertex_count * compute_prog_score(vs, vs_qpu_size);
+        score->render += compute_prog_score(fs, fs_qpu_size);
 }

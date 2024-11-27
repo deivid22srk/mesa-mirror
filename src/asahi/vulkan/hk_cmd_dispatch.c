@@ -4,7 +4,7 @@
  * Copyright 2022-2023 Collabora Ltd. and Red Hat Inc.
  * SPDX-License-Identifier: MIT
  */
-#include "shaders/query.h"
+#include "libagx/query.h"
 #include "vulkan/vulkan_core.h"
 #include "agx_helpers.h"
 #include "agx_linker.h"
@@ -105,8 +105,8 @@ hk_cdm_cache_flush(struct hk_device *dev, struct hk_cs *cs)
  */
 void
 hk_dispatch_with_usc(struct hk_device *dev, struct hk_cs *cs,
-                     struct hk_shader *s, uint32_t usc, struct hk_grid grid,
-                     struct hk_grid local_size)
+                     struct agx_shader_info *info, uint32_t usc,
+                     struct hk_grid grid, struct hk_grid local_size)
 {
    assert(cs->current + 0x2000 < cs->end && "should have ensured space");
    uint8_t *out = cs->current;
@@ -126,8 +126,8 @@ hk_dispatch_with_usc(struct hk_device *dev, struct hk_cs *cs,
       /* For now, always bind the txf sampler and nothing else */
       cfg.sampler_state_register_count = 1;
 
-      cfg.uniform_register_count = s->b.info.push_count;
-      cfg.preshader_register_count = s->b.info.nr_preamble_gprs;
+      cfg.uniform_register_count = info->push_count;
+      cfg.preshader_register_count = info->nr_preamble_gprs;
    }
 
    agx_push(out, CDM_LAUNCH_WORD_1, cfg) {
@@ -182,9 +182,9 @@ dispatch(struct hk_cmd_buffer *cmd, struct hk_grid grid)
       cmd, VK_QUERY_PIPELINE_STATISTIC_COMPUTE_SHADER_INVOCATIONS_BIT);
 
    if (stat) {
-      uint32_t local_size_threads = s->info.cs.local_size[0] *
-                                    s->info.cs.local_size[1] *
-                                    s->info.cs.local_size[2];
+      uint32_t local_size_threads = (uint32_t)s->b.info.workgroup_size[0] *
+                                    (uint32_t)s->b.info.workgroup_size[1] *
+                                    (uint32_t)s->b.info.workgroup_size[2];
 
       struct libagx_cs_invocation_params p = {
          .grid = cmd->state.cs.descriptors.root.cs.group_count_addr,
@@ -200,7 +200,8 @@ dispatch(struct hk_cmd_buffer *cmd, struct hk_grid grid)
          hk_upload_usc_words_kernel(cmd, s, &params, sizeof(params));
 
       perf_debug(dev, "CS invocation statistic");
-      hk_dispatch_with_usc(dev, cs, s, usc, hk_grid(1, 1, 1), hk_grid(1, 1, 1));
+      hk_dispatch_with_usc(dev, cs, &s->b.info, usc, hk_grid(1, 1, 1),
+                           hk_grid(1, 1, 1));
    }
 
    hk_ensure_cs_has_space(cmd, cs, 0x2000 /* TODO */);

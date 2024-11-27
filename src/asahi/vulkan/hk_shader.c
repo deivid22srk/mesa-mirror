@@ -36,9 +36,10 @@
 #include "vk_ycbcr_conversion.h"
 
 #include "asahi/compiler/agx_compile.h"
+#include "asahi/compiler/agx_nir.h"
+#include "asahi/compiler/agx_nir_texture.h"
 #include "asahi/lib/agx_abi.h"
 #include "asahi/lib/agx_linker.h"
-#include "asahi/lib/agx_nir_passes.h"
 #include "asahi/lib/agx_tilebuffer.h"
 #include "asahi/lib/agx_uvs.h"
 #include "compiler/spirv/nir_spirv.h"
@@ -364,15 +365,6 @@ lookup_ycbcr_conversion(const void *_state, uint32_t set, uint32_t binding,
    return sampler && sampler->vk.ycbcr_conversion
              ? &sampler->vk.ycbcr_conversion->state
              : NULL;
-}
-
-static inline bool
-nir_has_image_var(nir_shader *nir)
-{
-   nir_foreach_image_variable(_, nir)
-      return true;
-
-   return false;
 }
 
 static int
@@ -715,14 +707,16 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
             UINT32_MAX);
 
    NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in | nir_var_shader_out,
-            glsl_type_size, nir_lower_io_lower_64bit_to_32);
+            glsl_type_size,
+            nir_lower_io_lower_64bit_to_32 |
+               nir_lower_io_use_interpolated_input_intrinsics);
 
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_viewport_fs,
                nir_metadata_control_flow, NULL);
    }
 
-   NIR_PASS(_, nir, agx_nir_lower_texture, false);
+   NIR_PASS(_, nir, agx_nir_lower_texture);
    NIR_PASS(_, nir, agx_nir_lower_multisampled_image_store);
 
    agx_preprocess_nir(nir, dev->dev.libagx);
@@ -900,11 +894,6 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
    shader->info.clip_distance_array_size = nir->info.clip_distance_array_size;
    shader->info.cull_distance_array_size = nir->info.cull_distance_array_size;
    shader->b.info.outputs = outputs;
-
-   if (sw_stage == MESA_SHADER_COMPUTE) {
-      for (unsigned i = 0; i < 3; ++i)
-         shader->info.cs.local_size[i] = nir->info.workgroup_size[i];
-   }
 
    if (xfb_info) {
       assert(xfb_info->output_count < ARRAY_SIZE(shader->info.xfb_outputs));

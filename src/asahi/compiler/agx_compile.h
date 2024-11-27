@@ -7,6 +7,7 @@
 
 #include "compiler/nir/nir.h"
 #include "util/u_dynarray.h"
+#include "util/u_tristate.h"
 #include "shader_enums.h"
 
 struct agx_cf_binding {
@@ -135,6 +136,9 @@ struct agx_shader_info {
    /* Output mask set during driver lowering */
    uint64_t outputs;
 
+   /* Workgroup size */
+   uint16_t workgroup_size[3];
+
    /* There may be constants in the binary. The driver must map these to uniform
     * registers as specified hre.
     */
@@ -203,7 +207,7 @@ struct agx_device_key {
    /* Does the target GPU need explicit cluster coherency for atomics?
     * Only used on G13X.
     */
-   bool needs_g13x_coherency;
+   enum u_tristate needs_g13x_coherency;
 
    /* Is soft fault enabled? This is technically system-wide policy set by the
     * kernel, but that's functionally a hardware feature.
@@ -320,7 +324,6 @@ static const nir_shader_compiler_options agx_nir_options = {
    .lower_device_index_to_zero = true,
    .lower_hadd = true,
    .vectorize_io = true,
-   .use_interpolated_input_intrinsics = true,
    .has_amul = true,
    .has_isub = true,
    .support_16bit_alu = true,

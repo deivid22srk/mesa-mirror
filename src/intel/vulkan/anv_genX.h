@@ -46,20 +46,6 @@ struct anv_trtt_bind;
 typedef struct nir_builder nir_builder;
 typedef struct nir_shader nir_shader;
 
-extern const uint32_t genX(vk_to_intel_cullmode)[];
-
-extern const uint32_t genX(vk_to_intel_front_face)[];
-
-extern const uint32_t genX(vk_to_intel_primitive_type)[];
-
-extern const uint32_t genX(vk_to_intel_compare_op)[];
-
-extern const uint32_t genX(vk_to_intel_stencil_op)[];
-
-extern const uint32_t genX(vk_to_intel_logic_op)[];
-
-extern const uint32_t genX(vk_to_intel_fillmode)[];
-
 void genX(init_physical_device_state)(struct anv_physical_device *device);
 
 VkResult genX(init_device_state)(struct anv_device *device);
@@ -118,11 +104,10 @@ void genX(emit_pipeline_select)(struct anv_batch *batch, uint32_t pipeline,
 
 void genX(apply_task_urb_workaround)(struct anv_cmd_buffer *cmd_buffer);
 
-void genX(emit_vertex_input)(struct anv_batch *batch,
-                             uint32_t *vertex_element_dws,
-                             struct anv_graphics_pipeline *pipeline,
-                             const struct vk_vertex_input_state *vi,
-                             bool emit_in_pipeline);
+void genX(batch_emit_vertex_input)(struct anv_batch *batch,
+                                   struct anv_device *device,
+                                   struct anv_graphics_pipeline *pipeline,
+                                   const struct vk_vertex_input_state *vi);
 
 enum anv_pipe_bits
 genX(emit_apply_pipe_flushes)(struct anv_batch *batch,
@@ -282,11 +267,6 @@ genX(batch_emit_post_3dprimitive_was)(struct anv_batch *batch,
 void genX(batch_emit_fast_color_dummy_blit)(struct anv_batch *batch,
                                             struct anv_device *device);
 
-VkPolygonMode
-genX(raster_polygon_mode)(const struct anv_graphics_pipeline *pipeline,
-                          VkPolygonMode polygon_mode,
-                          VkPrimitiveTopology primitive_topology);
-
 void
 genX(graphics_pipeline_emit)(struct anv_graphics_pipeline *pipeline,
                              const struct vk_graphics_pipeline_state *state);
@@ -313,7 +293,7 @@ genX(ray_tracing_pipeline_emit)(struct anv_ray_tracing_pipeline *pipeline);
 
 void
 genX(batch_set_preemption)(struct anv_batch *batch,
-                           const struct intel_device_info *devinfo,
+                           struct anv_device *device,
                            uint32_t current_pipeline,
                            bool value);
 

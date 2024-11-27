@@ -50,22 +50,6 @@ _isel_err(isel_context* ctx, const char* file, unsigned line, const nir_instr* i
    free(out);
 }
 
-struct if_context {
-   Temp cond;
-
-   bool divergent_old;
-   bool had_divergent_discard_old;
-   bool had_divergent_discard_then;
-   bool has_divergent_continue_old;
-   bool has_divergent_continue_then;
-   struct exec_info exec_old;
-
-   unsigned BB_if_idx;
-   unsigned invert_idx;
-   Block BB_invert;
-   Block BB_endif;
-};
-
 struct loop_context {
    Block loop_exit;
 
@@ -1258,11 +1242,15 @@ visit_alu_instr(isel_context* ctx, nir_alu_instr* instr)
       if (instr->def.bit_size >= 32 || dst.type() == RegType::vgpr) {
          aco_ptr<Instruction> vec{create_instruction(aco_opcode::p_create_vector, Format::PSEUDO,
                                                      instr->def.num_components, 1)};
-         RegClass elem_rc = RegClass::get(RegType::vgpr, instr->def.bit_size / 8u);
+         RegClass elem_rc = RegClass::get(dst.type(), instr->def.bit_size / 8u);
          for (unsigned i = 0; i < num; ++i) {
             if (elems[i].type() == RegType::sgpr && elem_rc.is_subdword())
                elems[i] = emit_extract_vector(ctx, elems[i], 0, elem_rc);
-            vec->operands[i] = Operand{elems[i]};
+
+            if (nir_src_is_undef(instr->src[i].src))
+               vec->operands[i] = Operand{elem_rc};
+            else
+               vec->operands[i] = Operand{elems[i]};
          }
          vec->definitions[0] = Definition(dst);
          ctx->block->instructions.emplace_back(std::move(vec));
@@ -1273,16 +1261,20 @@ visit_alu_instr(isel_context* ctx, nir_alu_instr* instr)
 
          std::array<Temp, NIR_MAX_VEC_COMPONENTS> packed;
          uint32_t const_vals[NIR_MAX_VEC_COMPONENTS] = {};
+         bitarray32 undef_mask = UINT32_MAX;
          for (unsigned i = 0; i < num; i++) {
             unsigned packed_size = use_s_pack ? 16 : 32;
             unsigned idx = i * instr->def.bit_size / packed_size;
             unsigned offset = i * instr->def.bit_size % packed_size;
+            if (nir_src_is_undef(instr->src[i].src))
+               continue;
+            else
+               undef_mask[idx] = false;
+
             if (nir_src_is_const(instr->src[i].src)) {
                const_vals[idx] |= nir_src_as_uint(instr->src[i].src) << offset;
                continue;
             }
-            if (nir_src_is_undef(instr->src[i].src))
-               continue;
 
             if (offset != packed_size - instr->def.bit_size)
                elems[i] =
@@ -1313,7 +1305,9 @@ visit_alu_instr(isel_context* ctx, nir_alu_instr* instr)
                   packed[i] = bld.sop2(aco_opcode::s_pack_ll_b32_b16, bld.def(s1), packed[i * 2],
                                        Operand::c32(const_vals[i * 2 + 1]));
                else
-                  packed[i] = Temp(); /* Both constants, so reset the entry */
+                  packed[i] = Temp(0, s1); /* Both constants, so reset the entry */
+
+               undef_mask[i] = undef_mask[i * 2] && undef_mask[i * 2 + 1];
 
                if (same)
                   const_vals[i] = const_vals[i * 2] | (const_vals[i * 2 + 1] << 16);
@@ -1326,11 +1320,11 @@ visit_alu_instr(isel_context* ctx, nir_alu_instr* instr)
             if (const_vals[i] && packed[i].id())
                packed[i] = bld.sop2(aco_opcode::s_or_b32, bld.def(s1), bld.def(s1, scc),
                                     Operand::c32(const_vals[i]), packed[i]);
-            else if (!packed[i].id())
+            else if (!packed[i].id() && !undef_mask[i])
                packed[i] = bld.copy(bld.def(s1), Operand::c32(const_vals[i]));
          }
 
-         if (dst.size() == 1)
+         if (dst.size() == 1 && packed[0].id())
             bld.copy(Definition(dst), packed[0]);
          else {
             aco_ptr<Instruction> vec{
@@ -3330,10 +3324,16 @@ visit_alu_instr(isel_context* ctx, nir_alu_instr* instr)
          ctx, dst, instr->op == nir_op_unpack_32_4x8 || instr->op == nir_op_unpack_64_4x16 ? 4 : 2);
       break;
    case nir_op_pack_64_2x32_split: {
-      Temp src0 = get_alu_src(ctx, instr->src[0]);
-      Temp src1 = get_alu_src(ctx, instr->src[1]);
+      Operand src[2];
+      RegClass elem_rc = dst.regClass() == s2 ? s1 : v1;
+      for (unsigned i = 0; i < 2; i++) {
+         if (nir_src_is_undef(instr->src[i].src))
+            src[i] = Operand(elem_rc);
+         else
+            src[i] = Operand(get_alu_src(ctx, instr->src[i]));
+      }
 
-      bld.pseudo(aco_opcode::p_create_vector, Definition(dst), src0, src1);
+      bld.pseudo(aco_opcode::p_create_vector, Definition(dst), src[0], src[1]);
       break;
    }
    case nir_op_unpack_64_2x32_split_x:
@@ -3363,12 +3363,25 @@ visit_alu_instr(isel_context* ctx, nir_alu_instr* instr)
       }
       break;
    case nir_op_pack_32_2x16_split: {
-      Temp src0 = get_alu_src(ctx, instr->src[0]);
-      Temp src1 = get_alu_src(ctx, instr->src[1]);
+      Operand src0 = Operand(get_alu_src(ctx, instr->src[0]));
+      Operand src1 = Operand(get_alu_src(ctx, instr->src[1]));
       if (dst.regClass() == v1) {
-         src0 = emit_extract_vector(ctx, src0, 0, v2b);
-         src1 = emit_extract_vector(ctx, src1, 0, v2b);
+         if (nir_src_is_undef(instr->src[0].src))
+            src0 = Operand(v2b);
+         else
+            src0 = Operand(emit_extract_vector(ctx, src0.getTemp(), 0, v2b));
+
+         if (nir_src_is_undef(instr->src[1].src))
+            src1 = Operand(v2b);
+         else
+            src1 = Operand(emit_extract_vector(ctx, src1.getTemp(), 0, v2b));
+
          bld.pseudo(aco_opcode::p_create_vector, Definition(dst), src0, src1);
+      } else if (nir_src_is_undef(instr->src[1].src)) {
+         bld.copy(Definition(dst), src0);
+      } else if (nir_src_is_undef(instr->src[0].src)) {
+         bld.pseudo(aco_opcode::p_insert, Definition(dst), bld.def(s1, scc), src1, Operand::c32(1),
+                    Operand::c32(16));
       } else if (ctx->program->gfx_level >= GFX9) {
          bld.sop2(aco_opcode::s_pack_ll_b32_b16, Definition(dst), src0, src1);
       } else {
@@ -8086,6 +8099,10 @@ visit_cmat_muladd(isel_context* ctx, nir_intrinsic_instr* instr)
    emit_split_vector(ctx, dst, instr->def.num_components);
 }
 
+static void begin_empty_exec_skip(isel_context* ctx, nir_instr* instr, nir_block* block);
+
+static void end_empty_exec_skip(isel_context* ctx);
+
 void
 visit_intrinsic(isel_context* ctx, nir_intrinsic_instr* instr)
 {
@@ -8938,8 +8955,11 @@ visit_intrinsic(isel_context* ctx, nir_intrinsic_instr* instr)
 
       bld.pseudo(aco_opcode::p_demote_to_helper, cond);
 
+      /* Perform the demote in WQM so that it doesn't make exec empty. WQM should last until at
+       * least the next top-level block.
+       */
       if (ctx->block->loop_nest_depth || ctx->cf_info.parent_if.is_divergent)
-         ctx->cf_info.exec.potentially_empty_discard = true;
+         set_wqm(ctx);
 
       ctx->block->kind |= block_kind_uses_discard;
       ctx->program->needs_exact = true;
@@ -8963,11 +8983,13 @@ visit_intrinsic(isel_context* ctx, nir_intrinsic_instr* instr)
       }
 
       bld.pseudo(aco_opcode::p_discard_if, cond);
-
-      if (ctx->block->loop_nest_depth || ctx->cf_info.parent_if.is_divergent)
-         ctx->cf_info.exec.potentially_empty_discard = true;
-      ctx->cf_info.had_divergent_discard |= in_exec_divergent_or_in_loop(ctx);
       ctx->block->kind |= block_kind_uses_discard;
+
+      if (ctx->block->loop_nest_depth || ctx->cf_info.parent_if.is_divergent) {
+         ctx->cf_info.exec.potentially_empty_discard = true;
+         begin_empty_exec_skip(ctx, &instr->instr, instr->instr.block);
+      }
+      ctx->cf_info.had_divergent_discard |= in_exec_divergent_or_in_loop(ctx);
       ctx->program->needs_exact = true;
       break;
    }
@@ -10096,7 +10118,6 @@ visit_undef(isel_context* ctx, nir_undef_instr* instr)
 void
 begin_loop(isel_context* ctx, loop_context* lc)
 {
-   // TODO: we might want to wrap the loop around a branch if exec.potentially_empty=true
    append_logical_end(ctx->block);
    ctx->block->kind |= block_kind_loop_preheader | block_kind_uniform;
    Builder bld(ctx->program, ctx->block);
@@ -10190,6 +10211,9 @@ end_loop(isel_context* ctx, loop_context* lc)
          if (!ctx->cf_info.parent_loop.has_divergent_branch)
             add_logical_edge(block_idx, &ctx->program->blocks[loop_header_idx]);
          ctx->block = &ctx->program->blocks[block_idx];
+
+         /* SGPR temporaries might need loop exit phis to be created. */
+         ctx->program->should_repair_ssa = true;
       } else {
          ctx->block->kind |= (block_kind_continue | block_kind_uniform);
          if (!ctx->cf_info.parent_loop.has_divergent_branch)
@@ -10225,6 +10249,14 @@ emit_loop_jump(isel_context* ctx, bool is_break)
    append_logical_end(ctx->block);
    unsigned idx = ctx->block->index;
 
+   /* If exec is empty inside uniform control flow in a loop, we can assume that all invocations
+    * of the loop are inactive. Breaking from the loop is the right thing to do in that case.
+    * We shouldn't perform a uniform continue, or else we might never reach a break.
+    */
+   bool potentially_empty_exec = ctx->cf_info.exec.potentially_empty_discard ||
+                                 ctx->cf_info.exec.potentially_empty_break ||
+                                 ctx->cf_info.exec.potentially_empty_continue;
+
    if (is_break) {
       logical_target = ctx->cf_info.parent_loop.exit;
       add_logical_edge(idx, logical_target);
@@ -10250,7 +10282,7 @@ emit_loop_jump(isel_context* ctx, bool is_break)
       add_logical_edge(idx, logical_target);
       ctx->block->kind |= block_kind_continue;
 
-      if (!ctx->cf_info.parent_if.is_divergent) {
+      if (!ctx->cf_info.parent_if.is_divergent && !potentially_empty_exec) {
          /* uniform continue - directly jump to the loop header */
          ctx->block->kind |= block_kind_uniform;
          ctx->cf_info.has_branch = true;
@@ -10259,14 +10291,17 @@ emit_loop_jump(isel_context* ctx, bool is_break)
          return;
       }
 
-      /* for potential uniform breaks after this continue,
-         we must ensure that they are handled correctly */
-      ctx->cf_info.parent_loop.has_divergent_continue = true;
       ctx->cf_info.parent_loop.has_divergent_branch = true;
 
-      if (!ctx->cf_info.exec.potentially_empty_continue) {
-         ctx->cf_info.exec.potentially_empty_continue = true;
-         ctx->cf_info.exec.potentially_empty_continue_depth = ctx->block->loop_nest_depth;
+      if (ctx->cf_info.parent_if.is_divergent) {
+         /* for potential uniform breaks after this continue,
+            we must ensure that they are handled correctly */
+         ctx->cf_info.parent_loop.has_divergent_continue = true;
+
+         if (!ctx->cf_info.exec.potentially_empty_continue) {
+            ctx->cf_info.exec.potentially_empty_continue = true;
+            ctx->cf_info.exec.potentially_empty_continue_depth = ctx->block->loop_nest_depth;
+         }
       }
    }
 
@@ -10303,6 +10338,8 @@ emit_loop_continue(isel_context* ctx)
 void
 visit_jump(isel_context* ctx, nir_jump_instr* instr)
 {
+   end_empty_exec_skip(ctx);
+
    switch (instr->type) {
    case nir_jump_break: emit_loop_break(ctx); break;
    case nir_jump_continue: emit_loop_continue(ctx); break;
@@ -10345,6 +10382,12 @@ visit_block(isel_context* ctx, nir_block* block)
       ctx->unended_linear_vgprs.clear();
    }
 
+   nir_foreach_phi (instr, block)
+      visit_phi(ctx, instr);
+
+   nir_phi_instr* last_phi = nir_block_last_phi_instr(block);
+   begin_empty_exec_skip(ctx, last_phi ? &last_phi->instr : NULL, block);
+
    ctx->block->instructions.reserve(ctx->block->instructions.size() +
                                     exec_list_length(&block->instr_list) * 2);
    nir_foreach_instr (instr, block) {
@@ -10353,7 +10396,7 @@ visit_block(isel_context* ctx, nir_block* block)
       case nir_instr_type_load_const: visit_load_const(ctx, nir_instr_as_load_const(instr)); break;
       case nir_instr_type_intrinsic: visit_intrinsic(ctx, nir_instr_as_intrinsic(instr)); break;
       case nir_instr_type_tex: visit_tex(ctx, nir_instr_as_tex(instr)); break;
-      case nir_instr_type_phi: visit_phi(ctx, nir_instr_as_phi(instr)); break;
+      case nir_instr_type_phi: break;
       case nir_instr_type_undef: visit_undef(ctx, nir_instr_as_undef(instr)); break;
       case nir_instr_type_deref: break;
       case nir_instr_type_jump: visit_jump(ctx, nir_instr_as_jump(instr)); break;
@@ -10363,97 +10406,9 @@ visit_block(isel_context* ctx, nir_block* block)
    }
 }
 
-static bool
-all_uses_inside_loop(nir_def* def, nir_block* block_before_loop, nir_block* block_after_loop)
-{
-   nir_foreach_use_including_if (use, def) {
-      if (nir_src_is_if(use)) {
-         nir_block* branch_block =
-            nir_cf_node_as_block(nir_cf_node_prev(&nir_src_parent_if(use)->cf_node));
-         if (branch_block->index <= block_before_loop->index || branch_block->index >= block_after_loop->index)
-            return false;
-      } else {
-         nir_instr* instr = nir_src_parent_instr(use);
-         if ((instr->block->index <= block_before_loop->index || instr->block->index >= block_after_loop->index) &&
-             !(instr->type == nir_instr_type_phi && instr->block == block_after_loop)) {
-            return false;
-         }
-      }
-   }
-
-   return true;
-}
-
-Temp
-rename_temp(const std::map<unsigned, unsigned>& renames, Temp tmp)
-{
-   auto it = renames.find(tmp.id());
-   if (it != renames.end())
-      return Temp(it->second, tmp.regClass());
-   return tmp;
-}
-
-static void
-lcssa_workaround(isel_context* ctx, nir_loop* loop)
-{
-   nir_block* block_before_loop = nir_cf_node_as_block(nir_cf_node_prev(&loop->cf_node));
-   nir_block* block_after_loop = nir_cf_node_as_block(nir_cf_node_next(&loop->cf_node));
-
-   std::map<unsigned, unsigned> renames;
-   nir_foreach_block_in_cf_node (block, &loop->cf_node) {
-      /* These values are reachable from the loop exit even when continue_or_break is used. We
-       * shouldn't create phis with undef operands in case the contents are important even if exec
-       * is zero (for example, memory access addresses). */
-      if (nir_block_dominates(block, nir_loop_last_block(loop)))
-         continue;
-
-      /* Definitions in this block are not reachable from the loop exit, and so all uses are inside
-       * the loop. */
-      if (!nir_block_dominates(block, block_after_loop))
-         continue;
-
-      nir_foreach_instr (instr, block) {
-         nir_def* def = nir_instr_def(instr);
-         if (!def)
-            continue;
-
-         Temp tmp = get_ssa_temp(ctx, def);
-         if (!tmp.is_linear() || all_uses_inside_loop(def, block_before_loop, block_after_loop))
-            continue;
-
-         Temp new_tmp = ctx->program->allocateTmp(tmp.regClass());
-         aco_ptr<Instruction> phi(create_instruction(aco_opcode::p_phi, Format::PSEUDO,
-                                                     ctx->block->logical_preds.size(), 1));
-         for (unsigned i = 0; i < ctx->block->logical_preds.size(); i++)
-            phi->operands[i] = Operand(new_tmp);
-         phi->definitions[0] = Definition(tmp);
-         ctx->block->instructions.emplace(ctx->block->instructions.begin(), std::move(phi));
-
-         renames.emplace(tmp.id(), new_tmp.id());
-      }
-   }
-
-   if (renames.empty())
-      return;
-
-   for (unsigned i = ctx->block->index - 1;
-        ctx->program->blocks[i].loop_nest_depth > ctx->block->loop_nest_depth; i--) {
-      for (aco_ptr<Instruction>& instr : ctx->program->blocks[i].instructions) {
-         for (Definition& def : instr->definitions) {
-            if (def.isTemp())
-               def.setTemp(rename_temp(renames, def.getTemp()));
-         }
-         for (Operand& op : instr->operands) {
-            if (op.isTemp())
-               op.setTemp(rename_temp(renames, op.getTemp()));
-         }
-      }
-   }
-}
-
 static void begin_uniform_if_then(isel_context* ctx, if_context* ic, Temp cond);
-static void begin_uniform_if_else(isel_context* ctx, if_context* ic);
-static void end_uniform_if(isel_context* ctx, if_context* ic);
+static void begin_uniform_if_else(isel_context* ctx, if_context* ic, bool logical_else = true);
+static void end_uniform_if(isel_context* ctx, if_context* ic, bool logical_else = true);
 
 static void
 visit_loop(isel_context* ctx, nir_loop* loop)
@@ -10465,18 +10420,12 @@ visit_loop(isel_context* ctx, nir_loop* loop)
    visit_cf_list(ctx, &loop->body);
 
    end_loop(ctx, &lc);
-
-   /* Create extra LCSSA phis for continue_or_break */
-   if (ctx->block->linear_preds.size() > ctx->block->logical_preds.size())
-      lcssa_workaround(ctx, loop);
 }
 
 static void
 begin_divergent_if_then(isel_context* ctx, if_context* ic, Temp cond,
                         nir_selection_control sel_ctrl = nir_selection_control_none)
 {
-   ic->cond = cond;
-
    append_logical_end(ctx->block);
    ctx->block->kind |= block_kind_branch;
 
@@ -10625,7 +10574,9 @@ end_divergent_if(isel_context* ctx, if_context* ic)
 static void
 begin_uniform_if_then(isel_context* ctx, if_context* ic, Temp cond)
 {
-   assert(cond.regClass() == s1);
+   assert(!cond.id() || cond.regClass() == s1);
+
+   ic->cond = cond;
 
    append_logical_end(ctx->block);
    ctx->block->kind |= block_kind_uniform;
@@ -10634,8 +10585,13 @@ begin_uniform_if_then(isel_context* ctx, if_context* ic, Temp cond)
    aco_opcode branch_opcode = aco_opcode::p_cbranch_z;
    branch.reset(create_instruction(branch_opcode, Format::PSEUDO_BRANCH, 1, 1));
    branch->definitions[0] = Definition(ctx->program->allocateTmp(s2));
-   branch->operands[0] = Operand(cond);
-   branch->operands[0].setPrecolored(scc);
+   if (cond.id()) {
+      branch->operands[0] = Operand(cond);
+      branch->operands[0].setPrecolored(scc);
+   } else {
+      branch->operands[0] = Operand(exec, ctx->program->lane_mask);
+      branch->branch().rarely_taken = true;
+   }
    ctx->block->instructions.emplace_back(std::move(branch));
 
    ic->BB_if_idx = ctx->block->index;
@@ -10649,7 +10605,8 @@ begin_uniform_if_then(isel_context* ctx, if_context* ic, Temp cond)
    ic->has_divergent_continue_old = ctx->cf_info.parent_loop.has_divergent_continue;
 
    /** emit then block */
-   ctx->program->next_uniform_if_depth++;
+   if (ic->cond.id())
+      ctx->program->next_uniform_if_depth++;
    Block* BB_then = ctx->program->create_and_insert_block();
    add_edge(ic->BB_if_idx, BB_then);
    append_logical_start(BB_then);
@@ -10657,7 +10614,7 @@ begin_uniform_if_then(isel_context* ctx, if_context* ic, Temp cond)
 }
 
 static void
-begin_uniform_if_else(isel_context* ctx, if_context* ic)
+begin_uniform_if_else(isel_context* ctx, if_context* ic, bool logical_else)
 {
    Block* BB_then = ctx->block;
 
@@ -10685,25 +10642,30 @@ begin_uniform_if_else(isel_context* ctx, if_context* ic)
 
    /** emit else block */
    Block* BB_else = ctx->program->create_and_insert_block();
-   add_edge(ic->BB_if_idx, BB_else);
-   append_logical_start(BB_else);
+   if (logical_else) {
+      add_edge(ic->BB_if_idx, BB_else);
+      append_logical_start(BB_else);
+   } else {
+      add_linear_edge(ic->BB_if_idx, BB_else);
+   }
    ctx->block = BB_else;
 }
 
 static void
-end_uniform_if(isel_context* ctx, if_context* ic)
+end_uniform_if(isel_context* ctx, if_context* ic, bool logical_else)
 {
    Block* BB_else = ctx->block;
 
    if (!ctx->cf_info.has_branch) {
-      append_logical_end(BB_else);
+      if (logical_else)
+         append_logical_end(BB_else);
       /* branch from then block to endif block */
       aco_ptr<Instruction> branch;
       branch.reset(create_instruction(aco_opcode::p_branch, Format::PSEUDO_BRANCH, 0, 1));
       branch->definitions[0] = Definition(ctx->program->allocateTmp(s2));
       BB_else->instructions.emplace_back(std::move(branch));
       add_linear_edge(BB_else->index, &ic->BB_endif);
-      if (!ctx->cf_info.parent_loop.has_divergent_branch)
+      if (logical_else && !ctx->cf_info.parent_loop.has_divergent_branch)
          add_logical_edge(BB_else->index, &ic->BB_endif);
       BB_else->kind |= block_kind_uniform;
    }
@@ -10714,12 +10676,81 @@ end_uniform_if(isel_context* ctx, if_context* ic)
    ctx->cf_info.parent_loop.has_divergent_continue |= ic->has_divergent_continue_then;
 
    /** emit endif merge block */
-   ctx->program->next_uniform_if_depth--;
+   if (ic->cond.id())
+      ctx->program->next_uniform_if_depth--;
    ctx->block = ctx->program->insert_block(std::move(ic->BB_endif));
    append_logical_start(ctx->block);
 
    /* We shouldn't create unreachable blocks. */
    assert(!ctx->block->logical_preds.empty());
+}
+
+static void
+end_empty_exec_skip(isel_context* ctx)
+{
+   if (ctx->cf_info.skipping_empty_exec) {
+      begin_uniform_if_else(ctx, &ctx->cf_info.empty_exec_skip, false);
+      end_uniform_if(ctx, &ctx->cf_info.empty_exec_skip, false);
+      ctx->cf_info.skipping_empty_exec = false;
+
+      ctx->cf_info.exec.combine(ctx->cf_info.empty_exec_skip.exec_old);
+   }
+}
+
+/*
+ * If necessary, begin a branch which skips over instructions if exec is empty.
+ *
+ * The linear CFG:
+ *                        BB_IF
+ *                        /    \
+ *       BB_THEN (logical)      BB_ELSE (linear)
+ *                        \    /
+ *                        BB_ENDIF
+ *
+ * The logical CFG:
+ *                        BB_IF
+ *                          |
+ *                       BB_THEN (logical)
+ *                          |
+ *                       BB_ENDIF
+ *
+ * BB_THEN should not end with a branch, since that would make BB_ENDIF unreachable.
+ */
+static void
+begin_empty_exec_skip(isel_context* ctx, nir_instr* after_instr, nir_block* block)
+{
+   if (!ctx->cf_info.exec.potentially_empty_discard && !ctx->cf_info.exec.potentially_empty_break &&
+       !ctx->cf_info.exec.potentially_empty_continue)
+      return;
+
+   assert(!(ctx->block->kind & block_kind_top_level));
+
+   bool further_cf_empty = !nir_cf_node_next(&block->cf_node);
+
+   bool rest_of_block_empty = false;
+   if (after_instr) {
+      rest_of_block_empty =
+         nir_instr_is_last(after_instr) || nir_instr_next(after_instr)->type == nir_instr_type_jump;
+   } else {
+      rest_of_block_empty = exec_list_is_empty(&block->instr_list) ||
+                            nir_block_first_instr(block)->type == nir_instr_type_jump;
+   }
+
+   assert(!(ctx->block->kind & block_kind_export_end) || rest_of_block_empty);
+
+   if (rest_of_block_empty && further_cf_empty)
+      return;
+
+   /* Don't nest these skipping branches. It is not worth the complexity. */
+   end_empty_exec_skip(ctx);
+
+   begin_uniform_if_then(ctx, &ctx->cf_info.empty_exec_skip, Temp());
+   ctx->cf_info.skipping_empty_exec = true;
+
+   ctx->cf_info.empty_exec_skip.exec_old = ctx->cf_info.exec;
+   ctx->cf_info.exec = exec_info();
+
+   ctx->program->should_repair_ssa = true;
 }
 
 static void
@@ -10796,6 +10827,13 @@ visit_if(isel_context* ctx, nir_if* if_stmt)
 static void
 visit_cf_list(isel_context* ctx, struct exec_list* list)
 {
+   if (nir_cf_list_is_empty_block(list))
+      return;
+
+   bool skipping_empty_exec_old = ctx->cf_info.skipping_empty_exec;
+   if_context empty_exec_skip_old = std::move(ctx->cf_info.empty_exec_skip);
+   ctx->cf_info.skipping_empty_exec = false;
+
    foreach_list_typed (nir_cf_node, node, node, list) {
       switch (node->type) {
       case nir_cf_node_block: visit_block(ctx, nir_cf_node_as_block(node)); break;
@@ -10804,6 +10842,10 @@ visit_cf_list(isel_context* ctx, struct exec_list* list)
       default: unreachable("unimplemented cf list type");
       }
    }
+
+   end_empty_exec_skip(ctx);
+   ctx->cf_info.skipping_empty_exec = skipping_empty_exec_old;
+   ctx->cf_info.empty_exec_skip = std::move(empty_exec_skip_old);
 }
 
 static void
@@ -12378,6 +12420,103 @@ dump_vgprs_to_mem(isel_context* ctx, Builder& bld, Operand rsrc)
 }
 
 void
+dump_lds_to_mem(isel_context* ctx, Builder& bld, Operand rsrc)
+{
+   const uint32_t ttmp0_idx = ctx->program->gfx_level >= GFX9 ? 108 : 112;
+   const uint32_t base_offset = offsetof(struct aco_trap_handler_layout, lds[0]);
+
+   ac_hw_cache_flags cache_glc;
+   cache_glc.value = ac_glc;
+
+   PhysReg lds_size{ttmp0_idx + 2};
+   PhysReg soffset{ttmp0_idx + 3};
+
+   enable_thread_indexing(ctx, rsrc);
+
+   /* Determine the LDS size. */
+   const uint32_t lds_size_offset = 12;
+   const uint32_t lds_size_width = 9;
+
+   bld.sopk(aco_opcode::s_getreg_b32, Definition(lds_size, s1),
+            ((lds_size_width - 1) << 11) | (lds_size_offset << 6) | 6 /* LDS_ALLOC */);
+   Temp lds_size_non_zero =
+      bld.sopc(aco_opcode::s_cmp_lg_i32, bld.def(s1, scc), Operand(lds_size, s1), Operand::c32(0));
+
+   if_context ic;
+   begin_uniform_if_then(ctx, &ic, lds_size_non_zero);
+   {
+      bld.reset(ctx->block);
+
+      /* Wait for other waves in the same threadgroup. */
+      bld.sopp(aco_opcode::s_barrier, 0u);
+
+      /* Compute the LDS size in bytes (64 dw * 4). */
+      bld.sop2(aco_opcode::s_lshl_b32, Definition(lds_size, s1), bld.def(s1, scc),
+               Operand(lds_size, s1), Operand::c32(8u));
+
+      /* Add the base offset because this is used to exit the loop. */
+      bld.sop2(aco_opcode::s_add_u32, Definition(lds_size, s1), bld.def(s1, scc),
+               Operand(lds_size, s1), Operand::c32(base_offset));
+
+      /* Initialize soffset to base offset. */
+      bld.copy(Definition(soffset, s1), Operand::c32(base_offset));
+
+      /* Compute the LDS offset from the thread ID. */
+      bld.vop3(aco_opcode::v_mbcnt_lo_u32_b32, Definition(PhysReg{256}, v1), Operand::c32(-1u),
+               Operand::c32(0u));
+      bld.vop3(aco_opcode::v_mbcnt_hi_u32_b32_e64, Definition(PhysReg{256}, v1), Operand::c32(-1u),
+               Operand(PhysReg{256}, v1));
+      bld.vop2(aco_opcode::v_mul_u32_u24, Definition(PhysReg{256}, v1), Operand::c32(4u),
+               Operand(PhysReg{256}, v1));
+
+      Operand m = load_lds_size_m0(bld);
+
+      loop_context lc;
+      begin_loop(ctx, &lc);
+      {
+         bld.reset(ctx->block);
+
+         if (ctx->program->gfx_level >= GFX9) {
+            bld.ds(aco_opcode::ds_read_b32, Definition(PhysReg{257}, v1), Operand(PhysReg{256}, v1),
+                   0);
+         } else {
+            bld.ds(aco_opcode::ds_read_b32, Definition(PhysReg{257}, v1), Operand(PhysReg{256}, v1),
+                   m, 0);
+         }
+
+         bld.mubuf(aco_opcode::buffer_store_dword, Operand(rsrc), Operand(v1),
+                   Operand(PhysReg{soffset}, s1), Operand(PhysReg{257}, v1) /* v0 */,
+                   0 /* offset */, false /* offen */, false /* idxen */,
+                   /* addr64 */ false, /* disable_wqm */ false, cache_glc);
+
+         /* Increase v0 and the offset assuming it's wave64. */
+         bld.vop3(aco_opcode::v_mad_u32_u24, Definition(PhysReg{256}, v1), Operand::c32(4u),
+                  Operand::c32(64u), Operand(PhysReg{256}, v1));
+         bld.sop2(aco_opcode::s_add_u32, Definition(soffset, s1), bld.def(s1, scc),
+                  Operand(soffset, s1), Operand::c32(256u));
+
+         const Temp cond = bld.sopc(aco_opcode::s_cmp_ge_u32, bld.def(s1, scc),
+                                    Operand(soffset, s1), Operand(lds_size, s1));
+
+         if_context loop_break;
+         begin_uniform_if_then(ctx, &loop_break, cond);
+         {
+            emit_loop_break(ctx);
+         }
+         begin_uniform_if_else(ctx, &loop_break);
+         end_uniform_if(ctx, &loop_break);
+      }
+      end_loop(ctx, &lc);
+      bld.reset(ctx->block);
+   }
+   begin_uniform_if_else(ctx, &ic);
+   end_uniform_if(ctx, &ic);
+   bld.reset(ctx->block);
+
+   disable_thread_indexing(ctx, rsrc);
+}
+
+void
 select_trap_handler_shader(Program* program, ac_shader_config* config,
                            const struct aco_compiler_options* options,
                            const struct aco_shader_info* info, const struct ac_shader_args* args)
@@ -12526,6 +12665,9 @@ select_trap_handler_shader(Program* program, ac_shader_config* config,
       dump_sgpr_to_mem(&ctx, Operand(tma_rsrc, s4), Operand(PhysReg{i}, s1), offset);
       offset += 4;
    }
+
+   /* Dump LDS. */
+   dump_lds_to_mem(&ctx, bld, Operand(tma_rsrc, s4));
 
    /* Restore VGPRS. */
    restore_vgprs_from_mem(&ctx, Operand(tma_rsrc, s4));

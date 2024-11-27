@@ -6,9 +6,9 @@
  */
 #include "hk_physical_device.h"
 
+#include "asahi/compiler/agx_nir_texture.h"
 #include "asahi/lib/agx_device.h"
 #include "asahi/lib/agx_nir_lower_vbo.h"
-#include "asahi/lib/agx_nir_passes.h"
 #include "util/disk_cache.h"
 #include "util/mesa-sha1.h"
 #include "git_sha1.h"
@@ -21,10 +21,8 @@
 #include "hk_wsi.h"
 
 #include "util/simple_mtx.h"
-#include "util/u_debug.h"
 #include "vulkan/vulkan_core.h"
 #include "vulkan/wsi/wsi_common.h"
-#include "vk_device.h"
 #include "vk_drm_syncobj.h"
 #include "vk_shader_module.h"
 
@@ -139,7 +137,7 @@ hk_get_device_extensions(const struct hk_instance *instance,
       .EXT_conditional_rendering = false,
       .EXT_color_write_enable = true,
       .EXT_custom_border_color = true,
-      .EXT_depth_bias_control = false,
+      .EXT_depth_bias_control = true,
       .EXT_depth_clip_control = false,
       .EXT_depth_clip_enable = true,
       .EXT_descriptor_indexing = true,
@@ -440,10 +438,10 @@ hk_get_device_features(
       .customBorderColorWithoutFormat = true,
 
       /* VK_EXT_depth_bias_control */
-      .depthBiasControl = false,
-      .leastRepresentableValueForceUnormRepresentation = false,
+      .depthBiasControl = true,
+      .leastRepresentableValueForceUnormRepresentation = true,
       .floatRepresentation = false,
-      .depthBiasExact = false,
+      .depthBiasExact = true,
 
       /* VK_EXT_depth_clip_control */
       .depthClipControl = false,
@@ -478,7 +476,7 @@ hk_get_device_features(
       .extendedDynamicState3ConservativeRasterizationMode = false,
       .extendedDynamicState3ExtraPrimitiveOverestimationSize = false,
       .extendedDynamicState3DepthClipEnable = true,
-      .extendedDynamicState3SampleLocationsEnable = false,
+      .extendedDynamicState3SampleLocationsEnable = true,
       .extendedDynamicState3ColorBlendAdvanced = false,
       .extendedDynamicState3ProvokingVertexMode = true,
       .extendedDynamicState3LineRasterizationMode = true,

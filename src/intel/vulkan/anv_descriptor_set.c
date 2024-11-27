@@ -1366,8 +1366,12 @@ anv_descriptor_pool_heap_alloc(struct anv_descriptor_pool *pool,
 {
    uint64_t pool_vma_offset =
       util_vma_heap_alloc(&heap->heap, size, alignment);
-   if (pool_vma_offset == 0)
-      return vk_error(pool, VK_ERROR_FRAGMENTED_POOL);
+   if (pool_vma_offset == 0) {
+      if (size > heap->size - heap->alloc_size)
+         return vk_error(pool, VK_ERROR_OUT_OF_POOL_MEMORY);
+      else
+         return vk_error(pool, VK_ERROR_FRAGMENTED_POOL);
+   }
 
    assert(pool_vma_offset >= POOL_HEAP_OFFSET &&
           pool_vma_offset - POOL_HEAP_OFFSET <= INT32_MAX);
@@ -1378,6 +1382,7 @@ anv_descriptor_pool_heap_alloc(struct anv_descriptor_pool *pool,
       state->map = heap->host_mem + state->offset;
    else
       state->map = heap->bo->map + state->offset;
+   heap->alloc_size += size;
 
    return VK_SUCCESS;
 }
@@ -1386,6 +1391,7 @@ static void
 anv_descriptor_pool_heap_free(struct anv_descriptor_pool_heap *heap,
                               struct anv_state state)
 {
+   heap->alloc_size -= state.alloc_size;
    util_vma_heap_free(&heap->heap,
                       (uint64_t)state.offset + POOL_HEAP_OFFSET,
                       state.alloc_size);
@@ -1417,6 +1423,23 @@ VkResult anv_CreateDescriptorPool(
       ANV_PIPELINE_DESCRIPTOR_SET_LAYOUT_TYPE_INDIRECT :
       ANV_PIPELINE_DESCRIPTOR_SET_LAYOUT_TYPE_DIRECT;
 
+   /* Workaround application bugs when we're allocating surfaces & samplers in
+    * separate heaps (!indirect_descriptors). Some applications will specify a
+    * count of samplers too small and we might fail allocations in
+    * vkAllocateDescriptorsSets().
+    *
+    * Find the highest count across all descriptor types and use that for
+    * samplers.
+    */
+   uint32_t max_descriptor_count = 0;
+   if (device->physical->instance->anv_upper_bound_descriptor_pool_sampler &&
+       !device->physical->indirect_descriptors) {
+      for (uint32_t i = 0; i < pCreateInfo->poolSizeCount; i++) {
+         max_descriptor_count = MAX2(pCreateInfo->pPoolSizes[i].descriptorCount,
+                                     max_descriptor_count);
+      }
+   }
+
    for (uint32_t i = 0; i < pCreateInfo->poolSizeCount; i++) {
       enum anv_descriptor_data desc_data =
          pCreateInfo->pPoolSizes[i].type == VK_DESCRIPTOR_TYPE_MUTABLE_EXT ?
@@ -1443,7 +1466,8 @@ VkResult anv_CreateDescriptorPool(
       uint32_t desc_data_surface_size =
          desc_surface_size * pCreateInfo->pPoolSizes[i].descriptorCount;
       uint32_t desc_data_sampler_size =
-         desc_sampler_size * pCreateInfo->pPoolSizes[i].descriptorCount;
+         desc_sampler_size * MAX2(max_descriptor_count,
+                                  pCreateInfo->pPoolSizes[i].descriptorCount);
 
       /* Combined image sampler descriptors can take up to 3 slots if they
        * hold a YCbCr image.

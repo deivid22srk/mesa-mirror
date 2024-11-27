@@ -138,8 +138,9 @@ enum aco_compiler_debug_level {
 };
 
 struct aco_compiler_options {
-   bool dump_shader;
+   bool dump_ir;
    bool dump_preoptir;
+   bool record_asm;
    bool record_ir;
    bool record_stats;
    bool has_ls_vgpr_init_bug;
@@ -192,6 +193,7 @@ struct aco_symbol {
 
 #define MAX_SGPRS 108
 #define MAX_VGPRS       256
+#define MAX_LDS_SIZE    65536 /* 64 KiB */
 #define NUM_SAVED_VGPRS 2
 
 struct aco_trap_handler_layout {
@@ -215,6 +217,7 @@ struct aco_trap_handler_layout {
    uint32_t exec_hi;
    uint32_t sgprs[MAX_SGPRS];
    uint32_t vgprs[MAX_VGPRS * 64];
+   uint32_t lds[MAX_LDS_SIZE / 4];
 };
 
 #ifdef __cplusplus

@@ -1748,8 +1748,8 @@ static bool kill_ps_outputs_cb(struct nir_builder *b, nir_instr *instr, void *_k
    }
 
    /* Color outputs. */
-   unsigned comp_mask = BITFIELD_MASK(intr->num_components);
-   assert(nir_intrinsic_component(intr) == 0);
+   unsigned component = nir_intrinsic_component(intr);
+   unsigned comp_mask = BITFIELD_RANGE(component, intr->num_components);
    unsigned cb_shader_mask = ac_get_cb_shader_mask(key->ps.part.epilog.spi_shader_col_format);
 
    /* Preserve alpha if ALPHA_TESTING is enabled. */
@@ -1779,7 +1779,7 @@ static bool kill_ps_outputs_cb(struct nir_builder *b, nir_instr *instr, void *_k
    nir_def *new_value = intr->src[0].ssa;
    nir_def *undef = nir_undef(b, 1, new_value->bit_size);
 
-   unsigned kill_mask = ~output_mask & comp_mask;
+   unsigned kill_mask = (~output_mask & comp_mask) >> component;
    u_foreach_bit(i, kill_mask) {
       new_value = nir_vector_insert_imm(b, new_value, undef, i);
    }
@@ -1911,7 +1911,7 @@ static void si_lower_ngg(struct si_shader *shader, nir_shader *nir)
       .gfx_level = sel->screen->info.gfx_level,
       .max_workgroup_size = si_get_max_workgroup_size(shader),
       .wave_size = shader->wave_size,
-      .can_cull = !!key->ge.opt.ngg_culling,
+      .can_cull = si_shader_culling_enabled(shader),
       .disable_streamout = !si_shader_uses_streamout(shader),
       .vs_output_param_offset = shader->info.vs_output_param_offset,
       .has_param_exports = shader->info.nr_param_exports,
@@ -1942,12 +1942,12 @@ static void si_lower_ngg(struct si_shader *shader, nir_shader *nir)
 
       unsigned clip_plane_enable =
          SI_NGG_CULL_GET_CLIP_PLANE_ENABLE(key->ge.opt.ngg_culling);
-      unsigned num_vertices = gfx10_ngg_get_vertices_per_prim(shader);
+      unsigned num_vertices = si_get_num_vertices_per_output_prim(shader);
 
       options.num_vertices_per_primitive = num_vertices ? num_vertices : 3;
       options.early_prim_export = gfx10_ngg_export_prim_early(shader);
       options.passthrough = gfx10_is_ngg_passthrough(shader);
-      options.use_edgeflags = gfx10_edgeflags_have_effect(shader);
+      options.use_edgeflags = gfx10_has_variable_edgeflags(shader);
       options.has_gen_prim_query = options.has_xfb_prim_query =
          sel->screen->info.gfx_level >= GFX11 && !sel->info.base.vs.blit_sgprs_amd;
       options.export_primitive_id = key->ge.mono.u.vs_export_prim_id;

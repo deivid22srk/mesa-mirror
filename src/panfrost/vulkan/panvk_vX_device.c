@@ -1,5 +1,6 @@
 /*
  * Copyright © 2021 Collabora Ltd.
+ * Copyright © 2024 Arm Ltd.
  *
  * Derived from tu_image.c which is:
  * Copyright © 2016 Red Hat.
@@ -71,7 +72,7 @@ panvk_device_init_mempools(struct panvk_device *dev)
    panvk_pool_init(&dev->mempools.rw, dev, NULL, &rw_pool_props);
 
    struct panvk_pool_properties rw_nc_pool_props = {
-      .create_flags = PAN_KMOD_BO_FLAG_GPU_UNCACHED,
+      .create_flags = PAN_ARCH <= 9 ? 0 : PAN_KMOD_BO_FLAG_GPU_UNCACHED,
       .slab_size = 16 * 1024,
       .label = "Device RW uncached memory pool",
       .owns_bos = false,
@@ -250,6 +251,9 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
    device->vk.command_dispatch_table = &device->cmd_dispatch;
    device->vk.command_buffer_ops = &panvk_per_arch(cmd_buffer_ops);
    device->vk.shader_ops = &panvk_per_arch(device_shader_ops);
+#if PAN_ARCH >= 10
+   device->vk.check_status = panvk_per_arch(device_check_status);
+#endif
 
    device->kmod.allocator = (struct pan_kmod_allocator){
       .zalloc = panvk_kmod_zalloc,
@@ -311,6 +315,12 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
 
    panfrost_upload_sample_positions(device->sample_positions->addr.host);
 
+#if PAN_ARCH >= 10
+   result = panvk_per_arch(init_tiler_oom)(device);
+   if (result != VK_SUCCESS)
+      goto err_free_priv_bos;
+#endif
+
    vk_device_set_drm_fd(&device->vk, device->kmod.dev->fd);
 
    result = panvk_meta_init(device);
@@ -362,6 +372,7 @@ err_finish_queues:
    panvk_meta_cleanup(device);
 
 err_free_priv_bos:
+   panvk_priv_bo_unref(device->tiler_oom.handlers_bo);
    panvk_priv_bo_unref(device->sample_positions);
    panvk_priv_bo_unref(device->tiler_heap);
    panvk_device_cleanup_mempools(device);
@@ -395,6 +406,7 @@ panvk_per_arch(destroy_device)(struct panvk_device *device,
    }
 
    panvk_meta_cleanup(device);
+   panvk_priv_bo_unref(device->tiler_oom.handlers_bo);
    panvk_priv_bo_unref(device->tiler_heap);
    panvk_priv_bo_unref(device->sample_positions);
    panvk_device_cleanup_mempools(device);

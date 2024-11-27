@@ -454,6 +454,7 @@ panfrost_batch_to_fb_info(const struct panfrost_batch *batch,
                           bool reserve)
 {
    struct panfrost_device *dev = pan_device(batch->ctx->base.screen);
+   struct panfrost_screen *screen = pan_screen(batch->ctx->base.screen);
 
    memset(fb, 0, sizeof(*fb));
    memset(rts, 0, sizeof(*rts) * 8);
@@ -468,10 +469,11 @@ panfrost_batch_to_fb_info(const struct panfrost_batch *batch,
    fb->extent.maxx = batch->maxx - 1;
    fb->extent.maxy = batch->maxy - 1;
    fb->nr_samples = util_framebuffer_get_num_samples(&batch->key);
-   fb->force_samples = pan_tristate_get(batch->line_smoothing) ? 16 : 0;
+   fb->force_samples = (batch->line_smoothing == U_TRISTATE_YES) ? 16 : 0;
    fb->rt_count = batch->key.nr_cbufs;
-   fb->sprite_coord_origin = pan_tristate_get(batch->sprite_coord_origin);
-   fb->first_provoking_vertex = pan_tristate_get(batch->first_provoking_vertex);
+   fb->sprite_coord_origin = (batch->sprite_coord_origin == U_TRISTATE_YES);
+   fb->first_provoking_vertex =
+      (batch->first_provoking_vertex == U_TRISTATE_YES);
 
    static const unsigned char id_swz[] = {
       PIPE_SWIZZLE_X,
@@ -605,6 +607,8 @@ panfrost_batch_to_fb_info(const struct panfrost_batch *batch,
       fb->zs.preload.z = !fb->zs.clear.z && valid;
       fb->zs.preload.s = !fb->zs.clear.s && valid;
    }
+
+   screen->vtbl.select_tile_size(fb);
 }
 
 static void

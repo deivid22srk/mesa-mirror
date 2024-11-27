@@ -50,6 +50,7 @@
   rules:
     - !reference [.test, rules]
     - !reference [.gl-manual-rules, rules]
+    - !reference [.intel-common-manual-rules, rules]
     - changes:
         *i915g_file_list
       when: manual
@@ -73,6 +74,7 @@
     - !reference [.test, rules]
     - !reference [.anholt-farm-manual-rules, rules]
     - !reference [.gl-manual-rules, rules]
+    - !reference [.intel-common-manual-rules, rules]
     - changes:
         *crocus_file_list
       when: manual
@@ -97,6 +99,7 @@
     - !reference [.test, rules]
     - !reference [.collabora-farm-manual-rules, rules]
     - !reference [.gl-manual-rules, rules]
+    - !reference [.intel-common-manual-rules, rules]
     - changes:
         *iris_file_list
       when: manual
@@ -296,6 +299,7 @@
     DEVICE_TYPE: acer-chromebox-cxi4-puff
     FDO_CI_CONCURRENT: 9
     GPU_VERSION: iris-cml
+    HWCI_KERNEL_MODULES: i915
     RUNNER_TAG: mesa-ci-x86-64-lava-acer-chromebox-cxi4-puff
 
 
@@ -369,8 +373,8 @@
   extends:
     - .iris-test
     - .lava-acer-chromebox-cxi4-puff:x86_64
-#  variables:
-#    LAVA_FORCE_UART: 1
+  variables:
+    LAVA_FORCE_UART: 1
 
 .iris-whl-deqp:
   extends:

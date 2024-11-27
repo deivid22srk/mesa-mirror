@@ -41,6 +41,7 @@ static const driOptionDescription anv_dri_options[] = {
                      DRI_CONF_ENUM(512,  "512 stackids")
                      DRI_CONF_ENUM(1024, "1024 stackids")
                      DRI_CONF_ENUM(2048, "2048 stackids"))
+      DRI_CONF_ANV_UPPER_BOUND_DESCRIPTOR_POOL_SAMPLER(false)
    DRI_CONF_SECTION_END
 
    DRI_CONF_SECTION_DEBUG
@@ -136,29 +137,29 @@ anv_init_dri_options(struct anv_instance *instance)
                        instance->vk.app_info.engine_version);
 
     instance->assume_full_subgroups =
-            driQueryOptioni(&instance->dri_options, "anv_assume_full_subgroups");
-   instance->assume_full_subgroups_with_barrier =
-         driQueryOptionb(&instance->dri_options, "anv_assume_full_subgroups_with_barrier");
+       driQueryOptioni(&instance->dri_options, "anv_assume_full_subgroups");
+    instance->assume_full_subgroups_with_barrier =
+       driQueryOptionb(&instance->dri_options, "anv_assume_full_subgroups_with_barrier");
     instance->limit_trig_input_range =
-            driQueryOptionb(&instance->dri_options, "limit_trig_input_range");
+       driQueryOptionb(&instance->dri_options, "limit_trig_input_range");
     instance->sample_mask_out_opengl_behaviour =
-            driQueryOptionb(&instance->dri_options, "anv_sample_mask_out_opengl_behaviour");
+       driQueryOptionb(&instance->dri_options, "anv_sample_mask_out_opengl_behaviour");
     instance->force_filter_addr_rounding =
-            driQueryOptionb(&instance->dri_options, "anv_force_filter_addr_rounding");
+       driQueryOptionb(&instance->dri_options, "anv_force_filter_addr_rounding");
     instance->lower_depth_range_rate =
-            driQueryOptionf(&instance->dri_options, "lower_depth_range_rate");
+       driQueryOptionf(&instance->dri_options, "lower_depth_range_rate");
     instance->no_16bit =
-            driQueryOptionb(&instance->dri_options, "no_16bit");
+       driQueryOptionb(&instance->dri_options, "no_16bit");
     instance->intel_enable_wa_14018912822 =
-            driQueryOptionb(&instance->dri_options, "intel_enable_wa_14018912822");
+       driQueryOptionb(&instance->dri_options, "intel_enable_wa_14018912822");
     instance->mesh_conv_prim_attrs_to_vert_attrs =
-            driQueryOptioni(&instance->dri_options, "anv_mesh_conv_prim_attrs_to_vert_attrs");
+       driQueryOptioni(&instance->dri_options, "anv_mesh_conv_prim_attrs_to_vert_attrs");
     instance->fp64_workaround_enabled =
-            driQueryOptionb(&instance->dri_options, "fp64_workaround_enabled");
+       driQueryOptionb(&instance->dri_options, "fp64_workaround_enabled");
     instance->generated_indirect_threshold =
-            driQueryOptioni(&instance->dri_options, "generated_indirect_threshold");
+       driQueryOptioni(&instance->dri_options, "generated_indirect_threshold");
     instance->generated_indirect_ring_threshold =
-            driQueryOptioni(&instance->dri_options, "generated_indirect_ring_threshold");
+       driQueryOptioni(&instance->dri_options, "generated_indirect_ring_threshold");
     instance->query_clear_with_blorp_threshold =
        driQueryOptioni(&instance->dri_options, "query_clear_with_blorp_threshold");
     instance->query_copy_with_shader_threshold =
@@ -169,15 +170,18 @@ anv_init_dri_options(struct anv_instance *instance)
        driQueryOptionb(&instance->dri_options, "fake_sparse");
     instance->enable_tbimr = driQueryOptionb(&instance->dri_options, "intel_tbimr");
     instance->disable_fcv =
-            driQueryOptionb(&instance->dri_options, "anv_disable_fcv");
+       driQueryOptionb(&instance->dri_options, "anv_disable_fcv");
     instance->disable_xe2_ccs =
-            driQueryOptionb(&instance->dri_options, "anv_disable_xe2_ccs");
+       driQueryOptionb(&instance->dri_options, "anv_disable_xe2_ccs");
     instance->external_memory_implicit_sync =
-            driQueryOptionb(&instance->dri_options, "anv_external_memory_implicit_sync");
+       driQueryOptionb(&instance->dri_options, "anv_external_memory_implicit_sync");
     instance->compression_control_enabled =
        driQueryOptionb(&instance->dri_options, "compression_control_enabled");
     instance->anv_fake_nonlocal_memory =
-            driQueryOptionb(&instance->dri_options, "anv_fake_nonlocal_memory");
+       driQueryOptionb(&instance->dri_options, "anv_fake_nonlocal_memory");
+    instance->anv_upper_bound_descriptor_pool_sampler =
+       driQueryOptionb(&instance->dri_options,
+                       "anv_upper_bound_descriptor_pool_sampler");
 
     instance->stack_ids = driQueryOptioni(&instance->dri_options, "intel_stack_id");
     switch (instance->stack_ids) {
@@ -192,7 +196,8 @@ anv_init_dri_options(struct anv_instance *instance)
        instance->stack_ids = 512;
        break;
     }
-    instance->force_guc_low_latency = driQueryOptionb(&instance->dri_options, "force_guc_low_latency");
+    instance->force_guc_low_latency =
+       driQueryOptionb(&instance->dri_options, "force_guc_low_latency");
 }
 
 VkResult anv_CreateInstance(

@@ -200,13 +200,7 @@ static void si_destroy_context(struct pipe_context *context)
 {
    struct si_context *sctx = (struct si_context *)context;
 
-   /* Unreference the framebuffer normally to disable related logic
-    * properly.
-    */
-   struct pipe_framebuffer_state fb = {};
-   if (context->set_framebuffer_state)
-      context->set_framebuffer_state(context, &fb);
-
+   util_unreference_framebuffer_state(&sctx->framebuffer.state);
    si_release_all_descriptors(sctx);
 
    if (sctx->gfx_level >= GFX10 && sctx->has_graphics)
@@ -321,7 +315,8 @@ static void si_destroy_context(struct pipe_context *context)
    if (sctx->sh_query_result_shader)
       sctx->b.delete_compute_state(&sctx->b, sctx->sh_query_result_shader);
 
-   sctx->ws->cs_destroy(&sctx->gfx_cs);
+   if (sctx->gfx_cs.priv)
+      sctx->ws->cs_destroy(&sctx->gfx_cs);
    if (sctx->ctx)
       sctx->ws->ctx_destroy(sctx->ctx);
    if (sctx->sdma_cs) {
@@ -570,8 +565,13 @@ static struct pipe_context *si_create_context(struct pipe_screen *screen, unsign
       goto fail;
    }
 
-   ws->cs_create(&sctx->gfx_cs, sctx->ctx, sctx->has_graphics ? AMD_IP_GFX : AMD_IP_COMPUTE,
-                 (void *)si_flush_gfx_cs, sctx);
+   if (!ws->cs_create(&sctx->gfx_cs, sctx->ctx, sctx->has_graphics ? AMD_IP_GFX : AMD_IP_COMPUTE,
+                      (void *)si_flush_gfx_cs, sctx)) {
+      fprintf(stderr, "radeonsi: can't create gfx_cs\n");
+      sctx->gfx_cs.priv = NULL;
+      goto fail;
+   }
+   assert(sctx->gfx_cs.priv);
 
    /* Initialize private allocators. */
    u_suballocator_init(&sctx->allocator_zeroed_memory, &sctx->b, 128 * 1024, 0,
@@ -1406,7 +1406,7 @@ static struct pipe_screen *radeonsi_screen_create_impl(struct radeon_winsys *ws,
 	  sscreen->info.gfx_level >= GFX10) {
 	 /* Only bin draws that have no CONTEXT and SH register changes between
 	  * them because higher settings cause hangs. We've only been able to
-	  * reproduce hangs on smaller chips (e.g. Navi24, GFX1103), though all
+	  * reproduce hangs on smaller chips (e.g. Navi24, Phoenix), though all
 	  * chips might have them. What we see may be due to a driver bug.
 	  */
          sscreen->pbb_context_states_per_bin = 1;

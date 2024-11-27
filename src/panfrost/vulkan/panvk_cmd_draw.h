@@ -11,6 +11,7 @@
 #endif
 
 #include "panvk_blend.h"
+#include "panvk_cmd_oq.h"
 #include "panvk_entrypoints.h"
 #include "panvk_image.h"
 #include "panvk_image_view.h"
@@ -69,6 +70,10 @@ struct panvk_rendering_state {
 #if PAN_ARCH >= 10
    struct panfrost_ptr fbds;
    mali_ptr tiler;
+
+   /* When a secondary command buffer has to flush draws, it disturbs the
+    * inherited context, and the primary command buffer needs to know. */
+   bool invalidate_inherited_ctx;
 #endif
 };
 
@@ -77,6 +82,7 @@ enum panvk_cmd_graphics_dirty_state {
    PANVK_CMD_GRAPHICS_DIRTY_FS,
    PANVK_CMD_GRAPHICS_DIRTY_VB,
    PANVK_CMD_GRAPHICS_DIRTY_IB,
+   PANVK_CMD_GRAPHICS_DIRTY_OQ,
    PANVK_CMD_GRAPHICS_DIRTY_DESC_STATE,
    PANVK_CMD_GRAPHICS_DIRTY_RENDER_STATE,
    PANVK_CMD_GRAPHICS_DIRTY_PUSH_UNIFORMS,
@@ -91,6 +97,7 @@ struct panvk_cmd_graphics_state {
       struct vk_sample_locations_state sl;
    } dynamic;
 
+   struct panvk_occlusion_query_state occlusion_query;
    struct panvk_graphics_sysvals sysvals;
 
 #if PAN_ARCH <= 7
@@ -182,6 +189,10 @@ panvk_select_tiler_hierarchy_mask(const struct panvk_physical_device *phys_dev,
     */
    if (last_hierarchy_bit > tiler_features.max_levels)
       hierarchy_mask <<= last_hierarchy_bit - tiler_features.max_levels;
+
+   /* For effective tile size larger than 16x16, disable first level */
+   if (state->render.fb.info.tile_size > 16 * 16)
+      hierarchy_mask &= ~1;
 
    return hierarchy_mask;
 }

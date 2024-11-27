@@ -27,7 +27,6 @@ libpanvk_files = files(
   'panvk_mempool.c',
   'panvk_physical_device.c',
   'panvk_priv_bo.c',
-  'panvk_query.c',
   'panvk_wsi.c',
 )
 libpanvk_files += [sha1_h]
@@ -53,6 +52,7 @@ jm_files = [
   'jm/panvk_vX_cmd_dispatch.c',
   'jm/panvk_vX_cmd_draw.c',
   'jm/panvk_vX_cmd_event.c',
+  'jm/panvk_vX_cmd_query.c',
   'jm/panvk_vX_event.c',
   'jm/panvk_vX_queue.c',
 ]
@@ -64,7 +64,10 @@ csf_files = [
   'csf/panvk_vX_cmd_dispatch.c',
   'csf/panvk_vX_cmd_draw.c',
   'csf/panvk_vX_cmd_event.c',
+  'csf/panvk_vX_cmd_query.c',
+  'csf/panvk_vX_device.c',
   'csf/panvk_vX_event.c',
+  'csf/panvk_vX_exception_handler.c',
   'csf/panvk_vX_queue.c',
 ]
 
@@ -80,6 +83,7 @@ common_per_arch_files = [
   'panvk_vX_descriptor_set.c',
   'panvk_vX_descriptor_set_layout.c',
   'panvk_vX_device.c',
+  'panvk_vX_query_pool.c',
   'panvk_vX_image_view.c',
   'panvk_vX_nir_lower_descriptors.c',
   'panvk_vX_sampler.c',

@@ -337,16 +337,13 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
 
       uint32_t qfi = queue_create->queueFamilyIndex;
       device->queues[qfi] =
-         vk_alloc(&device->vk.alloc,
+         vk_zalloc(&device->vk.alloc,
                   queue_create->queueCount * sizeof(struct panvk_queue), 8,
                   VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
       if (!device->queues[qfi]) {
          result = panvk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
          goto err_finish_queues;
       }
-
-      memset(device->queues[qfi], 0,
-             queue_create->queueCount * sizeof(struct panvk_queue));
 
       for (unsigned q = 0; q < queue_create->queueCount; q++) {
          result = panvk_per_arch(queue_init)(device, &device->queues[qfi][q], q,
@@ -366,7 +363,7 @@ err_finish_queues:
       for (unsigned q = 0; q < device->queue_count[i]; q++)
          panvk_per_arch(queue_finish)(&device->queues[i][q]);
       if (device->queues[i])
-         vk_object_free(&device->vk, NULL, device->queues[i]);
+         vk_free(&device->vk.alloc, device->queues[i]);
    }
 
    panvk_meta_cleanup(device);
@@ -402,7 +399,7 @@ panvk_per_arch(destroy_device)(struct panvk_device *device,
       for (unsigned q = 0; q < device->queue_count[i]; q++)
          panvk_per_arch(queue_finish)(&device->queues[i][q]);
       if (device->queue_count[i])
-         vk_object_free(&device->vk, NULL, device->queues[i]);
+         vk_free(&device->vk.alloc, device->queues[i]);
    }
 
    panvk_meta_cleanup(device);

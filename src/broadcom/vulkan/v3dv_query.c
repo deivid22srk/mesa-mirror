@@ -43,9 +43,9 @@ kperfmon_create(struct v3dv_device *device,
              &pool->perfmon.counters[i * DRM_V3D_MAX_PERF_COUNTERS],
              req.ncounters);
 
-      int ret = v3dv_ioctl(device->pdevice->render_fd,
-                           DRM_IOCTL_V3D_PERFMON_CREATE,
-                           &req);
+      int ret = v3d_ioctl(device->pdevice->render_fd,
+                          DRM_IOCTL_V3D_PERFMON_CREATE,
+                          &req);
       if (ret)
          mesa_loge("Failed to create perfmon for query %d: %s\n", query,
                    strerror(errno));
@@ -68,9 +68,9 @@ kperfmon_destroy(struct v3dv_device *device,
          .id = pool->queries[query].perf.kperfmon_ids[i]
       };
 
-      int ret = v3dv_ioctl(device->pdevice->render_fd,
-                           DRM_IOCTL_V3D_PERFMON_DESTROY,
-                           &req);
+      int ret = v3d_ioctl(device->pdevice->render_fd,
+                          DRM_IOCTL_V3D_PERFMON_DESTROY,
+                          &req);
 
       if (ret) {
          mesa_loge("Failed to destroy perfmon %u: %s\n",
@@ -650,9 +650,9 @@ write_performance_query_result(struct v3dv_device *device,
                                    DRM_V3D_MAX_PERF_COUNTERS])
       };
 
-      int ret = v3dv_ioctl(device->pdevice->render_fd,
-                           DRM_IOCTL_V3D_PERFMON_GET_VALUES,
-                           &req);
+      int ret = v3d_ioctl(device->pdevice->render_fd,
+                          DRM_IOCTL_V3D_PERFMON_GET_VALUES,
+                          &req);
 
       if (ret) {
          mesa_loge("failed to get perfmon values: %s\n", strerror(errno));
@@ -1357,10 +1357,38 @@ v3dv_EnumeratePhysicalDeviceQueueFamilyPerformanceQueryCountersKHR(
 {
    V3DV_FROM_HANDLE(v3dv_physical_device, pDevice, physicalDevice);
 
-   return v3dv_X(pDevice, enumerate_performance_query_counters)(pDevice,
-                                                                pCounterCount,
-                                                                pCounters,
-                                                                pCounterDescriptions);
+   uint32_t desc_count = *pCounterCount;
+   uint8_t ncounters = pDevice->perfcntr->max_perfcnt;
+
+   VK_OUTARRAY_MAKE_TYPED(VkPerformanceCounterKHR,
+                          out, pCounters, pCounterCount);
+   VK_OUTARRAY_MAKE_TYPED(VkPerformanceCounterDescriptionKHR,
+                          out_desc, pCounterDescriptions, &desc_count);
+
+   for (int i = 0; i < ncounters; i++) {
+      const struct v3d_perfcntr_desc *perfcntr_desc = v3d_perfcntrs_get_by_index(pDevice->perfcntr, i);
+
+      vk_outarray_append_typed(VkPerformanceCounterKHR, &out, counter) {
+         counter->unit = VK_PERFORMANCE_COUNTER_UNIT_GENERIC_KHR;
+         counter->scope = VK_PERFORMANCE_COUNTER_SCOPE_COMMAND_KHR;
+         counter->storage = VK_PERFORMANCE_COUNTER_STORAGE_UINT64_KHR;
+
+         unsigned char sha1_result[20];
+         _mesa_sha1_compute(perfcntr_desc->name, strlen(perfcntr_desc->name), sha1_result);
+
+         memcpy(counter->uuid, sha1_result, sizeof(counter->uuid));
+      }
+
+      vk_outarray_append_typed(VkPerformanceCounterDescriptionKHR,
+                               &out_desc, desc) {
+         desc->flags = 0;
+         snprintf(desc->name, sizeof(desc->name), "%s", perfcntr_desc->name);
+         snprintf(desc->category, sizeof(desc->category), "%s", perfcntr_desc->category);
+         snprintf(desc->description, sizeof(desc->description), "%s", perfcntr_desc->description);
+      }
+   }
+
+   return vk_outarray_status(&out);
 }
 
 VKAPI_ATTR void VKAPI_CALL

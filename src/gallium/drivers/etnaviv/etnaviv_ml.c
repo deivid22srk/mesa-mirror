@@ -55,7 +55,7 @@ etna_ml_create_tensor(struct etna_ml_subgraph *subgraph, unsigned idx, unsigned 
    struct pipe_resource *res = tensors[idx];
 
    if (res != NULL) {
-      assert(size == pipe_buffer_size(res));
+      assert(size == pipe_buffer_size(res) || size == pipe_buffer_size(res) / 2);
       return;
    }
 
@@ -315,7 +315,11 @@ lower_operations(struct etna_ml_subgraph *subgraph,
       }
    }
 
+   /* Create combined input tensors first */
    list_for_each_entry(struct etna_operation, operation, etna_operations, link) {
+      if (operation->input_count == 1)
+         continue;
+
       etna_ml_create_tensor(subgraph, operation->input_tensors[0], operation->input_tensor_size);
 
       for (int i = 1; i < operation->input_count; i++)
@@ -325,6 +329,14 @@ lower_operations(struct etna_ml_subgraph *subgraph,
                                       i * operation->input_tensor_size / operation->input_count,
                                       operation->input_tensor_size / operation->input_count);
 
+   }
+
+   /* Create all other input tensors */
+   list_for_each_entry(struct etna_operation, operation, etna_operations, link) {
+      if (operation->input_count != 1)
+         continue;
+
+      etna_ml_create_tensor(subgraph, operation->input_tensors[0], operation->input_tensor_size);
    }
 
    /* Create any output tensors that aren't inputs to other operations, these
@@ -512,7 +524,8 @@ close_batch(struct pipe_context *pctx)
 
 void
 etna_ml_subgraph_invoke(struct pipe_context *pctx, struct pipe_ml_subgraph *psubgraph,
-                        unsigned inputs_count, unsigned input_idxs[], void *inputs[])
+                        unsigned inputs_count, unsigned input_idxs[], void *inputs[],
+                        bool is_signed[])
 {
    struct etna_context *ctx = etna_context(pctx);
    unsigned tp_core_count = etna_ml_get_core_info(ctx)->tp_core_count;
@@ -541,7 +554,19 @@ etna_ml_subgraph_invoke(struct pipe_context *pctx, struct pipe_ml_subgraph *psub
 
    for (int i = 0; i < inputs_count; i++) {
       struct pipe_resource *res = etna_ml_get_tensor(subgraph, input_idxs[i]);
-      pipe_buffer_write(pctx, res, offsets[input_idxs[i]], sizes[input_idxs[i]], inputs[i]);
+      if (is_signed[i]) {
+         struct pipe_transfer *dst_transfer;
+         const uint8_t *src = inputs[i];
+         uint8_t *dst_map;
+         dst_map = pipe_buffer_map_range(pctx, res, 0, sizes[input_idxs[i]], PIPE_MAP_WRITE, &dst_transfer);
+         assert(dst_map);
+         for (unsigned k = 0; k < sizes[input_idxs[i]]; k++) {
+            dst_map[k] = src[k] + 128;
+         }
+         pipe_buffer_unmap(pctx, dst_transfer);
+      } else {
+         pipe_buffer_write(pctx, res, offsets[input_idxs[i]], sizes[input_idxs[i]], inputs[i]);
+      }
    }
 
    unsigned i = 0;
@@ -629,7 +654,8 @@ etna_ml_subgraph_invoke(struct pipe_context *pctx, struct pipe_ml_subgraph *psub
 
 void
 etna_ml_subgraph_read_outputs(struct pipe_context *context, struct pipe_ml_subgraph *psubgraph,
-                              unsigned outputs_count, unsigned output_idxs[], void *outputs[])
+                              unsigned outputs_count, unsigned output_idxs[], void *outputs[],
+                              bool is_signed[])
 {
    struct etna_ml_subgraph *subgraph = (struct etna_ml_subgraph *)(psubgraph);
    unsigned operation_count = util_dynarray_num_elements(&subgraph->operations, struct etna_vip_instruction);
@@ -660,7 +686,22 @@ etna_ml_subgraph_read_outputs(struct pipe_context *context, struct pipe_ml_subgr
 
    for (int i = 0; i < outputs_count; i++) {
       struct pipe_resource *res = etna_ml_get_tensor(subgraph, output_idxs[i]);
-      pipe_buffer_read(context, res, 0, pipe_buffer_size(res), outputs[i]);
+      if (is_signed[i]) {
+         struct pipe_transfer *src_transfer;
+         uint8_t *src_map;
+         src_map = (uint8_t *) pipe_buffer_map_range(context,
+                                                     res,
+                                                     0, pipe_buffer_size(res),
+                                                     PIPE_MAP_READ,
+                                                     &src_transfer);
+         assert(src_map);
+         for (unsigned k = 0; k < pipe_buffer_size(res); k++) {
+            ((uint8_t *)(outputs[i]))[k] = src_map[k] - 128;
+         }
+         pipe_buffer_unmap(context, src_transfer);
+      } else {
+         pipe_buffer_read(context, res, 0, pipe_buffer_size(res), outputs[i]);
+      }
    }
 }
 

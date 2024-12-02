@@ -45,6 +45,7 @@ struct radv_vs_output_info {
    bool writes_primitive_shading_rate;
    bool writes_primitive_shading_rate_per_primitive;
    bool export_prim_id;
+   bool export_prim_id_per_primitive;
    unsigned pos_exports;
 };
 
@@ -181,8 +182,7 @@ struct radv_shader_info {
       uint32_t explicit_strict_shaded_mask;
       uint32_t float16_shaded_mask;
       uint32_t float16_hi_shaded_mask;
-      uint32_t num_interp;
-      uint32_t num_prim_interp;
+      uint32_t num_inputs;
       bool can_discard;
       bool early_fragment_test;
       bool post_depth_coverage;

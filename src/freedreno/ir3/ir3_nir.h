@@ -61,6 +61,7 @@ nir_mem_access_size_align ir3_mem_access_size_align(
    const void *cb_data);
 
 bool ir3_nir_opt_branch_and_or_not(nir_shader *nir);
+bool ir3_nir_opt_triops_bitwise(nir_shader *nir);
 bool ir3_optimize_loop(struct ir3_compiler *compiler,
                        const struct ir3_shader_nir_options *options,
                        nir_shader *s);
@@ -90,7 +91,7 @@ nir_def *ir3_nir_try_propagate_bit_shift(nir_builder *b,
                                              nir_def *offset,
                                              int32_t shift);
 
-bool ir3_nir_lower_64b_subgroups(nir_shader *nir);
+bool ir3_nir_lower_subgroups_filter(const nir_instr *instr, const void *data);
 bool ir3_nir_lower_shuffle(nir_shader *nir, struct ir3_shader *shader);
 bool ir3_nir_opt_subgroups(nir_shader *nir, struct ir3_shader_variant *v);
 

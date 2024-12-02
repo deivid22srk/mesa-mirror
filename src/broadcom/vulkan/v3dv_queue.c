@@ -395,8 +395,8 @@ handle_reset_query_cpu_job(struct v3dv_queue *queue,
        * submitted work to complete before executing (which we accomplish by using
        * V3DV_BARRIER_ALL on them) and that includes reset jobs submitted to the CPU queue.
        */
-      int ret = v3dv_ioctl(device->pdevice->render_fd,
-                           DRM_IOCTL_V3D_SUBMIT_CPU, &submit);
+      int ret = v3d_ioctl(device->pdevice->render_fd,
+                          DRM_IOCTL_V3D_SUBMIT_CPU, &submit);
 
       free(syncs);
       free(kperfmon_ids);
@@ -658,8 +658,8 @@ handle_copy_query_results_cpu_job(struct v3dv_queue *queue,
       submit.flags |= DRM_V3D_SUBMIT_EXTENSION;
       submit.extensions = (uintptr_t)(void *)&ms;
 
-      int ret = v3dv_ioctl(device->pdevice->render_fd,
-                           DRM_IOCTL_V3D_SUBMIT_CPU, &submit);
+      int ret = v3d_ioctl(device->pdevice->render_fd,
+                          DRM_IOCTL_V3D_SUBMIT_CPU, &submit);
 
       free(kperfmon_ids);
       free(bo_handles);
@@ -779,7 +779,7 @@ handle_timestamp_query_cpu_job(struct v3dv_queue *queue,
    submit.flags |= DRM_V3D_SUBMIT_EXTENSION;
    submit.extensions = (uintptr_t)(void *)&ms;
 
-   int ret = v3dv_ioctl(device->pdevice->render_fd,
+   int ret = v3d_ioctl(device->pdevice->render_fd,
 			DRM_IOCTL_V3D_SUBMIT_CPU, &submit);
 
    free(offsets);
@@ -880,7 +880,7 @@ handle_csd_indirect_cpu_job(struct v3dv_queue *queue,
    submit.flags |= DRM_V3D_SUBMIT_EXTENSION;
    submit.extensions = (uintptr_t)(void *)&ms;
 
-   int ret = v3dv_ioctl(device->pdevice->render_fd,
+   int ret = v3d_ioctl(device->pdevice->render_fd,
 			DRM_IOCTL_V3D_SUBMIT_CPU, &submit);
 
    free(bo_handles);
@@ -1010,8 +1010,8 @@ handle_cl_job(struct v3dv_queue *queue,
    submit.out_sync = 0;
 
    v3dv_clif_dump(device, job, &submit);
-   int ret = v3dv_ioctl(device->pdevice->render_fd,
-                        DRM_IOCTL_V3D_SUBMIT_CL, &submit);
+   int ret = v3d_ioctl(device->pdevice->render_fd,
+                       DRM_IOCTL_V3D_SUBMIT_CL, &submit);
 
    static bool warned = false;
    if (ret && !warned) {
@@ -1057,8 +1057,8 @@ handle_tfu_job(struct v3dv_queue *queue,
    job->tfu.in_sync = 0;
    job->tfu.out_sync = 0;
 
-   int ret = v3dv_ioctl(device->pdevice->render_fd,
-                        DRM_IOCTL_V3D_SUBMIT_TFU, &job->tfu);
+   int ret = v3d_ioctl(device->pdevice->render_fd,
+                       DRM_IOCTL_V3D_SUBMIT_TFU, &job->tfu);
 
    multisync_free(device, &ms);
    queue->last_job_syncs.first[V3DV_QUEUE_TFU] = false;
@@ -1122,8 +1122,8 @@ handle_csd_job(struct v3dv_queue *queue,
       job->perf->kperfmon_ids[counter_pass_idx] : 0;
    queue->last_perfmon_id = submit->perfmon_id;
 
-   int ret = v3dv_ioctl(device->pdevice->render_fd,
-                        DRM_IOCTL_V3D_SUBMIT_CSD, submit);
+   int ret = v3d_ioctl(device->pdevice->render_fd,
+                       DRM_IOCTL_V3D_SUBMIT_CSD, submit);
 
    static bool warned = false;
    if (ret && !warned) {
@@ -1182,7 +1182,7 @@ queue_create_noop_job(struct v3dv_queue *queue)
       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
    v3dv_job_init(queue->noop_job, V3DV_JOB_TYPE_GPU_CL, device, NULL, -1);
 
-   v3dv_X(device, job_emit_noop)(queue->noop_job);
+   v3d_X((&device->devinfo), job_emit_noop)(queue->noop_job);
 
    /* We use no-op jobs to signal semaphores/fences. These jobs needs to be
     * serialized across all hw queues to comply with Vulkan's signal operation
@@ -1236,7 +1236,7 @@ v3dv_queue_driver_submit(struct vk_queue *vk_queue,
       list_for_each_entry_safe(struct v3dv_job, job,
                                &cmd_buffer->jobs, list_link) {
          if (job->suspending) {
-            job = v3dv_X(job->device,
+            job = v3d_X((&job->device->devinfo),
                          cmd_buffer_prepare_suspend_job_for_submit)(job);
             if (!job)
                return VK_ERROR_OUT_OF_DEVICE_MEMORY;
@@ -1251,7 +1251,7 @@ v3dv_queue_driver_submit(struct vk_queue *vk_queue,
          if (job->resuming) {
             assert(first_suspend_job);
             assert(current_suspend_job);
-            v3dv_X(job->device, job_patch_resume_address)(first_suspend_job,
+            v3d_X((&job->device->devinfo), job_patch_resume_address)(first_suspend_job,
                                                           current_suspend_job,
                                                           job);
             current_suspend_job = NULL;

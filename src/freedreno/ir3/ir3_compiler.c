@@ -216,6 +216,8 @@ ir3_compiler_create(struct fd_device *dev, const struct fd_dev_id *dev_id,
       compiler->bitops_can_write_predicates = true;
       compiler->has_branch_and_or = true;
       compiler->has_predication = true;
+      compiler->predtf_nop_quirk = dev_info->a6xx.predtf_nop_quirk;
+      compiler->prede_nop_quirk = dev_info->a6xx.prede_nop_quirk;
       compiler->has_scalar_alu = dev_info->a6xx.has_scalar_alu;
       compiler->has_isam_v = dev_info->a6xx.has_isam_v;
       compiler->has_ssbo_imm_offsets = dev_info->a6xx.has_ssbo_imm_offsets;
@@ -285,6 +287,7 @@ ir3_compiler_create(struct fd_device *dev, const struct fd_dev_id *dev_id,
 
    compiler->bool_type = (compiler->gen >= 5) ? TYPE_U16 : TYPE_U32;
    compiler->has_shared_regfile = compiler->gen >= 5;
+   compiler->has_bitwise_triops = compiler->gen >= 5;
 
    /* The driver can't request this unless preambles are supported. */
    if (options->push_ubo_with_preamble)

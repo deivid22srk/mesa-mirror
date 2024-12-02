@@ -4869,6 +4869,7 @@ vtn_handle_entry_point(struct vtn_builder *b, const uint32_t *w,
    /* Let this be a name label regardless */
    unsigned name_words;
    entry_point->name = vtn_string_literal(b, &w[3], count - 3, &name_words);
+   entry_point->is_entrypoint = true;
 
    gl_shader_stage stage = vtn_stage_for_execution_model(w[1]);
    vtn_fail_if(stage == MESA_SHADER_NONE,
@@ -6100,10 +6101,10 @@ vtn_handle_ray_query_intrinsic(struct vtn_builder *b, SpvOp opcode,
 }
 
 static void
-vtn_handle_initialize_node_payloads(struct vtn_builder *b, SpvOp opcode,
+vtn_handle_allocate_node_payloads(struct vtn_builder *b, SpvOp opcode,
                                     const uint32_t *w, unsigned count)
 {
-   vtn_assert(opcode == SpvOpInitializeNodePayloadsAMDX);
+   vtn_assert(opcode == SpvOpAllocateNodePayloadsAMDX);
 
    nir_def *payloads = vtn_ssa_value(b, w[1])->def;
    mesa_scope scope = vtn_translate_scope(b, vtn_constant_uint(b, w[2]));
@@ -6620,11 +6621,8 @@ vtn_handle_body_instruction(struct vtn_builder *b, SpvOp opcode,
          nir_undef(&b->nb, 1, 32));
       break;
 
-   case SpvOpInitializeNodePayloadsAMDX:
-      vtn_handle_initialize_node_payloads(b, opcode, w, count);
-      break;
-
-   case SpvOpFinalizeNodePayloadsAMDX:
+   case SpvOpAllocateNodePayloadsAMDX:
+      vtn_handle_allocate_node_payloads(b, opcode, w, count);
       break;
 
    case SpvOpFinishWritingNodePayloadAMDX:
@@ -7349,8 +7347,10 @@ spirv_library_to_nir_builder(FILE *fp, const uint32_t *words, size_t word_count,
 
    fprintf(fp, "#include \"compiler/nir/nir_builder.h\"\n\n");
 
+   nir_fixup_is_exported(b->shader);
+
    vtn_foreach_function(func, &b->functions) {
-      if (func->linkage != SpvLinkageTypeExport)
+      if (!func->nir_func->is_exported || func->nir_func->is_entrypoint)
          continue;
 
       if (!func_to_nir_builder(fp, func))

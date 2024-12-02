@@ -240,6 +240,29 @@ function_decoration_cb(struct vtn_builder *b, struct vtn_value *val, int member,
    }
 }
 
+/*
+ * Usually, execution modes are per-shader and handled elsewhere. However, with
+ * create_library we will have modes per-nir_function. We can't represent all
+ * SPIR-V execution modes in nir_function, so this is lossy for multi-entrypoint
+ * SPIR-V. However, we do have workgroup_size in nir_function so we gather that
+ * here. If other execution modes are needed in the multi-entrypoint case, both
+ * nir_function and this callback will need to be extended suitably.
+ */
+static void
+function_execution_mode_cb(struct vtn_builder *b, struct vtn_value *func,
+                           const struct vtn_decoration *mode, void *data)
+{
+   nir_function *nir_func = data;
+
+   if (mode->exec_mode == SpvExecutionModeLocalSize) {
+      vtn_assert(b->shader->info.stage == MESA_SHADER_KERNEL);
+
+      nir_func->workgroup_size[0] = mode->operands[0];
+      nir_func->workgroup_size[1] = mode->operands[1];
+      nir_func->workgroup_size[2] = mode->operands[2];
+   }
+}
+
 bool
 vtn_cfg_handle_prepass_instruction(struct vtn_builder *b, SpvOp opcode,
                                    const uint32_t *w, unsigned count)
@@ -268,6 +291,12 @@ vtn_cfg_handle_prepass_instruction(struct vtn_builder *b, SpvOp opcode,
       nir_function *func =
          nir_function_create(b->shader, ralloc_strdup(b->shader, val->name));
 
+      /* Execution modes are gathered per-function with create_library (here)
+       * but per shader with !create_library (elsewhere).
+       */
+      if (b->options->create_library)
+         vtn_foreach_execution_mode(b, val, function_execution_mode_cb, func);
+
       unsigned num_params = 0;
       for (unsigned i = 0; i < func_type->length; i++)
          num_params += glsl_type_count_function_params(func_type->params[i]->type);
@@ -279,6 +308,17 @@ vtn_cfg_handle_prepass_instruction(struct vtn_builder *b, SpvOp opcode,
       func->should_inline = b->func->control & SpvFunctionControlInlineMask;
       func->dont_inline = b->func->control & SpvFunctionControlDontInlineMask;
       func->is_exported = b->func->linkage == SpvLinkageTypeExport;
+
+      /* This is a bit subtle: if we are compiling a non-library, we will have
+       * exactly one entrypoint. But in library mode, we can have 0, 1, or even
+       * multiple entrypoints. This is OK.
+       *
+       * So, we set is_entrypoint for libraries here (plumbing OpEntryPoint),
+       * but set is_entrypoint elsewhere for graphics shaders.
+       */
+      if (b->options->create_library) {
+         func->is_entrypoint = val->is_entrypoint;
+      }
 
       func->num_params = num_params;
       func->params = rzalloc_array(b->shader, nir_parameter, num_params);

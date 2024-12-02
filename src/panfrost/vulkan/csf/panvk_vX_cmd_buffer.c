@@ -138,7 +138,7 @@ finish_cs(struct panvk_cmd_buffer *cmdbuf, uint32_t subqueue)
 
       cs_move32_to(b, one, 1);
       cs_load64_to(b, debug_sync_addr, cs_subqueue_ctx_reg(b),
-                   offsetof(struct panvk_cs_subqueue_context, debug_syncobjs));
+                   offsetof(struct panvk_cs_subqueue_context, debug.syncobjs));
       cs_wait_slot(b, SB_ID(LS), false);
       cs_add64(b, debug_sync_addr, debug_sync_addr,
                sizeof(struct panvk_cs_sync32) * subqueue);
@@ -679,6 +679,7 @@ init_cs_builders(struct panvk_cmd_buffer *cmdbuf)
    };
 
    for (uint32_t i = 0; i < ARRAY_SIZE(cmdbuf->state.cs); i++) {
+      struct cs_builder *b = &cmdbuf->state.cs[i].builder;
       /* Lazy allocation of the root CS. */
       struct cs_buffer root_cs = {0};
 
@@ -701,7 +702,17 @@ init_cs_builders(struct panvk_cmd_buffer *cmdbuf)
          conf.reg_perm = cs_reg_perm;
       }
 
-      cs_builder_init(&cmdbuf->state.cs[i].builder, &conf, root_cs);
+      cs_builder_init(b, &conf, root_cs);
+
+      if (instance->debug_flags & PANVK_DEBUG_TRACE) {
+         cmdbuf->state.cs[i].tracing = (struct cs_tracing_ctx){
+            .enabled = true,
+            .ctx_reg = cs_subqueue_ctx_reg(b),
+            .tracebuf_addr_offset =
+               offsetof(struct panvk_cs_subqueue_context, debug.tracebuf.cs),
+            .ls_sb_slot = SB_ID(LS),
+         };
+      }
    }
 }
 
@@ -819,22 +830,16 @@ panvk_per_arch(BeginCommandBuffer)(VkCommandBuffer commandBuffer,
                                    const VkCommandBufferBeginInfo *pBeginInfo)
 {
    VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
-   struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
    struct panvk_instance *instance =
-      to_panvk_instance(dev->vk.physical->instance);
+      to_panvk_instance(cmdbuf->vk.base.device->physical->instance);
 
    vk_command_buffer_begin(&cmdbuf->vk, pBeginInfo);
    cmdbuf->flags = pBeginInfo->flags;
 
-   /* The descriptor ringbuf trips out pandecode because we always point to the
-    * next tiler/framebuffer descriptor after CS execution, which means we're
-    * decoding an uninitialized or stale descriptor.
-    * FIXME: find a way to trace the simultaneous path that doesn't crash. One
-    * option would be to disable CS intepretation and dump the RUN_xxx context
-    * on the side at execution time.
-    */
-   if (instance->debug_flags & PANVK_DEBUG_TRACE)
-      cmdbuf->flags &= ~VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
+   if (instance->debug_flags & PANVK_DEBUG_FORCE_SIMULTANEOUS) {
+      cmdbuf->flags |= VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
+      cmdbuf->flags &= ~VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+   }
 
    panvk_per_arch(cmd_inherit_render_state)(cmdbuf, pBeginInfo);
 

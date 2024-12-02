@@ -507,6 +507,9 @@ nir_function_create(nir_shader *shader, const char *name)
    func->subroutine_index = 0;
    func->num_subroutine_types = 0;
    func->subroutine_types = NULL;
+   func->workgroup_size[0] = 0;
+   func->workgroup_size[1] = 0;
+   func->workgroup_size[2] = 0;
 
    /* Only meaningful for shader libraries, so don't export by default. */
    func->is_exported = false;
@@ -2256,8 +2259,6 @@ nir_intrinsic_from_system_value(gl_system_value val)
       return nir_intrinsic_load_vertex_id;
    case SYSTEM_VALUE_INSTANCE_ID:
       return nir_intrinsic_load_instance_id;
-   case SYSTEM_VALUE_INSTANCE_INDEX:
-      return nir_intrinsic_load_instance_index;
    case SYSTEM_VALUE_DRAW_ID:
       return nir_intrinsic_load_draw_id;
    case SYSTEM_VALUE_BASE_INSTANCE:
@@ -2425,8 +2426,6 @@ nir_system_value_from_intrinsic(nir_intrinsic_op intrin)
       return SYSTEM_VALUE_VERTEX_ID;
    case nir_intrinsic_load_instance_id:
       return SYSTEM_VALUE_INSTANCE_ID;
-   case nir_intrinsic_load_instance_index:
-      return SYSTEM_VALUE_INSTANCE_INDEX;
    case nir_intrinsic_load_draw_id:
       return SYSTEM_VALUE_DRAW_ID;
    case nir_intrinsic_load_base_instance:
@@ -3544,6 +3543,19 @@ nir_remove_non_exported(nir_shader *nir)
    nir_foreach_function_safe(func, nir) {
       if (!func->is_exported)
          exec_node_remove(&func->node);
+   }
+}
+
+/*
+ * After precompiling entrypoints from a kernel library, we want to garbage
+ * collect the NIR entrypoints but leave the exported library functions. This
+ * helper does that.
+ */
+void
+nir_remove_entrypoints(nir_shader *nir)
+{
+   nir_foreach_entrypoint_safe(func, nir) {
+      exec_node_remove(&func->node);
    }
 }
 

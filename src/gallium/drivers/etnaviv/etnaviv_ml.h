@@ -94,6 +94,7 @@ struct etna_operation {
    unsigned weight_height;
    uint8_t weight_zero_point;
    float weight_scale;
+   bool weight_signed;
 
    uint8_t addition_offset;
 
@@ -123,11 +124,12 @@ etna_ml_subgraph_create(struct pipe_context *context,
 
 void
 etna_ml_subgraph_invoke(struct pipe_context *pctx, struct pipe_ml_subgraph *psubgraph,
-                        unsigned inputs_count, unsigned input_idxs[], void *inputs[]);
+                        unsigned inputs_count, unsigned input_idxs[], void *inputs[], bool is_signed[]);
 
 void
 etna_ml_subgraph_read_outputs(struct pipe_context *context, struct pipe_ml_subgraph *subgraph,
-                              unsigned outputs_count, unsigned output_idxs[], void *outputs[]);
+                              unsigned outputs_count, unsigned output_idxs[], void *outputs[],
+                              bool is_signed[]);
 
 void
 etna_ml_subgraph_destroy(struct pipe_context *context, struct pipe_ml_subgraph *subgraph);

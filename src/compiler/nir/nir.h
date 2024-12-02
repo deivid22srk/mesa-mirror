@@ -3635,6 +3635,11 @@ typedef struct nir_function {
    bool should_inline;
    bool dont_inline; /* from SPIR-V */
 
+   /* Static workgroup size, if this is a kernel function in a library of OpenCL
+    * kernels. Normally, the size in the shader info is used instead.
+    */
+   unsigned workgroup_size[3];
+
    /**
     * Is this function a subroutine type declaration
     * e.g. subroutine void type1(float arg1);
@@ -3656,6 +3661,9 @@ typedef struct nir_function {
    const struct glsl_type **subroutine_types;
 
    int subroutine_index;
+
+   /* A temporary for passes to use for storing flags. */
+   uint32_t pass_flags;
 } nir_function;
 
 typedef enum {
@@ -4003,15 +4011,6 @@ typedef struct nir_shader_compiler_options {
    bool lower_base_vertex;
 
    /**
-    * Whether the driver wants to work with instance_index instead of
-    * instance_id.
-    *
-    * When set, instance_id will be lowered to instance_index - base_instance.
-    * Otherwise, instance_index will be lowered to instance_id + base_instance.
-    */
-   bool supports_instance_index;
-
-   /**
     * If enabled, gl_HelperInvocation will be lowered as:
     *
     *   !((1 << sample_id) & sample_mask_in))
@@ -4331,15 +4330,6 @@ typedef struct nir_shader_compiler_options {
    uint8_t support_indirect_inputs;
    uint8_t support_indirect_outputs;
 
-   /**
-    * Remove varying loaded from uniform, let fragment shader load the
-    * uniform directly. GPU passing varying by memory can benifit from it
-    * for sure; but GPU passing varying by on chip resource may not.
-    * Because it saves on chip resource but may increase memory pressure when
-    * fragment task is far more than vertex one, so better left it disabled.
-    */
-   bool lower_varying_from_uniform;
-
    /** store the variable offset into the instrinsic range_base instead
     *  of adding it to the image index.
     */
@@ -4419,8 +4409,24 @@ typedef struct nir_shader_compiler_options {
     * Return the cost of an instruction that could be moved into the next
     * shader. If the cost of all instructions in an expression is <=
     * varying_expression_max_cost(), the instruction is moved.
+    *
+    * When this callback isn't set, nir_opt_varyings uses its own version.
     */
    unsigned (*varying_estimate_instr_cost)(struct nir_instr *instr);
+
+   /**
+    * When the varying_expression_max_cost callback isn't set, this specifies
+    * the maximum cost of a uniform expression that is allowed to be moved
+    * from output stores into the next shader stage to eliminate those output
+    * stores and corresponding inputs.
+    *
+    * 0 only allows propagating constants written to output stores to
+    * the next shader.
+    *
+    * At least 2 is required for moving a uniform stored in an output into
+    * the next shader according to default_varying_estimate_instr_cost.
+    */
+   unsigned max_varying_expression_cost;
 } nir_shader_compiler_options;
 
 typedef struct nir_shader {
@@ -4478,6 +4484,14 @@ typedef struct nir_shader {
 
 #define nir_foreach_function_safe(func, shader) \
    foreach_list_typed_safe(nir_function, func, node, &(shader)->functions)
+
+#define nir_foreach_entrypoint(func, lib) \
+   nir_foreach_function(func, lib)        \
+      if (func->is_entrypoint)
+
+#define nir_foreach_entrypoint_safe(func, lib) \
+   nir_foreach_function_safe(func, lib)        \
+      if (func->is_entrypoint)
 
 static inline nir_function *
 nir_foreach_function_with_impl_first(const nir_shader *shader)
@@ -4566,6 +4580,7 @@ nir_shader_get_function_for_name(const nir_shader *shader, const char *name)
  */
 void nir_remove_non_entrypoints(nir_shader *shader);
 void nir_remove_non_exported(nir_shader *shader);
+void nir_remove_entrypoints(nir_shader *shader);
 void nir_fixup_is_exported(nir_shader *shader);
 
 nir_shader *nir_shader_create(void *mem_ctx,
@@ -5517,6 +5532,7 @@ bool nir_inline_functions(nir_shader *shader);
 void nir_cleanup_functions(nir_shader *shader);
 bool nir_link_shader_functions(nir_shader *shader,
                                const nir_shader *link_shader);
+bool nir_lower_calls_to_builtins(nir_shader *s);
 
 void nir_find_inlinable_uniforms(nir_shader *shader);
 void nir_inline_uniforms(nir_shader *shader, unsigned num_uniforms,
@@ -5543,6 +5559,7 @@ void nir_fixup_deref_modes(nir_shader *shader);
 void nir_fixup_deref_types(nir_shader *shader);
 
 bool nir_lower_global_vars_to_local(nir_shader *shader);
+void nir_lower_constant_to_temp(nir_shader *shader);
 
 typedef enum {
    nir_lower_direct_array_deref_of_vec_load = (1 << 0),
@@ -6127,10 +6144,17 @@ bool nir_lower_atomics(nir_shader *shader, nir_instr_filter_cb filter);
 typedef struct nir_lower_subgroups_options {
    /* In addition to the boolean lowering options below, this optional callback
     * will filter instructions for lowering if non-NULL. The data passed will be
-    * this options struct itself.
+    * filter_data.
     */
    nir_instr_filter_cb filter;
 
+   /* Extra data passed to the filter. */
+   const void *filter_data;
+
+   /* In case the exact subgroup size is not known, subgroup_size should be
+    * set to 0. In that case, the maximum subgroup size will be calculated by
+    * ballot_components * ballot_bit_size.
+    */
    uint8_t subgroup_size;
    uint8_t ballot_bit_size;
    uint8_t ballot_components;
@@ -6152,6 +6176,7 @@ typedef struct nir_lower_subgroups_options {
    bool lower_elect : 1;
    bool lower_read_invocation_to_cond : 1;
    bool lower_rotate_to_shuffle : 1;
+   bool lower_rotate_clustered_to_shuffle : 1;
    bool lower_ballot_bit_count_to_mbcnt_amd : 1;
    bool lower_inverse_ballot : 1;
    bool lower_reduce : 1;

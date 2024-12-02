@@ -107,6 +107,7 @@ typedef enum {
    OPC_READ_COND_MACRO = _OPC(1, 54),
    OPC_READ_FIRST_MACRO = _OPC(1, 55),
    OPC_SHPS_MACRO       = _OPC(1, 56),
+   OPC_READ_GETLAST_MACRO = _OPC(1, 57),
 
    /* Macros that expand to a loop */
    OPC_SCAN_MACRO      = _OPC(1, 58),
@@ -791,6 +792,21 @@ is_cat3_float(opc_t opc)
    case OPC_MAD_F32:
    case OPC_SEL_F16:
    case OPC_SEL_F32:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static inline bool
+is_cat3_alt(opc_t opc)
+{
+   switch (opc) {
+   case OPC_SHLM:
+   case OPC_SHRM:
+   case OPC_SHLG:
+   case OPC_SHRG:
+   case OPC_ANDG:
       return true;
    default:
       return false;

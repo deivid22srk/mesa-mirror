@@ -488,6 +488,11 @@ intrinsic("as_uniform", src_comp=[0], dest_comp=0, bit_sizes=src0, flags=[CAN_EL
 # true. The second source must be true for exactly one lane.
 intrinsic("read_invocation_cond_ir3", src_comp=[0, 1], dest_comp=0, flags=[CAN_ELIMINATE])
 
+# Like read_first_invocation but using the getlast instruction instead of
+# getone. More specifically, this will read the value from the last active
+# invocation of the first cluster of 8 invocations with an active invocation.
+intrinsic("read_getlast_ir3", src_comp=[0], dest_comp=0, bit_sizes=src0, flags=[CAN_ELIMINATE])
+
 # Additional SPIR-V ballot intrinsics
 #
 # These correspond to the SPIR-V opcodes
@@ -891,7 +896,6 @@ system_value("first_vertex", 1)
 system_value("is_indexed_draw", 1)
 system_value("base_vertex", 1)
 system_value("instance_id", 1)
-system_value("instance_index", 1)
 system_value("base_instance", 1)
 system_value("draw_id", 1)
 system_value("sample_id", 1)

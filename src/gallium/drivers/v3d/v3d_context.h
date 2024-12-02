@@ -765,16 +765,6 @@ void v3d_program_init(struct pipe_context *pctx);
 void v3d_program_fini(struct pipe_context *pctx);
 void v3d_query_init(struct pipe_context *pctx);
 
-static inline int
-v3d_ioctl(int fd, unsigned long request, void *arg)
-{
-#if USE_V3D_SIMULATOR
-        return v3d_simulator_ioctl(fd, request, arg);
-#else
-        return drmIoctl(fd, request, arg);
-#endif
-}
-
 static inline bool
 v3d_transform_feedback_enabled(struct v3d_context *v3d)
 {
@@ -888,22 +878,6 @@ void v3d_disk_cache_store(struct v3d_context *v3d,
                           uint64_t *qpu_insts,
                           uint32_t qpu_size);
 #endif /* ENABLE_SHADER_CACHE */
-
-/* Helper to call hw ver specific functions */
-#define v3d_X(devinfo, thing) ({                                \
-        __typeof(&v3d42_##thing) v3d_X_thing;                   \
-        switch (devinfo->ver) {                                 \
-        case 42:                                                \
-                v3d_X_thing = &v3d42_##thing;                   \
-                break;                                          \
-        case 71:                                                \
-                v3d_X_thing = &v3d71_##thing;                   \
-                break;                                          \
-        default:                                                \
-                unreachable("Unsupported hardware generation"); \
-        }                                                       \
-        v3d_X_thing;                                            \
-})
 
 #ifdef v3dX
 #  include "v3dx_context.h"

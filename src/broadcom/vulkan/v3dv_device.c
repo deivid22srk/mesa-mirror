@@ -647,6 +647,9 @@ physical_device_finish(struct v3dv_physical_device *device)
 
    util_sparse_array_finish(&device->bo_map);
 
+   if (device->perfcntr)
+      v3d_perfcntrs_fini(device->perfcntr);
+
    close(device->render_fd);
    if (device->display_fd >= 0)
       close(device->display_fd);
@@ -741,7 +744,7 @@ v3d_has_feature(struct v3dv_physical_device *device, enum drm_v3d_param feature)
    struct drm_v3d_get_param p = {
       .param = feature,
    };
-   if (v3dv_ioctl(device->render_fd, DRM_IOCTL_V3D_GET_PARAM, &p) != 0)
+   if (v3d_ioctl(device->render_fd, DRM_IOCTL_V3D_GET_PARAM, &p) != 0)
       return false;
    return p.value;
 }
@@ -867,7 +870,7 @@ get_device_properties(const struct v3dv_physical_device *device,
       (UINT32_MAX - sizeof(struct v3dv_descriptor_set)) /
       sizeof(struct v3dv_descriptor);
    const uint32_t max_gpu_descriptors =
-      (UINT32_MAX / v3dv_X(device, max_descriptor_bo_size)());
+      (UINT32_MAX / v3d_X((&device->devinfo), max_descriptor_bo_size)());
 
    VkSubgroupFeatureFlags subgroup_ops = VK_SUBGROUP_FEATURE_BASIC_BIT;
    if (device->devinfo.ver >= 71) {
@@ -1318,7 +1321,7 @@ create_physical_device(struct v3dv_instance *instance,
    device->render_fd = render_fd;
    device->display_fd = primary_fd;
 
-   if (!v3d_get_device_info(device->render_fd, &device->devinfo, &v3dv_ioctl)) {
+   if (!v3d_get_device_info(device->render_fd, &device->devinfo, &v3d_ioctl)) {
       result = vk_errorf(instance, VK_ERROR_INITIALIZATION_FAILED,
                          "Failed to get info from device.");
       goto fail;
@@ -1343,6 +1346,16 @@ create_physical_device(struct v3dv_instance *instance,
       result = vk_errorf(instance, VK_ERROR_INITIALIZATION_FAILED,
                          "Kernel driver doesn't have required features.");
       goto fail;
+   }
+
+   if (device->caps.perfmon) {
+      device->perfcntr = v3d_perfcntrs_init(&device->devinfo, device->render_fd);
+
+      if (!device->perfcntr) {
+         result = vk_errorf(instance, VK_ERROR_INITIALIZATION_FAILED,
+                            "Failed to get init perfmon.");
+         goto fail;
+      }
    }
 
    result = init_uuids(device);
@@ -1873,14 +1886,14 @@ v3dv_CreateDevice(VkPhysicalDevice physicalDevice,
 
 
 #if MESA_DEBUG
-   v3dv_X(device, device_check_prepacked_sizes)();
+   v3d_X((&device->devinfo), device_check_prepacked_sizes)();
 #endif
    init_device_meta(device);
    v3dv_bo_cache_init(device);
    v3dv_pipeline_cache_init(&device->default_pipeline_cache, device, 0,
                             device->instance->default_pipeline_cache_enabled);
    device->default_attribute_float =
-      v3dv_X(device, create_default_attribute_values)(device, NULL);
+      v3d_X((&device->devinfo), create_default_attribute_values)(device, NULL);
 
    device->device_address_mem_ctx = ralloc_context(NULL);
    util_dynarray_init(&device->device_address_bo_list,
@@ -1979,7 +1992,7 @@ device_free_wsi_dumb(int32_t display_fd, int32_t dumb_handle)
    struct drm_mode_destroy_dumb destroy_dumb = {
       .handle = dumb_handle,
    };
-   if (v3dv_ioctl(display_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy_dumb)) {
+   if (v3d_ioctl(display_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy_dumb)) {
       mesa_loge("destroy dumb object %d: %s\n", dumb_handle, strerror(errno));
    }
 }
@@ -2060,7 +2073,7 @@ device_import_bo(struct v3dv_device *device,
    struct drm_v3d_get_bo_offset get_offset = {
       .handle = handle,
    };
-   ret = v3dv_ioctl(render_fd, DRM_IOCTL_V3D_GET_BO_OFFSET, &get_offset);
+   ret = v3d_ioctl(render_fd, DRM_IOCTL_V3D_GET_BO_OFFSET, &get_offset);
    if (ret)
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
    assert(get_offset.offset != 0);
@@ -2104,7 +2117,7 @@ device_alloc_for_wsi(struct v3dv_device *device,
    };
 
    int err;
-   err = v3dv_ioctl(display_fd, DRM_IOCTL_MODE_CREATE_DUMB, &create_dumb);
+   err = v3d_ioctl(display_fd, DRM_IOCTL_MODE_CREATE_DUMB, &create_dumb);
    if (err < 0)
       goto fail_create;
 
@@ -2966,7 +2979,7 @@ v3dv_CreateSampler(VkDevice _device,
       }
    }
 
-   v3dv_X(device, pack_sampler_state)(device, sampler, pCreateInfo, bc_info);
+   v3d_X((&device->devinfo), pack_sampler_state)(device, sampler, pCreateInfo, bc_info);
 
    *pSampler = v3dv_sampler_to_handle(sampler);
 

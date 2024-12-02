@@ -92,6 +92,7 @@
 #include "drm-uapi/v3d_drm.h"
 
 #include "vk_alloc.h"
+#include "perfcntrs/v3d_perfcntrs.h"
 #include "simulator/v3d_simulator.h"
 
 #include "v3dv_cl.h"
@@ -157,6 +158,7 @@ struct v3dv_physical_device {
    VkPhysicalDeviceMemoryProperties memory;
 
    struct v3d_device_info devinfo;
+   struct v3d_perfcntrs *perfcntr;
 
 #if USE_V3D_SIMULATOR
    struct v3d_simulator_file *sim_file;
@@ -2552,16 +2554,6 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(v3dv_render_pass, base, VkRenderPass,
 VK_DEFINE_NONDISP_HANDLE_CASTS(v3dv_sampler, base, VkSampler,
                                VK_OBJECT_TYPE_SAMPLER)
 
-static inline int
-v3dv_ioctl(int fd, unsigned long request, void *arg)
-{
-#if USE_V3D_SIMULATOR
-   return v3d_simulator_ioctl(fd, request, arg);
-#else
-   return drmIoctl(fd, request, arg);
-#endif
-}
-
 /* Flags OOM conditions in command buffer state.
  *
  * Note: notice that no-op jobs don't have a command buffer reference.
@@ -2598,22 +2590,6 @@ u64_compare(const void *key1, const void *key2)
 {
    return memcmp(key1, key2, sizeof(uint64_t)) == 0;
 }
-
-/* Helper to call hw ver specific functions */
-#define v3dv_X(device, thing) ({                      \
-   __typeof(&v3d42_##thing) v3d_X_thing;              \
-   switch (device->devinfo.ver) {                     \
-   case 42:                                           \
-      v3d_X_thing = &v3d42_##thing;                   \
-      break;                                          \
-   case 71:                                           \
-      v3d_X_thing = &v3d71_##thing;                   \
-      break;                                          \
-   default:                                           \
-      unreachable("Unsupported hardware generation"); \
-   }                                                  \
-   v3d_X_thing;                                       \
-})
 
 /* v3d_macros from common requires v3dX and V3DX definitions. Below we need to
  * define v3dX for each version supported, because when we compile code that

@@ -204,6 +204,9 @@ struct ir3_compiler {
     */
    bool has_shfl;
 
+   /* True if the bitwise triops (sh[lr][gm]/andg) are supported. */
+   bool has_bitwise_triops;
+
    /* Number of available predicate registers (p0.c) */
    uint32_t num_predicates;
 
@@ -215,6 +218,8 @@ struct ir3_compiler {
 
    /* True if predt/predf/prede are supported. */
    bool has_predication;
+   bool predtf_nop_quirk;
+   bool prede_nop_quirk;
 
    /* MAX_COMPUTE_VARIABLE_GROUP_INVOCATIONS_ARB */
    uint32_t max_variable_workgroup_size;

@@ -196,6 +196,7 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_read_invocation:
    case nir_intrinsic_read_first_invocation:
    case nir_intrinsic_read_invocation_cond_ir3:
+   case nir_intrinsic_read_getlast_ir3:
    case nir_intrinsic_vote_any:
    case nir_intrinsic_vote_all:
    case nir_intrinsic_vote_feq:
@@ -452,7 +453,6 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
       is_divergent |= !(options & nir_divergence_single_prim_per_subgroup);
       break;
    case nir_intrinsic_load_instance_id:
-   case nir_intrinsic_load_instance_index:
       is_divergent = !state->vertex_divergence;
       break;
    case nir_intrinsic_load_primitive_id:

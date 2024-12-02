@@ -241,6 +241,7 @@ static int si_init_surface(struct si_screen *sscreen, struct radeon_surf *surfac
       if (modifier == DRM_FORMAT_MOD_INVALID &&
           (ptex->bind & PIPE_BIND_CONST_BW ||
            ptex->bind & PIPE_BIND_PROTECTED ||
+           ptex->bind & PIPE_BIND_USE_FRONT_RENDERING ||
            sscreen->debug_flags & DBG(NO_DCC) ||
            (ptex->bind & PIPE_BIND_SCANOUT && sscreen->debug_flags & DBG(NO_DISPLAY_DCC))))
          flags |= RADEON_SURF_DISABLE_DCC;
@@ -288,6 +289,9 @@ static int si_init_surface(struct si_screen *sscreen, struct radeon_surf *surfac
 
          /* If constant (non-data-dependent) format is requested, disable DCC: */
          if (ptex->bind & PIPE_BIND_CONST_BW)
+            flags |= RADEON_SURF_DISABLE_DCC;
+
+         if (ptex->bind & PIPE_BIND_USE_FRONT_RENDERING)
             flags |= RADEON_SURF_DISABLE_DCC;
 
          switch (sscreen->info.gfx_level) {
@@ -381,6 +385,9 @@ static int si_init_surface(struct si_screen *sscreen, struct radeon_surf *surfac
 
    if (ptex->flags & PIPE_RESOURCE_FLAG_SPARSE)
       flags |= RADEON_SURF_PRT;
+
+   if (ptex->bind & (PIPE_BIND_VIDEO_DECODE_DPB | PIPE_BIND_VIDEO_ENCODE_DPB))
+      flags |= RADEON_SURF_VIDEO_REFERENCE;
 
    surface->modifier = modifier;
 
@@ -798,16 +805,31 @@ static bool si_texture_get_handle(struct pipe_screen *screen, struct pipe_contex
          assert(tex->surface.tile_swizzle == 0);
       }
 
-      /* Since shader image stores don't support DCC on GFX8,
-       * disable it for external clients that want write
-       * access.
+      const bool debug_disable_dcc = sscreen->debug_flags & DBG(NO_EXPORTED_DCC);
+      /* Since shader image stores don't support DCC on GFX9 and older,
+       * disable it for external clients that want write access.
        */
-      if (sscreen->debug_flags & DBG(NO_EXPORTED_DCC) ||
-          (usage & PIPE_HANDLE_USAGE_SHADER_WRITE && !tex->is_depth && tex->surface.meta_offset) ||
-          /* Displayable DCC requires an explicit flush. */
-          (!(usage & PIPE_HANDLE_USAGE_EXPLICIT_FLUSH) &&
-           si_displayable_dcc_needs_explicit_flush(tex))) {
-         if (si_texture_disable_dcc(sctx, tex)) {
+      const bool shader_write = sscreen->info.gfx_level <= GFX9 &&
+                                usage & PIPE_HANDLE_USAGE_SHADER_WRITE &&
+                                !tex->is_depth &&
+                                tex->surface.meta_offset;
+       /* Another reason to disable display dcc is front buffer rendering.
+        * This can happens with Xorg. If the ddx driver uses GBM_BO_USE_FRONT_RENDERING,
+        * there's nothing to do because the texture is not using DCC.
+        * If the flag isn't set, we have to infer it to get correct rendering.
+        */
+      const bool front_buffer_rendering = !(usage & PIPE_HANDLE_USAGE_EXPLICIT_FLUSH) &&
+                                           tex->buffer.b.b.bind & PIPE_BIND_SCANOUT;
+
+      /* If display dcc requires a retiling step, drop dcc. */
+      const bool explicit_flush = !(usage & PIPE_HANDLE_USAGE_EXPLICIT_FLUSH) &&
+                                  si_displayable_dcc_needs_explicit_flush(tex);
+
+      if (debug_disable_dcc || shader_write || front_buffer_rendering || explicit_flush) {
+         if (sscreen->info.gfx_level >= GFX12) {
+            si_reallocate_texture_inplace(sctx, tex, PIPE_BIND_CONST_BW, false);
+            update_metadata = true;
+         } else if (si_texture_disable_dcc(sctx, tex)) {
             update_metadata = true;
             /* si_texture_disable_dcc flushes the context */
             flush = false;
@@ -1619,6 +1641,9 @@ si_modifier_supports_resource(struct pipe_screen *screen,
 
    if (((templ->bind & PIPE_BIND_LINEAR) || sscreen->debug_flags & DBG(NO_TILING)) &&
        modifier != DRM_FORMAT_MOD_LINEAR)
+      return false;
+
+   if ((templ->bind & PIPE_BIND_USE_FRONT_RENDERING) && ac_modifier_has_dcc(modifier))
       return false;
 
    /* Protected content doesn't support DCC on GFX12. */

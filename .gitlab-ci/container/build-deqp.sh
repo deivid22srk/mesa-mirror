@@ -17,7 +17,7 @@ uncollapsed_section_start deqp-$deqp_api "Building dEQP $DEQP_API"
 
 # See `deqp_build_targets` below for which release is used to produce which
 # binary. Unless this comment has bitrotten:
-# - the commit from the main branch produces the deqp tools,
+# - the commit from the main branch produces the deqp tools and `deqp-vk`,
 # - the VK release produces `deqp-vk`,
 # - the GL release produces `glcts`, and
 # - the GLES release produces `deqp-gles*` and `deqp-egl`
@@ -34,6 +34,16 @@ DEQP_GLES_VERSION=3.2.11.0
 # patches.
 
 # shellcheck disable=SC2034
+main_cts_commits_to_backport=(
+    # If you find yourself wanting to add something in here, consider whether
+    # bumping DEQP_MAIN_COMMIT is not a better solution :)
+)
+
+# shellcheck disable=SC2034
+main_cts_patch_files=(
+)
+
+# shellcheck disable=SC2034
 vk_cts_commits_to_backport=(
     # Remove multi-line test results in DRM format modifier tests
     8c95af68a2a85cbdc7e1d9267ab029f73e9427d2
@@ -42,13 +52,6 @@ vk_cts_commits_to_backport=(
 # shellcheck disable=SC2034
 vk_cts_patch_files=(
 )
-
-if [ "${DEQP_TARGET}" = 'android' ]; then
-  vk_cts_patch_files+=(
-    build-deqp-vk_Allow-running-on-Android-from-the-command-line.patch
-    build-deqp-vk_Android-prints-to-stdout-instead-of-logcat.patch
-  )
-fi
 
 # shellcheck disable=SC2034
 gl_cts_commits_to_backport=(
@@ -91,6 +94,7 @@ git config --global user.name "Mesa CI"
 # shellcheck disable=SC2153
 case "${DEQP_API}" in
   tools) DEQP_VERSION="$DEQP_MAIN_COMMIT";;
+  *-main) DEQP_VERSION="$DEQP_MAIN_COMMIT";;
   VK) DEQP_VERSION="vulkan-cts-$DEQP_VK_VERSION";;
   GL) DEQP_VERSION="opengl-cts-$DEQP_GL_VERSION";;
   GLES) DEQP_VERSION="opengl-es-cts-$DEQP_GLES_VERSION";;
@@ -117,32 +121,40 @@ fi
 
 mkdir -p /deqp-$deqp_api
 
-if [ "$DEQP_API" = tools ]; then
-  commit_desc=$(git show --no-patch --format='commit %h on %ci' --abbrev=10 "$DEQP_COMMIT")
-  echo "dEQP main at $commit_desc" > /deqp-$deqp_api/version
+if [ "$DEQP_VERSION" = "$DEQP_MAIN_COMMIT" ]; then
+  prefix="main"
 else
-  cts_commits_to_backport="${deqp_api}_cts_commits_to_backport[@]"
-  for commit in "${!cts_commits_to_backport}"
-  do
-    PATCH_URL="https://github.com/KhronosGroup/VK-GL-CTS/commit/$commit.patch"
-    echo "Apply patch to ${DEQP_API} CTS from $PATCH_URL"
-    curl -L --retry 4 -f --retry-all-errors --retry-delay 60 $PATCH_URL | \
-      GIT_COMMITTER_DATE=$(date -d@0) git am -
-  done
+  prefix="$deqp_api"
+fi
 
-  cts_patch_files="${deqp_api}_cts_patch_files[@]"
-  for patch in "${!cts_patch_files}"
-  do
-    echo "Apply patch to ${DEQP_API} CTS from $patch"
-    GIT_COMMITTER_DATE=$(date -d@0) git am < $OLDPWD/.gitlab-ci/container/patches/$patch
-  done
+cts_commits_to_backport="${prefix}_cts_commits_to_backport[@]"
+for commit in "${!cts_commits_to_backport}"
+do
+  PATCH_URL="https://github.com/KhronosGroup/VK-GL-CTS/commit/$commit.patch"
+  echo "Apply patch to ${DEQP_API} CTS from $PATCH_URL"
+  curl -L --retry 4 -f --retry-all-errors --retry-delay 60 $PATCH_URL | \
+    GIT_COMMITTER_DATE=$(date -d@0) git am -
+done
 
-  {
-    echo "dEQP base version $DEQP_VERSION"
+cts_patch_files="${prefix}_cts_patch_files[@]"
+for patch in "${!cts_patch_files}"
+do
+  echo "Apply patch to ${DEQP_API} CTS from $patch"
+  GIT_COMMITTER_DATE=$(date -d@0) git am < $OLDPWD/.gitlab-ci/container/patches/$patch
+done
+
+{
+  if [ "$DEQP_VERSION" = "$DEQP_MAIN_COMMIT" ]; then
+    commit_desc=$(git show --no-patch --format='commit %h on %ci' --abbrev=10 "$DEQP_COMMIT")
+    echo "dEQP $DEQP_API at $commit_desc"
+  else
+    echo "dEQP $DEQP_API version $DEQP_VERSION"
+  fi
+  if [ "$(git rev-parse HEAD)" != "$DEQP_COMMIT" ]; then
     echo "The following local patches are applied on top:"
     git log --reverse --oneline "$DEQP_COMMIT".. --format='- %s'
-  } > /deqp-$deqp_api/version
-fi
+  fi
+} > /deqp-$deqp_api/version
 
 # --insecure is due to SSL cert failures hitting sourceforge for zlib and
 # libpng (sigh).  The archives get their checksums checked anyway, and git
@@ -165,7 +177,7 @@ if [ "${DEQP_API}" = 'GLES' ]; then
         -DCMAKE_BUILD_TYPE=Release \
         ${EXTRA_CMAKE_ARGS:-}
     ninja modules/egl/deqp-egl
-    mv /deqp-$deqp_api/modules/egl/deqp-egl{,-android}
+    mv modules/egl/deqp-egl{,-android}
   else
     # When including EGL/X11 testing, do that build first and save off its
     # deqp-egl binary.
@@ -174,14 +186,14 @@ if [ "${DEQP_API}" = 'GLES' ]; then
         -DCMAKE_BUILD_TYPE=Release \
         ${EXTRA_CMAKE_ARGS:-}
     ninja modules/egl/deqp-egl
-    mv /deqp-$deqp_api/modules/egl/deqp-egl{,-x11}
+    mv modules/egl/deqp-egl{,-x11}
 
     cmake -S /VK-GL-CTS -B . -G Ninja \
         -DDEQP_TARGET=wayland \
         -DCMAKE_BUILD_TYPE=Release \
         ${EXTRA_CMAKE_ARGS:-}
     ninja modules/egl/deqp-egl
-    mv /deqp-$deqp_api/modules/egl/deqp-egl{,-wayland}
+    mv modules/egl/deqp-egl{,-wayland}
   fi
 fi
 
@@ -199,7 +211,7 @@ fi
 
 deqp_build_targets=()
 case "${DEQP_API}" in
-  VK)
+  VK|VK-main)
     deqp_build_targets+=(deqp-vk)
     ;;
   GL)
@@ -221,59 +233,59 @@ ninja "${deqp_build_targets[@]}"
 
 if [ "${DEQP_TARGET}" != 'android' ] && [ "$DEQP_API" != tools ]; then
     # Copy out the mustpass lists we want.
-    mkdir -p /deqp-$deqp_api/mustpass
+    mkdir -p mustpass
 
-    if [ "${DEQP_API}" = 'VK' ]; then
+    if [ "${DEQP_API}" = 'VK' ] || [ "${DEQP_API}" = 'VK-main' ]; then
         for mustpass in $(< /VK-GL-CTS/external/vulkancts/mustpass/main/vk-default.txt) ; do
             cat /VK-GL-CTS/external/vulkancts/mustpass/main/$mustpass \
-                >> /deqp-$deqp_api/mustpass/vk-main.txt
+                >> mustpass/vk-main.txt
         done
     fi
 
     if [ "${DEQP_API}" = 'GL' ]; then
         cp \
             /VK-GL-CTS/external/openglcts/data/gl_cts/data/mustpass/gl/khronos_mustpass/main/*-main.txt \
-            /deqp-$deqp_api/mustpass/
+            mustpass/
         cp \
             /VK-GL-CTS/external/openglcts/data/gl_cts/data/mustpass/gl/khronos_mustpass_single/main/*-single.txt \
-            /deqp-$deqp_api/mustpass/
+            mustpass/
     fi
 
     if [ "${DEQP_API}" = 'GLES' ]; then
         cp \
             /VK-GL-CTS/external/openglcts/data/gl_cts/data/mustpass/gles/aosp_mustpass/main/*.txt \
-            /deqp-$deqp_api/mustpass/
+            mustpass/
         cp \
             /VK-GL-CTS/external/openglcts/data/gl_cts/data/mustpass/egl/aosp_mustpass/main/egl-main.txt \
-            /deqp-$deqp_api/mustpass/
+            mustpass/
         cp \
             /VK-GL-CTS/external/openglcts/data/gl_cts/data/mustpass/gles/khronos_mustpass/main/*-main.txt \
-            /deqp-$deqp_api/mustpass/
+            mustpass/
     fi
 
     # Compress the caselists, since Vulkan's in particular are gigantic; higher
     # compression levels provide no real measurable benefit.
-    zstd -1 --rm /deqp-$deqp_api/mustpass/*.txt
+    zstd -1 --rm mustpass/*.txt
 fi
 
 if [ "$DEQP_API" = tools ]; then
     # Save *some* executor utils, but otherwise strip things down
     # to reduct deqp build size:
-    mv /deqp-tools/executor/testlog-to-* /deqp-tools
-    rm -rf /deqp-tools/executor
+    mv executor/testlog-to-* .
+    rm -rf executor
 fi
 
 # Remove other mustpass files, since we saved off the ones we wanted to conventient locations above.
-rm -rf /deqp-$deqp_api/external/**/mustpass/
-rm -rf /deqp-$deqp_api/external/vulkancts/modules/vulkan/vk-main*
-rm -rf /deqp-$deqp_api/external/vulkancts/modules/vulkan/vk-default
+rm -rf external/**/mustpass/
+rm -rf external/vulkancts/modules/vulkan/vk-main*
+rm -rf external/vulkancts/modules/vulkan/vk-default
 
-rm -rf /deqp-$deqp_api/external/openglcts/modules/cts-runner
-rm -rf /deqp-$deqp_api/modules/internal
-rm -rf /deqp-$deqp_api/execserver
-rm -rf /deqp-$deqp_api/framework
+rm -rf external/openglcts/modules/cts-runner
+rm -rf modules/internal
+rm -rf execserver
+rm -rf framework
 find . -depth \( -iname '*cmake*' -o -name '*ninja*' -o -name '*.o' -o -name '*.a' \) -exec rm -rf {} \;
-if [ "${DEQP_API}" = 'VK' ]; then
+if [ "${DEQP_API}" = 'VK' ] || [ "${DEQP_API}" = 'VK-main' ]; then
   ${STRIP_CMD:-strip} external/vulkancts/modules/vulkan/deqp-vk
 fi
 if [ "${DEQP_API}" = 'GL' ] || [ "${DEQP_API}" = 'GLES' ]; then

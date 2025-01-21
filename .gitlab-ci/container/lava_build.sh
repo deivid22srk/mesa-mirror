@@ -50,7 +50,7 @@ if [[ "$DEBIAN_ARCH" = "arm64" ]]; then
     DEVICE_TREES+=" mt8192-asurada-spherion-r0.dtb"
     DEVICE_TREES+=" mt8183-kukui-jacuzzi-juniper-sku16.dtb"
     DEVICE_TREES+=" tegra210-p3450-0000.dtb"
-    DEVICE_TREES+=" apq8016-sbc.dtb"
+    DEVICE_TREES+=" apq8016-sbc-usb-host.dtb"
     DEVICE_TREES+=" apq8096-db820c.dtb"
     DEVICE_TREES+=" sc7180-trogdor-lazor-limozeen-nots-r5.dtb"
     DEVICE_TREES+=" sc7180-trogdor-kingoftown.dtb"
@@ -184,6 +184,7 @@ PKG_CI=(
   bash ca-certificates curl
   initramfs-tools jq netcat-openbsd dropbear openssh-server
   libasan8
+  libubsan1
   git
   python3-dev python3-pip python3-setuptools python3-wheel
   weston # Wayland

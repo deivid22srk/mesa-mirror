@@ -37,11 +37,17 @@
   stage: intel
   rules:
     - !reference [.test, rules]
+    - !reference [.ondracka-farm-rules, rules]
     - !reference [.gl-rules, rules]
     - !reference [.intel-common-rules, rules]
     - changes: &i915g_file_list
-        - src/gallium/drivers/i915/**/*
+        - src/gallium/drivers/i915/*
         - src/gallium/winsys/i915/**/*
+        - src/gallium/drivers/i915/ci/$GPU_VERSION-fails.txt
+        - src/gallium/drivers/i915/ci/$GPU_VERSION-flakes.txt
+        - src/gallium/drivers/i915/ci/$GPU_VERSION-skips.txt
+        - src/gallium/drivers/i915/ci/deqp-$DEQP_SUITE.toml
+        - src/gallium/drivers/i915/ci/gitlab-ci.yml
       when: on_success
 
 .i915g-manual-rules:
@@ -49,6 +55,7 @@
   extends: .no-auto-retry
   rules:
     - !reference [.test, rules]
+    - !reference [.ondracka-farm-manual-rules, rules]
     - !reference [.gl-manual-rules, rules]
     - !reference [.intel-common-manual-rules, rules]
     - changes:
@@ -122,7 +129,7 @@
   variables:
     JOB_PRIORITY: 40
     LAVA_S3_ARTIFACT_NAME: mesa-x86_64-default-release
-    S3_ARTIFACT_NAME: mesa-python-test
+    S3_ARTIFACT_NAME: mesa-python-ci-artifacts
   needs:
     - kernel+rootfs_x86_64
     - debian-release
@@ -196,7 +203,7 @@
     DEVICE_TYPE: acer-cb317-1h-c3z6-dedede
     FARM: collabora
     FDO_CI_CONCURRENT: 3
-    GPU_VERSION: iris-jsl
+    GPU_VERSION: anv-jsl
     HWCI_KERNEL_MODULES: i915
     RUNNER_TAG: mesa-ci-x86-64-lava-acer-cb317-1h-c3z6-dedede
 
@@ -419,7 +426,7 @@
     LAVA_TAGS: "cbg-0"
     # Ensure that we are using the release build artifact
     LAVA_S3_ARTIFACT_NAME: mesa-x86_64-default-release
-    S3_ARTIFACT_NAME: mesa-python-test
+    S3_ARTIFACT_NAME: mesa-python-ci-artifacts
 
 .iris-whl-traces-performance:
   extends:

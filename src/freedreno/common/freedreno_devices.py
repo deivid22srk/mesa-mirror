@@ -434,6 +434,7 @@ a6xx_gen4 = A6XXProps(
         #has_early_preamble = True,
         prede_nop_quirk = True,
         predtf_nop_quirk = True,
+        has_sad = True,
     )
 
 add_gpus([
@@ -864,6 +865,7 @@ a7xx_base = A6XXProps(
         has_ubwc_linear_mipmap_fallback = True,
         prede_nop_quirk = True,
         predtf_nop_quirk = True,
+        has_sad = True,
     )
 
 a7xx_gen1 = A7XXProps(
@@ -885,6 +887,7 @@ a7xx_gen2 = A7XXProps(
         has_64b_ssbo_atomics = True,
         has_primitive_shading_rate = True,
         reading_shading_rate_requires_smask_quirk = True,
+        has_ray_intersection = True,
     )
 
 a7xx_gen3 = A7XXProps(
@@ -906,6 +909,9 @@ a7xx_gen3 = A7XXProps(
         has_persistent_counter = True,
         has_64b_ssbo_atomics = True,
         has_primitive_shading_rate = True,
+        has_ray_intersection = True,
+        has_sw_fuse = True,
+        has_rt_workaround = True,
     )
 
 a730_magic_regs = dict(

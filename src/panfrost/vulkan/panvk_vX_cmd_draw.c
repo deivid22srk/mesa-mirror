@@ -77,13 +77,34 @@ render_state_set_z_attachment(struct panvk_cmd_buffer *cmdbuf,
 
    state->render.z_attachment.fmt = iview->vk.format;
    state->render.bound_attachments |= MESA_VK_RP_ATTACHMENT_DEPTH_BIT;
-   fbinfo->zs.view.zs = &iview->pview;
+
+   state->render.zs_pview = iview->pview;
+   fbinfo->zs.view.zs = &state->render.zs_pview;
+
+   /* D32_S8 is a multiplanar format, so we need to adjust the format of the
+    * depth-only view to match the one of the depth plane.
+    */
+   if (iview->pview.format == PIPE_FORMAT_Z32_FLOAT_S8X24_UINT)
+      state->render.zs_pview.format = PIPE_FORMAT_Z32_FLOAT;
+
+   state->render.zs_pview.planes[0] = &img->planes[0];
+   state->render.zs_pview.planes[1] = NULL;
    fbinfo->nr_samples =
       MAX2(fbinfo->nr_samples, pan_image_view_get_nr_samples(&iview->pview));
    state->render.z_attachment.iview = iview;
 
-   if (vk_format_has_stencil(img->vk.format))
+   /* D24S8 is a single plane format where the depth/stencil are interleaved.
+    * If we touch the depth component, we need to make sure the stencil
+    * component is preserved, hence the preload, and the view format adjusment.
+    */
+   if (img->vk.format == VK_FORMAT_D24_UNORM_S8_UINT) {
       fbinfo->zs.preload.s = true;
+      cmdbuf->state.gfx.render.zs_pview.format =
+         PIPE_FORMAT_Z24_UNORM_S8_UINT;
+   } else {
+      state->render.zs_pview.format =
+         vk_format_to_pipe_format(vk_format_depth_only(img->vk.format));
+   }
 
    if (att->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) {
       fbinfo->zs.clear.z = true;
@@ -119,28 +140,48 @@ render_state_set_s_attachment(struct panvk_cmd_buffer *cmdbuf,
    state->render.s_attachment.fmt = iview->vk.format;
    state->render.bound_attachments |= MESA_VK_RP_ATTACHMENT_STENCIL_BIT;
 
-   if (drm_is_afbc(img->vk.drm_format_mod)) {
-      assert(fbinfo->zs.view.zs == &iview->pview || !fbinfo->zs.view.zs);
-      fbinfo->zs.view.zs = &iview->pview;
+   state->render.s_pview = iview->pview;
+   fbinfo->zs.view.s = &state->render.s_pview;
+
+   /* D32_S8 is a multiplanar format, so we need to adjust the format of the
+    * stencil-only view to match the one of the stencil plane.
+    */
+   state->render.s_pview.format = img->vk.format == VK_FORMAT_D24_UNORM_S8_UINT
+                                     ? PIPE_FORMAT_Z24_UNORM_S8_UINT
+                                     : PIPE_FORMAT_S8_UINT;
+   if (img->vk.format == VK_FORMAT_D32_SFLOAT_S8_UINT) {
+      state->render.s_pview.planes[0] = NULL;
+      state->render.s_pview.planes[1] = &img->planes[1];
    } else {
-      fbinfo->zs.view.s =
-         &iview->pview != fbinfo->zs.view.zs ? &iview->pview : NULL;
+      state->render.s_pview.planes[0] = &img->planes[0];
+      state->render.s_pview.planes[1] = NULL;
    }
 
-   fbinfo->zs.view.s =
-      &iview->pview != fbinfo->zs.view.zs ? &iview->pview : NULL;
    fbinfo->nr_samples =
       MAX2(fbinfo->nr_samples, pan_image_view_get_nr_samples(&iview->pview));
    state->render.s_attachment.iview = iview;
 
-   if (vk_format_has_depth(img->vk.format)) {
-      assert(fbinfo->zs.view.zs == NULL || &iview->pview == fbinfo->zs.view.zs);
-      fbinfo->zs.view.zs = &iview->pview;
-
+   /* If the depth and stencil attachments point to the same image,
+    * and the format is D24S8, we can combine them in a single view
+    * addressing both components.
+    */
+   if (img->vk.format == VK_FORMAT_D24_UNORM_S8_UINT &&
+       state->render.z_attachment.iview &&
+       state->render.z_attachment.iview->vk.image == iview->vk.image) {
+      state->render.zs_pview.format = PIPE_FORMAT_Z24_UNORM_S8_UINT;
       fbinfo->zs.preload.s = false;
-      fbinfo->zs.clear.s = false;
-      if (!fbinfo->zs.clear.z)
-         fbinfo->zs.preload.z = true;
+      fbinfo->zs.view.s = NULL;
+
+   /* If there was no depth attachment, and the image format is D24S8,
+    * we use the depth+stencil slot, so we can benefit from AFBC, which
+    * is not supported on the stencil-only slot on Bifrost.
+    */
+   } else if (img->vk.format == VK_FORMAT_D24_UNORM_S8_UINT &&
+              fbinfo->zs.view.zs == NULL) {
+      fbinfo->zs.view.zs = &state->render.s_pview;
+      state->render.s_pview.format = PIPE_FORMAT_Z24_UNORM_S8_UINT;
+      fbinfo->zs.preload.z = true;
+      fbinfo->zs.view.s = NULL;
    }
 
    if (att->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) {
@@ -186,7 +227,10 @@ panvk_per_arch(cmd_init_render_state)(struct panvk_cmd_buffer *cmdbuf,
    memset(&state->render.s_attachment, 0, sizeof(state->render.s_attachment));
    state->render.bound_attachments = 0;
 
-   state->render.layer_count = pRenderingInfo->layerCount;
+   cmdbuf->state.gfx.render.layer_count = pRenderingInfo->viewMask ?
+      util_last_bit(pRenderingInfo->viewMask) :
+      pRenderingInfo->layerCount;
+   cmdbuf->state.gfx.render.view_mask = pRenderingInfo->viewMask;
    *fbinfo = (struct pan_fb_info){
       .tile_buf_budget = panfrost_query_optimal_tib_size(phys_dev->model),
       .nr_samples = 1,
@@ -213,7 +257,8 @@ panvk_per_arch(cmd_init_render_state)(struct panvk_cmd_buffer *cmdbuf,
       const VkRenderingAttachmentInfo *att = pRenderingInfo->pDepthAttachment;
       VK_FROM_HANDLE(panvk_image_view, iview, att->imageView);
 
-      if (iview && (iview->vk.aspects & VK_IMAGE_ASPECT_DEPTH_BIT)) {
+      if (iview) {
+         assert(iview->vk.image->aspects & VK_IMAGE_ASPECT_DEPTH_BIT);
          render_state_set_z_attachment(cmdbuf, att);
          att_width = MAX2(iview->vk.extent.width, att_width);
          att_height = MAX2(iview->vk.extent.height, att_height);
@@ -225,30 +270,11 @@ panvk_per_arch(cmd_init_render_state)(struct panvk_cmd_buffer *cmdbuf,
       const VkRenderingAttachmentInfo *att = pRenderingInfo->pStencilAttachment;
       VK_FROM_HANDLE(panvk_image_view, iview, att->imageView);
 
-      if (iview && (iview->vk.aspects & VK_IMAGE_ASPECT_STENCIL_BIT)) {
+      if (iview) {
+         assert(iview->vk.image->aspects & VK_IMAGE_ASPECT_STENCIL_BIT);
          render_state_set_s_attachment(cmdbuf, att);
          att_width = MAX2(iview->vk.extent.width, att_width);
          att_height = MAX2(iview->vk.extent.height, att_height);
-      }
-   }
-
-   if (fbinfo->zs.view.zs) {
-      const struct util_format_description *fdesc =
-         util_format_description(fbinfo->zs.view.zs->format);
-      bool needs_depth = fbinfo->zs.clear.z | fbinfo->zs.preload.z |
-                         util_format_has_depth(fdesc);
-      bool needs_stencil = fbinfo->zs.clear.s | fbinfo->zs.preload.s |
-                           util_format_has_stencil(fdesc);
-      enum pipe_format new_fmt =
-         util_format_get_blocksize(fbinfo->zs.view.zs->format) == 4
-            ? PIPE_FORMAT_Z24_UNORM_S8_UINT
-            : PIPE_FORMAT_Z32_FLOAT_S8X24_UINT;
-
-      if (needs_depth && needs_stencil &&
-          fbinfo->zs.view.zs->format != new_fmt) {
-         state->render.zs_pview = *fbinfo->zs.view.zs;
-         state->render.zs_pview.format = new_fmt;
-         fbinfo->zs.view.zs = &state->render.zs_pview;
       }
    }
 
@@ -367,7 +393,7 @@ panvk_per_arch(cmd_resolve_attachments)(struct panvk_cmd_buffer *cmdbuf)
             .extent.height = fbinfo->extent.maxy - fbinfo->extent.miny + 1,
          },
       .layerCount = cmdbuf->state.gfx.render.layer_count,
-      .viewMask = 0,
+      .viewMask = cmdbuf->state.gfx.render.view_mask,
       .colorAttachmentCount = color_att_count,
       .pColorAttachments = color_atts,
       .pDepthAttachment = &z_att,
@@ -486,7 +512,7 @@ panvk_per_arch(cmd_force_fb_preload)(struct panvk_cmd_buffer *cmdbuf,
       VkClearRect clear_rect = {
          .rect = render_info->renderArea,
          .baseArrayLayer = 0,
-         .layerCount = render_info->layerCount,
+         .layerCount = render_info->viewMask ? 1 : render_info->layerCount,
       };
 
       panvk_per_arch(CmdClearAttachments)(panvk_cmd_buffer_to_handle(cmdbuf),
@@ -511,6 +537,162 @@ panvk_per_arch(cmd_preload_render_area_border)(
    /* If the render area is aligned on a 32x32 section, we're good. */
    if (!render_area_is_32x32_aligned)
       panvk_per_arch(cmd_force_fb_preload)(cmdbuf, render_info);
+}
+
+/* This value has been selected to get
+ * dEQP-VK.draw.renderpass.inverted_depth_ranges.nodepthclamp_deltazero passing.
+ */
+#define MIN_DEPTH_CLIP_RANGE 37.7E-06f
+
+void
+panvk_per_arch(cmd_prepare_draw_sysvals)(struct panvk_cmd_buffer *cmdbuf,
+                                         const struct panvk_draw_info *info)
+{
+   struct vk_color_blend_state *cb = &cmdbuf->vk.dynamic_graphics_state.cb;
+   const struct panvk_shader *fs = get_fs(cmdbuf);
+   uint32_t noperspective_varyings = fs ? fs->info.varyings.noperspective : 0;
+   BITSET_DECLARE(dirty_sysvals, MAX_SYSVAL_FAUS) = {0};
+
+   set_gfx_sysval(cmdbuf, dirty_sysvals, vs.noperspective_varyings,
+                  noperspective_varyings);
+   set_gfx_sysval(cmdbuf, dirty_sysvals, vs.first_vertex, info->vertex.base);
+   set_gfx_sysval(cmdbuf, dirty_sysvals, vs.base_instance, info->instance.base);
+
+#if PAN_ARCH <= 7
+   set_gfx_sysval(cmdbuf, dirty_sysvals, vs.raw_vertex_offset,
+                  info->vertex.raw_offset);
+   set_gfx_sysval(cmdbuf, dirty_sysvals, layer_id, info->layer_id);
+#endif
+
+   if (dyn_gfx_state_dirty(cmdbuf, CB_BLEND_CONSTANTS)) {
+      for (unsigned i = 0; i < ARRAY_SIZE(cb->blend_constants); i++) {
+         set_gfx_sysval(cmdbuf, dirty_sysvals, blend.constants[i],
+                        CLAMP(cb->blend_constants[i], 0.0f, 1.0f));
+      }
+   }
+
+   if (dyn_gfx_state_dirty(cmdbuf, VP_VIEWPORTS) ||
+       dyn_gfx_state_dirty(cmdbuf, RS_DEPTH_CLIP_ENABLE) ||
+       dyn_gfx_state_dirty(cmdbuf, RS_DEPTH_CLAMP_ENABLE)) {
+      VkViewport *viewport = &cmdbuf->vk.dynamic_graphics_state.vp.viewports[0];
+
+      /* Upload the viewport scale. Defined as (px/2, py/2, pz) at the start of
+       * section 24.5 ("Controlling the Viewport") of the Vulkan spec. At the
+       * end of the section, the spec defines:
+       *
+       * px = width
+       * py = height
+       * pz = maxDepth - minDepth
+       */
+      set_gfx_sysval(cmdbuf, dirty_sysvals, viewport.scale.x,
+                     0.5f * viewport->width);
+      set_gfx_sysval(cmdbuf, dirty_sysvals, viewport.scale.y,
+                     0.5f * viewport->height);
+      set_gfx_sysval(cmdbuf, dirty_sysvals, viewport.scale.z,
+                     (viewport->maxDepth - viewport->minDepth));
+
+      /* Upload the viewport offset. Defined as (ox, oy, oz) at the start of
+       * section 24.5 ("Controlling the Viewport") of the Vulkan spec. At the
+       * end of the section, the spec defines:
+       *
+       * ox = x + width/2
+       * oy = y + height/2
+       * oz = minDepth
+       */
+      set_gfx_sysval(cmdbuf, dirty_sysvals, viewport.offset.x,
+                     (0.5f * viewport->width) + viewport->x);
+      set_gfx_sysval(cmdbuf, dirty_sysvals, viewport.offset.y,
+                     (0.5f * viewport->height) + viewport->y);
+      set_gfx_sysval(cmdbuf, dirty_sysvals, viewport.offset.z,
+                     viewport->minDepth);
+
+      /* Doing the viewport transform in the vertex shader and then depth
+       * clipping with the viewport depth range gets a similar result to
+       * clipping in clip-space, but loses precision when the viewport depth
+       * range is very small. When minDepth == maxDepth, this completely
+       * flattens the clip-space depth and results in never clipping.
+       *
+       * To work around this, set a lower limit on depth range when clipping is
+       * enabled. This results in slightly incorrect fragment depth values, and
+       * doesn't help with the precision loss, but at least clipping isn't
+       * completely broken.
+       */
+      const struct panvk_graphics_sysvals *sysvals = &cmdbuf->state.gfx.sysvals;
+      const struct vk_rasterization_state *rs =
+         &cmdbuf->vk.dynamic_graphics_state.rs;
+
+      if (vk_rasterization_state_depth_clip_enable(rs) &&
+          fabsf(sysvals->viewport.scale.z) < MIN_DEPTH_CLIP_RANGE) {
+         float z_min = viewport->minDepth;
+         float z_max = viewport->maxDepth;
+         float z_sign = z_min <= z_max ? 1.0f : -1.0f;
+
+         set_gfx_sysval(cmdbuf, dirty_sysvals, viewport.scale.z,
+                        z_sign * MIN_DEPTH_CLIP_RANGE);
+
+         /* Middle of the user range is
+         *    z_range_center = z_min + (z_max - z_min) * 0.5f,
+         * and we want to set the offset to
+         *    z_offset = z_range_center - viewport.scale.z * 0.5f
+         * which, when expanding, gives us
+         *    z_offset = (z_max + z_min - viewport.scale.z) * 0.5f
+         */
+         float z_offset = (z_max + z_min - sysvals->viewport.scale.z) * 0.5f;
+         /* Bump offset off-center if necessary, to not go out of range */
+         set_gfx_sysval(cmdbuf, dirty_sysvals, viewport.offset.z,
+                        CLAMP(z_offset, 0.0f, 1.0f));
+      }
+   }
+
+   const struct panvk_shader *vs = cmdbuf->state.gfx.vs.shader;
+
+#if PAN_ARCH <= 7
+   struct panvk_descriptor_state *desc_state = &cmdbuf->state.gfx.desc_state;
+   struct panvk_shader_desc_state *vs_desc_state = &cmdbuf->state.gfx.vs.desc;
+   struct panvk_shader_desc_state *fs_desc_state = &cmdbuf->state.gfx.fs.desc;
+
+   if (gfx_state_dirty(cmdbuf, DESC_STATE) || gfx_state_dirty(cmdbuf, VS)) {
+      set_gfx_sysval(cmdbuf, dirty_sysvals,
+                     desc.sets[PANVK_DESC_TABLE_VS_DYN_SSBOS],
+                     vs_desc_state->dyn_ssbos);
+   }
+
+   if (gfx_state_dirty(cmdbuf, DESC_STATE) || gfx_state_dirty(cmdbuf, FS)) {
+      set_gfx_sysval(cmdbuf, dirty_sysvals,
+                     desc.sets[PANVK_DESC_TABLE_FS_DYN_SSBOS],
+                     fs_desc_state->dyn_ssbos);
+   }
+
+   for (uint32_t i = 0; i < MAX_SETS; i++) {
+      uint32_t used_set_mask =
+         vs->desc_info.used_set_mask | (fs ? fs->desc_info.used_set_mask : 0);
+
+      if (used_set_mask & BITFIELD_BIT(i)) {
+         set_gfx_sysval(cmdbuf, dirty_sysvals, desc.sets[i],
+                        desc_state->sets[i]->descs.dev);
+      }
+   }
+#endif
+
+   /* We mask the dirty sysvals by the shader usage, and only flag
+    * the push uniforms dirty if those intersect. */
+   BITSET_DECLARE(dirty_shader_sysvals, MAX_SYSVAL_FAUS);
+   BITSET_AND(dirty_shader_sysvals, dirty_sysvals, vs->fau.used_sysvals);
+   if (!BITSET_IS_EMPTY(dirty_shader_sysvals))
+      gfx_state_set_dirty(cmdbuf, VS_PUSH_UNIFORMS);
+
+   if (fs) {
+      BITSET_AND(dirty_shader_sysvals, dirty_sysvals, fs->fau.used_sysvals);
+
+      /* If blend constants are not read by the blend shader, we can consider
+       * they are not read at all, so clear the dirty bits to avoid re-emitting
+       * FAUs when we can. */
+      if (!cmdbuf->state.gfx.cb.info.shader_loads_blend_const)
+         BITSET_CLEAR_RANGE(dirty_shader_sysvals, 0, 3);
+
+      if (!BITSET_IS_EMPTY(dirty_shader_sysvals))
+         gfx_state_set_dirty(cmdbuf, FS_PUSH_UNIFORMS);
+   }
 }
 
 VKAPI_ATTR void VKAPI_CALL

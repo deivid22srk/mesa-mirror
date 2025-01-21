@@ -1692,7 +1692,7 @@ sqtt_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache, ui
       if (!pipeline)
          continue;
 
-      const VkPipelineCreateFlagBits2KHR create_flags = vk_graphics_pipeline_create_flags(&pCreateInfos[i]);
+      const VkPipelineCreateFlagBits2 create_flags = vk_graphics_pipeline_create_flags(&pCreateInfos[i]);
       if (create_flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR)
          continue;
 
@@ -1760,7 +1760,7 @@ sqtt_CreateRayTracingPipelinesKHR(VkDevice _device, VkDeferredOperationKHR defer
 
    result = device->layer_dispatch.rgp.CreateRayTracingPipelinesKHR(_device, deferredOperation, pipelineCache, count,
                                                                     pCreateInfos, pAllocator, pPipelines);
-   if (result != VK_SUCCESS)
+   if (result != VK_SUCCESS && result != VK_OPERATION_DEFERRED_KHR)
       return result;
 
    for (unsigned i = 0; i < count; i++) {
@@ -1769,7 +1769,7 @@ sqtt_CreateRayTracingPipelinesKHR(VkDevice _device, VkDeferredOperationKHR defer
       if (!pipeline)
          continue;
 
-      const VkPipelineCreateFlagBits2KHR create_flags = vk_rt_pipeline_create_flags(&pCreateInfos[i]);
+      const VkPipelineCreateFlagBits2 create_flags = vk_rt_pipeline_create_flags(&pCreateInfos[i]);
       if (create_flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR)
          continue;
 

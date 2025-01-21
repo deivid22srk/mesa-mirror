@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "asahi_clc.h"
 #include "asahi/compiler/agx_compile.h"
 #include "asahi/compiler/agx_nir.h"
 #include "compiler/glsl_types.h"
@@ -36,6 +37,7 @@ static const struct spirv_to_nir_options spirv_options = {
    .temp_addr_format = nir_address_format_62bit_generic,
    .constant_addr_format = nir_address_format_64bit_global,
    .create_library = true,
+   .printf = true,
 };
 
 /* Standard optimization loop */
@@ -93,6 +95,11 @@ compile(void *memctx, const uint32_t *spirv, size_t spirv_size)
 
    nir_lower_compute_system_values_options cs = {.global_id_is_32bit = true};
    NIR_PASS(_, nir, nir_lower_compute_system_values, &cs);
+
+   NIR_PASS(_, nir, nir_lower_printf,
+            &(const struct nir_lower_printf_options){
+               .hash_format_strings = true,
+            });
 
    /* We have to lower away local constant initializers right before we
     * inline functions.  That way they get properly initialized at the top
@@ -181,7 +188,7 @@ print_shader(FILE *fp, const char *name, const char *suffix, uint32_t variant,
    memcpy(mem, &info, sizeof(info));
    memcpy((uint8_t *)mem + sizeof(info), p->binary, p->info.binary_size);
 
-   nir_precomp_print_blob(fp, name, suffix, variant, mem, sz_B);
+   nir_precomp_print_blob(fp, name, suffix, variant, mem, sz_B, true);
    free(mem);
 }
 
@@ -265,16 +272,20 @@ main(int argc, char **argv)
 
    nir_shader *nir = compile(mem_ctx, spirv_map, spirv_len);
 
+   /* load_preamble works at 16-bit granularity */
+   struct nir_precomp_opts opt = {.arg_align_B = 2};
+
    nir_foreach_entrypoint(libfunc, nir) {
       libfunc->pass_flags = 0;
-      struct nir_precomp_layout layout = nir_precomp_derive_layout(libfunc);
+      struct nir_precomp_layout layout =
+         nir_precomp_derive_layout(&opt, libfunc);
       unsigned nr_vars = nir_precomp_nr_variants(libfunc);
 
-      nir_precomp_print_layout_struct(fp_h, libfunc);
+      nir_precomp_print_layout_struct(fp_h, &opt, libfunc);
 
       for (unsigned v = 0; v < nr_vars; ++v) {
          nir_shader *s = nir_precompiled_build_variant(
-            libfunc, v, &agx_nir_options, load_kernel_input);
+            libfunc, v, &agx_nir_options, &opt, load_kernel_input);
 
          agx_link_libagx(s, nir);
 
@@ -338,7 +349,7 @@ main(int argc, char **argv)
    }
 
    nir_precomp_print_program_enum(fp_h, nir, "libagx");
-   nir_precomp_print_dispatch_macros(fp_h, nir);
+   nir_precomp_print_dispatch_macros(fp_h, &opt, nir);
 
    /* For each target, generate a table mapping programs to binaries */
    foreach_target(target)

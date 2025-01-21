@@ -204,6 +204,14 @@ struct vk_device {
     */
    VkResult (*check_status)(struct vk_device *device);
 
+   /* Get the device timestamp in the VK_TIME_DOMAIN_DEVICE_KHR domain */
+   VkResult (*get_timestamp)(struct vk_device *device, uint64_t *timestamp);
+
+   /** Host time domain used for timestamp calibration */
+   VkTimeDomainKHR calibrate_time_domain;
+   /** Period of VK_TIME_DOMAIN_DEVICE_KHR */
+   uint64_t device_time_domain_period;
+
    /** Creates a vk_sync that wraps a memory object
     *
     * This is always a one-shot object so it need not track any additional
@@ -412,10 +420,16 @@ vk_device_check_status(struct vk_device *device)
    return result;
 }
 
+VkResult
+vk_device_get_timestamp(struct vk_device *device, VkTimeDomainKHR domain,
+                        uint64_t *timestamp);
+
 #ifndef _WIN32
 
 uint64_t
 vk_clock_gettime(clockid_t clock_id);
+
+#endif //!_WIN32
 
 static inline uint64_t
 vk_time_max_deviation(uint64_t begin, uint64_t end, uint64_t max_clock_period)
@@ -459,8 +473,6 @@ vk_time_max_deviation(uint64_t begin, uint64_t end, uint64_t max_clock_period)
 
    return sample_interval + max_clock_period;
 }
-
-#endif //!_WIN32
 
 PFN_vkVoidFunction
 vk_device_get_proc_addr(const struct vk_device *device,

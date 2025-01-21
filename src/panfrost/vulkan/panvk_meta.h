@@ -51,7 +51,8 @@ panvk_meta_copy_get_image_properties(struct panvk_image *img)
    uint64_t mod = img->vk.drm_format_mod;
    enum pipe_format pfmt = vk_format_to_pipe_format(img->vk.format);
    unsigned blk_sz = util_format_get_blocksize(pfmt);
-   struct vk_meta_copy_image_properties props = {0};
+   struct vk_meta_copy_image_properties props;
+   memset(&props, 0, sizeof(props));
 
    if (drm_is_afbc(mod)) {
       if (!vk_format_is_depth_or_stencil(img->vk.format)) {
@@ -94,10 +95,10 @@ panvk_meta_copy_get_image_properties(struct panvk_image *img)
          props.depth.component_mask = BITFIELD_MASK(3);
          break;
       case VK_FORMAT_D32_SFLOAT_S8_UINT:
-         props.depth.view_format = VK_FORMAT_R32G32_UINT;
+         props.depth.view_format = VK_FORMAT_R32_UINT;
          props.depth.component_mask = BITFIELD_BIT(0);
-         props.stencil.view_format = VK_FORMAT_R32G32_UINT;
-         props.stencil.component_mask = BITFIELD_BIT(1);
+         props.stencil.view_format = VK_FORMAT_R8_UINT;
+         props.stencil.component_mask = BITFIELD_BIT(0);
          break;
       case VK_FORMAT_D16_UNORM:
          props.depth.view_format = VK_FORMAT_R16_UINT;

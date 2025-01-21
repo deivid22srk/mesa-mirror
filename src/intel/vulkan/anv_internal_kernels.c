@@ -87,14 +87,6 @@ compile_shader(struct anv_device *device,
 
    link_libanv(nir, libanv);
 
-   if (INTEL_DEBUG(DEBUG_SHADER_PRINT)) {
-      nir_lower_printf_options printf_opts = {
-         .ptr_bit_size               = 64,
-         .use_printf_base_identifier = true,
-      };
-      NIR_PASS_V(nir, nir_lower_printf, &printf_opts);
-   }
-
    NIR_PASS_V(nir, nir_lower_vars_to_ssa);
    NIR_PASS_V(nir, nir_opt_cse);
    NIR_PASS_V(nir, nir_opt_gcm, true);

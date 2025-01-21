@@ -178,6 +178,8 @@ if with_swrast
   warning('`gallium-drivers=swrast` is a deprecated alias for `gallium-drivers=softpipe,llvmpipe` and will be removed in version 25.0')
 endif
 
+with_amdgpu_virtio = get_option('amdgpu-virtio')
+
 with_gallium_radeonsi = gallium_drivers.contains('radeonsi')
 with_gallium_r300 = gallium_drivers.contains('r300')
 with_gallium_r600 = gallium_drivers.contains('r600')
@@ -306,9 +308,10 @@ with_any_broadcom = [
   with_broadcom_vk,
 ].contains(true)
 
-if get_option('intel-clc') != 'system'
+if get_option('intel-clc') != 'system' and get_option('precomp-compiler') != 'system'
   # Require intel-clc with Anv & Iris (for internal shaders)
   with_intel_clc = get_option('intel-clc') == 'enabled' or \
+                   get_option('precomp-compiler') == 'enabled' or \
                    with_intel_vk or with_gallium_iris
 else
   with_intel_clc = false
@@ -318,6 +321,10 @@ with_intel_vk_rt = get_option('intel-rt') \
   .disable_auto_if(not with_intel_vk) \
   .disable_if(host_machine.cpu_family() != 'x86_64', error_message : 'Intel Ray Tracing is only supported on x86_64') \
   .allowed()
+
+if with_intel_vk_rt
+  with_intel_bvh_grl = get_option('intel-bvh-grl')
+endif
 
 with_any_intel = [
   with_gallium_crocus,
@@ -590,7 +597,7 @@ if with_dri
 endif
 
 dep_dxheaders = null_dep
-if with_gallium_d3d12 or with_microsoft_clc or with_microsoft_vk
+if with_gallium_d3d12 or with_microsoft_clc or with_microsoft_vk or with_gfxstream_vk and host_machine.system() == 'windows'
   dep_dxheaders = dependency('directx-headers', required : false)
   if not dep_dxheaders.found()
     dep_dxheaders = dependency('DirectX-Headers',
@@ -635,8 +642,12 @@ endif
 
 # GLSL has interesting version output and Meson doesn't parse it correctly as of
 # Meson 1.4.0
-prog_glslang = find_program('glslangValidator', native : true,
-                            required : with_vulkan_overlay_layer or with_aco_tests or with_amd_vk or with_intel_vk)
+prog_glslang = find_program(
+  'glslangValidator',
+  native : true,
+  required : with_vulkan_overlay_layer or with_aco_tests or with_amd_vk or with_intel_vk or with_swrast_vk or with_freedreno_vk
+)
+
 if prog_glslang.found()
   # Check if glslang has depfile support. Support was added in 11.3.0, but
   # Windows path support was broken until 11.9.0.
@@ -810,7 +821,13 @@ if with_gallium_rusticl or with_nouveau_vk or with_tools.contains('etnaviv')
   endif
 endif
 
-with_clc = with_microsoft_clc or with_intel_clc or with_gallium_asahi or with_asahi_vk or with_gallium_rusticl
+if get_option('precomp-compiler') != 'system'
+  with_drivers_clc = get_option('precomp-compiler') == 'enabled'
+else
+  with_drivers_clc = false
+endif
+
+with_clc = get_option('mesa-clc') != 'auto' or with_microsoft_clc or with_intel_clc or with_drivers_clc or with_gallium_asahi or with_asahi_vk or with_gallium_rusticl
 
 dep_clc = null_dep
 if with_gallium_clover or with_clc
@@ -904,7 +921,9 @@ if get_option('allow-kcmp') \
   pre_args += '-DALLOW_KCMP'
 endif
 
-prog_python = import('python').find_installation('python3')
+# On Windows, a venv has no versioned aliased to 'python'.
+prog_python = find_program('python3', 'python', version : '>= 3.8')
+
 has_mako = run_command(
   prog_python, '-c',
   '''

@@ -16,8 +16,9 @@ enum r600_blitter_op /* bitmask */
 	R600_SAVE_TEXTURES       = 2,
 	R600_SAVE_FRAMEBUFFER    = 4,
 	R600_DISABLE_RENDER_COND = 8,
+	R600_SAVE_CONST_BUF0     = 16,
 
-	R600_CLEAR         = R600_SAVE_FRAGMENT_STATE,
+	R600_CLEAR         = R600_SAVE_FRAGMENT_STATE | R600_SAVE_CONST_BUF0,
 
 	R600_CLEAR_SURFACE = R600_SAVE_FRAGMENT_STATE | R600_SAVE_FRAMEBUFFER,
 
@@ -50,7 +51,8 @@ static void r600_blitter_begin(struct pipe_context *ctx, enum r600_blitter_op op
 	util_blitter_save_tessctrl_shader(rctx->blitter, rctx->tcs_shader);
 	util_blitter_save_tesseval_shader(rctx->blitter, rctx->tes_shader);
 	util_blitter_save_so_targets(rctx->blitter, rctx->b.streamout.num_targets,
-				     (struct pipe_stream_output_target**)rctx->b.streamout.targets);
+				     (struct pipe_stream_output_target**)rctx->b.streamout.targets,
+                                     MESA_PRIM_UNKNOWN);
 	util_blitter_save_rasterizer(rctx->blitter, rctx->rasterizer_state.cso);
 
 	if (op & R600_SAVE_FRAGMENT_STATE) {
@@ -61,6 +63,9 @@ static void r600_blitter_begin(struct pipe_context *ctx, enum r600_blitter_op op
 		util_blitter_save_depth_stencil_alpha(rctx->blitter, rctx->dsa_state.cso);
 		util_blitter_save_stencil_ref(rctx->blitter, &rctx->stencil_ref.pipe_state);
                 util_blitter_save_sample_mask(rctx->blitter, rctx->sample_mask.sample_mask, rctx->ps_iter_samples);
+	}
+
+	if (op & R600_SAVE_CONST_BUF0) {
 		util_blitter_save_fragment_constant_buffer_slot(rctx->blitter,
 								&rctx->constbuf_state[PIPE_SHADER_FRAGMENT].cb[0]);
 	}
@@ -824,6 +829,7 @@ static bool do_hardware_msaa_resolve(struct pipe_context *ctx,
 	    util_is_format_compatible(util_format_description(info->src.format),
 				      util_format_description(info->dst.format)) &&
 	    !info->scissor_enable &&
+	    !info->swizzle_enable &&
 	    (info->mask & PIPE_MASK_RGBA) == PIPE_MASK_RGBA &&
 	    dst_width == info->src.resource->width0 &&
 	    dst_height == info->src.resource->height0 &&

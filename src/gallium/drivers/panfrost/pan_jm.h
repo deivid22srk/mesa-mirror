@@ -34,7 +34,7 @@ struct panfrost_jm_batch {
       struct pan_jc vtc_jc;
 
       /* Fragment job, only one per batch. */
-      mali_ptr frag;
+      uint64_t frag;
    } jobs;
 };
 
@@ -61,7 +61,8 @@ GENX(jm_cleanup_context)(struct panfrost_context *ctx)
 {
 }
 
-void GENX(jm_init_batch)(struct panfrost_batch *batch);
+int
+GENX(jm_init_batch)(struct panfrost_batch *batch);
 
 static inline void
 GENX(jm_cleanup_batch)(struct panfrost_batch *batch)

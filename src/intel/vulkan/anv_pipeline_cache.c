@@ -32,6 +32,7 @@
 #include "vk_util.h"
 #include "compiler/spirv/nir_spirv.h"
 #include "shaders/float64_spv.h"
+#include "util/u_printf.h"
 
 /**
  * Embedded sampler management.
@@ -317,7 +318,7 @@ anv_shader_bin_create(struct anv_device *device,
       prog_data_in->const_data_offset;
 
    int rv_count = 0;
-   struct brw_shader_reloc_value reloc_values[9];
+   struct brw_shader_reloc_value reloc_values[10];
    assert((device->physical->va.dynamic_visible_pool.addr & 0xffffffff) == 0);
    reloc_values[rv_count++] = (struct brw_shader_reloc_value) {
       .id = BRW_SHADER_RELOC_DESCRIPTORS_BUFFER_ADDR_HIGH,
@@ -391,6 +392,10 @@ anv_shader_bin_create(struct anv_device *device,
       reloc_values[rv_count++] = (struct brw_shader_reloc_value) {
          .id = BRW_SHADER_RELOC_PRINTF_BUFFER_ADDR_HIGH,
          .value = device->printf.bo->offset >> 32,
+      };
+      reloc_values[rv_count++] = (struct brw_shader_reloc_value) {
+         .id = BRW_SHADER_RELOC_PRINTF_BUFFER_SIZE,
+         .value = anv_printf_buffer_size(),
       };
    } else if (prog_data_in->printf_info_count > 0) {
       unreachable("shader with printf intrinsics requires INTEL_DEBUG=shader-print");
@@ -474,8 +479,8 @@ anv_shader_bin_serialize(struct vk_pipeline_cache_object *object,
    blob_write_bytes(blob, shader->prog_data->relocs,
                     shader->prog_data->num_relocs *
                     sizeof(shader->prog_data->relocs[0]));
-   nir_serialize_printf_info(blob, shader->prog_data->printf_info,
-                             shader->prog_data->printf_info_count);
+   u_printf_serialize_info(blob, shader->prog_data->printf_info,
+                           shader->prog_data->printf_info_count);
 
    blob_write_uint32(blob, shader->num_stats);
    blob_write_bytes(blob, shader->stats,
@@ -555,8 +560,8 @@ anv_shader_bin_deserialize(struct vk_pipeline_cache *cache,
 
    void *mem_ctx = ralloc_context(NULL);
    prog_data.base.printf_info =
-      nir_deserialize_printf_info(mem_ctx, blob,
-                                  &prog_data.base.printf_info_count);
+      u_printf_deserialize_info(mem_ctx, blob,
+                                &prog_data.base.printf_info_count);
 
    uint32_t num_stats = blob_read_uint32(blob);
    const struct brw_compile_stats *stats =

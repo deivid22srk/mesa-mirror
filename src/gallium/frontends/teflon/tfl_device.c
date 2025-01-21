@@ -155,6 +155,28 @@ fill_operation(struct teflon_delegate *delegate, TfLiteContext *tf_context, TfLi
       case kTfLiteBuiltinAdd:
          operation->type = PIPE_ML_OPERATION_TYPE_ADD;
          break;
+      case kTfLiteBuiltinConcatenation:
+         operation->type = PIPE_ML_OPERATION_TYPE_CONCATENATION;
+         break;
+      case kTfLiteBuiltinSplit:
+         operation->type = PIPE_ML_OPERATION_TYPE_SPLIT;
+         break;
+      case kTfLiteBuiltinPad: {
+         int32_t *paddings = tf_context->tensors[node->inputs->data[1]].data.data;
+
+         operation->type = PIPE_ML_OPERATION_TYPE_PAD;
+         operation->pad.before_x = paddings[2];
+         operation->pad.after_x = paddings[3];
+         operation->pad.before_y = paddings[4];
+         operation->pad.after_y = paddings[5];
+         break;
+      }
+      case kTfLiteBuiltinFullyConnected: {
+         operation->type = PIPE_ML_OPERATION_TYPE_FULLY_CONNECTED;
+         operation->fcon.weight_tensor = &tensors[node->inputs->data[1]];
+         operation->fcon.bias_tensor = &tensors[node->inputs->data[2]];
+         break;
+      }
       default:
          unreachable("Unsupported ML operation type");
    }
@@ -165,7 +187,6 @@ fill_tensor(struct teflon_delegate *delegate, TfLiteContext *tf_context, struct 
 {
    struct pipe_context *context = delegate->context;
    TfLiteTensor tf_tensor = tf_context->tensors[index];
-   const TfLiteAffineQuantization *quant = (const TfLiteAffineQuantization *)tf_tensor.quantization.params;
 
    if (tf_tensor.type == kTfLiteNoType)
       return; /* Placeholder tensor */
@@ -175,8 +196,12 @@ fill_tensor(struct teflon_delegate *delegate, TfLiteContext *tf_context, struct 
 
    tensor->index = index;
    memcpy(tensor->dims, tf_tensor.dims->data, tf_tensor.dims->size * sizeof(*tensor->dims));
-   tensor->scale = quant->scale->data[0];
-   tensor->zero_point = quant->zero_point->data[0];
+
+   if (tf_tensor.quantization.type == kTfLiteAffineQuantization) {
+      const TfLiteAffineQuantization *quant = (const TfLiteAffineQuantization *)tf_tensor.quantization.params;
+      tensor->scale = quant->scale->data[0];
+      tensor->zero_point = quant->zero_point->data[0];
+   }
 
    switch(tf_tensor.type) {
       case kTfLiteUInt8:
@@ -221,8 +246,20 @@ dump_graph(struct pipe_tensor *tensors, unsigned tensor_count, struct pipe_ml_op
          case PIPE_ML_OPERATION_TYPE_CONVOLUTION:
             teflon_debug("%-6s ", operations[i].conv.depthwise ? "DWCONV" : "CONV");
             break;
+         case PIPE_ML_OPERATION_TYPE_CONCATENATION:
+            teflon_debug("%-6s ", "CONCAT");
+            break;
          case PIPE_ML_OPERATION_TYPE_POOLING:
             teflon_debug("%-6s ", "POOL");
+            break;
+         case PIPE_ML_OPERATION_TYPE_SPLIT:
+            teflon_debug("%-6s ", "SPLIT");
+            break;
+         case PIPE_ML_OPERATION_TYPE_PAD:
+            teflon_debug("%-6s ", "PAD");
+            break;
+         case PIPE_ML_OPERATION_TYPE_FULLY_CONNECTED:
+            teflon_debug("%-6s ", "FCON");
             break;
       }
 
@@ -510,7 +547,54 @@ PrepareDelegate(TfLiteContext *context, TfLiteDelegate *delegate)
             }
             break;
          }
-         case kTfLiteBuiltinAdd:
+         case kTfLiteBuiltinAdd: {
+            supported = context->tensors[node->inputs->data[0]].data.data == NULL &&
+                        context->tensors[node->inputs->data[1]].data.data == NULL;
+            break;
+         }
+         case kTfLiteBuiltinConcatenation: {
+            TfLiteConcatenationParams *params = node->builtin_data;
+            supported = true;
+
+            if (params->axis != 3 &&
+                params->axis != -1)
+               supported = false;
+
+            unsigned input_channels = context->tensors[node->inputs->data[0]].dims->data[3];
+            for (unsigned i = 1; i < node->inputs->size; i++)
+               if (input_channels != context->tensors[node->inputs->data[i]].dims->data[3])
+                  supported = false;
+
+            break;
+         }
+         case kTfLiteBuiltinSplit: {
+            int32_t axis = context->tensors[node->inputs->data[0]].data.i32[0];
+            supported = true;
+
+            if (axis != 3 &&
+                axis != -1)
+               supported = false;
+
+            unsigned output_channels = context->tensors[node->outputs->data[0]].dims->data[3];
+            for (unsigned i = 1; i < node->outputs->size; i++)
+               if (output_channels != context->tensors[node->outputs->data[i]].dims->data[3])
+                  supported = false;
+
+            break;
+         }
+         case kTfLiteBuiltinPad: {
+            uint32_t *padding = context->tensors[node->inputs->data[1]].data.data;
+            supported = padding[0] == 0 &&
+                        padding[1] == 0 &&
+                        padding[2] == 1 &&
+                        padding[3] == 1 &&
+                        padding[4] == 1 &&
+                        padding[5] == 1 &&
+                        padding[6] == 0 &&
+                        padding[7] == 0;
+            break;
+         }
+         case kTfLiteBuiltinFullyConnected:
             supported = true;
             break;
       }

@@ -456,12 +456,23 @@ genX(emit_urb_setup)(struct anv_device *device, struct anv_batch *batch,
       if (intel_urb_setup_changed(urb_cfg_in, urb_cfg_out,
           MESA_SHADER_TESS_EVAL) && urb_cfg_in->size[0] != 0) {
          for (int i = 0; i <= MESA_SHADER_GEOMETRY; i++) {
+#if GFX_VER >= 12
+            anv_batch_emit(batch, GENX(3DSTATE_URB_ALLOC_VS), urb) {
+               urb._3DCommandSubOpcode             += i;
+               urb.VSURBEntryAllocationSize        = urb_cfg_in->size[i] - 1;
+               urb.VSURBStartingAddressSlice0      = urb_cfg_in->start[i];
+               urb.VSURBStartingAddressSliceN      = urb_cfg_in->start[i];
+               urb.VSNumberofURBEntriesSlice0      = i == 0 ? 256 : 0;
+               urb.VSNumberofURBEntriesSliceN      = i == 0 ? 256 : 0;
+            }
+#else
             anv_batch_emit(batch, GENX(3DSTATE_URB_VS), urb) {
                urb._3DCommandSubOpcode      += i;
                urb.VSURBStartingAddress      = urb_cfg_in->start[i];
                urb.VSURBEntryAllocationSize  = urb_cfg_in->size[i] - 1;
                urb.VSNumberofURBEntries      = i == 0 ? 256 : 0;
             }
+#endif
          }
          genx_batch_emit_pipe_control(batch, device->info, _3D,
                                       ANV_PIPE_HDC_PIPELINE_FLUSH_BIT);
@@ -469,13 +480,25 @@ genX(emit_urb_setup)(struct anv_device *device, struct anv_batch *batch,
 #endif
 
    for (int i = 0; i <= MESA_SHADER_GEOMETRY; i++) {
+#if GFX_VER >= 12
+      anv_batch_emit(batch, GENX(3DSTATE_URB_ALLOC_VS), urb) {
+         urb._3DCommandSubOpcode             += i;
+         urb.VSURBEntryAllocationSize        = urb_cfg_out->size[i] - 1;
+         urb.VSURBStartingAddressSlice0      = urb_cfg_out->start[i];
+         urb.VSURBStartingAddressSliceN      = urb_cfg_out->start[i];
+         urb.VSNumberofURBEntriesSlice0      = urb_cfg_out->entries[i];
+         urb.VSNumberofURBEntriesSliceN      = urb_cfg_out->entries[i];
+      }
+#else
       anv_batch_emit(batch, GENX(3DSTATE_URB_VS), urb) {
          urb._3DCommandSubOpcode      += i;
          urb.VSURBStartingAddress      = urb_cfg_out->start[i];
          urb.VSURBEntryAllocationSize  = urb_cfg_out->size[i] - 1;
          urb.VSNumberofURBEntries      = urb_cfg_out->entries[i];
       }
+#endif
    }
+
 #if GFX_VERx10 >= 125
    if (device->vk.enabled_extensions.EXT_mesh_shader) {
       anv_batch_emit(batch, GENX(3DSTATE_URB_ALLOC_MESH), zero);
@@ -503,9 +526,15 @@ emit_urb_setup_mesh(struct anv_graphics_pipeline *pipeline,
 
    /* Zero out the primitive pipeline URB allocations. */
    for (int i = 0; i <= MESA_SHADER_GEOMETRY; i++) {
+#if GFX_VER >= 12
+      anv_pipeline_emit(pipeline, final.urb, GENX(3DSTATE_URB_ALLOC_VS), urb) {
+         urb._3DCommandSubOpcode += i;
+      }
+#else
       anv_pipeline_emit(pipeline, final.urb, GENX(3DSTATE_URB_VS), urb) {
          urb._3DCommandSubOpcode += i;
       }
+#endif
    }
 
    anv_pipeline_emit(pipeline, final.urb, GENX(3DSTATE_URB_ALLOC_TASK), urb) {
@@ -563,12 +592,23 @@ emit_urb_setup(struct anv_graphics_pipeline *pipeline,
                         &constrained);
 
    for (int i = 0; i <= MESA_SHADER_GEOMETRY; i++) {
+#if GFX_VER >= 12
+      anv_pipeline_emit(pipeline, final.urb, GENX(3DSTATE_URB_ALLOC_VS), urb) {
+         urb._3DCommandSubOpcode          += i;
+         urb.VSURBEntryAllocationSize      = pipeline->urb_cfg.size[i] - 1;
+         urb.VSURBStartingAddressSlice0    = pipeline->urb_cfg.start[i];
+         urb.VSURBStartingAddressSliceN    = pipeline->urb_cfg.start[i];
+         urb.VSNumberofURBEntriesSlice0    = pipeline->urb_cfg.entries[i];
+         urb.VSNumberofURBEntriesSliceN    = pipeline->urb_cfg.entries[i];
+      }
+#else
       anv_pipeline_emit(pipeline, final.urb, GENX(3DSTATE_URB_VS), urb) {
          urb._3DCommandSubOpcode      += i;
          urb.VSURBStartingAddress      = pipeline->urb_cfg.start[i];
          urb.VSURBEntryAllocationSize  = pipeline->urb_cfg.size[i] - 1;
          urb.VSNumberofURBEntries      = pipeline->urb_cfg.entries[i];
       }
+#endif
    }
 
 #if GFX_VERx10 >= 125
@@ -586,6 +626,14 @@ sbe_primitive_id_override(struct anv_graphics_pipeline *pipeline)
    const struct brw_wm_prog_data *wm_prog_data = get_wm_prog_data(pipeline);
    if (!wm_prog_data)
       return false;
+
+   if (anv_pipeline_is_mesh(pipeline)) {
+      const struct brw_mesh_prog_data *mesh_prog_data =
+         get_mesh_prog_data(pipeline);
+      const struct brw_mue_map *mue = &mesh_prog_data->map;
+      return (wm_prog_data->inputs & VARYING_BIT_PRIMITIVE_ID) &&
+              mue->start_dw[VARYING_SLOT_PRIMITIVE_ID] == -1;
+   }
 
    const struct intel_vue_map *fs_input_map =
       &anv_pipeline_get_last_vue_prog_data(pipeline)->vue_map;
@@ -1884,10 +1932,12 @@ genX(graphics_pipeline_emit)(struct anv_graphics_pipeline *pipeline,
        geom_or_tess_prim_id_used(pipeline));
 
    anv_pipeline_emit(pipeline, partial.vfg, GENX(3DSTATE_VFG), vfg) {
-      /* If 3DSTATE_TE: TE Enable == 1 then RR_STRICT else RR_FREE*/
+      /* Gfx12.5: If 3DSTATE_TE: TE Enable == 1 then RR_STRICT else RR_FREE */
       vfg.DistributionMode =
-         anv_pipeline_has_stage(pipeline, MESA_SHADER_TESS_EVAL) ? RR_STRICT :
-         RR_FREE;
+#if GFX_VER < 20
+         !anv_pipeline_has_stage(pipeline, MESA_SHADER_TESS_EVAL) ? RR_FREE :
+#endif
+         RR_STRICT;
       vfg.DistributionGranularity = needs_instance_granularity ?
          InstanceLevelGranularity : BatchLevelGranularity;
 #if INTEL_WA_14014851047_GFX_VER

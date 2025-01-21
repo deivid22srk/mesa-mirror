@@ -62,6 +62,7 @@ const char *ac_get_family_name(enum radeon_family family)
    CASE(GFX1150);
    CASE(GFX1151);
    CASE(GFX1152);
+   CASE(GFX1153);
    CASE(GFX1200);
    CASE(GFX1201);
 #undef CASE
@@ -90,28 +91,6 @@ enum amd_gfx_level ac_get_gfx_level(enum radeon_family family)
       return GFX7;
 
    return GFX6;
-}
-
-unsigned ac_get_family_id(enum radeon_family family)
-{
-   if (family >= CHIP_GFX1200)
-      return FAMILY_GFX12;
-   if (family >= CHIP_GFX1150)
-      return FAMILY_GFX1150;
-   if (family >= CHIP_NAVI31)
-      return FAMILY_NV3;
-   if (family >= CHIP_NAVI21)
-      return FAMILY_NV;
-   if (family >= CHIP_NAVI10)
-      return FAMILY_NV;
-   if (family >= CHIP_VEGA10)
-      return FAMILY_AI;
-   if (family >= CHIP_TONGA)
-      return FAMILY_VI;
-   if (family >= CHIP_BONAIRE)
-      return FAMILY_CI;
-
-   return FAMILY_SI;
 }
 
 const char *ac_get_llvm_processor_name(enum radeon_family family)
@@ -207,6 +186,8 @@ const char *ac_get_llvm_processor_name(enum radeon_family family)
       return "gfx1151";
    case CHIP_GFX1152:
       return "gfx1152";
+   case CHIP_GFX1153:
+      return "gfx1153";
    case CHIP_GFX1200:
       return "gfx1200";
    case CHIP_GFX1201:

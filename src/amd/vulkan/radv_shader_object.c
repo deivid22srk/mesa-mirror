@@ -122,7 +122,6 @@ static VkResult
 radv_shader_object_init_graphics(struct radv_shader_object *shader_obj, struct radv_device *device,
                                  const VkShaderCreateInfoEXT *pCreateInfo)
 {
-   const struct radv_physical_device *pdev = radv_device_physical(device);
    gl_shader_stage stage = vk_to_mesa_shader_stage(pCreateInfo->stage);
    struct radv_shader_stage stages[MESA_VULKAN_SHADER_STAGES];
 
@@ -143,9 +142,7 @@ radv_shader_object_init_graphics(struct radv_shader_object *shader_obj, struct r
    gfx_state.unknown_rast_prim = true;
    gfx_state.dynamic_provoking_vtx_mode = true;
    gfx_state.dynamic_line_rast_mode = true;
-
-   if (pdev->info.gfx_level >= GFX11)
-      gfx_state.ps.exports_mrtz_via_epilog = true;
+   gfx_state.ps.exports_mrtz_via_epilog = true;
 
    for (uint32_t i = 0; i < MAX_RTS; i++)
       gfx_state.ps.epilog.color_map[i] = i;
@@ -153,36 +150,7 @@ radv_shader_object_init_graphics(struct radv_shader_object *shader_obj, struct r
    struct radv_shader *shader = NULL;
    struct radv_shader_binary *binary = NULL;
 
-   VkShaderStageFlags next_stages = pCreateInfo->nextStage;
-   if (!next_stages) {
-      /* When next stage is 0, gather all valid next stages. */
-      switch (pCreateInfo->stage) {
-      case VK_SHADER_STAGE_VERTEX_BIT:
-         next_stages |=
-            VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT | VK_SHADER_STAGE_GEOMETRY_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
-         break;
-      case VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT:
-         next_stages |= VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
-         break;
-      case VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT:
-         next_stages |= VK_SHADER_STAGE_GEOMETRY_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
-         break;
-      case VK_SHADER_STAGE_GEOMETRY_BIT:
-      case VK_SHADER_STAGE_MESH_BIT_EXT:
-         next_stages |= VK_SHADER_STAGE_FRAGMENT_BIT;
-         break;
-      case VK_SHADER_STAGE_TASK_BIT_EXT:
-         next_stages |= VK_SHADER_STAGE_MESH_BIT_EXT;
-         break;
-      case VK_SHADER_STAGE_FRAGMENT_BIT:
-      case VK_SHADER_STAGE_COMPUTE_BIT:
-         break;
-      default:
-         unreachable("Invalid shader stage");
-      }
-   }
-
-   if (!next_stages) {
+   if (!pCreateInfo->nextStage) {
       struct radv_shader *shaders[MESA_VULKAN_SHADER_STAGES] = {NULL};
       struct radv_shader_binary *binaries[MESA_VULKAN_SHADER_STAGES] = {NULL};
 
@@ -197,6 +165,15 @@ radv_shader_object_init_graphics(struct radv_shader_object *shader_obj, struct r
       shader_obj->shader = shader;
       shader_obj->binary = binary;
    } else {
+      VkShaderStageFlags next_stages = pCreateInfo->nextStage;
+
+      /* The last VGT stage can always be used with rasterization enabled and a null fragment shader
+       * (ie. depth-only rendering). Because we don't want to have two variants for NONE and
+       * FRAGMENT, let's compile only one variant that works for both.
+       */
+      if (stage == MESA_SHADER_VERTEX || stage == MESA_SHADER_TESS_EVAL || stage == MESA_SHADER_GEOMETRY)
+         next_stages |= VK_SHADER_STAGE_FRAGMENT_BIT;
+
       radv_foreach_stage(next_stage, next_stages)
       {
          struct radv_shader *shaders[MESA_VULKAN_SHADER_STAGES] = {NULL};
@@ -433,7 +410,6 @@ radv_shader_object_create_linked(VkDevice _device, uint32_t createInfoCount, con
                                  const VkAllocationCallbacks *pAllocator, VkShaderEXT *pShaders)
 {
    VK_FROM_HANDLE(radv_device, device, _device);
-   const struct radv_physical_device *pdev = radv_device_physical(device);
    struct radv_shader_stage stages[MESA_VULKAN_SHADER_STAGES];
 
    for (unsigned i = 0; i < MESA_VULKAN_SHADER_STAGES; i++) {
@@ -451,9 +427,7 @@ radv_shader_object_create_linked(VkDevice _device, uint32_t createInfoCount, con
    gfx_state.unknown_rast_prim = true;
    gfx_state.dynamic_provoking_vtx_mode = true;
    gfx_state.dynamic_line_rast_mode = true;
-
-   if (pdev->info.gfx_level >= GFX11)
-      gfx_state.ps.exports_mrtz_via_epilog = true;
+   gfx_state.ps.exports_mrtz_via_epilog = true;
 
    for (uint32_t i = 0; i < MAX_RTS; i++)
       gfx_state.ps.epilog.color_map[i] = i;

@@ -23,6 +23,8 @@
 #include "panvk_physical_device.h"
 #include "panvk_priv_bo.h"
 #include "panvk_queue.h"
+#include "panvk_utrace.h"
+#include "panvk_utrace_perfetto.h"
 
 #include "genxml/decode.h"
 #include "genxml/gen_macros.h"
@@ -131,6 +133,7 @@ panvk_meta_init(struct panvk_device *device)
       return result;
 
    device->meta.use_stencil_export = true;
+   device->meta.use_rect_list_pipeline = true;
    device->meta.max_bind_map_buffer_size_B = 64 * 1024;
    device->meta.cmd_bind_map_buffer = panvk_meta_cmd_bind_map_buffer;
 
@@ -156,7 +159,7 @@ panvk_meta_cleanup(struct panvk_device *device)
 
 static enum pan_kmod_group_allow_priority_flags
 global_priority_to_group_allow_priority_flag(
-   enum VkQueueGlobalPriorityKHR priority)
+   VkQueueGlobalPriorityKHR priority)
 {
    switch (priority) {
    case VK_QUEUE_GLOBAL_PRIORITY_LOW_KHR:
@@ -179,7 +182,7 @@ check_global_priority(const struct panvk_physical_device *phys_dev,
    const VkDeviceQueueGlobalPriorityCreateInfoKHR *priority_info =
       vk_find_struct_const(create_info->pNext,
                            DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR);
-   const enum VkQueueGlobalPriorityKHR priority =
+   const VkQueueGlobalPriorityKHR priority =
       priority_info ? priority_info->globalPriority
                     : VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR;
 
@@ -355,6 +358,13 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
       }
    }
 
+   panvk_per_arch(utrace_context_init)(device);
+#if PAN_ARCH >= 10
+   panvk_utrace_perfetto_init(device, PANVK_SUBQUEUE_COUNT);
+#else
+   panvk_utrace_perfetto_init(device, 2);
+#endif
+
    *pDevice = panvk_device_to_handle(device);
    return VK_SUCCESS;
 
@@ -394,6 +404,8 @@ panvk_per_arch(destroy_device)(struct panvk_device *device,
 {
    if (!device)
       return;
+
+   panvk_per_arch(utrace_context_fini)(device);
 
    for (unsigned i = 0; i < PANVK_MAX_QUEUE_FAMILIES; i++) {
       for (unsigned q = 0; q < device->queue_count[i]; q++)

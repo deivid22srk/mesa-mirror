@@ -33,14 +33,24 @@ use std::slice;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
+use std::sync::Weak;
 
-// ugh, we are not allowed to take refs, so...
+// According to the CL spec we are not allowed to let any cl_kernel object hold any references on
+// its arguments as this might make it unfeasible for applications to free the backing memory of
+// memory objects allocated with `CL_USE_HOST_PTR`.
+//
+// However those arguments might temporarily get referenced by event objects, so we'll use Weak in
+// order to upgrade the reference when needed. It's also safer to use Weak over raw pointers,
+// because it makes it impossible to run into use-after-free issues.
+//
+// Technically we also need to do it for samplers, but there it's kinda pointless to take a weak
+// reference as samplers don't have the same host_ptr or any similar problems as cl_mem objects.
 #[derive(Clone)]
 pub enum KernelArgValue {
     None,
-    Buffer(Arc<Buffer>),
+    Buffer(Weak<Buffer>),
     Constant(Vec<u8>),
-    Image(Arc<Image>),
+    Image(Weak<Image>),
     LocalMem(usize),
     Sampler(Arc<Sampler>),
 }
@@ -430,7 +440,7 @@ struct NirKernelBuild {
     compiled_args: Vec<CompiledKernelArg>,
 }
 
-// SAFETY: `CSOWrapper` is only safe to use if the device supports `PIPE_CAP_SHAREABLE_SHADERS` and
+// SAFETY: `CSOWrapper` is only safe to use if the device supports `pipe_caps.shareable_shaders` and
 //         we make sure to set `nir_or_cso` to `KernelDevStateVariant::Cso` only if that's the case.
 unsafe impl Send for NirKernelBuild {}
 unsafe impl Sync for NirKernelBuild {}
@@ -654,6 +664,7 @@ fn compile_nir_to_args(
     let printf_opts = nir_lower_printf_options {
         ptr_bit_size: 0,
         use_printf_base_identifier: false,
+        hash_format_strings: false,
         max_buffer_size: dev.printf_buffer_size() as u32,
     };
     nir_pass!(nir, nir_lower_printf, &printf_opts);
@@ -1272,6 +1283,31 @@ impl Kernel {
         let arg_values = self.arg_values().clone();
         let nir_kernel_builds = Arc::clone(&self.builds[q.device]);
 
+        let mut buffer_arcs = HashMap::new();
+        let mut image_arcs = HashMap::new();
+
+        // need to preprocess buffer and image arguments so we hold a strong reference until the
+        // event was processed.
+        for arg in arg_values.iter() {
+            match arg {
+                Some(KernelArgValue::Buffer(buffer)) => {
+                    buffer_arcs.insert(
+                        // we use the ptr as the key, and also cast it to usize so we don't need to
+                        // deal with Send + Sync here.
+                        buffer.as_ptr() as usize,
+                        buffer.upgrade().ok_or(CL_INVALID_KERNEL_ARGS)?,
+                    );
+                }
+                Some(KernelArgValue::Image(image)) => {
+                    image_arcs.insert(
+                        image.as_ptr() as usize,
+                        image.upgrade().ok_or(CL_INVALID_KERNEL_ARGS)?,
+                    );
+                }
+                _ => {}
+            }
+        }
+
         // operations we want to report errors to the clients
         let mut block = create_kernel_arr::<u32>(block, 1)?;
         let mut grid = create_kernel_arr::<usize>(grid, 1)?;
@@ -1393,46 +1429,28 @@ impl Kernel {
                         match value {
                             KernelArgValue::Constant(c) => input.extend_from_slice(c),
                             KernelArgValue::Buffer(buffer) => {
-                                let res = buffer.get_res_of_dev(q.device)?;
-                                add_global(q, &mut input, &mut resource_info, res, buffer.offset);
-                            }
-                            KernelArgValue::Image(image) => {
-                                let res = image.get_res_of_dev(q.device)?;
-
-                                // If resource is a buffer, the image was created from a buffer. Use
-                                // strides and dimensions of the image then.
-                                let app_img_info = if res.as_ref().is_buffer()
-                                    && image.mem_type == CL_MEM_OBJECT_IMAGE2D
+                                let buffer = &buffer_arcs[&(buffer.as_ptr() as usize)];
+                                let rw = if api_arg.spirv.address_qualifier
+                                    == clc_kernel_arg_address_qualifier::CLC_KERNEL_ARG_ADDRESS_CONSTANT
                                 {
-                                    Some(AppImgInfo::new(
-                                        image.image_desc.row_pitch()?
-                                            / image.image_elem_size as u32,
-                                        image.image_desc.width()?,
-                                        image.image_desc.height()?,
-                                    ))
+                                    RWFlags::RD
                                 } else {
-                                    None
+                                    RWFlags::RW
                                 };
 
-                                let format = image.pipe_format;
+                                let res = buffer.get_res_for_access(ctx, rw)?;
+                                add_global(q, &mut input, &mut resource_info, res, buffer.offset());
+                            }
+                            KernelArgValue::Image(image) => {
+                                let image = &image_arcs[&(image.as_ptr() as usize)];
                                 let (formats, orders) = if api_arg.kind == KernelArgType::Image {
-                                    iviews.push(res.pipe_image_view(
-                                        format,
-                                        false,
-                                        image.pipe_image_host_access(),
-                                        app_img_info.as_ref(),
-                                    ));
+                                    iviews.push(image.image_view(ctx, false)?);
                                     (&mut img_formats, &mut img_orders)
                                 } else if api_arg.kind == KernelArgType::RWImage {
-                                    iviews.push(res.pipe_image_view(
-                                        format,
-                                        true,
-                                        image.pipe_image_host_access(),
-                                        app_img_info.as_ref(),
-                                    ));
+                                    iviews.push(image.image_view(ctx, true)?);
                                     (&mut img_formats, &mut img_orders)
                                 } else {
-                                    sviews.push((res.clone(), format, app_img_info));
+                                    sviews.push(image.sampler_view(ctx)?);
                                     (&mut tex_formats, &mut tex_orders)
                                 };
 
@@ -1517,10 +1535,6 @@ impl Kernel {
             // subtract the shader local_size as we only request something on top of that.
             variable_local_size -= static_local_size;
 
-            let mut sviews: Vec<_> = sviews
-                .iter()
-                .map(|(s, f, aii)| ctx.create_sampler_view(s, *f, aii.as_ref()))
-                .collect();
             let samplers: Vec<_> = samplers
                 .iter()
                 .map(|s| ctx.create_sampler_state(s))
@@ -1542,9 +1556,10 @@ impl Kernel {
                 }
             };
 
+            let sviews_len = sviews.len();
             ctx.bind_compute_state(cso.cso_ptr);
             ctx.bind_sampler_states(&samplers);
-            ctx.set_sampler_views(&mut sviews);
+            ctx.set_sampler_views(sviews);
             ctx.set_shader_images(&iviews);
             ctx.set_global_binding(resources.as_slice(), &mut globals);
 
@@ -1584,7 +1599,7 @@ impl Kernel {
 
             ctx.clear_global_binding(globals.len() as u32);
             ctx.clear_shader_images(iviews.len() as u32);
-            ctx.clear_sampler_views(sviews.len() as u32);
+            ctx.clear_sampler_views(sviews_len as u32);
             ctx.clear_sampler_states(samplers.len() as u32);
 
             ctx.bind_compute_state(ptr::null_mut());
@@ -1592,7 +1607,6 @@ impl Kernel {
             ctx.memory_barrier(PIPE_BARRIER_GLOBAL_BUFFER);
 
             samplers.iter().for_each(|s| ctx.delete_sampler_state(*s));
-            sviews.iter().for_each(|v| ctx.sampler_view_destroy(*v));
 
             if let Some(printf_buf) = &printf_buf {
                 let tx = ctx
@@ -1716,9 +1730,22 @@ impl Kernel {
     }
 
     pub fn local_mem_size(&self, dev: &Device) -> cl_ulong {
-        // TODO include args
+        // TODO: take alignment into account?
         // this is purely informational so it shouldn't even matter
-        self.builds.get(dev).unwrap()[NirKernelVariant::Default].shared_size as cl_ulong
+        let local =
+            self.builds.get(dev).unwrap()[NirKernelVariant::Default].shared_size as cl_ulong;
+        let args: cl_ulong = self
+            .arg_values()
+            .iter()
+            .map(|arg| match arg {
+                Some(KernelArgValue::LocalMem(val)) => *val as cl_ulong,
+                // If the local memory size, for any pointer argument to the kernel declared with
+                // the __local address qualifier, is not specified, its size is assumed to be 0.
+                _ => 0,
+            })
+            .sum();
+
+        local + args
     }
 
     pub fn has_svm_devs(&self) -> bool {

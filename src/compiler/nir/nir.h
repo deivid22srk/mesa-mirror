@@ -329,9 +329,9 @@ nir_const_value_for_raw_uint(uint64_t x, unsigned bit_size)
    /* clang-format off */
    switch (bit_size) {
    case 1:  v.b   = x;  break;
-   case 8:  v.u8  = x;  break;
-   case 16: v.u16 = x;  break;
-   case 32: v.u32 = x;  break;
+   case 8:  v.u8  = (uint8_t)x;  break;
+   case 16: v.u16 = (uint16_t)x;  break;
+   case 32: v.u32 = (uint32_t)x;  break;
    case 64: v.u64 = x;  break;
    default:
       unreachable("Invalid bit size");
@@ -1655,6 +1655,10 @@ bool nir_const_value_negative_equal(nir_const_value c1, nir_const_value c2,
 bool nir_alu_srcs_equal(const nir_alu_instr *alu1, const nir_alu_instr *alu2,
                         unsigned src1, unsigned src2);
 
+bool nir_alu_srcs_negative_equal_typed(const nir_alu_instr *alu1,
+                                       const nir_alu_instr *alu2,
+                                       unsigned src1, unsigned src2,
+                                       nir_alu_type base_type);
 bool nir_alu_srcs_negative_equal(const nir_alu_instr *alu1,
                                  const nir_alu_instr *alu2,
                                  unsigned src1, unsigned src2);
@@ -2146,27 +2150,7 @@ void nir_rewrite_image_intrinsic(nir_intrinsic_instr *instr,
                                  nir_def *handle, bool bindless);
 
 /* Determine if an intrinsic can be arbitrarily reordered and eliminated. */
-static inline bool
-nir_intrinsic_can_reorder(nir_intrinsic_instr *instr)
-{
-   if (nir_intrinsic_has_access(instr)) {
-      enum gl_access_qualifier access = nir_intrinsic_access(instr);
-      if (access & ACCESS_VOLATILE)
-         return false;
-      if (access & ACCESS_CAN_REORDER)
-         return true;
-   }
-
-   if (instr->intrinsic == nir_intrinsic_load_deref) {
-      nir_deref_instr *deref = nir_src_as_deref(instr->src[0]);
-      return nir_deref_mode_is_in_set(deref, nir_var_read_only_modes);
-   } else {
-      const nir_intrinsic_info *info =
-         &nir_intrinsic_infos[instr->intrinsic];
-      return (info->flags & NIR_INTRINSIC_CAN_ELIMINATE) &&
-             (info->flags & NIR_INTRINSIC_CAN_REORDER);
-   }
-}
+bool nir_intrinsic_can_reorder(nir_intrinsic_instr *instr);
 
 bool nir_intrinsic_writes_external_memory(const nir_intrinsic_instr *instr);
 
@@ -3859,6 +3843,9 @@ typedef enum {
  */
 typedef bool (*nir_instr_filter_cb)(const nir_instr *, const void *);
 
+/* Like nir_instr_filter_cb but specialized to intrinsics */
+typedef bool (*nir_intrin_filter_cb)(const nir_intrinsic_instr *, const void *);
+
 /** A vectorization width callback
  *
  * Returns the maximum vectorization width per instruction.
@@ -4033,6 +4020,11 @@ typedef struct nir_shader_compiler_options {
    bool optimize_sample_mask_in;
 
    /**
+    * Optimize load_front_face ? a : -a to load_front_face_fsign * a
+    */
+   bool optimize_load_front_face_fsign;
+
+   /**
     * Optimize boolean reductions of quad broadcasts. This should only be enabled if
     * nir_intrinsic_reduce supports INCLUDE_HELPERS.
     */
@@ -4178,8 +4170,12 @@ typedef struct nir_shader_compiler_options {
     * to imul with masked inputs and iadd */
    bool has_umad24;
 
-   /* Backend supports fused comapre against zero and csel */
+   /* Backend supports fused compare against zero and csel */
    bool has_fused_comp_and_csel;
+   /* Backend supports fused int eq/ne against zero and csel. */
+   bool has_icsel_eqz64;
+   bool has_icsel_eqz32;
+   bool has_icsel_eqz16;
 
    /* Backend supports fneo, fequ, fltu, fgeu. */
    bool has_fneo_fcmpu;
@@ -4287,11 +4283,6 @@ typedef struct nir_shader_compiler_options {
 
    bool lower_uniforms_to_ubo;
 
-   /* If the precision is ignored, backends that don't handle
-    * different precisions when passing data between stages and use
-    * vectorized IO can pack more varyings when linking. */
-   bool linker_ignore_precision;
-
    /* Specifies if indirect sampler array access will trigger forced loop
     * unrolling.
     */
@@ -4372,6 +4363,29 @@ typedef struct nir_shader_compiler_options {
 
    /** Whether derivative intrinsics must be scalarized. */
    bool scalarize_ddx;
+
+   /**
+    * Assign a range of driver locations to per-view outputs, with unique
+    * slots for each view. If unset, per-view outputs will be treated
+    * similarly to other arrayed IO, and only slots for one view will be
+    * assigned. Regardless of this setting, per-view outputs are only assigned
+    * slots for one value in var->data.location.
+    */
+   bool per_view_unique_driver_locations;
+
+   /**
+    * Emit nir_intrinsic_store_per_view_output with compacted view indices
+    * rather than absolute view indices. When using compacted indices, the Nth
+    * index refers to the Nth enabled view, not the Nth absolute view. For
+    * example, with view mask 0b1010, compacted index 0 is absolute index 1,
+    * and compacted index 1 is absolute index 3. Note that compacted view
+    * indices do not correspond directly to gl_ViewIndex.
+    *
+    * If compact_view_index is unset, per-view indices must be constant before
+    * nir_lower_io. This can be guaranteed by calling nir_lower_io_temporaries
+    * first.
+    */
+   bool compact_view_index;
 
    /** Options determining lowering and behavior of inputs and outputs. */
    nir_io_options io_options;
@@ -5089,6 +5103,12 @@ bool nir_def_all_uses_are_fsat(const nir_def *def);
 bool nir_def_all_uses_ignore_sign_bit(const nir_def *def);
 
 static inline int
+nir_def_first_component_read(nir_def *def)
+{
+    return (int)ffs(nir_def_components_read(def)) - 1;
+}
+
+static inline int
 nir_def_last_component_read(nir_def *def)
 {
     return (int)util_last_bit(nir_def_components_read(def)) - 1;
@@ -5590,6 +5610,8 @@ bool nir_lower_vars_to_scratch(nir_shader *shader,
                                glsl_type_size_align_func variable_size_align,
                                glsl_type_size_align_func scratch_layout_size_align);
 
+bool nir_lower_scratch_to_var(nir_shader *nir);
+
 void nir_lower_clip_halfz(nir_shader *shader);
 
 void nir_shader_gather_info(nir_shader *shader, nir_function_impl *entrypoint);
@@ -5674,11 +5696,11 @@ nir_opt_varyings(nir_shader *producer, nir_shader *consumer, bool spirv,
 
 bool nir_slot_is_sysval_output(gl_varying_slot slot,
                                gl_shader_stage next_shader);
-bool nir_slot_is_varying(gl_varying_slot slot);
+bool nir_slot_is_varying(gl_varying_slot slot, gl_shader_stage next_shader);
 bool nir_slot_is_sysval_output_and_varying(gl_varying_slot slot,
                                            gl_shader_stage next_shader);
 bool nir_remove_varying(nir_intrinsic_instr *intr, gl_shader_stage next_shader);
-bool nir_remove_sysval_output(nir_intrinsic_instr *intr);
+bool nir_remove_sysval_output(nir_intrinsic_instr *intr, gl_shader_stage next_shader);
 
 bool nir_lower_amul(nir_shader *shader,
                     int (*type_size)(const struct glsl_type *, bool));
@@ -5690,6 +5712,8 @@ void nir_assign_io_var_locations(nir_shader *shader,
                                  nir_variable_mode mode,
                                  unsigned *size,
                                  gl_shader_stage stage);
+
+bool nir_opt_clip_cull_const(nir_shader *shader);
 
 typedef enum {
    /* If set, this causes all 64-bit IO operations to be lowered on-the-fly
@@ -5943,42 +5967,8 @@ typedef struct {
 bool nir_lower_mem_access_bit_sizes(nir_shader *shader,
                                     const nir_lower_mem_access_bit_sizes_options *options);
 
-typedef struct {
-   /* Lower load_ubo to be robust. Out-of-bounds loads will return UNDEFINED
-    * values (not necessarily zero).
-    */
-   bool lower_ubo;
-
-   /* Lower load_ssbo/store_ssbo/ssbo_atomic(_swap) to be robust. Out-of-bounds
-    * loads and atomics will return UNDEFINED values (not necessarily zero).
-    * Out-of-bounds stores and atomics CORRUPT the contents of the SSBO.
-    *
-    * This suffices for robustBufferAccess but not robustBufferAccess2.
-    */
-   bool lower_ssbo;
-
-   /* Lower all image_load/image_store/image_atomic(_swap) instructions to be
-    * robust.  Out-of-bounds loads will return ZERO.
-    *
-    * This suffices for robustImageAccess but not robustImageAccess2.
-    */
-   bool lower_image;
-
-   /* Lower all buffer image instructions as above. Implied by lower_image. */
-   bool lower_buffer_image;
-
-   /* Lower image_atomic(_swap) for all dimensions. Implied by lower_image. */
-   bool lower_image_atomic;
-
-   /* Vulkan's robustBufferAccess feature is only concerned with buffers that
-    * are bound through descriptor sets, so shared memory is not included, but
-    * it may be useful to enable this for debugging.
-    */
-   bool lower_shared;
-} nir_lower_robust_access_options;
-
 bool nir_lower_robust_access(nir_shader *s,
-                             const nir_lower_robust_access_options *opts);
+                             nir_intrin_filter_cb filter, const void *data);
 
 /* clang-format off */
 typedef bool (*nir_should_vectorize_mem_func)(unsigned align_mul,
@@ -5987,7 +5977,7 @@ typedef bool (*nir_should_vectorize_mem_func)(unsigned align_mul,
                                               unsigned num_components,
                                               /* The hole between low and
                                                * high if they are not adjacent. */
-                                              unsigned hole_size,
+                                              int64_t hole_size,
                                               nir_intrinsic_instr *low,
                                               nir_intrinsic_instr *high,
                                               void *data);
@@ -6126,7 +6116,8 @@ nir_shader *nir_create_passthrough_gs(const nir_shader_compiler_options *options
                                       enum mesa_prim primitive_type,
                                       enum mesa_prim output_primitive_type,
                                       bool emulate_edgeflags,
-                                      bool force_line_strip_out);
+                                      bool force_line_strip_out,
+                                      bool passthrough_prim_id);
 
 bool nir_lower_fragcolor(nir_shader *shader, unsigned max_cbufs);
 bool nir_lower_fragcoord_wtrans(nir_shader *shader);
@@ -6705,7 +6696,7 @@ bool nir_lower_point_size(nir_shader *shader, float min, float max);
 void nir_lower_texcoord_replace(nir_shader *s, unsigned coord_replace,
                                 bool point_coord_is_sysval, bool yinvert);
 
-void nir_lower_texcoord_replace_late(nir_shader *s, unsigned coord_replace,
+bool nir_lower_texcoord_replace_late(nir_shader *s, unsigned coord_replace,
                                      bool point_coord_is_sysval);
 
 typedef enum {
@@ -6734,9 +6725,21 @@ bool nir_lower_memory_model(nir_shader *shader);
 bool nir_lower_goto_ifs(nir_shader *shader);
 bool nir_lower_continue_constructs(nir_shader *shader);
 
+typedef struct nir_lower_multiview_options {
+   uint32_t view_mask;
+
+   /**
+    * Bitfield of output locations that may be converted to a per-view array.
+    *
+    * If a variable exists in an allowed location, it will be converted to an
+    * array even if its value does not depend on the view index.
+    */
+   uint64_t allowed_per_view_outputs;
+} nir_lower_multiview_options;
+
 bool nir_shader_uses_view_index(nir_shader *shader);
-bool nir_can_lower_multiview(nir_shader *shader);
-bool nir_lower_multiview(nir_shader *shader, uint32_t view_mask);
+bool nir_can_lower_multiview(nir_shader *shader, nir_lower_multiview_options options);
+bool nir_lower_multiview(nir_shader *shader, nir_lower_multiview_options options);
 
 bool nir_lower_view_index_to_device_index(nir_shader *shader);
 
@@ -6807,10 +6810,12 @@ bool nir_lower_helper_writes(nir_shader *shader, bool lower_plain_stores);
 typedef struct nir_lower_printf_options {
    unsigned max_buffer_size;
    unsigned ptr_bit_size;
-   bool     use_printf_base_identifier;
+   bool use_printf_base_identifier;
+   bool hash_format_strings;
 } nir_lower_printf_options;
 
 bool nir_lower_printf(nir_shader *nir, const nir_lower_printf_options *options);
+bool nir_lower_printf_buffer(nir_shader *nir, uint64_t address, uint32_t size);
 
 /* This is here for unit tests. */
 bool nir_opt_comparison_pre_impl(nir_function_impl *impl);
@@ -6861,6 +6866,7 @@ bool nir_opt_deref(nir_shader *shader);
 
 bool nir_opt_find_array_copies(nir_shader *shader);
 
+bool nir_def_is_frag_coord_z(nir_def *def);
 bool nir_opt_fragdepth(nir_shader *shader);
 
 bool nir_opt_gcm(nir_shader *shader, bool value_number);
@@ -7098,7 +7104,7 @@ nir_opt_preamble(nir_shader *shader,
 
 nir_function_impl *nir_shader_get_preamble(nir_shader *shader);
 
-bool nir_lower_point_smooth(nir_shader *shader);
+bool nir_lower_point_smooth(nir_shader *shader, bool set_barycentrics);
 bool nir_lower_poly_line_smooth(nir_shader *shader, unsigned num_smooth_aa_sample);
 
 bool nir_mod_analysis(nir_scalar val, nir_alu_type val_type, unsigned div, unsigned *mod);

@@ -67,6 +67,13 @@ struct aco_ps_epilog_info {
    bool skip_null_export;
    unsigned broadcast_last_cbuf;
    enum compare_func alpha_func;
+   /* Depth/stencil/samplemask are always passed via VGPRs, and the epilog key can choose
+    * not to export them using these flags, which can be dynamic states.
+    */
+   bool kill_depth;
+   bool kill_stencil;
+   bool kill_samplemask;
+
    struct ac_arg alpha_reference;
    struct ac_arg depth;
    struct ac_arg stencil;
@@ -107,7 +114,7 @@ struct aco_shader_info {
    struct ac_arg epilog_pc; /* Vulkan only */
    struct {
       bool tcs_in_out_eq;
-      uint64_t tcs_temp_only_input_mask;
+      bool any_tcs_inputs_via_lds;
       bool has_prolog;
    } vs;
    struct {

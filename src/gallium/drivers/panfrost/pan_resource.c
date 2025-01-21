@@ -526,10 +526,6 @@ static bool
 panfrost_should_checksum(const struct panfrost_device *dev,
                          const struct panfrost_resource *pres)
 {
-   /* Checksumming is disabled by default due to fundamental unsoundness */
-   if (!(dev->debug & PAN_DBG_CRC))
-      return false;
-
    /* When checksumming is enabled, the tile data must fit in the
     * size of the writeback buffer, so don't checksum formats
     * that use too much space. */
@@ -540,7 +536,8 @@ panfrost_should_checksum(const struct panfrost_device *dev,
                               util_format_get_blocksize(pres->base.format);
 
    return pres->base.bind & PIPE_BIND_RENDER_TARGET && panfrost_is_2d(pres) &&
-          bytes_per_pixel <= bytes_per_pixel_max && pres->base.last_level == 0;
+          bytes_per_pixel <= bytes_per_pixel_max &&
+          pres->base.last_level == 0 && !(dev->debug & PAN_DBG_NO_CRC);
 }
 
 static void
@@ -588,10 +585,11 @@ panfrost_resource_setup(struct pipe_screen *screen,
    assert(valid);
 }
 
-static void
+static int
 panfrost_resource_init_afbc_headers(struct panfrost_resource *pres)
 {
-   panfrost_bo_mmap(pres->bo);
+   if (panfrost_bo_mmap(pres->bo))
+      return -1;
 
    unsigned nr_samples = MAX2(pres->base.nr_samples, 1);
 
@@ -612,6 +610,7 @@ panfrost_resource_init_afbc_headers(struct panfrost_resource *pres)
          }
       }
    }
+   return 0;
 }
 
 void
@@ -842,8 +841,12 @@ panfrost_resource_create_with_modifier(struct pipe_screen *screen,
       so->constant_stencil = true;
    }
 
-   if (drm_is_afbc(so->image.layout.modifier))
-      panfrost_resource_init_afbc_headers(so);
+   if (drm_is_afbc(so->image.layout.modifier)) {
+      if (panfrost_resource_init_afbc_headers(so)) {
+         FREE(so);
+         return NULL;
+      }
+   }
 
    panfrost_resource_set_damage_region(screen, &so->base, 0, NULL);
 
@@ -1111,16 +1114,19 @@ pan_dump_resource(struct panfrost_context *ctx, struct panfrost_resource *rsc)
 
    panfrost_flush_writer(ctx, linear, "dump image");
    panfrost_bo_wait(linear->bo, INT64_MAX, false);
-   panfrost_bo_mmap(linear->bo);
 
-   static unsigned frame_count = 0;
-   frame_count++;
-   snprintf(buffer, sizeof(buffer), "dump_image.%04d", frame_count);
+   if (!panfrost_bo_mmap(linear->bo)) {
+      static unsigned frame_count = 0;
+      frame_count++;
+      snprintf(buffer, sizeof(buffer), "dump_image.%04d", frame_count);
 
-   debug_dump_image(buffer, rsc->base.format, 0 /* UNUSED */, rsc->base.width0,
-                    rsc->base.height0,
-                    linear->image.layout.slices[0].row_stride,
-                    linear->bo->ptr.cpu);
+      debug_dump_image(buffer, rsc->base.format, 0 /* UNUSED */, rsc->base.width0,
+                     rsc->base.height0,
+                     linear->image.layout.slices[0].row_stride,
+                     linear->bo->ptr.cpu);
+   } else {
+      mesa_loge("failed to mmap, not dumping resource");
+   }
 
    if (plinear)
       pipe_resource_reference(&plinear, NULL);
@@ -1246,14 +1252,17 @@ panfrost_ptr_map(struct pipe_context *pctx, struct pipe_resource *resource,
          panfrost_bo_wait(staging->bo, INT64_MAX, false);
       }
 
-      panfrost_bo_mmap(staging->bo);
+      if (panfrost_bo_mmap(staging->bo))
+         return NULL;
+
       return staging->bo->ptr.cpu;
    }
 
    bool already_mapped = bo->ptr.cpu != NULL;
 
    /* If we haven't already mmaped, now's the time */
-   panfrost_bo_mmap(bo);
+   if (panfrost_bo_mmap(bo))
+      return NULL;
 
    if (dev->debug & (PAN_DBG_TRACE | PAN_DBG_SYNC)) {
       pandecode_inject_mmap(dev->decode_ctx, bo->ptr.gpu, bo->ptr.cpu,
@@ -1340,8 +1349,10 @@ panfrost_ptr_map(struct pipe_context *pctx, struct pipe_resource *resource,
             rsrc->bo = newbo;
             rsrc->image.data.base = newbo->ptr.gpu;
 
-            if (!copy_resource && drm_is_afbc(rsrc->image.layout.modifier))
-               panfrost_resource_init_afbc_headers(rsrc);
+            if (!copy_resource && drm_is_afbc(rsrc->image.layout.modifier)) {
+               if (panfrost_resource_init_afbc_headers(rsrc))
+                  return NULL;
+            }
 
             bo = newbo;
          } else {
@@ -1470,6 +1481,7 @@ pan_resource_modifier_convert(struct panfrost_context *ctx,
     * be able to convert back to another modifier if needed */
    rsrc->modifier_constant = false;
    pipe_resource_reference(&tmp_prsrc, NULL);
+   perf_debug(ctx, "resource_modifier_convert required due to: %s", reason);
 }
 
 /* Validate that an AFBC/AFRC resource may be used as a particular format. If it
@@ -1673,9 +1685,10 @@ panfrost_pack_afbc(struct panfrost_context *ctx,
    unsigned old_size = panfrost_bo_size(prsrc->bo);
    unsigned ratio = 100 * new_size / old_size;
 
-   if (ratio > screen->max_afbc_packing_ratio)
+   if (ratio > screen->max_afbc_packing_ratio) {
+      panfrost_bo_unreference(metadata_bo);
       return;
-
+   }
    perf_debug(ctx, "%i%%: %i KB -> %i KB\n", ratio, old_size / 1024,
               new_size / 1024);
 
@@ -1828,6 +1841,11 @@ panfrost_invalidate_resource(struct pipe_context *pctx,
    struct panfrost_context *ctx = pan_context(pctx);
    struct panfrost_batch *batch = panfrost_get_batch_for_fbo(ctx);
    struct panfrost_resource *rsrc = pan_resource(prsrc);
+
+   if (!batch) {
+      mesa_loge("panfrost_invalidate_resource failed");
+      return;
+   }
 
    rsrc->constant_stencil = true;
 

@@ -155,14 +155,13 @@ init_pipe_state(struct vl_compositor *c)
    sampler.mag_img_filter = PIPE_TEX_FILTER_LINEAR;
    sampler.compare_mode = PIPE_TEX_COMPARE_NONE;
    sampler.compare_func = PIPE_FUNC_ALWAYS;
+   c->sampler_linear = c->pipe->create_sampler_state(c->pipe, &sampler);
+
+   sampler.min_img_filter = PIPE_TEX_FILTER_NEAREST;
+   sampler.mag_img_filter = PIPE_TEX_FILTER_NEAREST;
+   c->sampler_nearest = c->pipe->create_sampler_state(c->pipe, &sampler);
 
    if (c->pipe_gfx_supported) {
-           c->sampler_linear = c->pipe->create_sampler_state(c->pipe, &sampler);
-
-           sampler.min_img_filter = PIPE_TEX_FILTER_NEAREST;
-           sampler.mag_img_filter = PIPE_TEX_FILTER_NEAREST;
-           c->sampler_nearest = c->pipe->create_sampler_state(c->pipe, &sampler);
-
            memset(&blend, 0, sizeof blend);
            blend.independent_blend_enable = 0;
            blend.rt[0].blend_enable = 0;
@@ -689,7 +688,10 @@ vl_compositor_set_rgba_layer(struct vl_compositor_state *s,
       return;
 
    s->used_layers |= 1 << layer;
-   s->layers[layer].fs = c->fs_rgba;
+   if (c->fs_rgba)
+      s->layers[layer].fs = c->fs_rgba;
+   else if (c->cs_rgba)
+      s->layers[layer].cs = c->cs_rgba;
    s->layers[layer].samplers[0] = c->sampler_linear;
    s->layers[layer].samplers[1] = NULL;
    s->layers[layer].samplers[2] = NULL;
@@ -817,17 +819,14 @@ vl_compositor_render(struct vl_compositor_state *s,
 }
 
 bool
-vl_compositor_init(struct vl_compositor *c, struct pipe_context *pipe)
+vl_compositor_init(struct vl_compositor *c, struct pipe_context *pipe, bool compute_only)
 {
    assert(c);
 
    memset(c, 0, sizeof(*c));
 
-   c->pipe_cs_composit_supported = pipe->screen->get_param(pipe->screen, PIPE_CAP_PREFER_COMPUTE_FOR_MULTIMEDIA) &&
-            pipe->screen->get_param(pipe->screen, PIPE_CAP_TGSI_TEX_TXF_LZ) &&
-            pipe->screen->get_param(pipe->screen, PIPE_CAP_TGSI_DIV);
-
-   c->pipe_gfx_supported = pipe->screen->get_param(pipe->screen, PIPE_CAP_GRAPHICS);
+   c->pipe_cs_composit_supported = compute_only || pipe->screen->caps.prefer_compute_for_multimedia;
+   c->pipe_gfx_supported = !compute_only && pipe->screen->caps.graphics;
    c->pipe = pipe;
 
    c->deinterlace = VL_COMPOSITOR_NONE;

@@ -1364,6 +1364,7 @@ print_intrinsic_instr(nir_intrinsic_instr *instr, print_state *state)
          case nir_intrinsic_load_per_vertex_input:
          case nir_intrinsic_load_input_vertex:
          case nir_intrinsic_load_coefficients_agx:
+         case nir_intrinsic_load_attribute_pan:
             mode = nir_var_shader_in;
             break;
 
@@ -1371,6 +1372,7 @@ print_intrinsic_instr(nir_intrinsic_instr *instr, print_state *state)
          case nir_intrinsic_store_output:
          case nir_intrinsic_store_per_primitive_output:
          case nir_intrinsic_store_per_vertex_output:
+         case nir_intrinsic_store_per_view_output:
             mode = nir_var_shader_out;
             break;
 
@@ -1423,7 +1425,8 @@ print_intrinsic_instr(nir_intrinsic_instr *instr, print_state *state)
              state->shader->info.stage == MESA_SHADER_GEOMETRY &&
              (instr->intrinsic == nir_intrinsic_store_output ||
               instr->intrinsic == nir_intrinsic_store_per_primitive_output ||
-              instr->intrinsic == nir_intrinsic_store_per_vertex_output)) {
+              instr->intrinsic == nir_intrinsic_store_per_vertex_output ||
+              instr->intrinsic == nir_intrinsic_store_per_view_output)) {
             unsigned gs_streams = io.gs_streams;
             fprintf(fp, " gs_streams(");
             for (unsigned i = 0; i < 4; i++) {
@@ -1651,6 +1654,7 @@ print_intrinsic_instr(nir_intrinsic_instr *instr, print_state *state)
    case nir_intrinsic_load_output:
    case nir_intrinsic_store_output:
    case nir_intrinsic_store_per_vertex_output:
+   case nir_intrinsic_store_per_view_output:
       var_mode = nir_var_shader_out;
       break;
    default:
@@ -2127,9 +2131,7 @@ print_block_preds(nir_block *block, print_state *state)
    FILE *fp = state->fp;
    nir_block **preds = nir_block_get_predecessors_sorted(block, NULL);
    for (unsigned i = 0; i < block->predecessors->entries; i++) {
-      if (i != 0)
-         fprintf(fp, " ");
-      fprintf(fp, "b%u", preds[i]->index);
+      fprintf(fp, " b%u", preds[i]->index);
    }
    ralloc_free(preds);
 }
@@ -2140,7 +2142,7 @@ print_block_succs(nir_block *block, print_state *state)
    FILE *fp = state->fp;
    for (unsigned i = 0; i < 2; i++) {
       if (block->successors[i]) {
-         fprintf(fp, "b%u ", block->successors[i]->index);
+         fprintf(fp, " b%u", block->successors[i]->index);
       }
    }
 }
@@ -2162,9 +2164,9 @@ print_block(nir_block *block, print_state *state, unsigned tabs)
 
    const bool empty_block = exec_list_is_empty(&block->instr_list);
    if (empty_block) {
-      fprintf(fp, "  // preds: ");
+      fprintf(fp, "  // preds:");
       print_block_preds(block, state);
-      fprintf(fp, ", succs: ");
+      fprintf(fp, ", succs:");
       print_block_succs(block, state);
       fprintf(fp, "\n");
       return;
@@ -2173,7 +2175,7 @@ print_block(nir_block *block, print_state *state, unsigned tabs)
    const unsigned block_length = 7 + count_digits(block->index) + 1;
    const unsigned pred_padding = block_length < state->padding_for_no_dest ? state->padding_for_no_dest - block_length : 0;
 
-   fprintf(fp, "%*s// preds: ", pred_padding, "");
+   fprintf(fp, "%*s// preds:", pred_padding, "");
    print_block_preds(block, state);
    fprintf(fp, "\n");
 
@@ -2184,7 +2186,7 @@ print_block(nir_block *block, print_state *state, unsigned tabs)
    }
 
    print_indentation(tabs, fp);
-   fprintf(fp, "%*s// succs: ", state->padding_for_no_dest, "");
+   fprintf(fp, "%*s// succs:", state->padding_for_no_dest, "");
    print_block_succs(block, state);
    fprintf(fp, "\n");
 }
@@ -2509,9 +2511,11 @@ print_shader_info(const struct shader_info *info, FILE *fp)
 {
    fprintf(fp, "shader: %s\n", gl_shader_stage_name(info->stage));
 
-   fprintf(fp, "source_blake3: {");
-   _mesa_blake3_print(fp, info->source_blake3);
-   fprintf(fp, "}\n");
+   if (memcmp(info->source_blake3, &(blake3_hash){0}, sizeof(info->source_blake3))) {
+      fprintf(fp, "source_blake3: {");
+      _mesa_blake3_print(fp, info->source_blake3);
+      fprintf(fp, "}\n");
+   }
 
    if (info->name)
       fprintf(fp, "name: %s\n", info->name);
@@ -2519,7 +2523,7 @@ print_shader_info(const struct shader_info *info, FILE *fp)
    if (info->label)
       fprintf(fp, "label: %s\n", info->label);
 
-   fprintf(fp, "internal: %s\n", info->internal ? "true" : "false");
+   print_nz_bool(fp, "internal", info->internal);
 
    if (gl_shader_stage_uses_workgroup(info->stage)) {
       fprintf(fp, "workgroup_size: %u, %u, %u%s\n",
@@ -2529,9 +2533,8 @@ print_shader_info(const struct shader_info *info, FILE *fp)
               info->workgroup_size_variable ? " (variable)" : "");
    }
 
-   fprintf(fp, "stage: %d\n"
-               "next_stage: %d\n",
-           info->stage, info->next_stage);
+   if (info->next_stage != MESA_SHADER_NONE)
+      fprintf(fp, "next_stage: %s\n", gl_shader_stage_name(info->next_stage));
 
    print_nz_unsigned(fp, "num_textures", info->num_textures);
    print_nz_unsigned(fp, "num_ubos", info->num_ubos);
@@ -2701,7 +2704,7 @@ print_shader_info(const struct shader_info *info, FILE *fp)
                  info->cs.workgroup_size_hint[1],
                  info->cs.workgroup_size_hint[2]);
       print_nz_unsigned(fp, "user_data_components_amd", info->cs.user_data_components_amd);
-      fprintf(fp, "ptr_size: %u\n", info->cs.ptr_size);
+      print_nz_unsigned(fp, "ptr_size", info->cs.ptr_size);
       break;
 
    case MESA_SHADER_MESH:
@@ -2730,9 +2733,9 @@ _nir_print_shader_annotated(nir_shader *shader, FILE *fp,
 
    print_shader_info(&shader->info, fp);
 
-   fprintf(fp, "inputs: %u\n", shader->num_inputs);
-   fprintf(fp, "outputs: %u\n", shader->num_outputs);
-   fprintf(fp, "uniforms: %u\n", shader->num_uniforms);
+   print_nz_unsigned(fp, "inputs", shader->num_inputs);
+   print_nz_unsigned(fp, "outputs", shader->num_outputs);
+   print_nz_unsigned(fp, "uniforms", shader->num_uniforms);
    if (shader->scratch_size)
       fprintf(fp, "scratch: %u\n", shader->scratch_size);
    if (shader->constant_data_size)

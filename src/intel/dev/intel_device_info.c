@@ -31,6 +31,7 @@
 #include "util/libdrm.h"
 
 #include "intel_device_info.h"
+#include "intel_hwconfig.h"
 #include "intel_wa.h"
 #include "i915/intel_device_info.h"
 #include "xe/intel_device_info.h"
@@ -1969,6 +1970,8 @@ intel_get_device_info_from_fd(int fd, struct intel_device_info *devinfo, int min
    intel_device_info_init_was(devinfo);
    intel_device_info_apply_workarounds(devinfo);
 
+   intel_check_hwconfig_items(fd, devinfo);
+
    return true;
 }
 
@@ -2056,7 +2059,9 @@ intel_device_info_get_max_slm_size(const struct intel_device_info *devinfo)
 {
    uint32_t bytes = 0;
 
-   if (devinfo->verx10 >= 200) {
+   if (devinfo->verx10 >= 300) {
+      bytes = 128 * 1024;
+   } else if (devinfo->verx10 >= 200) {
       bytes = intel_device_info_get_max_preferred_slm_size(devinfo);
    } else {
       bytes = 64 * 1024;
@@ -2070,7 +2075,9 @@ intel_device_info_get_max_preferred_slm_size(const struct intel_device_info *dev
 {
    uint32_t k_bytes = 0;
 
-   if (devinfo->verx10 >= 200) {
+   if (devinfo->verx10 >= 300) {
+      k_bytes = 192;
+   } else if (devinfo->verx10 >= 200) {
       if (intel_needs_workaround(devinfo, 16018610683))
          k_bytes = 128;
       else

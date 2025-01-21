@@ -86,7 +86,15 @@ radv_recompute_fs_input_bases_callback(UNUSED nir_builder *b, nir_intrinsic_inst
    if (location_bit & s->always_per_vertex) {
       new_base = util_bitcount64(s->always_per_vertex & location_mask);
    } else if (location_bit & s->potentially_per_primitive) {
-      new_base = s->num_always_per_vertex + util_bitcount64(s->potentially_per_primitive & location_mask);
+      new_base = s->num_always_per_vertex;
+
+      switch (location_bit) {
+      case VARYING_BIT_VIEWPORT:
+         break;
+      case VARYING_BIT_PRIMITIVE_ID:
+         new_base += !!(s->potentially_per_primitive & VARYING_BIT_VIEWPORT);
+         break;
+      }
    } else if (location_bit & s->always_per_primitive) {
       new_base = s->num_always_per_vertex + s->num_potentially_per_primitive +
                  util_bitcount64(s->always_per_primitive & location_mask);
@@ -105,14 +113,13 @@ radv_recompute_fs_input_bases_callback(UNUSED nir_builder *b, nir_intrinsic_inst
 bool
 radv_recompute_fs_input_bases(nir_shader *nir)
 {
-   const uint64_t always_per_vertex = nir->info.inputs_read & ~nir->info.per_primitive_inputs &
-                                      ~(VARYING_BIT_PRIMITIVE_ID | VARYING_BIT_LAYER | VARYING_BIT_VIEWPORT);
+   const uint64_t always_per_vertex =
+      nir->info.inputs_read & ~nir->info.per_primitive_inputs & ~(VARYING_BIT_PRIMITIVE_ID | VARYING_BIT_VIEWPORT);
 
-   const uint64_t potentially_per_primitive =
-      nir->info.inputs_read & (VARYING_BIT_PRIMITIVE_ID | VARYING_BIT_LAYER | VARYING_BIT_VIEWPORT);
+   const uint64_t potentially_per_primitive = nir->info.inputs_read & (VARYING_BIT_PRIMITIVE_ID | VARYING_BIT_VIEWPORT);
 
-   const uint64_t always_per_primitive = nir->info.inputs_read & nir->info.per_primitive_inputs &
-                                         ~(VARYING_BIT_PRIMITIVE_ID | VARYING_BIT_LAYER | VARYING_BIT_VIEWPORT);
+   const uint64_t always_per_primitive =
+      nir->info.inputs_read & nir->info.per_primitive_inputs & ~(VARYING_BIT_PRIMITIVE_ID | VARYING_BIT_VIEWPORT);
 
    radv_recompute_fs_input_bases_state s = {
       .always_per_vertex = always_per_vertex,
@@ -155,6 +162,9 @@ radv_nir_lower_io(struct radv_device *device, nir_shader *nir)
    }
 
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
+      /* Lower explicit input load intrinsics to sysvals for the layer ID. */
+      NIR_PASS(_, nir, nir_lower_system_values);
+
       /* Recompute FS input intrinsic bases to assign a location to each FS input.
        * The computed base will match the index of each input in SPI_PS_INPUT_CNTL_n.
        */
@@ -207,16 +217,17 @@ radv_nir_lower_io_to_mem(struct radv_device *device, struct radv_shader_stage *s
 
    if (nir->info.stage == MESA_SHADER_VERTEX) {
       if (info->vs.as_ls) {
-         NIR_PASS_V(nir, ac_nir_lower_ls_outputs_to_mem, map_output, info->vs.tcs_in_out_eq,
-                    info->vs.hs_inputs_read, info->vs.tcs_temp_only_input_mask);
+         NIR_PASS_V(nir, ac_nir_lower_ls_outputs_to_mem, map_output, pdev->info.gfx_level, info->vs.tcs_in_out_eq,
+                    info->vs.tcs_inputs_via_temp, info->vs.tcs_inputs_via_lds);
          return true;
       } else if (info->vs.as_es) {
          NIR_PASS_V(nir, ac_nir_lower_es_outputs_to_mem, map_output, pdev->info.gfx_level, info->esgs_itemsize, info->gs_inputs_read);
          return true;
       }
    } else if (nir->info.stage == MESA_SHADER_TESS_CTRL) {
-      NIR_PASS_V(nir, ac_nir_lower_hs_inputs_to_mem, map_input, info->vs.tcs_in_out_eq, info->vs.tcs_temp_only_input_mask);
-      NIR_PASS_V(nir, ac_nir_lower_hs_outputs_to_mem, map_output, pdev->info.gfx_level,
+      NIR_PASS_V(nir, ac_nir_lower_hs_inputs_to_mem, map_input, pdev->info.gfx_level, info->vs.tcs_in_out_eq,
+                 info->vs.tcs_inputs_via_temp, info->vs.tcs_inputs_via_lds);
+      NIR_PASS_V(nir, ac_nir_lower_hs_outputs_to_mem, &info->tcs.info, map_output, pdev->info.gfx_level,
                  info->tcs.tes_inputs_read, info->tcs.tes_patch_inputs_read, info->wave_size);
 
       return true;

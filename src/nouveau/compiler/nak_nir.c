@@ -799,7 +799,7 @@ nak_nir_remove_barriers(nir_shader *nir)
 static bool
 nak_mem_vectorize_cb(unsigned align_mul, unsigned align_offset,
                      unsigned bit_size, unsigned num_components,
-                     unsigned hole_size, nir_intrinsic_instr *low,
+                     int64_t hole_size, nir_intrinsic_instr *low,
                      nir_intrinsic_instr *high, void *cb_data)
 {
    /*
@@ -808,7 +808,7 @@ nak_mem_vectorize_cb(unsigned align_mul, unsigned align_offset,
     */
    assert(util_is_power_of_two_nonzero(align_mul));
 
-   if (hole_size)
+   if (hole_size > 0)
       return false;
 
    unsigned max_bytes = 128u / 8u;
@@ -1045,10 +1045,13 @@ nak_postprocess_nir(nir_shader *nir,
    if (nak->sm < 70)
       OPT(nir, nak_nir_split_64bit_conversions);
 
-   nir_convert_to_lcssa(nir, true, true);
+   bool lcssa_progress = nir_convert_to_lcssa(nir, false, false);
    nir_divergence_analysis(nir);
 
    if (nak->sm >= 75) {
+      if (lcssa_progress) {
+         OPT(nir, nak_nir_mark_lcssa_invariants);
+      }
       if (OPT(nir, nak_nir_lower_non_uniform_ldcx)) {
          OPT(nir, nir_copy_prop);
          OPT(nir, nir_opt_dce);

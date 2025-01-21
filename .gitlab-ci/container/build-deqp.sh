@@ -22,7 +22,7 @@ uncollapsed_section_start deqp-$deqp_api "Building dEQP $DEQP_API"
 # - the GL release produces `glcts`, and
 # - the GLES release produces `deqp-gles*` and `deqp-egl`
 
-DEQP_MAIN_COMMIT=e9a562cfdc4d05044e8465525a79e97016b7b324
+DEQP_MAIN_COMMIT=a9f7069b9a5ba94715a175cb1818ed504add0107
 DEQP_VK_VERSION=1.3.10.0
 DEQP_GL_VERSION=4.6.5.0
 DEQP_GLES_VERSION=3.2.11.0
@@ -37,6 +37,9 @@ DEQP_GLES_VERSION=3.2.11.0
 main_cts_commits_to_backport=(
     # If you find yourself wanting to add something in here, consider whether
     # bumping DEQP_MAIN_COMMIT is not a better solution :)
+
+    # Build testlog-* and other tools also on Android
+    0fcd87248f83a2174e5c938cb105dc2da03f3683
 )
 
 # shellcheck disable=SC2034
@@ -55,6 +58,11 @@ vk_cts_patch_files=(
 
 # shellcheck disable=SC2034
 gl_cts_commits_to_backport=(
+  # Add #include <cmath> in deMath.h when being compiled by C++
+  71808fe7d0a640dfd703e845d93ba1c5ab751055
+  # Revert "Add #include <cmath> in deMath.h when being compiled by C++ compiler"
+  # This also adds an alternative fix along with the revert.
+  6164879a0acce258637d261592a9c395e564b361
 )
 
 # shellcheck disable=SC2034
@@ -71,6 +79,11 @@ fi
 # shellcheck disable=SC2034
 # GLES builds also EGL
 gles_cts_commits_to_backport=(
+  # Add #include <cmath> in deMath.h when being compiled by C++
+  71808fe7d0a640dfd703e845d93ba1c5ab751055
+  # Revert "Add #include <cmath> in deMath.h when being compiled by C++ compiler"
+  # This also adds an alternative fix along with the revert.
+  6164879a0acce258637d261592a9c395e564b361
 )
 
 # shellcheck disable=SC2034
@@ -133,14 +146,14 @@ do
   PATCH_URL="https://github.com/KhronosGroup/VK-GL-CTS/commit/$commit.patch"
   echo "Apply patch to ${DEQP_API} CTS from $PATCH_URL"
   curl -L --retry 4 -f --retry-all-errors --retry-delay 60 $PATCH_URL | \
-    GIT_COMMITTER_DATE=$(date -d@0) git am -
+    GIT_COMMITTER_DATE=$(LC_TIME=C date -d@0) git am -
 done
 
 cts_patch_files="${prefix}_cts_patch_files[@]"
 for patch in "${!cts_patch_files}"
 do
   echo "Apply patch to ${DEQP_API} CTS from $patch"
-  GIT_COMMITTER_DATE=$(date -d@0) git am < $OLDPWD/.gitlab-ci/container/patches/$patch
+  GIT_COMMITTER_DATE=$(LC_TIME=C date -d@0) git am < $OLDPWD/.gitlab-ci/container/patches/$patch
 done
 
 {
@@ -154,7 +167,7 @@ done
     echo "The following local patches are applied on top:"
     git log --reverse --oneline "$DEQP_COMMIT".. --format='- %s'
   fi
-} > /deqp-$deqp_api/version
+} > /deqp-$deqp_api/deqp-$deqp_api-version
 
 # --insecure is due to SSL cert failures hitting sourceforge for zlib and
 # libpng (sigh).  The archives get their checksums checked anyway, and git
@@ -231,7 +244,7 @@ esac
 
 ninja "${deqp_build_targets[@]}"
 
-if [ "${DEQP_TARGET}" != 'android' ] && [ "$DEQP_API" != tools ]; then
+if [ "$DEQP_API" != tools ]; then
     # Copy out the mustpass lists we want.
     mkdir -p mustpass
 

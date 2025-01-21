@@ -1129,7 +1129,7 @@ static bool
 elk_nir_should_vectorize_mem(unsigned align_mul, unsigned align_offset,
                              unsigned bit_size,
                              unsigned num_components,
-                             unsigned hole_size,
+                             int64_t hole_size,
                              nir_intrinsic_instr *low,
                              nir_intrinsic_instr *high,
                              void *data)
@@ -1138,7 +1138,7 @@ elk_nir_should_vectorize_mem(unsigned align_mul, unsigned align_offset,
     * those back into 32-bit ones anyway and UBO loads aren't split in NIR so
     * we don't want to make a mess for the back-end.
     */
-   if (bit_size > 32 || hole_size || !nir_num_components_valid(num_components))
+   if (bit_size > 32 || hole_size > 0 || !nir_num_components_valid(num_components))
       return false;
 
    if (low->intrinsic == nir_intrinsic_load_ubo_uniform_block_intel ||
@@ -1899,7 +1899,7 @@ elk_nir_get_var_type(const struct nir_shader *nir, nir_variable *var)
    const struct glsl_type *type = var->interface_type;
    if (!type) {
       type = var->type;
-      if (nir_is_arrayed_io(var, nir->info.stage) || var->data.per_view) {
+      if (nir_is_arrayed_io(var, nir->info.stage)) {
          assert(glsl_type_is_array(type));
          type = glsl_get_array_element(type);
       }

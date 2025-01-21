@@ -21,7 +21,7 @@ struct panvk_cmd_compute_state {
    struct panvk_descriptor_state desc_state;
    const struct panvk_shader *shader;
    struct panvk_compute_sysvals sysvals;
-   mali_ptr push_uniforms;
+   uint64_t push_uniforms;
    struct {
       struct panvk_shader_desc_state desc;
    } cs;
@@ -41,7 +41,37 @@ struct panvk_cmd_compute_state {
 #define clear_dirty_after_dispatch(__cmdbuf)                                   \
    do {                                                                        \
       compute_state_clear_all_dirty(__cmdbuf);                                 \
-      desc_state_clear_all_dirty(&(__cmdbuf)->state.compute.desc_state);       \
    } while (0)
+
+#define set_compute_sysval(__cmdbuf, __dirty, __name, __val)                   \
+   do {                                                                        \
+      struct panvk_compute_sysvals __new_sysval;                               \
+      __new_sysval.__name = (__val);                                           \
+      if (memcmp(&(__cmdbuf)->state.compute.sysvals.__name,                    \
+                 &__new_sysval.__name, sizeof(__new_sysval.__name))) {         \
+         (__cmdbuf)->state.compute.sysvals.__name = __new_sysval.__name;       \
+         BITSET_SET_RANGE(__dirty, sysval_fau_start(compute, __name),          \
+                          sysval_fau_start(compute, __name));                  \
+      }                                                                        \
+   } while (0)
+
+struct panvk_dispatch_info {
+   struct {
+      uint32_t x, y, z;
+   } wg_base;
+
+   struct {
+      struct {
+         uint32_t x, y, z;
+      } wg_count;
+   } direct;
+
+   struct {
+      uint64_t buffer_dev_addr;
+   } indirect;
+};
+
+void panvk_per_arch(cmd_prepare_dispatch_sysvals)(
+   struct panvk_cmd_buffer *cmdbuf, const struct panvk_dispatch_info *info);
 
 #endif

@@ -2283,6 +2283,8 @@ nir_intrinsic_from_system_value(gl_system_value val)
       return nir_intrinsic_load_line_coord;
    case SYSTEM_VALUE_FRONT_FACE:
       return nir_intrinsic_load_front_face;
+   case SYSTEM_VALUE_FRONT_FACE_FSIGN:
+      return nir_intrinsic_load_front_face_fsign;
    case SYSTEM_VALUE_SAMPLE_ID:
       return nir_intrinsic_load_sample_id;
    case SYSTEM_VALUE_SAMPLE_POS:
@@ -2414,7 +2416,7 @@ nir_intrinsic_from_system_value(gl_system_value val)
    case SYSTEM_VALUE_SM_ID_NV:
       return nir_intrinsic_load_sm_id_nv;
    default:
-      unreachable("system value does not directly correspond to intrinsic");
+      return nir_num_intrinsics;
    }
 }
 
@@ -2450,6 +2452,8 @@ nir_system_value_from_intrinsic(nir_intrinsic_op intrin)
       return SYSTEM_VALUE_LINE_COORD;
    case nir_intrinsic_load_front_face:
       return SYSTEM_VALUE_FRONT_FACE;
+   case nir_intrinsic_load_front_face_fsign:
+      return SYSTEM_VALUE_FRONT_FACE_FSIGN;
    case nir_intrinsic_load_sample_id:
       return SYSTEM_VALUE_SAMPLE_ID;
    case nir_intrinsic_load_sample_pos:
@@ -2705,6 +2709,42 @@ nir_image_intrinsic_coord_components(const nir_intrinsic_instr *instr)
       return coords;
    else
       return coords + nir_intrinsic_image_array(instr);
+}
+
+bool
+nir_intrinsic_can_reorder(nir_intrinsic_instr *instr)
+{
+   if (nir_intrinsic_has_access(instr)) {
+      enum gl_access_qualifier access = nir_intrinsic_access(instr);
+      if (access & ACCESS_VOLATILE)
+         return false;
+      if (access & ACCESS_CAN_REORDER)
+         return true;
+   }
+
+   const nir_intrinsic_info *info;
+   if (instr->intrinsic == nir_intrinsic_load_deref) {
+      nir_deref_instr *deref = nir_src_as_deref(instr->src[0]);
+      if (nir_deref_mode_is_in_set(deref, nir_var_system_value)) {
+         nir_variable *var = nir_deref_instr_get_variable(deref);
+         if (!var)
+            return false;
+
+         nir_intrinsic_op sysval_op =
+            nir_intrinsic_from_system_value((gl_system_value)var->data.location);
+         if (sysval_op == nir_num_intrinsics)
+            return true;
+
+         info = &nir_intrinsic_infos[sysval_op];
+      } else {
+         return nir_deref_mode_is_in_set(deref, nir_var_read_only_modes);
+      }
+   } else {
+      info = &nir_intrinsic_infos[instr->intrinsic];
+   }
+
+   return (info->flags & NIR_INTRINSIC_CAN_ELIMINATE) &&
+          (info->flags & NIR_INTRINSIC_CAN_REORDER);
 }
 
 nir_src *
@@ -3453,11 +3493,18 @@ nir_slot_is_sysval_output(gl_varying_slot slot, gl_shader_stage next_shader)
 /**
  * Whether an input/output slot is consumed by the next shader stage,
  * or written by the previous shader stage.
+ *
+ * Pass MESA_SHADER_NONE if the next shader is unknown.
  */
 bool
-nir_slot_is_varying(gl_varying_slot slot)
+nir_slot_is_varying(gl_varying_slot slot, gl_shader_stage next_shader)
 {
+   bool unknown = next_shader == MESA_SHADER_NONE;
+   bool exactly_before_fs = next_shader == MESA_SHADER_FRAGMENT || unknown;
+   bool at_most_before_gs = next_shader <= MESA_SHADER_GEOMETRY || unknown;
+
    return slot >= VARYING_SLOT_VAR0 ||
+          (slot == VARYING_SLOT_POS && at_most_before_gs) ||
           slot == VARYING_SLOT_COL0 ||
           slot == VARYING_SLOT_COL1 ||
           slot == VARYING_SLOT_BFC0 ||
@@ -3465,6 +3512,7 @@ nir_slot_is_varying(gl_varying_slot slot)
           slot == VARYING_SLOT_FOGC ||
           (slot >= VARYING_SLOT_TEX0 && slot <= VARYING_SLOT_TEX7) ||
           slot == VARYING_SLOT_PNTC ||
+          (slot == VARYING_SLOT_CLIP_VERTEX && at_most_before_gs) ||
           slot == VARYING_SLOT_CLIP_DIST0 ||
           slot == VARYING_SLOT_CLIP_DIST1 ||
           slot == VARYING_SLOT_CULL_DIST0 ||
@@ -3473,7 +3521,8 @@ nir_slot_is_varying(gl_varying_slot slot)
           slot == VARYING_SLOT_LAYER ||
           slot == VARYING_SLOT_VIEWPORT ||
           slot == VARYING_SLOT_TESS_LEVEL_OUTER ||
-          slot == VARYING_SLOT_TESS_LEVEL_INNER;
+          slot == VARYING_SLOT_TESS_LEVEL_INNER ||
+          (slot == VARYING_SLOT_VIEW_INDEX && exactly_before_fs);
 }
 
 bool
@@ -3481,7 +3530,7 @@ nir_slot_is_sysval_output_and_varying(gl_varying_slot slot,
                                       gl_shader_stage next_shader)
 {
    return nir_slot_is_sysval_output(slot, next_shader) &&
-          nir_slot_is_varying(slot);
+          nir_slot_is_varying(slot, next_shader);
 }
 
 /**
@@ -3511,11 +3560,11 @@ nir_remove_varying(nir_intrinsic_instr *intr, gl_shader_stage next_shader)
  * logic. If the instruction has no other use, it's removed.
  */
 bool
-nir_remove_sysval_output(nir_intrinsic_instr *intr)
+nir_remove_sysval_output(nir_intrinsic_instr *intr, gl_shader_stage next_shader)
 {
    nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
 
-   if ((!sem.no_varying && nir_slot_is_varying(sem.location)) ||
+   if ((!sem.no_varying && nir_slot_is_varying(sem.location, next_shader)) ||
        nir_instr_xfb_write_mask(intr)) {
       /* Demote the store instruction. */
       sem.no_sysval_output = true;

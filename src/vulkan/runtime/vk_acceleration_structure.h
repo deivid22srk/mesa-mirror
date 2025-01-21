@@ -28,9 +28,21 @@
 #include "vk_object.h"
 #include "radix_sort/radix_sort_vk.h"
 
+#include "bvh/vk_bvh.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+enum vk_acceleration_structure_build_step {
+   VK_ACCELERATION_STRUCTURE_BUILD_STEP_TOP,
+   VK_ACCELERATION_STRUCTURE_BUILD_STEP_BUILD_LEAVES,
+   VK_ACCELERATION_STRUCTURE_BUILD_STEP_MORTON_GENERATE,
+   VK_ACCELERATION_STRUCTURE_BUILD_STEP_MORTON_SORT,
+   VK_ACCELERATION_STRUCTURE_BUILD_STEP_LBVH_BUILD_INTERNAL,
+   VK_ACCELERATION_STRUCTURE_BUILD_STEP_PLOC_BUILD_INTERNAL,
+   VK_ACCELERATION_STRUCTURE_BUILD_STEP_ENCODE,
+};
 
 struct vk_acceleration_structure {
    struct vk_object_base base;
@@ -49,6 +61,10 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(vk_acceleration_structure, base, VkAccelerationSt
 #define MAX_UPDATE_PASSES 2
 
 struct vk_acceleration_structure_build_ops {
+   void (*begin_debug_marker)(VkCommandBuffer commandBuffer,
+                              enum vk_acceleration_structure_build_step step,
+                              const char *format, ...);
+   void (*end_debug_marker)(VkCommandBuffer commandBuffer);
    VkDeviceSize (*get_as_size)(VkDevice device,
                                const VkAccelerationStructureBuildGeometryInfoKHR *pBuildInfo,
                                uint32_t leaf_count);
@@ -75,8 +91,8 @@ struct vk_acceleration_structure_build_ops {
                                         const VkAccelerationStructureBuildGeometryInfoKHR *build_info,
                                         const VkAccelerationStructureBuildRangeInfoKHR *build_range_infos,
                                         uint32_t leaf_count,
-                                        struct vk_acceleration_structure *dst,
-                                        struct vk_acceleration_structure *src);
+                                        struct vk_acceleration_structure *src,
+                                        struct vk_acceleration_structure *dst);
 };
 
 struct vk_acceleration_structure_build_args {
@@ -124,6 +140,12 @@ struct vk_bvh_geometry_data
 vk_fill_geometry_data(VkAccelerationStructureTypeKHR type, uint32_t first_id, uint32_t geom_index,
                       const VkAccelerationStructureGeometryKHR *geometry,
                       const VkAccelerationStructureBuildRangeInfoKHR *build_range_info);
+
+void vk_accel_struct_cmd_begin_debug_marker(VkCommandBuffer commandBuffer,
+                                            enum vk_acceleration_structure_build_step step,
+                                            const char *format, ...);
+
+void vk_accel_struct_cmd_end_debug_marker(VkCommandBuffer commandBuffer);
 
 #ifdef __cplusplus
 }

@@ -138,7 +138,7 @@ private:
                               unsigned align_offset,
                               unsigned bit_size,
                               unsigned num_components,
-                              unsigned hole_size,
+                              int64_t hole_size,
                               nir_intrinsic_instr *low,
                               nir_intrinsic_instr *high,
                               void *cb_data);
@@ -1371,12 +1371,12 @@ Converter::memVectorizeCb(unsigned align_mul,
                           unsigned align_offset,
                           unsigned bit_size,
                           unsigned num_components,
-                          unsigned hole_size,
+                          int64_t hole_size,
                           nir_intrinsic_instr *low,
                           nir_intrinsic_instr *high,
                           void *cb_data)
 {
-   if (hole_size)
+   if (hole_size > 0)
       return false;
 
    /*
@@ -3676,6 +3676,17 @@ nvir_nir_shader_compiler_options(int chipset, uint8_t shader_type)
    op.discard_is_demote = true;
    op.has_ddx_intrinsics = true;
    op.scalarize_ddx = true;
+   op.support_indirect_inputs = (uint8_t)BITFIELD_MASK(MESA_SHADER_GEOMETRY + 1);
+   op.support_indirect_outputs = (uint8_t)BITFIELD_MASK(MESA_SHADER_GEOMETRY + 1);
+
+   /* HW doesn't support indirect addressing of fragment program inputs
+    * on Volta.  The binary driver generates a function to handle every
+    * possible indirection, and indirectly calls the function to handle
+    * this instead.
+    */
+   if (chipset < NVISA_GV100_CHIPSET)
+      op.support_indirect_outputs |= BITFIELD_BIT(MESA_SHADER_FRAGMENT);
+
    return op;
 }
 

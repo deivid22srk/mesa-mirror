@@ -139,8 +139,8 @@ struct pipe_context {
     *
     * Caps:
     * - Always supported: Direct multi draws
-    * - PIPE_CAP_MULTI_DRAW_INDIRECT: Indirect multi draws
-    * - PIPE_CAP_MULTI_DRAW_INDIRECT_PARAMS: Indirect draw count
+    * - pipe_caps.multi_draw_indirect: Indirect multi draws
+    * - pipe_caps.multi_draw_indirect_params: Indirect draw count
     *
     * Differences against glMultiDraw and glMultiMode:
     * - "info->mode" and "draws->index_bias" are always constant due to the lack
@@ -650,9 +650,10 @@ struct pipe_context {
                                         struct pipe_stream_output_target *);
 
    void (*set_stream_output_targets)(struct pipe_context *,
-                              unsigned num_targets,
-                              struct pipe_stream_output_target **targets,
-                              const unsigned *offsets);
+                                     unsigned num_targets,
+                                     struct pipe_stream_output_target **targets,
+                                     const unsigned *offsets,
+                                     enum mesa_prim output_prim);
 
    uint32_t (*stream_output_target_offset)(struct pipe_stream_output_target *target);
 
@@ -1086,7 +1087,7 @@ struct pipe_context {
     *
     * (2) implement GL's InvalidateBufferData. For backwards compatibility,
     * you must only rely on the usability for this purpose when
-    * PIPE_CAP_INVALIDATE_BUFFER is enabled.
+    * pipe_caps.invalidate_buffer is enabled.
     */
    void (*invalidate_resource)(struct pipe_context *ctx,
                                struct pipe_resource *resource);

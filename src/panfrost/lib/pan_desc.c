@@ -66,8 +66,11 @@ mali_sampling_mode(const struct pan_image_view *view)
    unsigned nr_samples = pan_image_view_get_nr_samples(view);
 
    if (nr_samples > 1) {
+      ASSERTED const struct pan_image *first_plane =
+         pan_image_view_get_first_plane(view);
+
       assert(view->nr_samples == nr_samples);
-      assert(view->planes[0]->layout.slices[0].surface_stride != 0);
+      assert(first_plane->layout.slices[0].surface_stride != 0);
       return MALI_MSAA_LAYERED;
    }
 
@@ -86,7 +89,8 @@ static bool
 renderblock_fits_in_single_pass(const struct pan_image_view *view,
                                 unsigned tile_size)
 {
-   uint64_t mod = view->planes[0]->layout.modifier;
+   const struct pan_image *first_plane = pan_image_view_get_first_plane(view);
+   uint64_t mod = first_plane->layout.modifier;
 
    if (!drm_is_afbc(mod))
       return tile_size >= 16 * 16;
@@ -203,7 +207,7 @@ pan_prepare_s(const struct pan_fb_info *fb, unsigned layer_idx,
    if (!s)
       return;
 
-   const struct pan_image *image = pan_image_view_get_zs_image(s);
+   const struct pan_image *image = pan_image_view_get_s_plane(s);
    unsigned level = s->first_level;
 
    ext->s_msaa = mali_sampling_mode(s);
@@ -233,7 +237,7 @@ pan_prepare_zs(const struct pan_fb_info *fb, unsigned layer_idx,
    if (!zs)
       return;
 
-   const struct pan_image *image = pan_image_view_get_zs_image(zs);
+   const struct pan_image *image = pan_image_view_get_zs_plane(zs);
    unsigned level = zs->first_level;
 
    ext->zs_msaa = mali_sampling_mode(zs);
@@ -296,7 +300,7 @@ pan_prepare_crc(const struct pan_fb_info *fb, int rt_crc,
    assert(rt_crc < fb->rt_count);
 
    const struct pan_image_view *rt = fb->rts[rt_crc].view;
-   const struct pan_image *image = pan_image_view_get_rt_image(rt);
+   const struct pan_image *image = pan_image_view_get_color_plane(rt);
    const struct pan_image_slice_layout *slice =
       &image->layout.slices[rt->first_level];
 
@@ -317,7 +321,7 @@ pan_prepare_crc(const struct pan_fb_info *fb, int rt_crc,
 
 static void
 pan_emit_zs_crc_ext(const struct pan_fb_info *fb, unsigned layer_idx,
-                    int rt_crc, void *zs_crc_ext)
+                    int rt_crc, struct mali_zs_crc_extension_packed *zs_crc_ext)
 {
    pan_pack(zs_crc_ext, ZS_CRC_EXTENSION, cfg) {
       pan_prepare_crc(fb, rt_crc, &cfg);
@@ -467,7 +471,7 @@ pan_rt_init_format(const struct pan_image_view *rt,
    }
 
 #if PAN_ARCH >= 10
-   const struct pan_image *image = pan_image_view_get_rt_image(rt);
+   const struct pan_image *image = pan_image_view_get_color_plane(rt);
 
    if (drm_is_afrc(image->layout.modifier))
       cfg->afrc.writeback_format = writeback_format;
@@ -505,16 +509,17 @@ pan_prepare_rt(const struct pan_fb_info *fb, unsigned layer_idx,
       return;
    }
 
-   const struct pan_image *image = pan_image_view_get_rt_image(rt);
+   const struct pan_image *image = pan_image_view_get_color_plane(rt);
 
    if (!drm_is_afrc(image->layout.modifier))
       cfg->write_enable = true;
 
    cfg->dithering_enable = true;
 
+   const struct pan_image *first_plane = pan_image_view_get_first_plane(rt);
    unsigned level = rt->first_level;
    ASSERTED unsigned layer_count = rt->dim == MALI_TEXTURE_DIMENSION_3D
-                                      ? rt->planes[0]->layout.depth
+                                      ? first_plane->layout.depth
                                       : rt->last_layer - rt->first_layer + 1;
 
    assert(rt->last_level == rt->first_level);
@@ -600,7 +605,8 @@ pan_prepare_rt(const struct pan_fb_info *fb, unsigned layer_idx,
 #endif
 
 void
-GENX(pan_emit_tls)(const struct pan_tls_info *info, void *out)
+GENX(pan_emit_tls)(const struct pan_tls_info *info,
+                   struct mali_local_storage_packed *out)
 {
    pan_pack(out, LOCAL_STORAGE, cfg) {
       if (info->tls.size) {
@@ -639,7 +645,8 @@ GENX(pan_emit_tls)(const struct pan_tls_info *info, void *out)
 #if PAN_ARCH <= 5
 static void
 pan_emit_midgard_tiler(const struct pan_fb_info *fb,
-                       const struct pan_tiler_context *tiler_ctx, void *out)
+                       const struct pan_tiler_context *tiler_ctx,
+                       struct mali_tiler_context_packed *out)
 {
    bool hierarchy = !tiler_ctx->midgard.no_hierarchical_tiling;
 
@@ -674,8 +681,8 @@ pan_emit_midgard_tiler(const struct pan_fb_info *fb,
 
 #if PAN_ARCH >= 5
 static void
-pan_emit_rt(const struct pan_fb_info *fb, unsigned layer_idx,
-            unsigned idx, unsigned cbuf_offset, void *out)
+pan_emit_rt(const struct pan_fb_info *fb, unsigned layer_idx, unsigned idx,
+            unsigned cbuf_offset, struct mali_render_target_packed *out)
 {
    pan_pack(out, RENDER_TARGET, cfg) {
       pan_prepare_rt(fb, layer_idx, idx, cbuf_offset, &cfg);
@@ -706,9 +713,11 @@ pan_fix_frame_shader_mode(enum mali_pre_post_frame_shader_mode mode,
  * render target. Check this condition. */
 
 static bool
-pan_force_clean_write_rt(const struct pan_image_view *rt, unsigned tile_size)
+pan_force_clean_write_on(const struct pan_image *image, unsigned tile_size)
 {
-   const struct pan_image *image = pan_image_view_get_rt_image(rt);
+   if (!image)
+      return false;
+
    if (!drm_is_afbc(image->layout.modifier))
       return false;
 
@@ -728,17 +737,24 @@ pan_force_clean_write(const struct pan_fb_info *fb, unsigned tile_size)
    assert(tile_size <= panfrost_max_effective_tile_size(PAN_ARCH));
 
    for (unsigned i = 0; i < fb->rt_count; ++i) {
-      if (fb->rts[i].view && !fb->rts[i].discard &&
-          pan_force_clean_write_rt(fb->rts[i].view, tile_size))
+      if (!fb->rts[i].view || fb->rts[i].discard)
+         continue;
+
+      const struct pan_image *img =
+         pan_image_view_get_color_plane(fb->rts[i].view);
+
+      if (pan_force_clean_write_on(img, tile_size))
          return true;
    }
 
    if (fb->zs.view.zs && !fb->zs.discard.z &&
-       pan_force_clean_write_rt(fb->zs.view.zs, tile_size))
+       pan_force_clean_write_on(pan_image_view_get_zs_plane(fb->zs.view.zs),
+                                tile_size))
       return true;
 
    if (fb->zs.view.s && !fb->zs.discard.s &&
-       pan_force_clean_write_rt(fb->zs.view.s, tile_size))
+       pan_force_clean_write_on(pan_image_view_get_s_plane(fb->zs.view.s),
+                                tile_size))
       return true;
 
    return false;
@@ -837,8 +853,9 @@ GENX(pan_emit_fbd)(const struct pan_fb_info *fb, unsigned layer_idx,
          bool clean_tile_write = fb->rts[crc_rt].clear;
 
 #if PAN_ARCH >= 6
-         clean_tile_write |= pan_force_clean_write_rt(fb->rts[crc_rt].view,
-                                                      fb->tile_size);
+         clean_tile_write |= pan_force_clean_write_on(
+            pan_image_view_get_color_plane(fb->rts[crc_rt].view),
+            fb->tile_size);
 #endif
 
          /* If the CRC was valid it stays valid, if it wasn't, we must ensure
@@ -885,7 +902,10 @@ GENX(pan_emit_fbd)(const struct pan_fb_info *fb, unsigned layer_idx,
 #endif
 
    if (has_zs_crc_ext) {
-      pan_emit_zs_crc_ext(fb, layer_idx, crc_rt, out + pan_size(FRAMEBUFFER));
+      struct mali_zs_crc_extension_packed *zs_crc_ext =
+         out + pan_size(FRAMEBUFFER);
+
+      pan_emit_zs_crc_ext(fb, layer_idx, crc_rt, zs_crc_ext);
       rtd += pan_size(ZS_CRC_EXTENSION);
    }
 
@@ -905,7 +925,7 @@ GENX(pan_emit_fbd)(const struct pan_fb_info *fb, unsigned layer_idx,
    }
 
    struct mali_framebuffer_pointer_packed tag;
-   pan_pack(tag.opaque, FRAMEBUFFER_POINTER, cfg) {
+   pan_pack(&tag, FRAMEBUFFER_POINTER, cfg) {
       cfg.zs_crc_extension_present = has_zs_crc_ext;
       cfg.render_target_count = MAX2(fb->rt_count, 1);
    }
@@ -964,7 +984,7 @@ GENX(pan_emit_fbd)(const struct pan_fb_info *fb, unsigned layer_idx,
 
       if (fb->rt_count && fb->rts[0].view) {
          const struct pan_image_view *rt = fb->rts[0].view;
-         const struct pan_image *image = pan_image_view_get_rt_image(rt);
+         const struct pan_image *image = pan_image_view_get_color_plane(rt);
 
          const struct util_format_description *desc =
             util_format_description(rt->format);
@@ -1015,7 +1035,7 @@ GENX(pan_emit_fbd)(const struct pan_fb_info *fb, unsigned layer_idx,
 
       if (fb->zs.view.zs) {
          const struct pan_image_view *zs = fb->zs.view.zs;
-         const struct pan_image *image = pan_image_view_get_zs_image(zs);
+         const struct pan_image *image = pan_image_view_get_zs_plane(zs);
          unsigned level = zs->first_level;
          struct pan_surface surf;
 
@@ -1054,7 +1074,7 @@ GENX(pan_emit_fbd)(const struct pan_fb_info *fb, unsigned layer_idx,
 
 #if PAN_ARCH <= 9
 void
-GENX(pan_emit_fragment_job_payload)(const struct pan_fb_info *fb, mali_ptr fbd,
+GENX(pan_emit_fragment_job_payload)(const struct pan_fb_info *fb, uint64_t fbd,
                                     void *out)
 {
    pan_section_pack(out, FRAGMENT_JOB, PAYLOAD, payload) {

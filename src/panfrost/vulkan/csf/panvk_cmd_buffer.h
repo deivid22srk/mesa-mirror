@@ -23,6 +23,7 @@
 #include "vk_command_buffer.h"
 
 #include "util/list.h"
+#include "util/perf/u_trace.h"
 
 #define MAX_VBS 16
 #define MAX_RTS 8
@@ -82,7 +83,12 @@ get_fbd_size(bool has_zs_ext, uint32_t rt_count)
    offsetof(struct panvk_cs_subqueue_context, tiler_oom_ctx._name)
 #define TILER_OOM_CTX_FBDPTR_OFFSET(_pass)                                     \
    (TILER_OOM_CTX_FIELD_OFFSET(fbds) +                                         \
-    (PANVK_IR_##_pass##_PASS * sizeof(mali_ptr)))
+    (PANVK_IR_##_pass##_PASS * sizeof(uint64_t)))
+
+struct panvk_cs_occlusion_query {
+   uint64_t next;
+   uint64_t syncobj;
+};
 
 struct panvk_cs_subqueue_context {
    uint64_t syncobjs;
@@ -92,13 +98,14 @@ struct panvk_cs_subqueue_context {
       struct panvk_cs_desc_ringbuf desc_ringbuf;
       uint64_t tiler_heap;
       uint64_t geom_buf;
+      uint64_t oq_chain;
    } render;
    struct {
       uint32_t counter;
-      mali_ptr fbds[PANVK_IR_PASS_COUNT];
+      uint64_t fbds[PANVK_IR_PASS_COUNT];
       uint32_t td_count;
       uint32_t layer_count;
-      mali_ptr reg_dump_addr;
+      uint64_t reg_dump_addr;
    } tiler_oom_ctx;
    struct {
       uint64_t syncobjs;
@@ -180,11 +187,13 @@ enum panvk_cs_regs {
    PANVK_CS_REG_SUBQUEUE_CTX_END = 91,
 };
 
+#define CS_REG_SCRATCH_COUNT                                                   \
+   (PANVK_CS_REG_SCRATCH_END - PANVK_CS_REG_SCRATCH_START + 1)
+
 static inline struct cs_index
 cs_scratch_reg_tuple(struct cs_builder *b, unsigned start, unsigned count)
 {
-   assert(PANVK_CS_REG_SCRATCH_START + start + count - 1 <=
-          PANVK_CS_REG_SCRATCH_END);
+   assert(start + count <= CS_REG_SCRATCH_COUNT);
    return cs_reg_tuple(b, PANVK_CS_REG_SCRATCH_START + start, count);
 }
 
@@ -376,6 +385,10 @@ struct panvk_cmd_buffer {
    uint32_t flush_id;
 
    struct {
+      struct u_trace uts[PANVK_SUBQUEUE_COUNT];
+   } utrace;
+
+   struct {
       struct panvk_cmd_graphics_state gfx;
       struct panvk_cmd_compute_state compute;
       struct panvk_push_constant_state push_constants;
@@ -421,9 +434,8 @@ void panvk_per_arch(get_cs_deps)(struct panvk_cmd_buffer *cmdbuf,
                                  const VkDependencyInfo *in,
                                  struct panvk_cs_deps *out);
 
-void panvk_per_arch(cmd_prepare_exec_cmd_for_draws)(
-   struct panvk_cmd_buffer *primary,
-   struct panvk_cmd_buffer *secondary);
+VkResult panvk_per_arch(cmd_prepare_exec_cmd_for_draws)(
+   struct panvk_cmd_buffer *primary, struct panvk_cmd_buffer *secondary);
 
 void panvk_per_arch(cmd_inherit_render_state)(
    struct panvk_cmd_buffer *cmdbuf,

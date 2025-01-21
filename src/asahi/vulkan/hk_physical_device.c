@@ -23,6 +23,7 @@
 #include "util/simple_mtx.h"
 #include "vulkan/vulkan_core.h"
 #include "vulkan/wsi/wsi_common.h"
+#include "unstable_asahi_drm.h"
 #include "vk_drm_syncobj.h"
 #include "vk_shader_module.h"
 
@@ -40,7 +41,7 @@ hk_get_vk_version()
    if (version_override)
       return version_override;
 
-   return VK_MAKE_VERSION(1, 3, VK_HEADER_VERSION);
+   return VK_MAKE_VERSION(1, 4, VK_HEADER_VERSION);
 }
 
 static void
@@ -349,6 +350,9 @@ hk_get_device_features(
       .dynamicRendering = true,
       .shaderIntegerDotProduct = true,
       .maintenance4 = true,
+
+      /* Vulkan 1.4 */
+      .pushDescriptor = true,
 
       /* VK_KHR_dynamic_rendering_local_read */
       .dynamicRenderingLocalRead = true,
@@ -714,8 +718,9 @@ hk_get_device_properties(const struct agx_device *dev,
       .sampledImageStencilSampleCounts = sample_counts,
       .storageImageSampleCounts = sample_counts,
       .maxSampleMaskWords = 1,
-      .timestampComputeAndGraphics = false,
-      .timestampPeriod = 1,
+      .timestampComputeAndGraphics = agx_supports_timestamps(dev),
+      /* FIXME: Is timestamp period actually 1? */
+      .timestampPeriod = 1.0f,
       .maxClipDistances = 8,
       .maxCullDistances = 8,
       .maxCombinedClipAndCullDistances = 8,
@@ -767,7 +772,7 @@ hk_get_device_properties(const struct agx_device *dev,
       .independentResolveNone = true,
       .independentResolve = true,
       .driverID = VK_DRIVER_ID_MESA_HONEYKRISP,
-      .conformanceVersion = (VkConformanceVersion){1, 3, 8, 3},
+      .conformanceVersion = (VkConformanceVersion){1, 4, 0, 0},
       .denormBehaviorIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL,
       .roundingModeIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL,
       .shaderSignedZeroInfNanPreserveFloat16 = true,
@@ -835,6 +840,10 @@ hk_get_device_properties(const struct agx_device *dev,
       .uniformTexelBufferOffsetAlignmentBytes = HK_MIN_TEXEL_BUFFER_ALIGNMENT,
       .uniformTexelBufferOffsetSingleTexelAlignment = true,
       .maxBufferSize = HK_MAX_BUFFER_SIZE,
+
+      /* Vulkan 1.4 properties */
+      .dynamicRenderingLocalReadDepthStencilAttachments = false,
+      .dynamicRenderingLocalReadMultisampledAttachments = true,
 
       /* VK_KHR_push_descriptor */
       .maxPushDescriptors = HK_MAX_PUSH_DESCRIPTORS,
@@ -1378,7 +1387,8 @@ hk_GetPhysicalDeviceQueueFamilyProperties2(
       {
          p->queueFamilyProperties.queueFlags = queue_family->queue_flags;
          p->queueFamilyProperties.queueCount = queue_family->queue_count;
-         p->queueFamilyProperties.timestampValidBits = 0; // TODO 64;
+         p->queueFamilyProperties.timestampValidBits =
+            agx_supports_timestamps(&pdev->dev) ? 64 : 0;
          p->queueFamilyProperties.minImageTransferGranularity =
             (VkExtent3D){1, 1, 1};
 
@@ -1393,31 +1403,6 @@ hk_GetPhysicalDeviceQueueFamilyProperties2(
          }
       }
    }
-}
-
-static const VkTimeDomainKHR hk_time_domains[] = {
-   VK_TIME_DOMAIN_DEVICE_KHR,
-   VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR,
-#ifdef CLOCK_MONOTONIC_RAW
-   VK_TIME_DOMAIN_CLOCK_MONOTONIC_RAW_KHR,
-#endif
-};
-
-VKAPI_ATTR VkResult VKAPI_CALL
-hk_GetPhysicalDeviceCalibrateableTimeDomainsKHR(VkPhysicalDevice physicalDevice,
-                                                uint32_t *pTimeDomainCount,
-                                                VkTimeDomainKHR *pTimeDomains)
-{
-   VK_OUTARRAY_MAKE_TYPED(VkTimeDomainKHR, out, pTimeDomains, pTimeDomainCount);
-
-   for (int d = 0; d < ARRAY_SIZE(hk_time_domains); d++) {
-      vk_outarray_append_typed(VkTimeDomainKHR, &out, i)
-      {
-         *i = hk_time_domains[d];
-      }
-   }
-
-   return vk_outarray_status(&out);
 }
 
 VKAPI_ATTR void VKAPI_CALL

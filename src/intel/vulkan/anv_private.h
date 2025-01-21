@@ -102,6 +102,7 @@
 #include "vk_log.h"
 #include "vk_ycbcr_conversion.h"
 #include "vk_video.h"
+#include "vk_meta.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -165,7 +166,7 @@ struct intel_perf_query_result;
 #define MAX_RTS          8
 #define MAX_VIEWPORTS   16
 #define MAX_SCISSORS    16
-#define MAX_PUSH_CONSTANTS_SIZE 128
+#define MAX_PUSH_CONSTANTS_SIZE 256  /* Minimum requirement as of Vulkan 1.4 */
 #define MAX_DYNAMIC_BUFFERS 16
 #define MAX_PUSH_DESCRIPTORS 32 /* Minimum requirement */
 #define MAX_INLINE_UNIFORM_BLOCK_SIZE 4096
@@ -1136,7 +1137,10 @@ struct anv_physical_device {
       uint32_t                                  dynamic_visible_mem_types;
       /** Mask of memory types of protected buffers/images */
       uint32_t                                  protected_mem_types;
-      /** Mask of memory types of compressed buffers/images */
+      /**
+       * Mask of memory types of compressed buffers/images. This is generally
+       * a win for images, but a loss for buffers.
+       */
       uint32_t                                  compressed_mem_types;
     } memory;
 
@@ -1303,7 +1307,7 @@ struct anv_instance {
     unsigned                                    force_vk_vendor;
     bool                                        has_fake_sparse;
     bool                                        disable_fcv;
-    bool                                        disable_xe2_ccs;
+    bool                                        enable_buffer_comp;
     bool                                        compression_control_enabled;
     bool                                        anv_fake_nonlocal_memory;
     bool                                        anv_upper_bound_descriptor_pool_sampler;
@@ -1335,6 +1339,8 @@ struct anv_queue {
       uint32_t                               context_id; /* i915 */
       uint32_t                               exec_queue_id; /* Xe */
    };
+
+   uint32_t                                  bind_queue_id; /* Xe */
 
    /** Context/Engine id which executes companion RCS command buffer */
    uint32_t                                  companion_rcs_id;
@@ -1453,6 +1459,7 @@ enum anv_gfx_state_bits {
    ANV_GFX_STATE_CLIP,
    ANV_GFX_STATE_CC_STATE,
    ANV_GFX_STATE_CC_STATE_PTR,
+   ANV_GFX_STATE_COARSE_PIXEL,
    ANV_GFX_STATE_CPS,
    ANV_GFX_STATE_DEPTH_BOUNDS,
    ANV_GFX_STATE_INDEX_BUFFER,
@@ -1549,6 +1556,15 @@ struct anv_gfx_dynamic_state {
       uint32_t LineStripListProvokingVertexSelect;
       uint32_t TriangleFanProvokingVertexSelect;
    } clip;
+
+   /* 3DSTATE_COARSE_PIXEL */
+   struct {
+      uint32_t    CPSizeX;
+      uint32_t    CPSizeY;
+      uint32_t    CPSizeCombiner0Opcode;
+      uint32_t    CPSizeCombiner1Opcode;
+      bool        DisableCPSPointers;
+   } coarse_pixel;
 
    /* 3DSTATE_CPS/3DSTATE_CPS_POINTERS */
    struct {
@@ -1828,6 +1844,28 @@ enum anv_rt_bvh_build_method {
    ANV_BVH_BUILD_METHOD_NEW_SAH,
 };
 
+/* If serialization-breaking or algorithm-breaking changes are made,
+ * increment the digits at the end
+ */
+#define ANV_RT_UUID_MACRO             "ANV_RT_BVH_0001"
+
+enum bvh_dump_type {
+   BVH_ANV,
+   BVH_IR_HDR,
+   BVH_IR_AS
+};
+
+struct anv_bvh_dump {
+   struct anv_bo *bo;
+   uint32_t bvh_id;
+   uint64_t dump_size;
+   VkGeometryTypeKHR geometry_type;
+   enum bvh_dump_type dump_type;
+
+   /* Link in the anv_device.bvh_dumps list */
+   struct list_head link;
+};
+
 struct anv_device_astc_emu {
     struct vk_texcompress_astc_state           *texcompress;
 
@@ -1863,6 +1901,9 @@ struct anv_device {
 
     /** List of anv_image objects with a private binding for implicit CCS */
     struct list_head                            image_private_objects;
+
+    /** List of anv_bvh_dump objects that get dumped on cmd buf completion */
+    struct list_head                            bvh_dumps;
 
     /** Memory pool for batch buffers */
     struct anv_bo_pool                          batch_bo_pool;
@@ -1903,6 +1944,7 @@ struct anv_device {
     struct anv_address                          workaround_address;
 
     struct anv_bo *                             dummy_aux_bo;
+    struct anv_bo *                             mem_fence_bo;
 
     /**
      * Workarounds for game bugs.
@@ -2102,7 +2144,21 @@ struct anv_device {
         */
        struct util_dynarray                      prints;
     } printf;
+
+    struct {
+       simple_mtx_t  mutex;
+       struct radix_sort_vk *radix_sort;
+       struct vk_acceleration_structure_build_args build_args;
+   } accel_struct_build;
+
+   struct vk_meta_device meta_device;
 };
+
+static inline uint32_t
+anv_printf_buffer_size(void)
+{
+   return debug_get_num_option("ANV_PRINTF_BUFFER_SIZE", 1024 * 1024);
+}
 
 static inline uint32_t
 anv_get_first_render_queue_index(struct anv_physical_device *pdevice)
@@ -2259,6 +2315,8 @@ VkResult anv_device_print_init(struct anv_device *device);
 void anv_device_print_fini(struct anv_device *device);
 void anv_device_print_shader_prints(struct anv_device *device);
 
+void anv_dump_bvh_to_files(struct anv_device *device);
+
 VkResult anv_queue_init(struct anv_device *device, struct anv_queue *queue,
                         const VkDeviceQueueCreateInfo *pCreateInfo,
                         uint32_t index_in_family);
@@ -2286,6 +2344,12 @@ anv_queue_post_submit(struct anv_queue *queue, VkResult submit_result)
 
    if (INTEL_DEBUG(DEBUG_SHADER_PRINT))
       anv_device_print_shader_prints(queue->device);
+
+#if ANV_SUPPORT_RT && !ANV_SUPPORT_RT_GRL
+   /* The recorded bvh is dumped to files upon command buffer completion */
+   if (INTEL_DEBUG(DEBUG_BVH_ANY))
+      anv_dump_bvh_to_files(queue->device);
+#endif
 
    return result;
 }
@@ -3846,6 +3910,9 @@ struct anv_cmd_pipeline_state {
 
    struct anv_push_constants push_constants;
 
+   /** Amount of data written to anv_push_constants::client_data */
+   uint16_t push_constants_client_size;
+
    /** Tracks whether the push constant data has changed and need to be reemitted */
    bool                                         push_constants_data_dirty;
 
@@ -3996,6 +4063,9 @@ struct anv_cmd_ray_tracing_state {
       struct anv_bo *bo;
       struct brw_rt_scratch_layout layout;
    } scratch;
+
+   uint32_t debug_marker_count;
+   enum vk_acceleration_structure_build_step debug_markers[5];
 
    struct anv_address build_priv_mem_addr;
    size_t             build_priv_mem_size;
@@ -4186,6 +4256,10 @@ struct anv_cmd_buffer {
    struct anv_query_pool                       *perf_query_pool;
 
    struct anv_cmd_state                         state;
+
+   /* Fast-clear statistics. */
+   uint64_t                                     num_dependent_clears;
+   uint64_t                                     num_independent_clears;
 
    struct anv_address                           return_addr;
 
@@ -5431,22 +5505,6 @@ struct anv_image {
       /** Location of the fast clear state.  */
       struct anv_image_memory_range fast_clear_memory_range;
 
-      /**
-       * Whether this image can be fast cleared with non-zero clear colors.
-       * This can happen with mutable images when formats of different bit
-       * sizes per components are used.
-       *
-       * On Gfx9+, because the clear colors are stored as a 4 components 32bit
-       * values, we can clear in R16G16_UNORM (store 2 16bit values in the
-       * components 0 & 1 of the clear color) and then draw in R32_UINT which
-       * would interpret the clear color as a single component value, using
-       * only the first 16bit component of the previous written clear color.
-       *
-       * On Gfx7/7.5/8, only CC_ZERO/CC_ONE clear colors are supported, this
-       * boolean will prevent the usage of CC_ONE.
-       */
-      bool can_non_zero_fast_clear;
-
       struct {
          /** Whether the image has CCS data mapped through AUX-TT. */
          bool mapped;
@@ -5463,6 +5521,7 @@ struct anv_image {
 
    /* Link in the anv_device.image_private_objects list */
    struct list_head link;
+   struct anv_image_memory_range av1_cdf_table;
 };
 
 static inline bool
@@ -5888,11 +5947,41 @@ anv_image_choose_isl_surf_usage(struct anv_physical_device *device,
                                 VkImageCompressionFlagsEXT comp_flags);
 
 void
+anv_cmd_copy_addr(struct anv_cmd_buffer *cmd_buffer,
+                  struct anv_address src_addr,
+                  struct anv_address dst_addr,
+                  uint64_t size);
+void
 anv_cmd_buffer_fill_area(struct anv_cmd_buffer *cmd_buffer,
                          struct anv_address address,
                          VkDeviceSize size,
                          uint32_t data,
                          bool protected);
+void
+anv_cmd_fill_buffer_addr(VkCommandBuffer cmd_buffer,
+                         VkDeviceAddress dstAddr,
+                         VkDeviceSize size,
+                         uint32_t data);
+void
+anv_cmd_buffer_update_addr(struct anv_cmd_buffer *cmd_buffer,
+                           struct anv_address address,
+                           VkDeviceSize dstOffset,
+                           VkDeviceSize dataSize,
+                           const void* pData,
+                           bool is_protected);
+void
+anv_cmd_write_buffer_cp(VkCommandBuffer cmd_buffer,
+                        VkDeviceAddress dstAddr,
+                        void *data,
+                        uint32_t size);
+void
+anv_cmd_dispatch_unaligned(VkCommandBuffer cmd_buffer,
+                           uint32_t invocations_x,
+                           uint32_t invocations_y,
+                           uint32_t invocations_z);
+
+void
+anv_cmd_flush_buffer_write_cp(VkCommandBuffer cmd_buffer);
 
 VkResult
 anv_cmd_buffer_ensure_rcs_companion(struct anv_cmd_buffer *cmd_buffer);
@@ -6194,6 +6283,7 @@ struct anv_vid_mem {
 
 #define ANV_MB_WIDTH 16
 #define ANV_MB_HEIGHT 16
+#define ANV_VIDEO_H264_MAX_DPB_SLOTS 17
 #define ANV_VIDEO_H264_MAX_NUM_REF_FRAME 16
 #define ANV_VIDEO_H265_MAX_NUM_REF_FRAME 16
 #define ANV_VIDEO_H265_HCP_NUM_REF_FRAME 8
@@ -6222,17 +6312,71 @@ enum anv_vid_mem_h265_types {
    ANV_VID_MEM_H265_ENC_MAX,
 };
 
+enum anv_vid_mem_av1_types {
+   ANV_VID_MEM_AV1_BITSTREAM_LINE_ROWSTORE,
+   ANV_VID_MEM_AV1_BITSTREAM_TILE_LINE_ROWSTORE,
+   ANV_VID_MEM_AV1_INTRA_PREDICTION_LINE_ROWSTORE,
+   ANV_VID_MEM_AV1_INTRA_PREDICTION_TILE_LINE_ROWSTORE,
+   ANV_VID_MEM_AV1_SPATIAL_MOTION_VECTOR_LINE,
+   ANV_VID_MEM_AV1_SPATIAL_MOTION_VECTOR_TILE_LINE,
+   ANV_VID_MEM_AV1_LOOP_RESTORATION_META_TILE_COLUMN,
+   ANV_VID_MEM_AV1_LOOP_RESTORATION_FILTER_TILE_LINE_Y,
+   ANV_VID_MEM_AV1_LOOP_RESTORATION_FILTER_TILE_LINE_U,
+   ANV_VID_MEM_AV1_LOOP_RESTORATION_FILTER_TILE_LINE_V,
+   ANV_VID_MEM_AV1_DEBLOCKER_FILTER_LINE_Y,
+   ANV_VID_MEM_AV1_DEBLOCKER_FILTER_LINE_U,
+   ANV_VID_MEM_AV1_DEBLOCKER_FILTER_LINE_V,
+   ANV_VID_MEM_AV1_DEBLOCKER_FILTER_TILE_LINE_Y,
+   ANV_VID_MEM_AV1_DEBLOCKER_FILTER_TILE_LINE_U,
+   ANV_VID_MEM_AV1_DEBLOCKER_FILTER_TILE_LINE_V,
+   ANV_VID_MEM_AV1_DEBLOCKER_FILTER_TILE_COLUMN_Y,
+   ANV_VID_MEM_AV1_DEBLOCKER_FILTER_TILE_COLUMN_U,
+   ANV_VID_MEM_AV1_DEBLOCKER_FILTER_TILE_COLUMN_V,
+   ANV_VID_MEM_AV1_CDEF_FILTER_LINE,
+   ANV_VID_MEM_AV1_CDEF_FILTER_TILE_LINE,
+   ANV_VID_MEM_AV1_CDEF_FILTER_TILE_COLUMN,
+   ANV_VID_MEM_AV1_CDEF_FILTER_META_TILE_LINE,
+   ANV_VID_MEM_AV1_CDEF_FILTER_META_TILE_COLUMN,
+   ANV_VID_MEM_AV1_CDEF_FILTER_TOP_LEFT_CORNER,
+   ANV_VID_MEM_AV1_SUPER_RES_TILE_COLUMN_Y,
+   ANV_VID_MEM_AV1_SUPER_RES_TILE_COLUMN_U,
+   ANV_VID_MEM_AV1_SUPER_RES_TILE_COLUMN_V,
+   ANV_VID_MEM_AV1_LOOP_RESTORATION_FILTER_TILE_COLUMN_Y,
+   ANV_VID_MEM_AV1_LOOP_RESTORATION_FILTER_TILE_COLUMN_U,
+   ANV_VID_MEM_AV1_LOOP_RESTORATION_FILTER_TILE_COLUMN_V,
+   ANV_VID_MEM_AV1_CDF_DEFAULTS_0,
+   ANV_VID_MEM_AV1_CDF_DEFAULTS_1,
+   ANV_VID_MEM_AV1_CDF_DEFAULTS_2,
+   ANV_VID_MEM_AV1_CDF_DEFAULTS_3,
+   ANV_VID_MEM_AV1_DBD_BUFFER,
+   ANV_VID_MEM_AV1_MAX,
+};
+
+struct anv_av1_video_refs_info {
+   const struct anv_image *img;
+   uint8_t default_cdf_index;
+};
+
 struct anv_video_session {
    struct vk_video_session vk;
 
+   bool cdf_initialized;
    /* the decoder needs some private memory allocations */
-   struct anv_vid_mem vid_mem[ANV_VID_MEM_H265_ENC_MAX];
+   struct anv_vid_mem vid_mem[ANV_VID_MEM_AV1_MAX];
+   struct anv_av1_video_refs_info prev_refs[STD_VIDEO_AV1_NUM_REF_FRAMES];
 };
 
 struct anv_video_session_params {
    struct vk_video_session_parameters vk;
    VkVideoEncodeRateControlModeFlagBitsKHR rc_mode;
 };
+
+void anv_init_av1_cdf_tables(struct anv_cmd_buffer *cmd,
+                             struct anv_video_session *vid);
+
+uint32_t anv_video_get_image_mv_size(struct anv_device *device,
+                                     struct anv_image *image,
+                                     const struct VkVideoProfileListInfoKHR *profile_list);
 
 void
 anv_dump_pipe_bits(enum anv_pipe_bits bits, FILE *f);

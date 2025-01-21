@@ -36,6 +36,7 @@
 #include "util/u_math.h"
 
 #include "vk_format.h"
+#include "av1_tables.h"
 
 #define ANV_OFFSET_IMPLICIT UINT64_MAX
 
@@ -304,9 +305,9 @@ anv_image_choose_isl_surf_usage(struct anv_physical_device *device,
 
 static isl_tiling_flags_t
 choose_isl_tiling_flags(const struct intel_device_info *devinfo,
+                        const struct anv_image *image,
                         const struct anv_image_create_info *anv_info,
-                        const struct isl_drm_modifier_info *isl_mod_info,
-                        bool legacy_scanout)
+                        const struct isl_drm_modifier_info *isl_mod_info)
 {
    const VkImageCreateInfo *base_info = anv_info->vk_info;
    isl_tiling_flags_t flags = 0;
@@ -332,7 +333,7 @@ choose_isl_tiling_flags(const struct intel_device_info *devinfo,
       flags &= anv_info->isl_tiling_flags;
    }
 
-   if (legacy_scanout) {
+   if (image->vk.wsi_legacy_scanout) {
       isl_tiling_flags_t legacy_mask = ISL_TILING_LINEAR_BIT;
       if (devinfo->has_tiling_uapi)
          legacy_mask |= ISL_TILING_X_BIT;
@@ -366,89 +367,13 @@ add_surface(struct anv_device *device,
 }
 
 static bool
-can_fast_clear_with_non_zero_color(const struct intel_device_info *devinfo,
-                                   const struct anv_image *image,
-                                   uint32_t plane,
-                                   const VkImageFormatListCreateInfo *fmt_list)
+image_may_use_r32_view(VkImageCreateFlags create_flags,
+                       VkFormat vk_format,
+                       const VkImageFormatListCreateInfo *fmt_list)
 {
-   /* If we don't have an AUX surface where fast clears apply, we can return
-    * early.
-    */
-   if (!isl_aux_usage_has_fast_clears(image->planes[plane].aux_usage))
-      return false;
-
-   /* On TGL (< C0), if a block of fragment shader outputs match the surface's
-    * clear color, the HW may convert them to fast-clears (see HSD 1607794140).
-    * This can lead to rendering corruptions if not handled properly. We
-    * restrict the clear color to zero to avoid issues that can occur with:
-    *     - Texture view rendering (including blorp_copy calls)
-    *     - Images with multiple levels or array layers
-    */
-   if (image->planes[plane].aux_usage == ISL_AUX_USAGE_FCV_CCS_E)
-      return false;
-
-   /* Turning on non zero fast clears for CCS_E introduces a performance
-    * regression for games such as F1 22 and RDR2 by introducing additional
-    * partial resolves. Let's turn non zero fast clears back off till we can
-    * fix performance.
-    */
-   if (image->planes[plane].aux_usage == ISL_AUX_USAGE_CCS_E &&
-       devinfo->ver >= 12)
-      return false;
-
-   /* Generally, enabling non-zero fast-clears is dependent on knowing which
-    * formats will be used with the surface. So, disable them if we lack this
-    * knowledge.
-    *
-    * For dmabufs with clear color modifiers, we already restrict
-    * problematic accesses for the clear color during the negotiation
-    * phase. So, don't restrict clear color support in this case.
-    */
-   const struct isl_drm_modifier_info *isl_mod_info =
-      image->vk.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT ?
-      isl_drm_modifier_get_info(image->vk.drm_format_mod) : NULL;
-
-   if (anv_image_view_formats_incomplete(image) &&
-       !(isl_mod_info && isl_mod_info->supports_clear_color))
-      return false;
-
-   enum isl_format img_format = image->planes[plane].primary_surface.isl.format;
-
-   /* Check bit compatibility for clear color components */
-   for (uint32_t i = 0; fmt_list && i < fmt_list->viewFormatCount; i++) {
-      if (fmt_list->pViewFormats[i] == VK_FORMAT_UNDEFINED)
-         continue;
-
-      struct anv_format_plane view_format_plane =
-         anv_get_format_plane(devinfo, fmt_list->pViewFormats[i],
-                              plane, image->vk.tiling);
-
-      enum isl_format view_format = view_format_plane.isl_format;
-
-      if (!isl_formats_have_same_bits_per_channel(img_format, view_format))
-         return false;
-   }
-
-   return true;
-}
-
-/**
- * Return true if the storage image could be used with atomics.
- *
- * If the image was created with an explicit format, we check it for typed
- * atomic support.  If MUTABLE_FORMAT_BIT is set, then we check the optional
- * format list, seeing if /any/ of the formats support typed atomics.  If no
- * list is supplied, we fall back to using the bpb, as the application could
- * make an image view with a format that does use atomics.
- */
-static bool
-storage_image_format_supports_atomic(const struct intel_device_info *devinfo,
-                                     VkImageCreateFlags create_flags,
-                                     enum isl_format format,
-                                     VkImageTiling vk_tiling,
-                                     const VkImageFormatListCreateInfo *fmt_list)
-{
-   if (isl_format_supports_typed_atomics(devinfo, format))
+   if (vk_format == VK_FORMAT_R32_SINT ||
+       vk_format == VK_FORMAT_R32_UINT ||
+       vk_format == VK_FORMAT_R32_SFLOAT)
       return true;
 
    if (!(create_flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT))
@@ -456,23 +381,16 @@ storage_image_format_supports_atomic(const struct intel_device_info *devinfo,
 
    if (fmt_list) {
       for (uint32_t i = 0; i < fmt_list->viewFormatCount; i++) {
-         if (fmt_list->pViewFormats[i] == VK_FORMAT_UNDEFINED)
-            continue;
-
-         enum isl_format view_format =
-            anv_get_isl_format(devinfo, fmt_list->pViewFormats[i],
-                               VK_IMAGE_ASPECT_COLOR_BIT, vk_tiling);
-
-         if (isl_format_supports_typed_atomics(devinfo, view_format))
+         if (fmt_list->pViewFormats[i] == VK_FORMAT_R32_SINT ||
+             fmt_list->pViewFormats[i] == VK_FORMAT_R32_UINT ||
+             fmt_list->pViewFormats[i] == VK_FORMAT_R32_SFLOAT)
             return true;
       }
 
       return false;
    }
 
-   /* No explicit format list.  Any 16/32/64bpp format could be used with atomics. */
-   unsigned bpb = isl_format_get_layout(format)->bpb;
-   return bpb == 16 || bpb == 32 || bpb == 64;
+   return vk_format_get_blocksizebits(vk_format) == 32;
 }
 
 static bool
@@ -538,18 +456,31 @@ anv_formats_ccs_e_compatible(const struct intel_device_info *devinfo,
       if (!formats_ccs_e_compatible(devinfo, create_flags, aspect,
                                     format, vk_tiling, fmt_list))
          return false;
+   }
 
-      if (vk_usage & VK_IMAGE_USAGE_STORAGE_BIT) {
-         if (devinfo->verx10 < 125)
-            return false;
-
-         /* Disable compression when surface can be potentially used for
-          * atomic operation.
+   if ((vk_usage & VK_IMAGE_USAGE_STORAGE_BIT) &&
+       vk_tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) {
+      assert(vk_format_aspects(vk_format) == VK_IMAGE_ASPECT_COLOR_BIT);
+      if (devinfo->ver == 12) {
+         /* From the TGL Bspec 44930 (r47128):
+          *
+          *    "Memory atomic operation on compressed data is not supported
+          *     in Gen12 E2E compression. Result of such operation is
+          *     undefined.
+          *
+          *     Software should ensure at the time of the Atomic operation
+          *     the surface is resolved (uncompressed) state."
+          *
+          * On gfx12.0, compression is not supported with atomic
+          * operations. On gfx12.5, the support is there, but it's slow
+          * (see HSD 1406337848).
           */
-         if (storage_image_format_supports_atomic(devinfo, create_flags,
-                                                  format, vk_tiling,
-                                                  fmt_list))
+         if (image_may_use_r32_view(create_flags, vk_format, fmt_list))
             return false;
+
+      } else if (devinfo->ver <= 11) {
+         /* Storage accesses are not supported on compressed surfaces. */
+         return false;
       }
    }
 
@@ -940,7 +871,7 @@ add_video_buffers(struct anv_device *device,
                   const struct VkVideoProfileListInfoKHR *profile_list,
                   bool independent_profile)
 {
-   ASSERTED bool ok;
+   ASSERTED VkResult ok;
    unsigned size = 0;
 
    if (independent_profile) {
@@ -949,19 +880,7 @@ add_video_buffers(struct anv_device *device,
       unsigned h_mb = DIV_ROUND_UP(image->vk.extent.height, ANV_MB_HEIGHT);
       size = w_mb * h_mb * 128;
    } else {
-      for (unsigned i = 0; i < profile_list->profileCount; i++) {
-         if (profile_list->pProfiles[i].videoCodecOperation == VK_VIDEO_CODEC_OPERATION_DECODE_H264_BIT_KHR ||
-             profile_list->pProfiles[i].videoCodecOperation == VK_VIDEO_CODEC_OPERATION_ENCODE_H264_BIT_KHR) {
-            unsigned w_mb = DIV_ROUND_UP(image->vk.extent.width, ANV_MB_WIDTH);
-            unsigned h_mb = DIV_ROUND_UP(image->vk.extent.height, ANV_MB_HEIGHT);
-            size = w_mb * h_mb * 128;
-         } else if (profile_list->pProfiles[i].videoCodecOperation == VK_VIDEO_CODEC_OPERATION_DECODE_H265_BIT_KHR ||
-                    profile_list->pProfiles[i].videoCodecOperation == VK_VIDEO_CODEC_OPERATION_ENCODE_H265_BIT_KHR) {
-            unsigned w_mb = DIV_ROUND_UP(image->vk.extent.width, 32);
-            unsigned h_mb = DIV_ROUND_UP(image->vk.extent.height, 32);
-            size = ALIGN(w_mb * h_mb, 2) << 6;
-         }
-      }
+      size = anv_video_get_image_mv_size(device, image, profile_list);
    }
 
    if (size == 0)
@@ -969,6 +888,19 @@ add_video_buffers(struct anv_device *device,
 
    ok = image_binding_grow(device, image, ANV_IMAGE_MEMORY_BINDING_PRIVATE,
                            ANV_OFFSET_IMPLICIT, size, 65536, &image->vid_dmv_top_surface);
+   if (ok != VK_SUCCESS)
+      return ok;
+
+   /* Doesn't work for av1 without provided profiles */
+   if (!independent_profile) {
+      for (unsigned i = 0; i < profile_list->profileCount; i++) {
+         if (profile_list->pProfiles[i].videoCodecOperation == VK_VIDEO_CODEC_OPERATION_DECODE_AV1_BIT_KHR) {
+            ok = image_binding_grow(device, image, ANV_IMAGE_MEMORY_BINDING_PRIVATE,
+                                    ANV_OFFSET_IMPLICIT, av1_cdf_max_num_bytes, 4096, &image->av1_cdf_table);
+         }
+      }
+   }
+
    return ok;
 }
 
@@ -1809,8 +1741,7 @@ anv_image_init(struct anv_device *device, struct anv_image *image,
       isl_extra_usage_flags |= ISL_SURF_USAGE_DISPLAY_BIT;
 
    const isl_tiling_flags_t isl_tiling_flags =
-      choose_isl_tiling_flags(device->info, create_info, isl_mod_info,
-                              image->vk.wsi_legacy_scanout);
+      choose_isl_tiling_flags(device->info, image, create_info, isl_mod_info);
 
    const VkImageFormatListCreateInfo *fmt_list =
       vk_find_struct_const(pCreateInfo->pNext,
@@ -1954,14 +1885,6 @@ anv_image_init(struct anv_device *device, struct anv_image *image,
    r = check_drm_format_mod(device, image);
    if (r != VK_SUCCESS)
       goto fail;
-
-   /* Once we have all the bindings, determine whether we can do non 0 fast
-    * clears for each plane.
-    */
-   for (uint32_t p = 0; p < image->n_planes; p++) {
-      image->planes[p].can_non_zero_fast_clear =
-         can_fast_clear_with_non_zero_color(device->info, image, p, fmt_list);
-   }
 
    if (anv_image_is_sparse(image)) {
       r = anv_image_init_sparse_bindings(image, create_info);
@@ -3438,6 +3361,10 @@ anv_layout_to_fast_clear_type(const struct intel_device_info * const devinfo,
    const VkImageUsageFlags layout_usage =
       vk_image_layout_to_usage_flags(layout, aspect) & image->vk.usage;
 
+   const struct isl_drm_modifier_info *isl_mod_info =
+      image->vk.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT ?
+      isl_drm_modifier_get_info(image->vk.drm_format_mod) : NULL;
+
    switch (aux_state) {
    case ISL_AUX_STATE_CLEAR:
       unreachable("We never use this state");
@@ -3445,8 +3372,30 @@ anv_layout_to_fast_clear_type(const struct intel_device_info * const devinfo,
    case ISL_AUX_STATE_PARTIAL_CLEAR:
    case ISL_AUX_STATE_COMPRESSED_CLEAR:
 
-      if (!image->planes[plane].can_non_zero_fast_clear)
+      /* Generally, enabling non-zero fast-clears is dependent on knowing which
+       * formats will be used with the surface. So, disable them if we lack
+       * this knowledge.
+       *
+       * For dmabufs with clear color modifiers, we already restrict
+       * problematic accesses for the clear color during the negotiation
+       * phase. So, don't restrict clear color support in this case.
+       */
+      if (anv_image_view_formats_incomplete(image) &&
+          !(isl_mod_info && isl_mod_info->supports_clear_color)) {
          return ANV_FAST_CLEAR_DEFAULT_VALUE;
+      }
+
+      /* On gfx12, the FCV feature may convert a block of fragment shader
+       * outputs to fast-clears. If this image has multiple subresources,
+       * restrict the clear color to zero to keep the fast cleared blocks in
+       * sync.
+       */
+      if (image->planes[plane].aux_usage == ISL_AUX_USAGE_FCV_CCS_E &&
+          (image->vk.mip_levels > 1 ||
+           image->vk.array_layers > 1 ||
+           image->vk.extent.depth > 1)) {
+         return ANV_FAST_CLEAR_DEFAULT_VALUE;
+      }
 
       /* On gfx9, we only load clear colors for attachments and for BLORP
        * surfaces. Outside of those surfaces, we can only support the default
@@ -3563,6 +3512,21 @@ anv_can_fast_clear_color(const struct anv_cmd_buffer *cmd_buffer,
    /* Wa_16021232440: Disable fast clear when height is 16k */
    if (intel_needs_workaround(cmd_buffer->device->info, 16021232440) &&
        image->vk.extent.height == 16 * 1024) {
+      return false;
+   }
+
+   /* The fast-clear preamble and/or postamble flushes are more expensive than
+    * the flushes performed by BLORP during slow clears. Use a heuristic to
+    * determine if the cost of the flushes are worth fast-clearing. See
+    * genX(cmd_buffer_update_color_aux_op)() and blorp_exec_on_render().
+    * TODO: Tune for Xe2
+    */
+   if (cmd_buffer->device->info->verx10 <= 125 &&
+       cmd_buffer->num_independent_clears >= 16 &&
+       cmd_buffer->num_independent_clears >
+       cmd_buffer->num_dependent_clears * 2) {
+      anv_perf_warn(VK_LOG_OBJS(&image->vk.base),
+                    "Not enough back-to-back fast-clears. Slow clearing.");
       return false;
    }
 

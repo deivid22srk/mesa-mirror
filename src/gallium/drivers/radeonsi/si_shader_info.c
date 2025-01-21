@@ -9,7 +9,9 @@
 #include "util/mesa-sha1.h"
 #include "sid.h"
 #include "nir.h"
+#include "nir_xfb_info.h"
 #include "aco_interface.h"
+#include "ac_nir.h"
 
 struct si_shader_profile si_shader_profiles[] =
 {
@@ -65,8 +67,11 @@ static void scan_io_usage(const nir_shader *nir, struct si_shader_info *info,
       nir_instr *src_instr = intr->src[0].ssa->parent_instr;
       if (src_instr->type == nir_instr_type_intrinsic) {
          nir_intrinsic_instr *baryc = nir_instr_as_intrinsic(src_instr);
-         if (nir_intrinsic_infos[baryc->intrinsic].index_map[NIR_INTRINSIC_INTERP_MODE] > 0)
+         if (nir_intrinsic_has_interp_mode(baryc))
             interp = nir_intrinsic_interp_mode(baryc);
+         else if (nir_intrinsic_has_flags(baryc) &&
+                  AC_VECTOR_ARG_FLAG_GET_NAME(baryc) == AC_VECTOR_ARG_INTERP_MODE)
+            interp = AC_VECTOR_ARG_FLAG_GET_VALUE(baryc);
          else
             unreachable("unknown barycentric intrinsic");
       } else {
@@ -213,6 +218,8 @@ static void scan_io_usage(const nir_shader *nir, struct si_shader_info *info,
                      info->enabled_streamout_buffer_mask |=
                         BITFIELD_BIT(stream * 4 + xfb.out[i % 2].buffer);
                   }
+
+                  info->output_xfb_writemask[loc] |= nir_instr_xfb_write_mask(intr);
                }
             }
 
@@ -231,11 +238,17 @@ static void scan_io_usage(const nir_shader *nir, struct si_shader_info *info,
                 nir->info.stage == MESA_SHADER_TESS_EVAL ||
                 nir->info.stage == MESA_SHADER_GEOMETRY) {
                if (slot_semantic == VARYING_SLOT_TESS_LEVEL_INNER ||
-                   slot_semantic == VARYING_SLOT_TESS_LEVEL_OUTER ||
-                   (slot_semantic >= VARYING_SLOT_PATCH0 &&
-                    slot_semantic < VARYING_SLOT_TESS_MAX)) {
-                  info->patch_outputs_written |=
-                     BITFIELD_BIT(ac_shader_io_get_unique_index_patch(slot_semantic));
+                   slot_semantic == VARYING_SLOT_TESS_LEVEL_OUTER) {
+                  if (!nir_intrinsic_io_semantics(intr).no_varying) {
+                     info->tess_levels_written_for_tes |=
+                        BITFIELD_BIT(ac_shader_io_get_unique_index_patch(slot_semantic));
+                  }
+               } else if (slot_semantic >= VARYING_SLOT_PATCH0 &&
+                          slot_semantic < VARYING_SLOT_TESS_MAX) {
+                  if (!nir_intrinsic_io_semantics(intr).no_varying) {
+                     info->patch_outputs_written_for_tes |=
+                        BITFIELD_BIT(ac_shader_io_get_unique_index_patch(slot_semantic));
+                  }
                } else if ((slot_semantic <= VARYING_SLOT_VAR31 ||
                            slot_semantic >= VARYING_SLOT_VAR0_16BIT) &&
                           slot_semantic != VARYING_SLOT_EDGE) {
@@ -252,7 +265,9 @@ static void scan_io_usage(const nir_shader *nir, struct si_shader_info *info,
                   if (slot_semantic != VARYING_SLOT_LAYER &&
                       slot_semantic != VARYING_SLOT_VIEWPORT) {
                      info->ls_es_outputs_written |= bit;
-                     info->tcs_outputs_written |= bit;
+
+                     if (!nir_intrinsic_io_semantics(intr).no_varying)
+                        info->tcs_outputs_written_for_tes |= bit;
                   }
                }
             }
@@ -270,6 +285,13 @@ static void scan_io_usage(const nir_shader *nir, struct si_shader_info *info,
             }
          }
       }
+   }
+
+   if (nir->info.stage == MESA_SHADER_FRAGMENT && !is_input && semantic == FRAG_RESULT_DEPTH) {
+      if (nir_def_is_frag_coord_z(intr->src[0].ssa))
+         info->output_z_equals_input_z = true;
+      else
+         info->output_z_is_not_input_z = true;
    }
 }
 
@@ -324,6 +346,8 @@ static void scan_instruction(const struct nir_shader *nir, struct si_shader_info
 
       info->has_non_uniform_tex_access =
          tex->texture_non_uniform || tex->sampler_non_uniform;
+
+      info->has_shadow_comparison |= tex->is_shadow;
    } else if (instr->type == nir_instr_type_intrinsic) {
       nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
       const char *intr_name = nir_intrinsic_infos[intr->intrinsic].name;
@@ -449,9 +473,9 @@ static void scan_instruction(const struct nir_shader *nir, struct si_shader_info
       }
       case nir_intrinsic_load_vector_arg_amd:
          /* Non-monolithic lowered PS can have this. We need to record color usage. */
-         if (nir_intrinsic_flags(intr) & SI_VECTOR_ARG_IS_COLOR) {
+         if (AC_VECTOR_ARG_FLAG_GET_NAME(intr) == AC_VECTOR_ARG_IS_COLOR) {
             /* The channel can be between 0 and 7. */
-            unsigned chan = SI_GET_VECTOR_ARG_COLOR_COMPONENT(nir_intrinsic_flags(intr));
+            unsigned chan = AC_VECTOR_ARG_FLAG_GET_VALUE(intr);
             info->colors_read |= BITFIELD_BIT(chan);
          }
          break;
@@ -504,27 +528,41 @@ static void scan_instruction(const struct nir_shader *nir, struct si_shader_info
    }
 }
 
-void si_nir_scan_shader(struct si_screen *sscreen, const struct nir_shader *nir,
+void si_nir_scan_shader(struct si_screen *sscreen, struct nir_shader *nir,
                         struct si_shader_info *info)
 {
+   bool force_use_aco = false;
+   if (sscreen->force_shader_use_aco) {
+      if (!memcmp(sscreen->use_aco_shader_blake, nir->info.source_blake3,
+                  sizeof(sscreen->use_aco_shader_blake))) {
+         force_use_aco = true;
+      }
+   }
+
+   nir->info.use_aco_amd = aco_is_gpu_supported(&sscreen->info) &&
+                           sscreen->info.has_image_opcodes &&
+                           (sscreen->use_aco || nir->info.use_aco_amd || force_use_aco ||
+                            /* Use ACO for streamout on gfx12 because it's faster. */
+                            (sscreen->info.gfx_level >= GFX12 && nir->xfb_info &&
+                             nir->xfb_info->output_count));
+
+   if (nir->info.stage == MESA_SHADER_FRAGMENT) {
+      /* post_depth_coverage implies early_fragment_tests */
+      nir->info.fs.early_fragment_tests |= nir->info.fs.post_depth_coverage;
+   }
+
    memset(info, 0, sizeof(*info));
    info->base = nir->info;
-   info->base.use_aco_amd = aco_is_gpu_supported(&sscreen->info) &&
-                            (sscreen->use_aco || nir->info.use_aco_amd) &&
-                            sscreen->info.has_image_opcodes;
 
    /* Get options from shader profiles. */
    for (unsigned i = 0; i < ARRAY_SIZE(si_shader_profiles); i++) {
-      if (_mesa_printed_blake3_equal(info->base.source_blake3, si_shader_profiles[i].blake3)) {
+      if (_mesa_printed_blake3_equal(nir->info.source_blake3, si_shader_profiles[i].blake3)) {
          info->options = si_shader_profiles[i].options;
          break;
       }
    }
 
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
-      /* post_depth_coverage implies early_fragment_tests */
-      info->base.fs.early_fragment_tests |= info->base.fs.post_depth_coverage;
-
       info->color_interpolate[0] = nir->info.fs.color0_interp;
       info->color_interpolate[1] = nir->info.fs.color1_interp;
       for (unsigned i = 0; i < 2; i++) {
@@ -565,7 +603,8 @@ void si_nir_scan_shader(struct si_screen *sscreen, const struct nir_shader *nir,
       (BITFIELD64_BIT(VARYING_SLOT_TESS_LEVEL_INNER) |
        BITFIELD64_BIT(VARYING_SLOT_TESS_LEVEL_OUTER));
 
-   info->uses_frontface = BITSET_TEST(nir->info.system_values_read, SYSTEM_VALUE_FRONT_FACE);
+   info->uses_frontface = BITSET_TEST(nir->info.system_values_read, SYSTEM_VALUE_FRONT_FACE) |
+                          BITSET_TEST(nir->info.system_values_read, SYSTEM_VALUE_FRONT_FACE_FSIGN);
    info->uses_instanceid = BITSET_TEST(nir->info.system_values_read, SYSTEM_VALUE_INSTANCE_ID);
    info->uses_base_vertex = BITSET_TEST(nir->info.system_values_read, SYSTEM_VALUE_BASE_VERTEX);
    info->uses_base_instance = BITSET_TEST(nir->info.system_values_read, SYSTEM_VALUE_BASE_INSTANCE);
@@ -619,6 +658,13 @@ void si_nir_scan_shader(struct si_screen *sscreen, const struct nir_shader *nir,
          scan_instruction(nir, info, instr);
    }
 
+   if (nir->info.stage == MESA_SHADER_VERTEX || nir->info.stage == MESA_SHADER_TESS_EVAL ||
+       nir->info.stage == MESA_SHADER_GEOMETRY) {
+      info->num_streamout_components = 0;
+      for (unsigned i = 0; i < info->num_outputs; i++)
+         info->num_streamout_components += util_bitcount(info->output_xfb_writemask[i]);
+   }
+
    if (nir->info.stage == MESA_SHADER_VERTEX || nir->info.stage == MESA_SHADER_TESS_EVAL) {
       /* Add the PrimitiveID output, but don't increment num_outputs.
        * The driver inserts PrimitiveID only when it's used by the pixel shader,
@@ -630,6 +676,7 @@ void si_nir_scan_shader(struct si_screen *sscreen, const struct nir_shader *nir,
    }
 
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
+      info->output_z_equals_input_z &= !info->output_z_is_not_input_z;
       info->allow_flat_shading = !(info->uses_persp_center || info->uses_persp_centroid ||
                                    info->uses_persp_sample || info->uses_linear_center ||
                                    info->uses_linear_centroid || info->uses_linear_sample ||
@@ -643,7 +690,7 @@ void si_nir_scan_shader(struct si_screen *sscreen, const struct nir_shader *nir,
                                    BITSET_TEST(nir->info.system_values_read, SYSTEM_VALUE_SAMPLE_MASK_IN) ||
                                    BITSET_TEST(nir->info.system_values_read, SYSTEM_VALUE_HELPER_INVOCATION));
 
-      info->uses_vmem_load_other |= info->base.fs.uses_fbfetch_output;
+      info->uses_vmem_load_other |= nir->info.fs.uses_fbfetch_output;
 
       /* Add both front and back color inputs. */
       unsigned num_inputs_with_colors = info->num_inputs;
@@ -672,7 +719,7 @@ void si_nir_scan_shader(struct si_screen *sscreen, const struct nir_shader *nir,
 
    if (nir->info.stage == MESA_SHADER_VERTEX) {
       info->num_vs_inputs =
-         nir->info.stage == MESA_SHADER_VERTEX && !info->base.vs.blit_sgprs_amd ? info->num_inputs : 0;
+         nir->info.stage == MESA_SHADER_VERTEX && !nir->info.vs.blit_sgprs_amd ? info->num_inputs : 0;
       unsigned num_vbos_in_sgprs = si_num_vbos_in_user_sgprs_inline(sscreen->info.gfx_level);
       info->num_vbos_in_user_sgprs = MIN2(info->num_vs_inputs, num_vbos_in_sgprs);
    }
@@ -693,22 +740,23 @@ void si_nir_scan_shader(struct si_screen *sscreen, const struct nir_shader *nir,
          assert(((info->esgs_vertex_stride / 4) & C_028AAC_ITEMSIZE) == 0);
       }
 
-      info->tcs_vgpr_only_inputs = ~info->base.tess.tcs_cross_invocation_inputs_read &
-                                   ~info->base.inputs_read_indirectly &
-                                   info->base.inputs_read;
+      info->tcs_inputs_via_temp = nir->info.tess.tcs_same_invocation_inputs_read;
+      info->tcs_inputs_via_lds = nir->info.tess.tcs_cross_invocation_inputs_read |
+                                 (nir->info.tess.tcs_same_invocation_inputs_read &
+                                  nir->info.inputs_read_indirectly);
    }
 
    if (nir->info.stage == MESA_SHADER_GEOMETRY) {
       info->gsvs_vertex_size = info->num_outputs * 16;
-      info->max_gsvs_emit_size = info->gsvs_vertex_size * info->base.gs.vertices_out;
+      info->max_gsvs_emit_size = info->gsvs_vertex_size * nir->info.gs.vertices_out;
       info->gs_input_verts_per_prim =
-         mesa_vertices_per_prim(info->base.gs.input_primitive);
+         mesa_vertices_per_prim(nir->info.gs.input_primitive);
    }
 
    info->clipdist_mask = info->writes_clipvertex ? SI_USER_CLIP_PLANE_MASK :
-                         u_bit_consecutive(0, info->base.clip_distance_array_size);
-   info->culldist_mask = u_bit_consecutive(0, info->base.cull_distance_array_size) <<
-                         info->base.clip_distance_array_size;
+                         u_bit_consecutive(0, nir->info.clip_distance_array_size);
+   info->culldist_mask = u_bit_consecutive(0, nir->info.cull_distance_array_size) <<
+                         nir->info.clip_distance_array_size;
 
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       for (unsigned i = 0; i < info->num_inputs; i++) {

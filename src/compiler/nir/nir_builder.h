@@ -667,7 +667,7 @@ nir_swizzle(nir_builder *build, nir_def *src, const unsigned *swiz,
    for (unsigned i = 0; i < num_components && i < NIR_MAX_VEC_COMPONENTS; i++) {
       if (swiz[i] != i)
          is_identity_swizzle = false;
-      alu_src.swizzle[i] = swiz[i];
+      alu_src.swizzle[i] = (uint8_t)swiz[i];
    }
 
    if (num_components == src->num_components && is_identity_swizzle)
@@ -819,7 +819,7 @@ nir_vector_extract(nir_builder *b, nir_def *vec, nir_def *c)
    if (nir_src_is_const(c_src)) {
       uint64_t c_const = nir_src_as_uint(c_src);
       if (c_const < vec->num_components)
-         return nir_channel(b, vec, c_const);
+         return nir_channel(b, vec, (unsigned)c_const);
       else
          return nir_undef(b, 1, vec->bit_size);
    } else {
@@ -847,7 +847,7 @@ nir_vector_insert_imm(nir_builder *b, nir_def *vec,
          vec_instr->src[i].swizzle[0] = 0;
       } else {
          vec_instr->src[i].src = nir_src_for_ssa(vec);
-         vec_instr->src[i].swizzle[0] = i;
+         vec_instr->src[i].swizzle[0] = (uint8_t)i;
       }
    }
 
@@ -866,7 +866,7 @@ nir_vector_insert(nir_builder *b, nir_def *vec, nir_def *scalar,
    if (nir_src_is_const(c_src)) {
       uint64_t c_const = nir_src_as_uint(c_src);
       if (c_const < vec->num_components)
-         return nir_vector_insert_imm(b, vec, scalar, c_const);
+         return nir_vector_insert_imm(b, vec, scalar, (unsigned )c_const);
       else
          return vec;
    } else {
@@ -1220,7 +1220,7 @@ nir_a_minus_bc(nir_builder *build, nir_def *src0, nir_def *src1,
 static inline nir_def *
 nir_pack_bits(nir_builder *b, nir_def *src, unsigned dest_bit_size)
 {
-   assert(src->num_components * src->bit_size == dest_bit_size);
+   assert((unsigned)(src->num_components * src->bit_size) == dest_bit_size);
 
    switch (dest_bit_size) {
    case 64:
@@ -1278,6 +1278,15 @@ nir_unpack_bits(nir_builder *b, nir_def *src, unsigned dest_bit_size)
          return nir_unpack_64_2x32(b, src);
       case 16:
          return nir_unpack_64_4x16(b, src);
+      case 8: {
+         nir_def *split = nir_unpack_64_2x32(b, src);
+         nir_def *lo = nir_unpack_32_4x8(b, nir_channel(b, split, 0));
+         nir_def *hi = nir_unpack_32_4x8(b, nir_channel(b, split, 1));
+         return nir_vec8(b, nir_channel(b, lo, 0), nir_channel(b, lo, 1),
+                         nir_channel(b, lo, 2), nir_channel(b, lo, 3),
+                         nir_channel(b, hi, 0), nir_channel(b, hi, 1),
+                         nir_channel(b, hi, 2), nir_channel(b, hi, 3));
+      }
       default:
          break;
       }
@@ -1899,7 +1908,7 @@ nir_load_global(nir_builder *build, nir_def *addr, unsigned align,
 {
    nir_intrinsic_instr *load =
       nir_intrinsic_instr_create(build->shader, nir_intrinsic_load_global);
-   load->num_components = num_components;
+   load->num_components = (uint8_t)num_components;
    load->src[0] = nir_src_for_ssa(addr);
    nir_intrinsic_set_align(load, align, 0);
    nir_def_init(&load->instr, &load->def, num_components, bit_size);
@@ -1930,7 +1939,7 @@ nir_load_global_constant(nir_builder *build, nir_def *addr, unsigned align,
 {
    nir_intrinsic_instr *load =
       nir_intrinsic_instr_create(build->shader, nir_intrinsic_load_global_constant);
-   load->num_components = num_components;
+   load->num_components = (uint8_t)num_components;
    load->src[0] = nir_src_for_ssa(addr);
    nir_intrinsic_set_align(load, align, 0);
    nir_def_init(&load->instr, &load->def, num_components, bit_size);

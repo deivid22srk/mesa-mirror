@@ -10,3 +10,5 @@ Add.Op/input_size_80_weight_size_5_input_channels_32_output_channels_256_stride_
 
 MobileDetParam.Op/mobiledet082,Fail
 MobileDet.Whole,Fail
+
+YoloX.Whole,Fail

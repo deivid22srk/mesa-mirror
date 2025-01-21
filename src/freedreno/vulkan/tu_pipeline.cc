@@ -79,6 +79,7 @@ tu6_load_state_size(struct tu_pipeline *pipeline,
          case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
          case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
          case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+         case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:
             /* IBO-backed resources only need one packet for all graphics stages */
             if (stage_count)
                count += 1;
@@ -174,7 +175,8 @@ tu6_emit_load_state(struct tu_device *device,
             FALLTHROUGH;
          case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
          case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
-         case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER: {
+         case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+         case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR: {
             unsigned mul = binding->size / (A6XX_TEX_CONST_DWORDS * 4);
             /* IBO-backed resources only need one packet for all graphics stages */
             if (stages & ~VK_SHADER_STAGE_COMPUTE_BIT) {
@@ -619,10 +621,10 @@ tu6_emit_const(struct tu_cs *cs, uint32_t opcode, enum tu_geom_consts_type type,
       uint32_t base;
       switch (type) {
       case TU_CONSTS_PRIMITIVE_MAP:
-         base = const_state->offsets.primitive_map;
+         base = const_state->allocs.consts[IR3_CONST_ALLOC_PRIMITIVE_MAP].offset_vec4;
          break;
       case TU_CONSTS_PRIMITIVE_PARAM:
-         base = const_state->offsets.primitive_param;
+         base = const_state->allocs.consts[IR3_CONST_ALLOC_PRIMITIVE_PARAM].offset_vec4;
          break;
       default:
          unreachable("bad consts type");
@@ -2239,6 +2241,9 @@ tu_emit_program_state(struct tu_cs *sub_cs,
           push_consts->type == IR3_PUSH_CONSTS_SHARED_PREAMBLE) {
          prog->shared_consts = *push_consts;
       }
+
+      if (variants[i]->info.uses_ray_intersection)
+         prog->uses_ray_intersection = true;
    }
 
    unsigned dynamic_descriptor_offset = 0;
@@ -2827,8 +2832,8 @@ void
 tu6_emit_depth_bias(struct tu_cs *cs, const struct vk_rasterization_state *rs)
 {
    tu_cs_emit_pkt4(cs, REG_A6XX_GRAS_SU_POLY_OFFSET_SCALE, 3);
-   tu_cs_emit(cs, A6XX_GRAS_SU_POLY_OFFSET_SCALE(rs->depth_bias.slope).value);
-   tu_cs_emit(cs, A6XX_GRAS_SU_POLY_OFFSET_OFFSET(rs->depth_bias.constant).value);
+   tu_cs_emit(cs, A6XX_GRAS_SU_POLY_OFFSET_SCALE(rs->depth_bias.slope_factor).value);
+   tu_cs_emit(cs, A6XX_GRAS_SU_POLY_OFFSET_OFFSET(rs->depth_bias.constant_factor).value);
    tu_cs_emit(cs, A6XX_GRAS_SU_POLY_OFFSET_OFFSET_CLAMP(rs->depth_bias.clamp).value);
 }
 
@@ -3780,9 +3785,8 @@ tu_emit_draw_state(struct tu_cmd_buffer *cmd)
               cmd->vk.dynamic_graphics_state.ms.alpha_to_coverage_enable,
               cmd->vk.dynamic_graphics_state.ms.alpha_to_one_enable,
               cmd->vk.dynamic_graphics_state.ms.sample_mask);
-   if (EMIT_STATE(blend_lrz) ||
-       ((cmd->state.dirty & TU_CMD_DIRTY_SUBPASS) &&
-        !cmd->state.pipeline_blend_lrz)) {
+   if (!cmd->state.pipeline_blend_lrz &&
+       (EMIT_STATE(blend_lrz) || (cmd->state.dirty & TU_CMD_DIRTY_SUBPASS))) {
       bool blend_reads_dest = tu6_calc_blend_lrz(&cmd->vk.dynamic_graphics_state.cb,
                                                  &cmd->state.vk_rp);
       if (blend_reads_dest != cmd->state.blend_reads_dest) {
@@ -3790,9 +3794,8 @@ tu_emit_draw_state(struct tu_cmd_buffer *cmd)
          cmd->state.dirty |= TU_CMD_DIRTY_LRZ;
       }
    }
-   if (EMIT_STATE(bandwidth) ||
-       ((cmd->state.dirty & TU_CMD_DIRTY_SUBPASS) &&
-        !cmd->state.pipeline_bandwidth))
+   if (!cmd->state.pipeline_bandwidth &&
+       (EMIT_STATE(bandwidth) || (cmd->state.dirty & TU_CMD_DIRTY_SUBPASS)))
       tu_calc_bandwidth(&cmd->state.bandwidth, &cmd->vk.dynamic_graphics_state.cb,
                         &cmd->state.vk_rp);
    DRAW_STATE(blend_constants, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
@@ -4814,6 +4817,14 @@ tu_GetPipelineExecutableStatisticsKHR(
                 "shader executable.");
       stat->format = VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR;
       stat->value.u64 = exe->stats.ldp_count;
+   }
+
+   vk_outarray_append_typed(VkPipelineExecutableStatisticKHR, &out, stat) {
+      WRITE_STR(stat->name, "Preamble Instruction Count");
+      WRITE_STR(stat->description,
+                "Total number of IR3 instructions in the preamble.");
+      stat->format = VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR;
+      stat->value.u64 = exe->stats.preamble_instrs_count;
    }
 
    vk_outarray_append_typed(VkPipelineExecutableStatisticKHR, &out, stat) {

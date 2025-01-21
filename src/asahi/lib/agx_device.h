@@ -11,6 +11,7 @@
 #include "util/simple_mtx.h"
 #include "util/sparse_array.h"
 #include "util/timespec.h"
+#include "util/u_printf.h"
 #include "util/vma.h"
 #include "agx_bo.h"
 #include "agx_pack.h"
@@ -30,7 +31,7 @@ static const uint64_t AGX_SUPPORTED_INCOMPAT_FEATURES =
 
 enum agx_dbg {
    AGX_DBG_TRACE = BITFIELD_BIT(0),
-   /* bit 1 unused */
+   AGX_DBG_BODUMP = BITFIELD_BIT(1),
    AGX_DBG_NO16 = BITFIELD_BIT(2),
    AGX_DBG_DIRTY = BITFIELD_BIT(3),
    AGX_DBG_PRECOMPILE = BITFIELD_BIT(4),
@@ -46,7 +47,7 @@ enum agx_dbg {
    AGX_DBG_SMALLTILE = BITFIELD_BIT(14),
    AGX_DBG_NOMSAA = BITFIELD_BIT(15),
    AGX_DBG_NOSHADOW = BITFIELD_BIT(16),
-   /* bit 17 unused */
+   AGX_DBG_BODUMPVERBOSE = BITFIELD_BIT(17),
    AGX_DBG_SCRATCH = BITFIELD_BIT(18),
    AGX_DBG_NOSOFT = BITFIELD_BIT(19),
    AGX_DBG_FEEDBACK = BITFIELD_BIT(20),
@@ -84,6 +85,12 @@ typedef struct {
    ssize_t (*get_params)(struct agx_device *dev, void *buf, size_t size);
    int (*submit)(struct agx_device *dev, struct drm_asahi_submit *submit,
                  struct agx_submit_virt *virt);
+   int (*bo_bind_object)(struct agx_device *dev, struct agx_bo *bo,
+                         uint32_t *object_handle, size_t size_B,
+                         uint64_t offset_B, uint32_t flags);
+   int (*bo_unbind_object)(struct agx_device *dev, uint32_t object_handle,
+                           uint32_t flags);
+
 } agx_device_ops_t;
 
 struct agx_device {
@@ -156,7 +163,28 @@ struct agx_device {
 
    /* Simplified device selection */
    enum agx_chip chip;
+
+   struct {
+      uint64_t num;
+      uint64_t den;
+   } timestamp_to_ns;
+
+   struct {
+      uint64_t num;
+      uint64_t den;
+   } user_timestamp_to_ns;
+
+   struct u_printf_ctx printf;
 };
+
+static inline void *
+agx_bo_map(struct agx_bo *bo)
+{
+   if (!bo->_map)
+      bo->dev->ops.bo_mmap(bo->dev, bo);
+
+   return bo->_map;
+}
 
 static inline bool
 agx_has_soft_fault(struct agx_device *dev)
@@ -200,7 +228,14 @@ uint64_t agx_get_gpu_timestamp(struct agx_device *dev);
 static inline uint64_t
 agx_gpu_time_to_ns(struct agx_device *dev, uint64_t gpu_time)
 {
-   return (gpu_time * NSEC_PER_SEC) / dev->params.timer_frequency_hz;
+   return (gpu_time * dev->timestamp_to_ns.num) / dev->timestamp_to_ns.den;
+}
+
+static inline uint64_t
+agx_gpu_timestamp_to_ns(struct agx_device *dev, uint64_t gpu_timestamp)
+{
+   return (gpu_timestamp * dev->user_timestamp_to_ns.num) /
+          dev->user_timestamp_to_ns.den;
 }
 
 void agx_get_device_uuid(const struct agx_device *dev, void *uuid);
@@ -213,3 +248,9 @@ struct agx_va *agx_va_alloc(struct agx_device *dev, uint64_t size_B,
                             uint64_t align_B, enum agx_va_flags flags,
                             uint64_t fixed_va);
 void agx_va_free(struct agx_device *dev, struct agx_va *va);
+
+static inline bool
+agx_supports_timestamps(const struct agx_device *dev)
+{
+   return (dev->params.feat_compat & DRM_ASAHI_FEAT_USER_TIMESTAMPS);
+}

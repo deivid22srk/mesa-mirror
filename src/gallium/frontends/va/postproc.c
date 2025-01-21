@@ -415,6 +415,15 @@ static VAStatus vlVaPostProcBlit(vlVaDriver *drv, vlVaContext *context,
       return VA_STATUS_SUCCESS;
    }
 
+   if (src->interlaced != dst->interlaced) {
+      deinterlace = deinterlace ? deinterlace : VL_COMPOSITOR_WEAVE;
+      vl_compositor_yuv_deint_full(&drv->cstate, &drv->compositor,
+                                   src, dst, &src_rect, &dst_rect,
+                                   deinterlace);
+
+      return VA_STATUS_SUCCESS;
+   }
+
    for (i = 0; i < VL_MAX_SURFACES; ++i) {
       struct pipe_surface *from = src_surfaces[i];
       struct pipe_blit_info blit;
@@ -454,8 +463,7 @@ static VAStatus vlVaPostProcBlit(vlVaDriver *drv, vlVaContext *context,
       blit.mask = PIPE_MASK_RGBA;
       blit.filter = PIPE_TEX_MIPFILTER_LINEAR;
 
-      if (drv->pipe->screen->get_param(drv->pipe->screen,
-                                       PIPE_CAP_PREFER_COMPUTE_FOR_MULTIMEDIA))
+      if (drv->pipe->screen->caps.prefer_compute_for_multimedia)
          util_compute_blit(drv->pipe, &blit, &context->blit_cs);
       else
          drv->pipe->blit(drv->pipe, &blit);
@@ -494,9 +502,15 @@ vlVaApplyDeint(vlVaDriver *drv, vlVaContext *context,
       context->deint = NULL;
    }
 
+   if (!drv->pipe_gfx) {
+      drv->pipe_gfx = pipe_create_multimedia_context(drv->pipe->screen, false);
+      if (!drv->pipe_gfx)
+         return current;
+   }
+
    if (!context->deint) {
       context->deint = MALLOC(sizeof(struct vl_deint_filter));
-      if (!vl_deint_filter_init(context->deint, drv->pipe, current->width,
+      if (!vl_deint_filter_init(context->deint, drv->pipe_gfx, current->width,
                                 current->height, false, false, !current->interlaced)) {
          FREE(context->deint);
          context->deint = NULL;
@@ -510,6 +524,9 @@ vlVaApplyDeint(vlVaDriver *drv, vlVaContext *context,
 
    vl_deint_filter_render(context->deint, prevprev->buffer, prev->buffer,
                           current, next->buffer, field);
+
+   drv->pipe_gfx->flush(drv->pipe_gfx, NULL, 0);
+
    return context->deint->video_buffer;
 }
 
@@ -656,8 +673,7 @@ vlVaHandleVAProcPipelineParameterBufferType(vlVaDriver *drv, vlVaContext *contex
    /* Some devices may be media only (PIPE_VIDEO_ENTRYPOINT_PROCESSING with video engine)
     * and won't have shader support
     */
-   if (!drv->vscreen->pscreen->get_param(drv->vscreen->pscreen, PIPE_CAP_GRAPHICS) &&
-       !drv->vscreen->pscreen->get_param(drv->vscreen->pscreen, PIPE_CAP_COMPUTE))
+   if (!drv->vscreen->pscreen->caps.graphics && !drv->vscreen->pscreen->caps.compute)
       return VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
 
    /* Subsampled formats not supported */

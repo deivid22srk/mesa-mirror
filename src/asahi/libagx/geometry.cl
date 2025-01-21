@@ -5,18 +5,9 @@
  */
 
 #include "geometry.h"
+#include "libagx_intrinsics.h"
 #include "query.h"
 #include "tessellator.h"
-
-/* Compatible with util/u_math.h */
-static inline uint
-util_logbase2_ceil(uint n)
-{
-   if (n <= 1)
-      return 0;
-   else
-      return 32 - clz(n - 1);
-}
 
 /* Swap the two non-provoking vertices third vert in odd triangles. This
  * generates a vertex ID list with a consistent winding order.
@@ -229,10 +220,68 @@ vertex_id_for_topology(enum mesa_prim mode, bool flatshade_first, uint prim,
    }
 }
 
+uint
+libagx_map_to_line_adj(uint id)
+{
+   /* Sequence (1, 2), (5, 6), (9, 10), ... */
+   return ((id & ~1) * 2) + (id & 1) + 1;
+}
+
+uint
+libagx_map_to_line_strip_adj(uint id)
+{
+   /* Sequence (1, 2), (2, 3), (4, 5), .. */
+   uint prim = id / 2;
+   uint vert = id & 1;
+   return prim + vert + 1;
+}
+
+uint
+libagx_map_to_tri_strip_adj(uint id)
+{
+   /* Sequence (0, 2, 4), (2, 6, 4), (4, 6, 8), (6, 10, 8)
+    *
+    * Although tri strips with adjacency have 6 cases in general, after
+    * disregarding the vertices only available in a geometry shader, there are
+    * only even/odd cases. In other words, it's just a triangle strip subject to
+    * extra padding.
+    *
+    * Dividing through by two, the sequence is:
+    *
+    *   (0, 1, 2), (1, 3, 2), (2, 3, 4), (3, 5, 4)
+    */
+   uint prim = id / 3;
+   uint vtx = id % 3;
+
+   /* Flip the winding order of odd triangles */
+   if ((prim % 2) == 1) {
+      if (vtx == 1)
+         vtx = 2;
+      else if (vtx == 2)
+         vtx = 1;
+   }
+
+   return 2 * (prim + vtx);
+}
+
+static void
+store_index(uintptr_t index_buffer, uint index_size_B, uint id, uint value)
+{
+   global uint32_t *out_32 = (global uint32_t *)index_buffer;
+   global uint16_t *out_16 = (global uint16_t *)index_buffer;
+   global uint8_t *out_8 = (global uint8_t *)index_buffer;
+
+   if (index_size_B == 4)
+      out_32[id] = value;
+   else if (index_size_B == 2)
+      out_16[id] = value;
+   else
+      out_8[id] = value;
+}
+
 static uint
-libagx_load_index_buffer_internal(uintptr_t index_buffer,
-                                  uint32_t index_buffer_range_el, uint id,
-                                  uint index_size)
+load_index(uintptr_t index_buffer, uint32_t index_buffer_range_el, uint id,
+           uint index_size)
 {
    bool oob = id >= index_buffer_range_el;
 
@@ -265,36 +314,44 @@ uint
 libagx_load_index_buffer(constant struct agx_ia_state *p, uint id,
                          uint index_size)
 {
-   return libagx_load_index_buffer_internal(
-      p->index_buffer, p->index_buffer_range_el, id, index_size);
+   return load_index(p->index_buffer, p->index_buffer_range_el, id, index_size);
 }
 
 static void
-increment_ia_counters(global uint32_t *ia_vertices,
-                      global uint32_t *vs_invocations, uint count)
+increment_counters(global uint32_t *a, global uint32_t *b, global uint32_t *c,
+                   uint count)
 {
-   if (ia_vertices) {
-      *ia_vertices += count;
-   }
+   global uint32_t *ptr[] = {a, b, c};
 
-   if (vs_invocations) {
-      *vs_invocations += count;
+   for (uint i = 0; i < 3; ++i) {
+      if (ptr[i]) {
+         *(ptr[i]) += count;
+      }
    }
 }
 
 KERNEL(1)
 libagx_increment_ia(global uint32_t *ia_vertices,
-                    global uint32_t *vs_invocations, constant uint32_t *draw)
+                    global uint32_t *ia_primitives,
+                    global uint32_t *vs_invocations, global uint32_t *c_prims,
+                    global uint32_t *c_invs, constant uint32_t *draw,
+                    enum mesa_prim prim)
 {
-   increment_ia_counters(ia_vertices, vs_invocations, draw[0] * draw[1]);
+   increment_counters(ia_vertices, vs_invocations, NULL, draw[0] * draw[1]);
+
+   uint prims = u_decomposed_prims_for_vertices(prim, draw[0]) * draw[1];
+   increment_counters(ia_primitives, c_prims, c_invs, prims);
 }
 
 KERNEL(1024)
 libagx_increment_ia_restart(global uint32_t *ia_vertices,
+                            global uint32_t *ia_primitives,
                             global uint32_t *vs_invocations,
+                            global uint32_t *c_prims, global uint32_t *c_invs,
                             constant uint32_t *draw, uint64_t index_buffer,
                             uint32_t index_buffer_range_el,
-                            uint32_t restart_index, uint32_t index_size_B)
+                            uint32_t restart_index, uint32_t index_size_B,
+                            enum mesa_prim prim)
 {
    uint tid = get_global_id(0);
    unsigned count = draw[0];
@@ -305,8 +362,8 @@ libagx_increment_ia_restart(global uint32_t *ia_vertices,
 
    /* Count non-restart indices */
    for (uint i = tid; i < count; i += 1024) {
-      uint index = libagx_load_index_buffer_internal(
-         index_buffer, index_buffer_range_el, start + i, index_size_B);
+      uint index = load_index(index_buffer, index_buffer_range_el, start + i,
+                              index_size_B);
 
       if (index != restart_index)
          partial++;
@@ -320,7 +377,30 @@ libagx_increment_ia_restart(global uint32_t *ia_vertices,
 
    /* Elect a single thread from the workgroup to increment the counters */
    if (tid == 0) {
-      increment_ia_counters(ia_vertices, vs_invocations, scratch * draw[1]);
+      increment_counters(ia_vertices, vs_invocations, NULL, scratch * draw[1]);
+   }
+
+   /* TODO: We should vectorize this */
+   if ((ia_primitives || c_prims || c_invs) && tid == 0) {
+      uint accum = 0;
+      int last_restart = -1;
+      for (uint i = 0; i < count; ++i) {
+         uint index = load_index(index_buffer, index_buffer_range_el, start + i,
+                                 index_size_B);
+
+         if (index == restart_index) {
+            accum +=
+               u_decomposed_prims_for_vertices(prim, i - last_restart - 1);
+            last_restart = i;
+         }
+      }
+
+      {
+         accum +=
+            u_decomposed_prims_for_vertices(prim, count - last_restart - 1);
+      }
+
+      increment_counters(ia_primitives, c_prims, c_invs, accum * draw[1]);
    }
 }
 
@@ -332,10 +412,11 @@ static uint
 first_true_thread_in_workgroup(bool cond, local uint *scratch)
 {
    barrier(CLK_LOCAL_MEM_FENCE);
-   scratch[get_sub_group_id()] = nir_ballot(cond);
+   scratch[get_sub_group_id()] = sub_group_ballot(cond)[0];
    barrier(CLK_LOCAL_MEM_FENCE);
 
-   uint first_group = ctz(nir_ballot(scratch[get_sub_group_local_id()]));
+   uint first_group =
+      ctz(sub_group_ballot(scratch[get_sub_group_local_id()])[0]);
    uint off = ctz(first_group < 32 ? scratch[first_group] : 0);
    return (first_group * 32) + off;
 }
@@ -397,9 +478,6 @@ libagx_unroll_restart(global struct agx_geometry_state *heap,
    }
 
    barrier(CLK_LOCAL_MEM_FENCE);
-   global uint32_t *out_32 = (global uint32_t *)out_ptr;
-   global uint16_t *out_16 = (global uint16_t *)out_ptr;
-   global uint8_t *out_8 = (global uint8_t *)out_ptr;
 
    uintptr_t in_ptr = (uintptr_t)(libagx_index_buffer(
       index_buffer, index_buffer_size_el, in_draw[2], index_size_B, zero_sink));
@@ -414,9 +492,9 @@ libagx_unroll_restart(global struct agx_geometry_state *heap,
       uint next_restart = needle;
       for (;;) {
          uint idx = next_restart + tid;
-         bool restart = idx >= count || libagx_load_index_buffer_internal(
-                                           in_ptr, index_buffer_size_el, idx,
-                                           index_size_B) == restart_index;
+         bool restart =
+            idx >= count || load_index(in_ptr, index_buffer_size_el, idx,
+                                       index_size_B) == restart_index;
 
          uint next_offs = first_true_thread_in_workgroup(restart, scratch);
 
@@ -436,15 +514,10 @@ libagx_unroll_restart(global struct agx_geometry_state *heap,
             uint offset = needle + id;
 
             uint x = ((out_prims_base + i) * per_prim) + vtx;
-            uint y = libagx_load_index_buffer_internal(
-               in_ptr, index_buffer_size_el, offset, index_size_B);
+            uint y =
+               load_index(in_ptr, index_buffer_size_el, offset, index_size_B);
 
-            if (index_size_B == 4)
-               out_32[x] = y;
-            else if (index_size_B == 2)
-               out_16[x] = y;
-            else
-               out_8[x] = y;
+            store_index(out_ptr, index_size_B, x, y);
          }
       }
 

@@ -238,6 +238,7 @@ get_device_extensions(const struct anv_physical_device *device,
       .KHR_video_decode_queue                = device->video_decode_enabled,
       .KHR_video_decode_h264                 = VIDEO_CODEC_H264DEC && device->video_decode_enabled,
       .KHR_video_decode_h265                 = VIDEO_CODEC_H265DEC && device->video_decode_enabled,
+      .KHR_video_decode_av1                  = device->info.ver >= 12 && VIDEO_CODEC_AV1DEC && device->video_decode_enabled,
       .KHR_video_encode_queue                = device->video_encode_enabled,
       .KHR_video_encode_h264                 = VIDEO_CODEC_H264ENC && device->video_encode_enabled,
       .KHR_video_encode_h265                 = device->info.ver >= 12 && VIDEO_CODEC_H265ENC && device->video_encode_enabled,
@@ -527,6 +528,9 @@ get_features(const struct anv_physical_device *pdevice,
       .dynamicRendering = true,
       .shaderIntegerDotProduct = true,
       .maintenance4 = true,
+
+      /* Vulkan 1.4 */
+      .pushDescriptor = true,
 
       /* VK_EXT_4444_formats */
       .formatA4R4G4B4 = true,
@@ -1003,8 +1007,8 @@ get_properties_1_2(const struct anv_physical_device *pdevice,
 
    p->conformanceVersion = (VkConformanceVersion) {
       .major = 1,
-      .minor = 3,
-      .subminor = 6,
+      .minor = 4,
+      .subminor = 0,
       .patch = 0,
    };
 
@@ -1353,6 +1357,10 @@ get_properties(const struct anv_physical_device *pdevice,
 
       /* VK_KHR_cooperative_matrix */
       .cooperativeMatrixSupportedStages = VK_SHADER_STAGE_COMPUTE_BIT,
+
+      /* Vulkan 1.4 */
+      .dynamicRenderingLocalReadDepthStencilAttachments = true,
+      .dynamicRenderingLocalReadMultisampledAttachments = true,
    };
 
    snprintf(props->deviceName, sizeof(props->deviceName),
@@ -1685,7 +1693,7 @@ get_properties(const struct anv_physical_device *pdevice,
       /* Bounded by the maximum representable size in
        * 3DSTATE_MESH_SHADER_BODY::SharedLocalMemorySize.  Same for Task.
        */
-      const uint32_t max_slm_size = 64 * 1024;
+      const uint32_t max_slm_size = intel_device_info_get_max_slm_size(devinfo);
 
       /* Bounded by the maximum representable size in
        * 3DSTATE_MESH_SHADER_BODY::LocalXMaximum.  Same for Task.
@@ -2433,9 +2441,6 @@ anv_physical_device_try_create(struct vk_instance *vk_instance,
       goto fail_fd;
    }
 
-   if (devinfo.ver == 20 && instance->disable_xe2_ccs)
-      intel_debug |= DEBUG_NO_CCS;
-
    /* Disable Wa_16013994831 on Gfx12.0 because we found other cases where we
     * need to always disable preemption :
     *    - https://gitlab.freedesktop.org/mesa/mesa/-/issues/5963
@@ -2806,6 +2811,8 @@ void anv_GetPhysicalDeviceQueueFamilyProperties2(
                if (queue_family->queueFlags & VK_QUEUE_VIDEO_DECODE_BIT_KHR) {
                   prop->videoCodecOperations = VK_VIDEO_CODEC_OPERATION_DECODE_H264_BIT_KHR |
                                                VK_VIDEO_CODEC_OPERATION_DECODE_H265_BIT_KHR;
+                  if (pdevice->info.ver >= 12)
+                     prop->videoCodecOperations |= VK_VIDEO_CODEC_OPERATION_DECODE_AV1_BIT_KHR;
                }
 
                if (queue_family->queueFlags & VK_QUEUE_VIDEO_ENCODE_BIT_KHR) {
@@ -3124,31 +3131,6 @@ VkResult anv_GetPhysicalDeviceCooperativeMatrixPropertiesKHR(
             prop->saturatingAccumulation = VK_TRUE;
             prop->scope = convert_scope(cfg->scope);
          }
-      }
-   }
-
-   return vk_outarray_status(&out);
-}
-
-static const VkTimeDomainKHR anv_time_domains[] = {
-   VK_TIME_DOMAIN_DEVICE_KHR,
-   VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR,
-#ifdef CLOCK_MONOTONIC_RAW
-   VK_TIME_DOMAIN_CLOCK_MONOTONIC_RAW_KHR,
-#endif
-};
-
-VkResult anv_GetPhysicalDeviceCalibrateableTimeDomainsKHR(
-   VkPhysicalDevice                             physicalDevice,
-   uint32_t                                     *pTimeDomainCount,
-   VkTimeDomainKHR                              *pTimeDomains)
-{
-   int d;
-   VK_OUTARRAY_MAKE_TYPED(VkTimeDomainKHR, out, pTimeDomains, pTimeDomainCount);
-
-   for (d = 0; d < ARRAY_SIZE(anv_time_domains); d++) {
-      vk_outarray_append_typed(VkTimeDomainKHR, &out, i) {
-         *i = anv_time_domains[d];
       }
    }
 

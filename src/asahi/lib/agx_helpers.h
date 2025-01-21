@@ -104,24 +104,6 @@ agx_translate_sample_count(unsigned samples)
    }
 }
 
-static inline enum agx_index_size
-agx_translate_index_size(uint8_t size_B)
-{
-   /* Index sizes are encoded logarithmically */
-   STATIC_ASSERT(__builtin_ctz(1) == AGX_INDEX_SIZE_U8);
-   STATIC_ASSERT(__builtin_ctz(2) == AGX_INDEX_SIZE_U16);
-   STATIC_ASSERT(__builtin_ctz(4) == AGX_INDEX_SIZE_U32);
-
-   assert((size_B == 1) || (size_B == 2) || (size_B == 4));
-   return __builtin_ctz(size_B);
-}
-
-static inline uint8_t
-agx_index_size_to_B(enum agx_index_size size)
-{
-   return 1 << size;
-}
-
 static enum agx_conservative_depth
 agx_translate_depth_layout(enum gl_frag_depth_layout layout)
 {
@@ -278,20 +260,21 @@ agx_fill_decompress_args(struct ail_layout *layout, unsigned layer,
 }
 
 #undef libagx_decompress
-#define libagx_decompress(context, grid, layout, layer, level, ptr, images)    \
+#define libagx_decompress(context, grid, barrier, layout, layer, level, ptr,   \
+                          images)                                              \
    libagx_decompress_struct(                                                   \
-      context, grid,                                                           \
+      context, grid, barrier,                                                  \
       agx_fill_decompress_args(layout, layer, level, ptr, images),             \
       util_logbase2(layout->sample_count_sa))
 
-#define libagx_tessellate(context, grid, prim, mode, state)                    \
+#define libagx_tessellate(context, grid, barrier, prim, mode, state)           \
    if (prim == TESS_PRIMITIVE_QUADS) {                                         \
-      libagx_tess_quad(context, grid, state, mode);                            \
+      libagx_tess_quad(context, grid, barrier, state, mode);                   \
    } else if (prim == TESS_PRIMITIVE_TRIANGLES) {                              \
-      libagx_tess_tri(context, grid, state, mode);                             \
+      libagx_tess_tri(context, grid, barrier, state, mode);                    \
    } else {                                                                    \
       assert(prim == TESS_PRIMITIVE_ISOLINES);                                 \
-      libagx_tess_isoline(context, grid, state, mode);                         \
+      libagx_tess_isoline(context, grid, barrier, state, mode);                \
    }
 
 struct agx_border_packed;

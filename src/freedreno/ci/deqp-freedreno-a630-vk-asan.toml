@@ -3,12 +3,10 @@
 deqp = "/deqp-vk/external/vulkancts/modules/vulkan/deqp-vk"
 caselists = ["/deqp-vk/mustpass/vk-main.txt"]
 skips = ["install/freedreno-a6xx-skips.txt"]
-fraction = 1000
+fraction = 400
 renderer_check = "Turnip Adreno .* 630"
 prefix = "asan-"
-[deqp.env]
-# Disable leak checking as of CTS 1.3.3.0 because the CTS itself leaks memory
-ASAN_OPTIONS = "detect_leaks=0"
+tests_per_group = 500
 
 # Force the spiller on one test so we see its memory usage.
 [[deqp]]
@@ -17,7 +15,9 @@ caselists = ["/deqp-vk/mustpass/vk-main.txt"]
 skips = ["install/freedreno-a6xx-skips.txt"]
 include = ["dEQP-VK.graphicsfuzz.barrier-in-loop-with-break"]
 prefix = "spill-"
+tests_per_group = 1
 [deqp.env]
+# Increase the hangcheck timer for our spilling tests which bump up against
+# the .5s default.
+FREEDRENO_HANGCHECK_MS = "2000"
 IR3_SHADER_DEBUG = "spillall"
-# Disable leak checking as of CTS 1.3.3.0 because the CTS itself leaks memory
-ASAN_OPTIONS = "detect_leaks=0"

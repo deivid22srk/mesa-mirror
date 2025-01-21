@@ -31,8 +31,7 @@
 #include "util/macros.h"
 #include "util/u_debug.h"
 #else
-#define ENUM_PACKED
-#define BITFIELD_BIT(b) (1u << (b))
+#include "libcl/libcl.h"
 #define debug_printf(x, ...)
 #endif
 
@@ -558,9 +557,8 @@ _mesa_varying_slot_in_fs(gl_varying_slot slot)
 /*@}*/
 
 /**
- * If the gl_register_file is PROGRAM_SYSTEM_VALUE, the register index will be
- * one of these values.  If a NIR variable's mode is nir_var_system_value, it
- * will be one of these values.
+ * If a NIR variable's mode is nir_var_system_value, it will be one of these
+ * values.
  */
 typedef enum
 {
@@ -785,6 +783,7 @@ typedef enum
    SYSTEM_VALUE_POINT_COORD,
    SYSTEM_VALUE_LINE_COORD, /**< Coord along axis perpendicular to line */
    SYSTEM_VALUE_FRONT_FACE,
+   SYSTEM_VALUE_FRONT_FACE_FSIGN,
    SYSTEM_VALUE_SAMPLE_ID,
    SYSTEM_VALUE_SAMPLE_POS,
    SYSTEM_VALUE_SAMPLE_POS_OR_CENTER,
@@ -1387,6 +1386,18 @@ u_reduced_prim(enum mesa_prim prim)
    default:
       return MESA_PRIM_TRIANGLES;
    }
+}
+
+static inline bool
+mesa_prim_has_adjacency(enum mesa_prim prim)
+{
+   static_assert(MESA_PRIM_LINE_STRIP_ADJACENCY == MESA_PRIM_LINES_ADJACENCY + 1, "");
+   static_assert(MESA_PRIM_TRIANGLES_ADJACENCY == MESA_PRIM_LINES_ADJACENCY + 2, "");
+   static_assert(MESA_PRIM_TRIANGLE_STRIP_ADJACENCY == MESA_PRIM_LINES_ADJACENCY + 3, "");
+
+   /* Adjacency primitives are together so we can do a simple comparison */
+   return prim >= MESA_PRIM_LINES_ADJACENCY &&
+          prim <= MESA_PRIM_TRIANGLE_STRIP_ADJACENCY;
 }
 
 /**

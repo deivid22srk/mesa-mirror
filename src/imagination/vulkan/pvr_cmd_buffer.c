@@ -3776,8 +3776,7 @@ static uint16_t pvr_get_dynamic_descriptor_primary_offset(
    struct pvr_descriptor_size_info size_info;
    uint32_t offset;
 
-   assert(binding->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC ||
-          binding->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC);
+   assert(vk_descriptor_type_is_dynamic(binding->type));
    assert(desc_idx < binding->descriptor_count);
 
    pvr_descriptor_size_info_init(device, binding->type, &size_info);
@@ -3806,8 +3805,7 @@ static uint16_t pvr_get_dynamic_descriptor_secondary_offset(
    struct pvr_descriptor_size_info size_info;
    uint32_t offset;
 
-   assert(binding->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC ||
-          binding->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC);
+   assert(vk_descriptor_type_is_dynamic(binding->type));
    assert(desc_idx < binding->descriptor_count);
 
    pvr_descriptor_size_info_init(device, binding->type, &size_info);
@@ -5273,8 +5271,8 @@ pvr_setup_isp_depth_bias_scissor_state(struct pvr_cmd_buffer *const cmd_buffer)
          .constant_factor = pvr_calculate_final_depth_bias_contant_factor(
             dev_info,
             cmd_buffer->state.depth_format,
-            dynamic_state->rs.depth_bias.constant),
-         .slope_factor = dynamic_state->rs.depth_bias.slope,
+            dynamic_state->rs.depth_bias.constant_factor),
+         .slope_factor = dynamic_state->rs.depth_bias.slope_factor,
          .clamp = dynamic_state->rs.depth_bias.clamp,
       };
 

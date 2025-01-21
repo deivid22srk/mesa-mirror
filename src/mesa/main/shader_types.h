@@ -233,6 +233,9 @@ struct gl_shader
    /** Global xfb_stride out qualifier if any */
    GLuint TransformFeedbackBufferStride[MAX_FEEDBACK_BUFFERS];
 
+   /* for OVR_multiview */
+   uint32_t view_mask;
+
    struct gl_shader_info info;
 
    /* ARB_gl_spirv related data */
@@ -245,9 +248,6 @@ struct gl_shader
 struct gl_linked_shader
 {
    gl_shader_stage Stage;
-
-   /** All gl_shader::compiled_source_blake3 combined. */
-   blake3_hash linked_source_blake3;
 
    struct gl_program *Program;  /**< Post-compile assembly code */
 

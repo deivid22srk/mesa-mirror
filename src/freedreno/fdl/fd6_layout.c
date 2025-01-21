@@ -19,7 +19,8 @@ static bool
 is_r8g8(const struct fdl_layout *layout)
 {
    return layout->cpp == 2 &&
-          util_format_get_nr_components(layout->format) == 2;
+          util_format_get_nr_components(layout->format) == 2 &&
+          !layout->is_mutable;
 }
 
 void
@@ -98,7 +99,8 @@ fdl6_tile_alignment(struct fdl_layout *layout, uint32_t *heightalign)
     * looser alignment requirements, however the validity of alignment is
     * heavily undertested and the "officially" supported alignment is 4096b.
     */
-   if (layout->ubwc || util_format_is_depth_or_stencil(layout->format))
+   if (layout->ubwc || util_format_is_depth_or_stencil(layout->format) ||
+       is_r8g8(layout))
       layout->base_align = 4096;
    else if (layout->cpp == 1)
       layout->base_align = 64;
@@ -115,7 +117,7 @@ bool
 fdl6_layout(struct fdl_layout *layout, const struct fd_dev_info *info,
             enum pipe_format format, uint32_t nr_samples, uint32_t width0,
             uint32_t height0, uint32_t depth0, uint32_t mip_levels,
-            uint32_t array_size, bool is_3d,
+            uint32_t array_size, bool is_3d, bool is_mutable,
             struct fdl_explicit_layout *explicit_layout)
 {
    uint32_t offset = 0, heightalign;
@@ -134,6 +136,7 @@ fdl6_layout(struct fdl_layout *layout, const struct fd_dev_info *info,
    layout->format = format;
    layout->nr_samples = nr_samples;
    layout->layer_first = !is_3d;
+   layout->is_mutable = is_mutable;
 
    fdl6_get_ubwc_blockwidth(layout, &ubwc_blockwidth, &ubwc_blockheight);
 
@@ -266,10 +269,8 @@ fdl6_layout(struct fdl_layout *layout, const struct fd_dev_info *info,
             if (pitch != fdl_pitch(layout, level - 1) / 2)
                min_3d_layer_size = slice->size0 = nblocksy * pitch;
 
-            /* If the height is now less than the alignment requirement, then
-             * scale it up and let this be the minimum layer size.
-             */
-            if (tile_mode && util_format_get_nblocksy(format, height) < heightalign)
+            /* If the height wouldn't be aligned, stay aligned instead */
+            if (slice->size0 < nblocksy * pitch)
                min_3d_layer_size = slice->size0 = nblocksy * pitch;
 
             /* If the size would become un-page-aligned, stay aligned instead. */

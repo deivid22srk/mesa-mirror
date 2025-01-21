@@ -342,6 +342,7 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_preamble_start_ir3:
    case nir_intrinsic_optimization_barrier_sgpr_amd:
    case nir_intrinsic_load_printf_buffer_address:
+   case nir_intrinsic_load_printf_buffer_size:
    case nir_intrinsic_load_printf_base_identifier:
    case nir_intrinsic_load_core_id_agx:
    case nir_intrinsic_load_samples_log2_agx:
@@ -384,6 +385,12 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
          is_divergent = true;
       }
       break;
+   case nir_intrinsic_load_attribute_pan:
+      assert(stage == MESA_SHADER_VERTEX);
+      is_divergent = src_divergent(instr->src[0], state) ||
+                     src_divergent(instr->src[1], state) ||
+                     src_divergent(instr->src[2], state);
+      break;
    case nir_intrinsic_load_per_vertex_input:
       is_divergent = src_divergent(instr->src[0], state) ||
                      src_divergent(instr->src[1], state);
@@ -418,6 +425,12 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
          unreachable("Invalid stage for load_output");
       }
       break;
+   case nir_intrinsic_load_per_view_output:
+      is_divergent = instr->src[0].ssa->divergent ||
+                     instr->src[1].ssa->divergent ||
+                     (stage == MESA_SHADER_TESS_CTRL &&
+                      !(options & nir_divergence_single_patch_per_tcs_subgroup));
+      break;
    case nir_intrinsic_load_per_vertex_output:
       /* TCS and NV_mesh_shader only (EXT_mesh_shader does not allow loading outputs). */
       assert(stage == MESA_SHADER_TESS_CTRL || stage == MESA_SHADER_MESH);
@@ -434,6 +447,7 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
       break;
    case nir_intrinsic_load_layer_id:
    case nir_intrinsic_load_front_face:
+   case nir_intrinsic_load_front_face_fsign:
    case nir_intrinsic_load_back_face_agx:
       assert(stage == MESA_SHADER_FRAGMENT || state->shader->info.internal);
       is_divergent = !(options & nir_divergence_single_prim_per_subgroup);
@@ -536,6 +550,7 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
 
    case nir_intrinsic_load_ssbo:
    case nir_intrinsic_load_ssbo_ir3:
+   case nir_intrinsic_load_uav_ir3:
       is_divergent = (src_divergent(instr->src[0], state) &&
                       (nir_intrinsic_access(instr) & ACCESS_NON_UNIFORM)) ||
                      src_divergent(instr->src[1], state) ||
@@ -684,7 +699,8 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_load_const_ir3:
    case nir_intrinsic_load_frag_size_ir3:
    case nir_intrinsic_load_frag_offset_ir3:
-   case nir_intrinsic_bindless_resource_ir3: {
+   case nir_intrinsic_bindless_resource_ir3:
+   case nir_intrinsic_ray_intersection_ir3: {
       unsigned num_srcs = nir_intrinsic_infos[instr->intrinsic].num_srcs;
       for (unsigned i = 0; i < num_srcs; i++) {
          if (src_divergent(instr->src[i], state)) {
@@ -750,6 +766,7 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_load_line_coord:
    case nir_intrinsic_load_frag_coord:
    case nir_intrinsic_load_frag_coord_zw:
+   case nir_intrinsic_load_frag_coord_zw_pan:
    case nir_intrinsic_load_frag_coord_unscaled_ir3:
    case nir_intrinsic_load_pixel_coord:
    case nir_intrinsic_load_fully_covered:
@@ -1463,7 +1480,7 @@ nir_has_divergent_loop(nir_shader *shader)
 
    foreach_list_typed(nir_cf_node, node, node, &func->body) {
       if (node->type == nir_cf_node_loop) {
-         if (nir_loop_is_divergent(nir_cf_node_as_loop(node)))
+         if (nir_cf_node_as_loop(node)->divergent_break)
             return true;
       }
    }

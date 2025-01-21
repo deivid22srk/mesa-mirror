@@ -295,6 +295,10 @@ radv_use_dcc_for_image_early(struct radv_device *device, struct radv_image *imag
    if (instance->drirc.disable_dcc_mips && pCreateInfo->mipLevels > 1)
       return false;
 
+   /* Force disable DCC for stores to workaround game bugs. */
+   if (instance->drirc.disable_dcc_stores && (pCreateInfo->usage & VK_IMAGE_USAGE_STORAGE_BIT))
+      return false;
+
    /* DCC MSAA can't work on GFX10.3 and earlier without FMASK. */
    if (pCreateInfo->samples > 1 && pdev->info.gfx_level < GFX11 && (instance->debug_flags & RADV_DEBUG_NO_FMASK))
       return false;
@@ -763,7 +767,7 @@ radv_query_opaque_metadata(struct radv_device *device, struct radv_image *image,
                                 plane_height, image->vk.extent.depth, 0.0f, desc, NULL, NULL, NULL);
 
    radv_set_mutable_tex_desc_fields(device, image, base_level_info, plane_id, 0, 0, surface->blk_w, false, false, false,
-                                    false, desc, NULL);
+                                    false, desc, NULL, 0);
 
    ac_surface_compute_umd_metadata(&pdev->info, surface, image->vk.mip_levels, desc, &md->size_metadata, md->metadata,
                                    instance->debug_flags & RADV_DEBUG_EXTRA_MD);
@@ -1736,7 +1740,7 @@ radv_BindImageMemory2(VkDevice _device, uint32_t bindInfoCount, const VkBindImag
    for (uint32_t i = 0; i < bindInfoCount; ++i) {
       VK_FROM_HANDLE(radv_device_memory, mem, pBindInfos[i].memory);
       VK_FROM_HANDLE(radv_image, image, pBindInfos[i].image);
-      VkBindMemoryStatusKHR *status = (void *)vk_find_struct_const(&pBindInfos[i], BIND_MEMORY_STATUS_KHR);
+      VkBindMemoryStatus *status = (void *)vk_find_struct_const(&pBindInfos[i], BIND_MEMORY_STATUS);
 
       if (status)
          *status->pResult = VK_SUCCESS;
@@ -1795,8 +1799,8 @@ radv_BindImageMemory2(VkDevice _device, uint32_t bindInfoCount, const VkBindImag
 }
 
 VKAPI_ATTR void VKAPI_CALL
-radv_GetImageSubresourceLayout2KHR(VkDevice _device, VkImage _image, const VkImageSubresource2KHR *pSubresource,
-                                   VkSubresourceLayout2KHR *pLayout)
+radv_GetImageSubresourceLayout2(VkDevice _device, VkImage _image, const VkImageSubresource2 *pSubresource,
+                                VkSubresourceLayout2 *pLayout)
 {
    VK_FROM_HANDLE(radv_image, image, _image);
    VK_FROM_HANDLE(radv_device, device, _device);

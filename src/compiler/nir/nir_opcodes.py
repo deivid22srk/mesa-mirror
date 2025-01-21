@@ -872,6 +872,9 @@ opcode("ushr", 0, tuint, [0, 0], [tuint, tuint32], False, "",
        "src0 >> (src1 & (sizeof(src0) * 8 - 1))",
        description = "Unsigned right-shift." + shift_note)
 
+opcode("udiv_aligned_4", 0, tuint, [0], [tuint], False, "",
+       "src0 >> 2", description = "Divide a multiple of 4 by 4")
+
 opcode("urol", 0, tuint, [0, 0], [tuint, tuint32], False, "", """
    uint32_t rotate_mask = sizeof(src0) * 8 - 1;
    dst = (src0 << (src1 & rotate_mask)) |
@@ -1063,6 +1066,8 @@ opcode("b16csel", 0, tuint, [0, 0, 0],
 opcode("b32csel", 0, tuint, [0, 0, 0],
        [tbool32, tuint, tuint], False, selection, "src0 ? src1 : src2",
        description = csel_description.format("a 32-bit", "0 vs ~0"))
+
+triop("icsel_eqz", tint, selection, "(src0 == 0) ? src1 : src2")
 
 triop("i32csel_gt", tint32, selection, "(src0 > 0) ? src1 : src2")
 triop("i32csel_ge", tint32, selection, "(src0 >= 0) ? src1 : src2")

@@ -73,6 +73,7 @@ panvk_image_can_use_mod(struct panvk_image *image, uint64_t mod)
        * - tiling is set to linear
        * - this is a 1D image
        * - this is a 3D image on a pre-v7 GPU
+       * - this is a mutable format image on v7
        */
       if (!(instance->debug_flags & PANVK_DEBUG_AFBC) ||
           ((image->vk.usage | image->vk.stencil_usage) &
@@ -82,7 +83,9 @@ panvk_image_can_use_mod(struct panvk_image *image, uint64_t mod)
           !panfrost_format_supports_afbc(arch, pfmt) ||
           image->vk.tiling == VK_IMAGE_TILING_LINEAR ||
           image->vk.image_type == VK_IMAGE_TYPE_1D ||
-          (image->vk.image_type == VK_IMAGE_TYPE_3D && arch < 7))
+          (image->vk.image_type == VK_IMAGE_TYPE_3D && arch < 7) ||
+          ((image->vk.create_flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) &&
+           arch == 7))
          return false;
 
       const struct util_format_description *fdesc =
@@ -207,7 +210,19 @@ panvk_image_init_layouts(struct panvk_image *image,
 
    image->plane_count = vk_format_get_plane_count(pCreateInfo->format);
 
+   /* Z32_S8X24 is not supported on v9+, and we don't want to use it
+    * on v7- anyway, because it's less efficient than the multiplanar
+    * alternative.
+    */
+   if (image->vk.format == VK_FORMAT_D32_SFLOAT_S8_UINT)
+      image->plane_count = 2;
+
    for (uint8_t plane = 0; plane < image->plane_count; plane++) {
+      VkFormat format =
+         (image->vk.format == VK_FORMAT_D32_SFLOAT_S8_UINT) ?
+         ((plane == 0) ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_S8_UINT) :
+         image->vk.format;
+
       struct pan_image_explicit_layout plane_layout;
       if (explicit_info)
          plane_layout = (struct pan_image_explicit_layout){
@@ -216,7 +231,7 @@ panvk_image_init_layouts(struct panvk_image *image,
          };
 
       image->planes[plane].layout = (struct pan_image_layout){
-         .format = vk_format_to_pipe_format(image->vk.format),
+         .format = vk_format_to_pipe_format(format),
          .dim = panvk_image_type_to_mali_tex_dim(image->vk.image_type),
          .width = image->vk.extent.width,
          .height = image->vk.extent.height,
@@ -299,9 +314,25 @@ panvk_image_get_total_size(const struct panvk_image *image)
 static bool
 is_disjoint(struct panvk_image *image)
 {
-   assert(image->plane_count > 1 ||
+   assert((image->plane_count > 1 &&
+           image->vk.format != VK_FORMAT_D32_SFLOAT_S8_UINT) ||
           !(image->vk.create_flags & VK_IMAGE_CREATE_DISJOINT_BIT));
    return image->vk.create_flags & VK_IMAGE_CREATE_DISJOINT_BIT;
+}
+
+static void
+panvk_image_init(struct panvk_device *dev, struct panvk_image *image,
+                 const VkImageCreateInfo *pCreateInfo)
+{
+   /* Add any create/usage flags that might be needed for meta operations.
+    * This is run before the modifier selection because some
+    * usage/create_flags influence the modifier selection logic. */
+   panvk_image_pre_mod_select_meta_adjustments(image);
+
+   /* Now that we've patched the create/usage flags, we can proceed with the
+    * modifier selection. */
+   image->vk.drm_format_mod = panvk_image_get_mod(image, pCreateInfo);
+   panvk_image_init_layouts(image, pCreateInfo);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -326,15 +357,7 @@ panvk_CreateImage(VkDevice device, const VkImageCreateInfo *pCreateInfo,
    if (!image)
       return panvk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
 
-   /* Add any create/usage flags that might be needed for meta operations.
-    * This is run before the modifier selection because some
-    * usage/create_flags influence the modifier selection logic. */
-   panvk_image_pre_mod_select_meta_adjustments(image);
-
-   /* Now that we've patched the create/usage flags, we can proceed with the
-    * modifier selection. */
-   image->vk.drm_format_mod = panvk_image_get_mod(image, pCreateInfo);
-   panvk_image_init_layouts(image, pCreateInfo);
+   panvk_image_init(dev, image, pCreateInfo);
 
    /*
     * From the Vulkan spec:
@@ -417,6 +440,38 @@ panvk_GetImageMemoryRequirements2(VkDevice device,
    pMemoryRequirements->memoryRequirements.memoryTypeBits = 1;
    pMemoryRequirements->memoryRequirements.alignment = alignment;
    pMemoryRequirements->memoryRequirements.size = size;
+
+   vk_foreach_struct_const(ext, pMemoryRequirements->pNext) {
+      switch (ext->sType) {
+      case VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS: {
+         VkMemoryDedicatedRequirements *dedicated = (void *)ext;
+         dedicated->requiresDedicatedAllocation = false;
+         dedicated->prefersDedicatedAllocation = dedicated->requiresDedicatedAllocation;
+         break;
+      }
+      default:
+         vk_debug_ignored_stype(ext->sType);
+         break;
+      }
+   }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+panvk_GetDeviceImageMemoryRequirements(VkDevice device,
+                                       const VkDeviceImageMemoryRequirements *pInfo,
+                                       VkMemoryRequirements2 *pMemoryRequirements)
+{
+   VK_FROM_HANDLE(panvk_device, dev, device);
+
+   struct panvk_image image;
+   vk_image_init(&dev->vk, &image.vk, pInfo->pCreateInfo);
+   panvk_image_init(dev, &image, pInfo->pCreateInfo);
+
+   VkImageMemoryRequirementsInfo2 info2 = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
+      .image = panvk_image_to_handle(&image),
+   };
+   panvk_GetImageMemoryRequirements2(device, &info2, pMemoryRequirements);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -429,9 +484,19 @@ panvk_GetImageSparseMemoryRequirements2(
    *pSparseMemoryRequirementCount = 0;
 }
 
+VKAPI_ATTR void VKAPI_CALL
+panvk_GetDeviceImageSparseMemoryRequirements(VkDevice device,
+                                             const VkDeviceImageMemoryRequirements *pInfo,
+                                             uint32_t *pSparseMemoryRequirementCount,
+                                             VkSparseImageMemoryRequirements2 *pSparseMemoryRequirements)
+{
+   /* Sparse images are not yet supported. */
+   *pSparseMemoryRequirementCount = 0;
+}
+
 static void
 panvk_image_plane_bind(struct pan_image *plane, struct pan_kmod_bo *bo,
-                       mali_ptr base, uint64_t offset)
+                       uint64_t base, uint64_t offset)
 {
    plane->data.base = base;
    plane->data.offset = offset;

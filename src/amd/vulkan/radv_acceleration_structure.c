@@ -280,8 +280,8 @@ radv_device_init_null_accel_struct(struct radv_device *device)
    VkBufferCreateInfo buffer_create_info = {
       .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
       .pNext =
-         &(VkBufferUsageFlags2CreateInfoKHR){
-            .sType = VK_STRUCTURE_TYPE_BUFFER_USAGE_FLAGS_2_CREATE_INFO_KHR,
+         &(VkBufferUsageFlags2CreateInfo){
+            .sType = VK_STRUCTURE_TYPE_BUFFER_USAGE_FLAGS_2_CREATE_INFO,
             .usage = VK_BUFFER_USAGE_2_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR,
          },
       .size = size,
@@ -451,7 +451,7 @@ radv_encode_as(VkCommandBuffer commandBuffer, const VkAccelerationStructureBuild
    struct radv_dispatch_info dispatch = {
       .unaligned = true,
       .ordered = true,
-      .blocks = {leaf_count, 1, 1},
+      .blocks = {MAX2(leaf_count, 1), 1, 1},
    };
 
    radv_compute_dispatch(cmd_buffer, &dispatch);
@@ -469,9 +469,9 @@ radv_init_header_bind_pipeline(VkCommandBuffer commandBuffer, uint32_t key)
    /* Wait for encoding to finish. */
    cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_CS_PARTIAL_FLUSH |
                                    radv_src_access_flush(cmd_buffer, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                                                         VK_ACCESS_2_SHADER_WRITE_BIT, NULL, NULL) |
+                                                         VK_ACCESS_2_SHADER_WRITE_BIT, 0, NULL, NULL) |
                                    radv_dst_access_flush(cmd_buffer, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                                                         VK_ACCESS_2_SHADER_READ_BIT, NULL, NULL);
+                                                         VK_ACCESS_2_SHADER_READ_BIT, 0, NULL, NULL);
 
    device->vk.dispatch_table.CmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
                                              device->meta_state.accel_struct_build.header_pipeline);
@@ -551,6 +551,8 @@ radv_init_header(VkCommandBuffer commandBuffer, const VkAccelerationStructureBui
 
       radv_CmdUpdateBuffer(commandBuffer, dst->buffer, dst->offset + layout.geometry_info_offset, geometry_infos_size,
                            geometry_infos);
+
+      free(geometry_infos);
    }
 }
 
@@ -578,9 +580,9 @@ radv_update_bind_pipeline(VkCommandBuffer commandBuffer)
    /* Wait for update scratch initialization to finish.. */
    cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_CS_PARTIAL_FLUSH |
                                    radv_src_access_flush(cmd_buffer, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                                                         VK_ACCESS_2_SHADER_WRITE_BIT, NULL, NULL) |
+                                                         VK_ACCESS_2_SHADER_WRITE_BIT, 0, NULL, NULL) |
                                    radv_dst_access_flush(cmd_buffer, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                                                         VK_ACCESS_2_SHADER_READ_BIT, NULL, NULL);
+                                                         VK_ACCESS_2_SHADER_READ_BIT, 0, NULL, NULL);
 
    device->vk.dispatch_table.CmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
                                              device->meta_state.accel_struct_build.update_pipeline);
@@ -599,7 +601,7 @@ pack_geometry_id_and_flags(uint32_t geometry_id, uint32_t flags)
 static void
 radv_update_as(VkCommandBuffer commandBuffer, const VkAccelerationStructureBuildGeometryInfoKHR *build_info,
                const VkAccelerationStructureBuildRangeInfoKHR *build_range_infos, uint32_t leaf_count,
-               struct vk_acceleration_structure *dst, struct vk_acceleration_structure *src)
+               struct vk_acceleration_structure *src, struct vk_acceleration_structure *dst)
 {
    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
@@ -659,6 +661,8 @@ static const struct radix_sort_vk_target_config radix_sort_config = {
 };
 
 static const struct vk_acceleration_structure_build_ops build_ops = {
+   .begin_debug_marker = vk_accel_struct_cmd_begin_debug_marker,
+   .end_debug_marker = vk_accel_struct_cmd_end_debug_marker,
    .get_as_size = radv_get_as_size,
    .get_update_scratch_size = radv_get_update_scratch_size,
    .get_encode_key[0] = radv_get_encode_key,
@@ -734,12 +738,6 @@ radv_device_init_accel_struct_build_state(struct radv_device *device)
 
    device->meta_state.accel_struct_build.radix_sort = vk_create_radix_sort_u64(
       radv_device_to_handle(device), &device->meta_state.alloc, device->meta_state.cache, radix_sort_config);
-
-   result = vk_meta_device_init(&device->vk, &device->meta_state.device);
-   if (result != VK_SUCCESS)
-      goto exit;
-
-   device->meta_state.device.pipeline_cache = device->meta_state.cache;
 
    device->vk.as_build_ops = &build_ops;
    device->vk.write_buffer_cp = radv_write_buffer_cp;
@@ -830,7 +828,7 @@ radv_CmdCopyAccelerationStructureKHR(VkCommandBuffer commandBuffer, const VkCopy
                               sizeof(consts), &consts);
 
    cmd_buffer->state.flush_bits |= radv_dst_access_flush(cmd_buffer, VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
-                                                         VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT, NULL, NULL);
+                                                         VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT, 0, NULL, NULL);
 
    radv_indirect_dispatch(
       cmd_buffer, src_buffer->bo,
@@ -936,7 +934,7 @@ radv_CmdCopyAccelerationStructureToMemoryKHR(VkCommandBuffer commandBuffer,
                               sizeof(consts), &consts);
 
    cmd_buffer->state.flush_bits |= radv_dst_access_flush(cmd_buffer, VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
-                                                         VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT, NULL, NULL);
+                                                         VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT, 0, NULL, NULL);
 
    radv_indirect_dispatch(
       cmd_buffer, src_buffer->bo,

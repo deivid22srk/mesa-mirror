@@ -27,6 +27,8 @@
 #include "vulkan/wsi/wsi_common.h"
 #include "vk_cmd_enqueue_entrypoints.h"
 #include "vk_common_entrypoints.h"
+#include "vk_debug_utils.h"
+#include "vk_device.h"
 #include "vk_pipeline_cache.h"
 
 #include <fcntl.h>
@@ -58,7 +60,7 @@ hk_upload_rodata(struct hk_device *dev)
    if (!dev->rodata.bo)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
 
-   uint8_t *map = dev->rodata.bo->map;
+   uint8_t *map = agx_bo_map(dev->rodata.bo);
    uint32_t offs = 0;
 
    offs = align(offs, 8);
@@ -85,7 +87,7 @@ hk_upload_rodata(struct hk_device *dev)
       cfg.buffer = dev->rodata.bo->va->addr + offs;
    }
 
-   uint64_t *image_heap_ptr = dev->rodata.bo->map + offs;
+   uint64_t *image_heap_ptr = (void *)map + offs;
    *image_heap_ptr = dev->images.bo->va->addr;
    offs += sizeof(uint64_t);
 
@@ -106,7 +108,7 @@ hk_upload_rodata(struct hk_device *dev)
     */
    offs = align(offs, 16);
    dev->rodata.zero_sink = dev->rodata.bo->va->addr + offs;
-   memset(dev->rodata.bo->map + offs, 0, 16);
+   memset(map + offs, 0, 16);
    offs += 16;
 
    /* For null storage descriptors, we need to reserve 16 bytes to catch writes.
@@ -276,6 +278,22 @@ hk_sampler_heap_remove(struct hk_device *dev, struct hk_rc_sampler *rc)
    simple_mtx_unlock(&h->lock);
 }
 
+static VkResult
+hk_check_status(struct vk_device *device)
+{
+   struct hk_device *dev = container_of(device, struct hk_device, vk);
+   return vk_check_printf_status(&dev->vk, &dev->dev.printf);
+}
+
+static VkResult
+hk_get_timestamp(struct vk_device *device, uint64_t *timestamp)
+{
+   struct hk_device *dev = container_of(device, struct hk_device, vk);
+   unreachable("todo");
+   // *timestamp = agx_get_gpu_timestamp(dev);
+   return VK_SUCCESS;
+}
+
 /*
  * To implement nullDescriptor, the descriptor set code will reference
  * preuploaded null descriptors at fixed offsets in the image heap. Here we
@@ -387,6 +405,8 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
 
    vk_device_set_drm_fd(&dev->vk, dev->dev.fd);
    dev->vk.command_buffer_ops = &hk_cmd_buffer_ops;
+   dev->vk.check_status = hk_check_status;
+   dev->vk.get_timestamp = hk_get_timestamp;
 
    result = hk_descriptor_table_init(dev, &dev->images, AGX_TEXTURE_LENGTH,
                                      1024, 1024 * 1024);
@@ -518,57 +538,4 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    agx_bg_eot_cleanup(&dev->bg_eot);
    agx_close_device(&dev->dev);
    vk_free(&dev->vk.alloc, dev);
-}
-
-VKAPI_ATTR VkResult VKAPI_CALL
-hk_GetCalibratedTimestampsKHR(
-   VkDevice _device, uint32_t timestampCount,
-   const VkCalibratedTimestampInfoKHR *pTimestampInfos, uint64_t *pTimestamps,
-   uint64_t *pMaxDeviation)
-{
-   // VK_FROM_HANDLE(hk_device, dev, _device);
-   // struct hk_physical_device *pdev = hk_device_physical(dev);
-   uint64_t max_clock_period = 0;
-   uint64_t begin, end;
-   int d;
-
-#ifdef CLOCK_MONOTONIC_RAW
-   begin = vk_clock_gettime(CLOCK_MONOTONIC_RAW);
-#else
-   begin = vk_clock_gettime(CLOCK_MONOTONIC);
-#endif
-
-   for (d = 0; d < timestampCount; d++) {
-      switch (pTimestampInfos[d].timeDomain) {
-      case VK_TIME_DOMAIN_DEVICE_KHR:
-         unreachable("todo");
-         // pTimestamps[d] = agx_get_gpu_timestamp(&pdev->dev);
-         max_clock_period = MAX2(
-            max_clock_period, 1); /* FIXME: Is timestamp period actually 1? */
-         break;
-      case VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR:
-         pTimestamps[d] = vk_clock_gettime(CLOCK_MONOTONIC);
-         max_clock_period = MAX2(max_clock_period, 1);
-         break;
-
-#ifdef CLOCK_MONOTONIC_RAW
-      case VK_TIME_DOMAIN_CLOCK_MONOTONIC_RAW_KHR:
-         pTimestamps[d] = begin;
-         break;
-#endif
-      default:
-         pTimestamps[d] = 0;
-         break;
-      }
-   }
-
-#ifdef CLOCK_MONOTONIC_RAW
-   end = vk_clock_gettime(CLOCK_MONOTONIC_RAW);
-#else
-   end = vk_clock_gettime(CLOCK_MONOTONIC);
-#endif
-
-   *pMaxDeviation = vk_time_max_deviation(begin, end, max_clock_period);
-
-   return VK_SUCCESS;
 }

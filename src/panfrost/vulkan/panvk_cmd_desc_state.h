@@ -29,15 +29,15 @@ struct panvk_cmd_buffer;
 
 struct panvk_shader_desc_state {
 #if PAN_ARCH <= 7
-   mali_ptr tables[PANVK_BIFROST_DESC_TABLE_COUNT];
-   mali_ptr img_attrib_table;
-   mali_ptr dyn_ssbos;
+   uint64_t tables[PANVK_BIFROST_DESC_TABLE_COUNT];
+   uint64_t img_attrib_table;
+   uint64_t dyn_ssbos;
 #else
    struct {
-      mali_ptr dev_addr;
+      uint64_t dev_addr;
       uint32_t size;
    } driver_set;
-   mali_ptr res_table;
+   uint64_t res_table;
 #endif
 };
 
@@ -54,12 +54,6 @@ struct panvk_descriptor_state {
 
    uint32_t dyn_buf_offsets[MAX_SETS][MAX_DYNAMIC_BUFFERS];
 };
-
-static inline void
-desc_state_clear_all_dirty(struct panvk_descriptor_state *desc_state)
-{
-   BITSET_ZERO(desc_state->dirty_push_sets);
-}
 
 #if PAN_ARCH <= 7
 VkResult panvk_per_arch(cmd_prepare_dyn_ssbos)(

@@ -104,14 +104,15 @@
  * implement that mechanism, a driver must implement the following function
  * signature:
  *
- *    MESA_DISPATCH_PRECOMP(context, grid, kernel index, argument pointer,
- *                          size of arguments)
+ *    MESA_DISPATCH_PRECOMP(context, grid, barrier, kernel index,
+ *                          argument pointer, size of arguments)
  *
  * The exact types used are determined by the driver. context is something like
- * a Vulkan command buffer. grid represents the 3D dispatch size. kernel index
- * is the index of the precompiled kernel (nir_precomp_index). argument pointer
- * is a host pointer to the sized argument structure, which the driver must
- * upload and bind (e.g. as push constants).
+ * a Vulkan command buffer. grid represents the 3D dispatch size. barrier
+ * describes the synchronization and cache flushing required before and after
+ * the dispatch. kernel index is the index of the precompiled kernel
+ * (nir_precomp_index). argument pointer is a host pointer to the sized argument
+ * structure, which the driver must upload and bind (e.g. as push constants).
  *
  * Because the types are ambiguous here, the same mechanism works for both
  * Gallium and Vulkan drivers.
@@ -160,6 +161,14 @@
  */
 
 #define NIR_PRECOMP_MAX_ARGS (64)
+
+struct nir_precomp_opts {
+   /* If nonzero, minimum (power-of-two) alignment required for kernel
+    * arguments. Kernel arguments will be naturally aligned regardless, but this
+    * models a minimum alignment required by some hardware.
+    */
+   unsigned arg_align_B;
+};
 
 struct nir_precomp_layout {
    unsigned size_B;
@@ -217,7 +226,8 @@ nir_precomp_has_variants(const nir_function *f)
 }
 
 static inline struct nir_precomp_layout
-nir_precomp_derive_layout(const nir_function *f)
+nir_precomp_derive_layout(const struct nir_precomp_opts *opt,
+                          const nir_function *f)
 {
    struct nir_precomp_layout l = { 0 };
 
@@ -227,6 +237,12 @@ nir_precomp_derive_layout(const nir_function *f)
 
       /* Align members naturally */
       l.offset_B[a] = ALIGN_POT(l.size_B, param.bit_size / 8);
+
+      /* Align arguments to driver minimum */
+      if (opt->arg_align_B) {
+         l.offset_B[a] = ALIGN_POT(l.offset_B[a], opt->arg_align_B);
+      }
+
       l.prepadded[a] = (l.offset_B[a] != l.size_B);
       l.size_B = l.offset_B[a] + (param.num_components * param.bit_size) / 8;
    }
@@ -400,9 +416,10 @@ nir_precomp_print_program_enum(FILE *fp, const nir_shader *lib, const char *pref
 }
 
 static inline void
-nir_precomp_print_layout_struct(FILE *fp, const nir_function *func)
+nir_precomp_print_layout_struct(FILE *fp, const struct nir_precomp_opts *opt,
+                                const nir_function *func)
 {
-   struct nir_precomp_layout layout = nir_precomp_derive_layout(func);
+   struct nir_precomp_layout layout = nir_precomp_derive_layout(opt, func);
 
    /* Generate a C struct matching the data layout we chose. This is how
     * the CPU will pack arguments.
@@ -454,15 +471,16 @@ nir_precomp_print_layout_struct(FILE *fp, const nir_function *func)
 }
 
 static inline void
-nir_precomp_print_dispatch_macros(FILE *fp, const nir_shader *nir)
+nir_precomp_print_dispatch_macros(FILE *fp, const struct nir_precomp_opts *opt,
+                                  const nir_shader *nir)
 {
    nir_foreach_entrypoint(func, nir) {
-      struct nir_precomp_layout layout = nir_precomp_derive_layout(func);
+      struct nir_precomp_layout layout = nir_precomp_derive_layout(opt, func);
 
       for (unsigned i = 0; i < 2; ++i) {
          bool is_struct = i == 0;
 
-         fprintf(fp, "#define %s%s(_context, _grid%s", func->name,
+         fprintf(fp, "#define %s%s(_context, _grid, _barrier%s", func->name,
                  is_struct ? "_struct" : "", is_struct ? ", _data" : "");
 
          /* Add the arguments, including variant parameters. For struct macros,
@@ -506,7 +524,7 @@ nir_precomp_print_dispatch_macros(FILE *fp, const nir_shader *nir)
          /* Dispatch via MESA_DISPATCH_PRECOMP, which the driver must #define
           * suitably before #include-ing this file.
           */
-         fprintf(fp, "   MESA_DISPATCH_PRECOMP(_context, _grid, ");
+         fprintf(fp, "   MESA_DISPATCH_PRECOMP(_context, _grid, _barrier, ");
          nir_precomp_print_enum_value(fp, func);
          nir_precomp_print_variant_params(fp, func, false);
          fprintf(fp, ", &_args, sizeof(_args)); \\\n");
@@ -551,13 +569,15 @@ nir_precomp_print_binary_map(FILE *fp, const nir_shader *nir,
 static inline nir_shader *
 nir_precompiled_build_variant(const nir_function *libfunc, unsigned variant,
                               const nir_shader_compiler_options *opts,
+                              const struct nir_precomp_opts *precomp_opt,
                               nir_def *(*load_arg)(nir_builder *b,
                                                    unsigned num_components,
                                                    unsigned bit_size,
                                                    unsigned offset_B))
 {
-   struct nir_precomp_layout layout = nir_precomp_derive_layout(libfunc);
    bool has_variants = nir_precomp_has_variants(libfunc);
+   struct nir_precomp_layout layout =
+      nir_precomp_derive_layout(precomp_opt, libfunc);
 
    nir_builder b;
    if (has_variants) {
@@ -598,9 +618,9 @@ nir_precompiled_build_variant(const nir_function *libfunc, unsigned variant,
 
 static inline void
 nir_precomp_print_blob(FILE *fp, const char *arr_name, const char *suffix,
-                       uint32_t variant, const uint32_t *data, size_t len)
+                       uint32_t variant, const uint32_t *data, size_t len, bool is_static)
 {
-   fprintf(fp, "const uint32_t %s_%u_%s[%zu] = {", arr_name, variant, suffix,
+   fprintf(fp, "%sconst uint32_t %s_%u_%s[%zu] = {", is_static ? "static " : "", arr_name, variant, suffix,
            DIV_ROUND_UP(len, 4));
    for (unsigned i = 0; i < (len / 4); i++) {
       if (i % 4 == 0)
@@ -632,7 +652,7 @@ nir_precomp_print_nir(FILE *fp_c, FILE *fp_h, const nir_shader *nir,
    nir_serialize(&blob, nir, true /* strip */);
 
    nir_precomp_print_blob(fp_c, name, suffix, 0, (const uint32_t *)blob.data,
-                          blob.size);
+                          blob.size, false);
 
    fprintf(fp_h, "extern const uint32_t %s_0_%s[%zu];\n", name, suffix,
            DIV_ROUND_UP(blob.size, 4));

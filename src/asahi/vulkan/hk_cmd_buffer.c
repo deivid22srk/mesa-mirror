@@ -187,7 +187,7 @@ hk_pool_alloc_internal(struct hk_cmd_buffer *cmd, uint32_t size,
       util_dynarray_append(&cmd->large_bos, struct agx_bo *, bo);
       return (struct agx_ptr){
          .gpu = bo->va->addr,
-         .cpu = bo->map,
+         .cpu = agx_bo_map(bo),
       };
    }
 
@@ -220,7 +220,7 @@ hk_pool_alloc_internal(struct hk_cmd_buffer *cmd, uint32_t size,
     * BO.
     */
    if (uploader->map == NULL || size < uploader->offset) {
-      uploader->map = bo->bo->map;
+      uploader->map = agx_bo_map(bo->bo);
       uploader->base = bo->bo->va->addr;
       uploader->offset = size;
    }
@@ -637,7 +637,6 @@ hk_upload_usc_words(struct hk_cmd_buffer *cmd, struct hk_shader *s,
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
 
    enum pipe_shader_type sw_stage = s->info.stage;
-   enum pipe_shader_type hw_stage = s->b.info.stage;
 
    unsigned constant_push_ranges = DIV_ROUND_UP(s->b.info.rodata.size_16, 64);
    unsigned push_ranges = 2;
@@ -683,7 +682,7 @@ hk_upload_usc_words(struct hk_cmd_buffer *cmd, struct hk_shader *s,
       if (cmd->state.gfx.draw_id_ptr)
          agx_usc_uniform(&b, (6 * count) + 4, 1, cmd->state.gfx.draw_id_ptr);
 
-      if (hw_stage == MESA_SHADER_COMPUTE) {
+      if (linked->sw_indexing) {
          agx_usc_uniform(
             &b, (6 * count) + 8, 4,
             root_ptr + hk_root_descriptor_offset(draw.input_assembly));
@@ -710,7 +709,8 @@ hk_upload_usc_words(struct hk_cmd_buffer *cmd, struct hk_shader *s,
 
 void
 hk_dispatch_precomp(struct hk_cs *cs, struct agx_grid grid,
-                    enum libagx_program idx, void *data, size_t data_size)
+                    enum agx_barrier barrier, enum libagx_program idx,
+                    void *data, size_t data_size)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cs->cmd);
    struct agx_precompiled_shader *prog = agx_get_precompiled(&dev->bg_eot, idx);
@@ -812,14 +812,11 @@ hk_ensure_cs_has_space(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    struct agx_ptr T = hk_pool_alloc(cmd, size, 256);
 
    /* Jump from the old control stream to the new control stream */
-   if (vdm) {
-      agx_vdm_jump(cs->current, T.gpu);
-   } else {
-      agx_cdm_jump(cs->current, T.gpu);
-   }
+   agx_cs_jump(cs->current, T.gpu, vdm);
 
    /* Swap out the control stream */
    cs->current = T.cpu;
    cs->end = cs->current + size;
+   cs->chunk = T;
    cs->stream_linked = true;
 }

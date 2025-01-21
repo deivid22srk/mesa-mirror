@@ -479,6 +479,7 @@ VkResult anv_CreateDevice(
 
    list_inithead(&device->memory_objects);
    list_inithead(&device->image_private_objects);
+   list_inithead(&device->bvh_dumps);
 
    if (pthread_mutex_init(&device->mutex, NULL) != 0) {
       result = vk_error(device, VK_ERROR_INITIALIZATION_FAILED);
@@ -707,9 +708,24 @@ VkResult anv_CreateDevice(
                                    0 /* explicit_address */,
                                    &device->dummy_aux_bo);
       if (result != VK_SUCCESS)
-         goto fail_workaround_bo;
+         goto fail_alloc_device_bo;
 
       device->isl_dev.dummy_aux_address = device->dummy_aux_bo->offset;
+   }
+
+   /* Programming note from MI_MEM_FENCE specification:
+    *
+    *    Software must ensure STATE_SYSTEM_MEM_FENCE_ADDRESS command is
+    *    programmed prior to programming this command.
+    *
+    * HAS 1607240579 then provides the size information: 4K
+    */
+   if (device->info->verx10 >= 200) {
+      result = anv_device_alloc_bo(device, "mem_fence", 4096,
+                                   ANV_BO_ALLOC_NO_LOCAL_MEM, 0,
+                                   &device->mem_fence_bo);
+      if (result != VK_SUCCESS)
+         goto fail_alloc_device_bo;
    }
 
    struct anv_address wa_addr = (struct anv_address) {
@@ -761,7 +777,7 @@ VkResult anv_CreateDevice(
                                    0 /* explicit_address */,
                                    &device->ray_query_bo[0]);
       if (result != VK_SUCCESS)
-         goto fail_dummy_aux_bo;
+         goto fail_alloc_device_bo;
 
       /* We need a separate ray query bo for CCS engine with Wa_14022863161. */
       if (intel_needs_workaround(device->isl_dev.info, 14022863161) &&
@@ -783,7 +799,7 @@ VkResult anv_CreateDevice(
    /* Emit the CPS states before running the initialization batch as those
     * structures are referenced.
     */
-   if (device->info->ver >= 12) {
+   if (device->info->ver >= 12 && device->info->ver < 30) {
       uint32_t n_cps_states = 3 * 3; /* All combinaisons of X by Y CP sizes (1, 2, 4) */
 
       if (device->info->has_coarse_pixel_primitive_and_cb)
@@ -949,8 +965,13 @@ VkResult anv_CreateDevice(
    }
    if (!device->vk.enabled_extensions.EXT_sample_locations)
       BITSET_CLEAR(device->gfx_dirty_state, ANV_GFX_STATE_SAMPLE_PATTERN);
-   if (!device->vk.enabled_extensions.KHR_fragment_shading_rate)
-      BITSET_CLEAR(device->gfx_dirty_state, ANV_GFX_STATE_CPS);
+   if (!device->vk.enabled_extensions.KHR_fragment_shading_rate) {
+      if (device->info->ver >= 30) {
+         BITSET_CLEAR(device->gfx_dirty_state, ANV_GFX_STATE_COARSE_PIXEL);
+      } else {
+         BITSET_CLEAR(device->gfx_dirty_state, ANV_GFX_STATE_CPS);
+      }
+   }
    if (!device->vk.enabled_extensions.EXT_mesh_shader) {
       BITSET_CLEAR(device->gfx_dirty_state, ANV_GFX_STATE_SBE_MESH);
       BITSET_CLEAR(device->gfx_dirty_state, ANV_GFX_STATE_CLIP_MESH);
@@ -985,14 +1006,22 @@ VkResult anv_CreateDevice(
 
    anv_device_utrace_init(device);
 
-   result = anv_genX(device->info, init_device_state)(device);
+   result = vk_meta_device_init(&device->vk, &device->meta_device);
    if (result != VK_SUCCESS)
       goto fail_utrace;
+
+   result = anv_genX(device->info, init_device_state)(device);
+   if (result != VK_SUCCESS)
+      goto fail_meta_device;
+
+   simple_mtx_init(&device->accel_struct_build.mutex, mtx_plain);
 
    *pDevice = anv_device_to_handle(device);
 
    return VK_SUCCESS;
 
+ fail_meta_device:
+   vk_meta_device_finish(&device->vk, &device->meta_device);
  fail_utrace:
    anv_device_utrace_finish(device);
  fail_queues:
@@ -1030,10 +1059,11 @@ VkResult anv_CreateDevice(
       if (device->ray_query_bo[i])
          anv_device_release_bo(device, device->ray_query_bo[i]);
    }
- fail_dummy_aux_bo:
+ fail_alloc_device_bo:
+   if (device->mem_fence_bo)
+      anv_device_release_bo(device, device->mem_fence_bo);
    if (device->dummy_aux_bo)
       anv_device_release_bo(device, device->dummy_aux_bo);
- fail_workaround_bo:
    anv_device_release_bo(device, device->workaround_bo);
  fail_surface_aux_map_pool:
    if (device->info->has_aux_map) {
@@ -1118,6 +1148,12 @@ void anv_DestroyDevice(
    /* Do TRTT batch garbage collection before destroying queues. */
    anv_device_finish_trtt(device);
 
+   if (device->accel_struct_build.radix_sort) {
+      radix_sort_vk_destroy(device->accel_struct_build.radix_sort,
+                            _device, &device->vk.alloc);
+   }
+   vk_meta_device_finish(&device->vk, &device->meta_device);
+
    anv_device_utrace_finish(device);
 
    for (uint32_t i = 0; i < device->queue_count; i++)
@@ -1180,6 +1216,8 @@ void anv_DestroyDevice(
    anv_device_release_bo(device, device->workaround_bo);
    if (device->dummy_aux_bo)
       anv_device_release_bo(device, device->dummy_aux_bo);
+   if (device->mem_fence_bo)
+      anv_device_release_bo(device, device->mem_fence_bo);
    anv_device_release_bo(device, device->trivial_batch_bo);
 
    if (device->info->has_aux_map) {
@@ -1217,6 +1255,8 @@ void anv_DestroyDevice(
 
    pthread_cond_destroy(&device->queue_submit);
    pthread_mutex_destroy(&device->mutex);
+
+   simple_mtx_destroy(&device->accel_struct_build.mutex);
 
    ralloc_free(device->fp64_nir);
 

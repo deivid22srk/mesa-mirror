@@ -25,7 +25,8 @@
 #include <vector>
 #include "brw_compiler.h"
 #include "brw_fs.h"
-#include "brw_fs_builder.h"
+#include "brw_builder.h"
+#include "brw_generator.h"
 #include "brw_nir.h"
 #include "brw_private.h"
 #include "compiler/nir/nir_builder.h"
@@ -267,7 +268,7 @@ brw_nir_align_launch_mesh_workgroups(nir_shader *nir)
 static void
 brw_emit_urb_fence(fs_visitor &s)
 {
-   const fs_builder bld1 = fs_builder(&s).at_end().exec_all().group(1, 0);
+   const brw_builder bld1 = brw_builder(&s).at_end().exec_all().group(1, 0);
    brw_reg dst = bld1.vgrf(BRW_TYPE_UD);
    fs_inst *fence = bld1.emit(SHADER_OPCODE_MEMORY_FENCE, dst,
                               brw_vec8_grf(0, 0),
@@ -310,17 +311,17 @@ run_task_mesh(fs_visitor &s, bool allow_spilling)
 
    brw_calculate_cfg(s);
 
-   brw_fs_optimize(s);
+   brw_optimize(s);
 
    s.assign_curb_setup();
 
-   brw_fs_lower_3src_null_dest(s);
-   brw_fs_workaround_memory_fence_before_eot(s);
-   brw_fs_workaround_emit_dummy_mov_instruction(s);
+   brw_lower_3src_null_dest(s);
+   brw_workaround_memory_fence_before_eot(s);
+   brw_workaround_emit_dummy_mov_instruction(s);
 
    brw_allocate_registers(s, allow_spilling);
 
-   brw_fs_workaround_source_arf_before_eot(s);
+   brw_workaround_source_arf_before_eot(s);
 
    return !s.failed;
 }
@@ -424,7 +425,7 @@ brw_compile_task(const struct brw_compiler *compiler,
       brw_print_tue_map(stderr, &prog_data->map);
    }
 
-   fs_generator g(compiler, &params->base, &prog_data->base.base,
+   brw_generator g(compiler, &params->base, &prog_data->base.base,
                   MESA_SHADER_TASK);
    if (unlikely(debug_enabled)) {
       g.enable_debug(ralloc_asprintf(params->base.mem_ctx,
@@ -901,19 +902,25 @@ brw_compute_mue_map(const struct brw_compiler *compiler,
                BITFIELD64_BIT(VARYING_SLOT_POS);
 
    if (outputs_written & per_primitive_header_bits) {
+      bool zero_layer_viewport = false;
       if (outputs_written & BITFIELD64_BIT(VARYING_SLOT_PRIMITIVE_SHADING_RATE)) {
          map->start_dw[VARYING_SLOT_PRIMITIVE_SHADING_RATE] =
                map->per_primitive_start_dw + 0;
          map->len_dw[VARYING_SLOT_PRIMITIVE_SHADING_RATE] = 1;
+         /* Wa_16020916187: force 0 writes to layer and viewport slots */
+         zero_layer_viewport =
+            intel_needs_workaround(compiler->devinfo, 16020916187);
       }
 
-      if (outputs_written & BITFIELD64_BIT(VARYING_SLOT_LAYER)) {
+      if ((outputs_written & BITFIELD64_BIT(VARYING_SLOT_LAYER)) ||
+          zero_layer_viewport) {
          map->start_dw[VARYING_SLOT_LAYER] =
                map->per_primitive_start_dw + 1; /* RTAIndex */
          map->len_dw[VARYING_SLOT_LAYER] = 1;
       }
 
-      if (outputs_written & BITFIELD64_BIT(VARYING_SLOT_VIEWPORT)) {
+      if ((outputs_written & BITFIELD64_BIT(VARYING_SLOT_VIEWPORT)) ||
+          zero_layer_viewport) {
           map->start_dw[VARYING_SLOT_VIEWPORT] =
                 map->per_primitive_start_dw + 2;
           map->len_dw[VARYING_SLOT_VIEWPORT] = 1;
@@ -1550,6 +1557,17 @@ brw_mesh_autostrip_enable(const struct brw_compiler *compiler, struct nir_shader
    if (compiler->devinfo->ver < 20)
       return false;
 
+   const uint64_t outputs_written = nir->info.outputs_written;
+
+   /* Wa_16020916187
+    * We've allocated slots for layer/viewport in brw_compute_mue_map() if this
+    * workaround is needed and will let brw_nir_initialize_mue() initialize
+    * those to 0. The workaround also requires disabling autostrip.
+    */
+   if (intel_needs_workaround(compiler->devinfo, 16020916187) &&
+       (BITFIELD64_BIT(VARYING_SLOT_PRIMITIVE_SHADING_RATE) & outputs_written))
+       return false;
+
    if (map->start_dw[VARYING_SLOT_VIEWPORT] < 0 &&
        map->start_dw[VARYING_SLOT_LAYER] < 0)
       return true;
@@ -1720,7 +1738,7 @@ brw_compile_mesh(const struct brw_compiler *compiler,
       brw_print_mue_map(stderr, &prog_data->map, nir);
    }
 
-   fs_generator g(compiler, &params->base, &prog_data->base.base,
+   brw_generator g(compiler, &params->base, &prog_data->base.base,
                   MESA_SHADER_MESH);
    if (unlikely(debug_enabled)) {
       g.enable_debug(ralloc_asprintf(params->base.mem_ctx,

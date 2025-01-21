@@ -8,6 +8,12 @@
 #include "si_query.h"
 #include "si_shader_internal.h"
 
+static bool gfx10_ngg_writes_user_edgeflags(struct si_shader *shader)
+{
+   return gfx10_has_variable_edgeflags(shader) &&
+          shader->selector->info.writes_edgeflag;
+}
+
 bool gfx10_ngg_export_prim_early(struct si_shader *shader)
 {
    struct si_shader_selector *sel = shader->selector;
@@ -53,8 +59,7 @@ bool gfx10_ngg_calculate_subgroup_info(struct si_shader *shader)
    const gl_shader_stage gs_stage = gs_sel->stage;
    const unsigned gs_num_invocations = MAX2(gs_sel->info.base.gs.invocations, 1);
    const unsigned input_prim = si_get_input_prim(gs_sel, &shader->key, false);
-   const bool use_adjacency =
-      input_prim >= MESA_PRIM_LINES_ADJACENCY && input_prim <= MESA_PRIM_TRIANGLE_STRIP_ADJACENCY;
+   const bool use_adjacency = mesa_prim_has_adjacency(input_prim);
    const unsigned max_verts_per_prim = mesa_vertices_per_prim(input_prim);
    const unsigned min_verts_per_prim = gs_stage == MESA_SHADER_GEOMETRY ? max_verts_per_prim : 1;
 
@@ -68,7 +73,7 @@ bool gfx10_ngg_calculate_subgroup_info(struct si_shader *shader)
 
    /* All these are per subgroup: */
    const unsigned min_esverts =
-      gs_sel->screen->info.gfx_level >= GFX11 ? 3 : /* gfx11 requires at least 1 primitive per TG */
+      gs_sel->screen->info.gfx_level >= GFX11 ? max_verts_per_prim : /* gfx11 requires at least 1 primitive per TG */
       gs_sel->screen->info.gfx_level >= GFX10_3 ? 29 : (24 - 1 + max_verts_per_prim);
    bool max_vert_out_per_gs_instance = false;
    unsigned max_gsprims_base, max_esverts_base;

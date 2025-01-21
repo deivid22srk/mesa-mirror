@@ -174,6 +174,7 @@ static const driOptionDescription radv_dri_options[] = {
       DRI_CONF_RADV_DISABLE_TC_COMPAT_HTILE_GENERAL(false)
       DRI_CONF_RADV_DISABLE_DCC(false)
       DRI_CONF_RADV_DISABLE_DCC_MIPS(false)
+      DRI_CONF_RADV_DISABLE_DCC_STORES(false)
       DRI_CONF_RADV_DISABLE_ANISO_SINGLE_LEVEL(false)
       DRI_CONF_RADV_DISABLE_TRUNC_COORD(false)
       DRI_CONF_RADV_DISABLE_SINKING_LOAD_INPUT_FS(false)
@@ -185,11 +186,11 @@ static const driOptionDescription radv_dri_options[] = {
       DRI_CONF_RADV_RT_WAVE64(false)
       DRI_CONF_RADV_LEGACY_SPARSE_BINDING(false)
       DRI_CONF_RADV_FORCE_PSTATE_PEAK_GFX11_DGPU(false)
-      DRI_CONF_DUAL_COLOR_BLEND_BY_LOCATION(false)
       DRI_CONF_RADV_OVERRIDE_GRAPHICS_SHADER_VERSION(0)
       DRI_CONF_RADV_OVERRIDE_COMPUTE_SHADER_VERSION(0)
       DRI_CONF_RADV_OVERRIDE_RAY_TRACING_SHADER_VERSION(0)
       DRI_CONF_RADV_SSBO_NON_UNIFORM(false)
+      DRI_CONF_RADV_LOWER_TERMINATE_TO_DISCARD(false)
       DRI_CONF_RADV_APP_LAYER()
    DRI_CONF_SECTION_END
 };
@@ -257,9 +258,6 @@ radv_init_dri_options(struct radv_instance *instance)
 
    instance->drirc.force_rt_wave64 = driQueryOptionb(&instance->drirc.options, "radv_rt_wave64");
 
-   instance->drirc.dual_color_blend_by_location =
-      driQueryOptionb(&instance->drirc.options, "dual_color_blend_by_location");
-
    instance->drirc.legacy_sparse_binding = driQueryOptionb(&instance->drirc.options, "radv_legacy_sparse_binding");
 
    instance->drirc.force_pstate_peak_gfx11_dgpu =
@@ -286,6 +284,10 @@ radv_init_dri_options(struct radv_instance *instance)
    instance->drirc.vk_require_astc = driQueryOptionb(&instance->drirc.options, "vk_require_astc");
 
    instance->drirc.disable_dcc_mips = driQueryOptionb(&instance->drirc.options, "radv_disable_dcc_mips");
+   instance->drirc.disable_dcc_stores = driQueryOptionb(&instance->drirc.options, "radv_disable_dcc_stores");
+
+   instance->drirc.lower_terminate_to_discard =
+      driQueryOptionb(&instance->drirc.options, "radv_lower_terminate_to_discard");
 }
 
 static const struct vk_instance_extension_table radv_instance_extensions_supported = {

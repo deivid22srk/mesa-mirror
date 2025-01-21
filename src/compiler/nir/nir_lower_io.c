@@ -148,6 +148,14 @@ nir_is_arrayed_io(const nir_variable *var, gl_shader_stage stage)
    if (var->data.patch || !glsl_type_is_array(var->type))
       return false;
 
+   if (var->data.per_view) {
+      /* Nested arrayed outputs (both per-view and per-{vertex,primitive}) are
+       * unsupported. */
+      assert(stage == MESA_SHADER_VERTEX);
+      assert(var->data.mode == nir_var_shader_out);
+      return true;
+   }
+
    if (stage == MESA_SHADER_MESH) {
       /* NV_mesh_shader: this is flat array for the whole workgroup. */
       if (var->data.location == VARYING_SLOT_PRIMITIVE_INDICES)
@@ -352,8 +360,14 @@ emit_load(struct lower_io_state *state,
       }
       break;
    case nir_var_shader_out:
-      op = !array_index ? nir_intrinsic_load_output : var->data.per_primitive ? nir_intrinsic_load_per_primitive_output
-                                                                              : nir_intrinsic_load_per_vertex_output;
+      if (!array_index)
+         op = nir_intrinsic_load_output;
+      else if (var->data.per_primitive)
+         op = nir_intrinsic_load_per_primitive_output;
+      else if (var->data.per_view)
+         op = nir_intrinsic_load_per_view_output;
+      else
+         op = nir_intrinsic_load_per_vertex_output;
       break;
    case nir_var_uniform:
       op = nir_intrinsic_load_uniform;
@@ -495,9 +509,15 @@ emit_store(struct lower_io_state *state, nir_def *data,
    nir_builder *b = &state->builder;
 
    assert(var->data.mode == nir_var_shader_out);
-   nir_intrinsic_op op =
-      !array_index ? nir_intrinsic_store_output : var->data.per_primitive ? nir_intrinsic_store_per_primitive_output
-                                                                          : nir_intrinsic_store_per_vertex_output;
+   nir_intrinsic_op op;
+   if (!array_index)
+      op = nir_intrinsic_store_output;
+   else if (var->data.per_view)
+      op = nir_intrinsic_store_per_view_output;
+   else if (var->data.per_primitive)
+      op = nir_intrinsic_store_per_primitive_output;
+   else
+      op = nir_intrinsic_store_per_vertex_output;
 
    nir_intrinsic_instr *store =
       nir_intrinsic_instr_create(state->builder.shader, op);
@@ -678,10 +698,30 @@ lower_interpolate_at(nir_intrinsic_instr *intrin, struct lower_io_state *state,
                                   offset,
                                   .base = var->data.driver_location,
                                   .component = component,
-                                  .io_semantics = semantics,
-                                  .dest_type = nir_type_float | intrin->def.bit_size);
+                                  .io_semantics = semantics);
 
    return load;
+}
+
+/**
+ * Convert a compact view index emitted by nir_lower_multiview to an absolute
+ * view index.
+ */
+static nir_def *
+uncompact_view_index(nir_builder *b, nir_src compact_index_src)
+{
+   /* We require nir_lower_io_to_temporaries when using absolute view indices,
+    * which ensures index is constant */
+   assert(nir_src_is_const(compact_index_src));
+   unsigned compact_index = nir_src_as_uint(compact_index_src);
+
+   unsigned view_index;
+   uint32_t view_mask = b->shader->info.view_mask;
+   for (unsigned i = 0; i <= compact_index; i++) {
+      view_index = u_bit_scan(&view_mask);
+   }
+
+   return nir_imm_int(b, view_index);
 }
 
 static bool
@@ -768,6 +808,9 @@ nir_lower_io_block(nir_block *block,
       offset = get_io_offset(b, deref, is_arrayed ? &array_index : NULL,
                              state->type_size, &component_offset,
                              bindless_type_size);
+
+      if (!options->compact_view_index && array_index && var->data.per_view)
+         array_index = uncompact_view_index(b, nir_src_for_ssa(array_index));
 
       nir_def *replacement = NULL;
 
@@ -2806,6 +2849,7 @@ nir_get_io_offset_src_number(const nir_intrinsic_instr *instr)
    case nir_intrinsic_load_input_vertex:
    case nir_intrinsic_load_per_vertex_input:
    case nir_intrinsic_load_per_vertex_output:
+   case nir_intrinsic_load_per_view_output:
    case nir_intrinsic_load_per_primitive_output:
    case nir_intrinsic_load_interpolated_input:
    case nir_intrinsic_load_smem_amd:
@@ -2823,7 +2867,9 @@ nir_get_io_offset_src_number(const nir_intrinsic_instr *instr)
       return 1;
    case nir_intrinsic_store_ssbo:
    case nir_intrinsic_store_per_vertex_output:
+   case nir_intrinsic_store_per_view_output:
    case nir_intrinsic_store_per_primitive_output:
+   case nir_intrinsic_load_attribute_pan:
       return 2;
    default:
       return -1;
@@ -2841,7 +2887,7 @@ nir_get_io_offset_src(nir_intrinsic_instr *instr)
 }
 
 /**
- * Return the vertex index source number for a load/store per_vertex intrinsic or -1 if there's no offset.
+ * Return the array index source number for an arrayed load/store intrinsic or -1 if there's no offset.
  */
 int
 nir_get_io_arrayed_index_src_number(const nir_intrinsic_instr *instr)
@@ -2849,9 +2895,11 @@ nir_get_io_arrayed_index_src_number(const nir_intrinsic_instr *instr)
    switch (instr->intrinsic) {
    case nir_intrinsic_load_per_vertex_input:
    case nir_intrinsic_load_per_vertex_output:
+   case nir_intrinsic_load_per_view_output:
    case nir_intrinsic_load_per_primitive_output:
       return 0;
    case nir_intrinsic_store_per_vertex_output:
+   case nir_intrinsic_store_per_view_output:
    case nir_intrinsic_store_per_primitive_output:
       return 1;
    default:
@@ -2860,7 +2908,7 @@ nir_get_io_arrayed_index_src_number(const nir_intrinsic_instr *instr)
 }
 
 /**
- * Return the vertex index source for a load/store per_vertex intrinsic.
+ * Return the array index source for an arrayed load/store intrinsic.
  */
 nir_src *
 nir_get_io_arrayed_index_src(nir_intrinsic_instr *instr)
@@ -2992,9 +3040,11 @@ is_output(nir_intrinsic_instr *intrin)
 {
    return intrin->intrinsic == nir_intrinsic_load_output ||
           intrin->intrinsic == nir_intrinsic_load_per_vertex_output ||
+          intrin->intrinsic == nir_intrinsic_load_per_view_output ||
           intrin->intrinsic == nir_intrinsic_load_per_primitive_output ||
           intrin->intrinsic == nir_intrinsic_store_output ||
           intrin->intrinsic == nir_intrinsic_store_per_vertex_output ||
+          intrin->intrinsic == nir_intrinsic_store_per_view_output ||
           intrin->intrinsic == nir_intrinsic_store_per_primitive_output;
 }
 
@@ -3003,6 +3053,7 @@ is_dual_slot(nir_intrinsic_instr *intrin)
 {
    if (intrin->intrinsic == nir_intrinsic_store_output ||
        intrin->intrinsic == nir_intrinsic_store_per_vertex_output ||
+       intrin->intrinsic == nir_intrinsic_store_per_view_output ||
        intrin->intrinsic == nir_intrinsic_store_per_primitive_output) {
       return nir_src_bit_size(intrin->src[0]) == 64 &&
              nir_src_num_components(intrin->src[0]) >= 3;
@@ -3298,6 +3349,15 @@ nir_lower_io_passes(nir_shader *nir, bool renumber_vs_inputs)
       NIR_PASS_V(nir, nir_split_var_copies);
       NIR_PASS_V(nir, nir_lower_var_copies);
       NIR_PASS_V(nir, nir_lower_global_vars_to_local);
+
+      /* This is partially redundant with nir_lower_io_to_temporaries.
+       * The problem is that nir_lower_io_to_temporaries doesn't handle TCS.
+       */
+      if (nir->info.stage == MESA_SHADER_TESS_CTRL) {
+         NIR_PASS(_, nir, nir_lower_indirect_derefs,
+                  (!has_indirect_inputs ? nir_var_shader_in : 0) |
+                  (!has_indirect_outputs ? nir_var_shader_out : 0), UINT32_MAX);
+      }
    }
 
    /* The correct lower_64bit_to_32 flag is required by st/mesa depending

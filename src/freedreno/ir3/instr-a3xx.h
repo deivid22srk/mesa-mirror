@@ -348,6 +348,9 @@ typedef enum {
     */
    OPC_PUSH_CONSTS_LOAD_MACRO = _OPC(6, 84),
 
+   OPC_RAY_INTERSECTION = _OPC(6, 90),
+   OPC_RESBASE          = _OPC(6, 91),
+
    /* category 7: */
    OPC_BAR             = _OPC(7, 0),
    OPC_FENCE           = _OPC(7, 1),
@@ -635,6 +638,18 @@ is_madsh(opc_t opc)
    switch (opc) {
    case OPC_MADSH_U16:
    case OPC_MADSH_M16:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static inline bool
+is_sad(opc_t opc)
+{
+   switch (opc) {
+   case OPC_SAD_S16:
+   case OPC_SAD_S32:
       return true;
    default:
       return false;

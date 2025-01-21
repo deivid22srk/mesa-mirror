@@ -38,6 +38,7 @@ struct ir3_info {
    /* Size in dwords of the instructions. */
    uint16_t sizedwords;
    uint16_t instrs_count; /* expanded to account for rpt's */
+   uint16_t preamble_instrs_count;
    uint16_t nops_count;   /* # of nop instructions, including nopN */
    uint16_t mov_count;
    uint16_t cov_count;
@@ -58,6 +59,7 @@ struct ir3_info {
    bool double_threadsize;
    bool multi_dword_ldp_stp;
    bool early_preamble;
+   bool uses_ray_intersection;
 
    /* number of sync bits: */
    uint16_t ss, sy;
@@ -1191,6 +1193,7 @@ is_load(struct ir3_instruction *instr)
    case OPC_L2G:
    case OPC_LDLW:
    case OPC_LDLV:
+   case OPC_RAY_INTERSECTION:
       /* probably some others too.. */
       return true;
    case OPC_LDC:
@@ -1699,7 +1702,7 @@ ir3_cat2_absneg(opc_t opc)
 
 /* map cat3 instructions to valid abs/neg flags: */
 static inline unsigned
-ir3_cat3_absneg(opc_t opc)
+ir3_cat3_absneg(opc_t opc, unsigned src_n)
 {
    switch (opc) {
    case OPC_MAD_F16:
@@ -1707,6 +1710,10 @@ ir3_cat3_absneg(opc_t opc)
    case OPC_SEL_F16:
    case OPC_SEL_F32:
       return IR3_REG_FNEG;
+
+   case OPC_SAD_S16:
+   case OPC_SAD_S32:
+      return src_n == 1 ? IR3_REG_SNEG : 0;
 
    case OPC_MAD_U16:
    case OPC_MADSH_U16:
@@ -1716,8 +1723,6 @@ ir3_cat3_absneg(opc_t opc)
    case OPC_MAD_S24:
    case OPC_SEL_S16:
    case OPC_SEL_S32:
-   case OPC_SAD_S16:
-   case OPC_SAD_S32:
       /* neg *may* work on 3rd src.. */
 
    case OPC_SEL_B16:
@@ -3028,6 +3033,7 @@ INSTR4(ATOMIC_S_OR)
 INSTR4(ATOMIC_S_XOR)
 #endif
 INSTR4NODST(LDG_K)
+INSTR5(RAY_INTERSECTION)
 
 /* cat7 instructions: */
 INSTR0(BAR)

@@ -210,6 +210,11 @@ ixor_bcsel = [
 cleanup_amul = [
    # Neither operation overflows so we can keep the amul.
    (('amul', ('amul', a, '#b'), '#c'), ('amul', a, ('imul', b, c))),
+
+   # Result of u2u64 has zero in upper half, so the shift doesn't overflow, so
+   # neither multiplication overflows.
+   (('amul', ('ishl', ('u2u64', 'a@32'), '#b(is_ult_32)'), '#c'),
+    ('amul', ('u2u64', a), ('ishl', c, b))),
 ]
 
 fuse_lea = []
@@ -292,6 +297,11 @@ for s_ in range(1, 5):
 fuse_lea += [
     (('iadd', a, ('u2u64', 'b@32')), ('ulea_agx', a, b, 0)),
     (('iadd', a, ('i2i64', 'b@32')), ('ilea_agx', a, b, 0)),
+
+    (('iadd', a, ('iadd', ('u2u64', 'b@32'), c)),
+     ('ulea_agx', ('iadd', a, c), b, 0)),
+    (('iadd', a, ('iadd', ('i2i64', 'b@32'), c)),
+     ('ilea_agx', ('iadd', a, c), b, 0)),
 ]
 
 # After lowering address arithmetic, the various address arithmetic opcodes are

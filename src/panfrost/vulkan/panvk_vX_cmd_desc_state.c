@@ -47,8 +47,7 @@ cmd_desc_state_bind_sets(struct panvk_descriptor_state *desc_state,
       for (unsigned b = 0; b < set->layout->binding_count; b++) {
          VkDescriptorType type = set->layout->bindings[b].type;
 
-         if (type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC &&
-             type != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC)
+         if (!vk_descriptor_type_is_dynamic(type))
             continue;
 
          unsigned dyn_buf_idx = set->layout->bindings[b].desc_idx;
@@ -234,7 +233,7 @@ panvk_per_arch(cmd_prepare_shader_desc_tables)(
          return VK_ERROR_OUT_OF_DEVICE_MEMORY;
 
       /* Emit a dummy sampler if we have to. */
-      pan_pack(sampler.cpu, SAMPLER, cfg) {
+      pan_cast_and_pack(sampler.cpu, SAMPLER, cfg) {
          cfg.clamp_integer_array_indices = false;
       }
 
@@ -330,7 +329,7 @@ panvk_per_arch(cmd_prepare_push_descs)(struct panvk_cmd_buffer *cmdbuf,
 
       if (!(used_set_mask & BITFIELD_BIT(i)) || !push_set ||
           desc_state->sets[i] != push_set || push_set->descs.dev ||
-	  !BITSET_TEST(desc_state->dirty_push_sets, i))
+          !BITSET_TEST(desc_state->dirty_push_sets, i))
          continue;
 
       struct panfrost_ptr ptr = panvk_cmd_alloc_dev_mem(
@@ -342,6 +341,8 @@ panvk_per_arch(cmd_prepare_push_descs)(struct panvk_cmd_buffer *cmdbuf,
       memcpy(ptr.cpu, push_set->descs.host,
              push_set->desc_count * PANVK_DESCRIPTOR_SIZE);
       push_set->descs.dev = ptr.gpu;
+
+      BITSET_CLEAR(desc_state->dirty_push_sets, i);
    }
 
    return VK_SUCCESS;

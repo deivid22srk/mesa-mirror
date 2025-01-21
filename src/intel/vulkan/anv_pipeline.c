@@ -531,6 +531,15 @@ rp_color_mask(const struct vk_render_pass_state *rp)
          color_mask |= BITFIELD_BIT(i);
    }
 
+   /* If there is depth/stencil attachment, even if the fragment shader
+    * doesn't write the depth/stencil output, we need a valid render target so
+    * that the compiler doesn't use the null-rt which would cull the
+    * depth/stencil output.
+    */
+   if (rp->depth_attachment_format != VK_FORMAT_UNDEFINED ||
+       rp->stencil_attachment_format != VK_FORMAT_UNDEFINED)
+      color_mask |= 1;
+
    return color_mask;
 }
 
@@ -960,55 +969,19 @@ print_ubo_load(nir_builder *b,
                nir_intrinsic_instr *intrin,
                UNUSED void *cb_data)
 {
-   if (intrin->intrinsic != nir_intrinsic_load_ubo)
+   if (intrin->intrinsic != nir_intrinsic_load_uniform)
       return false;
 
-   b->cursor = nir_before_instr(&intrin->instr);
-   nir_printf_fmt(b, true, 64, "ubo=> pos=%02.2fx%02.2f offset=0x%08x\n",
-                  nir_channel(b, nir_load_frag_coord(b), 0),
-                  nir_channel(b, nir_load_frag_coord(b), 1),
-                  intrin->src[1].ssa);
-
    b->cursor = nir_after_instr(&intrin->instr);
-   nir_printf_fmt(b, true, 64, "ubo<= pos=%02.2fx%02.2f offset=0x%08x val=0x%08x\n",
+   nir_printf_fmt(b, true, 64,
+                  "uniform<= pos=%02.2fx%02.2f offset=0x%08x val=0x%08x\n",
                   nir_channel(b, nir_load_frag_coord(b), 0),
                   nir_channel(b, nir_load_frag_coord(b), 1),
-                  intrin->src[1].ssa,
+                  intrin->src[0].ssa,
                   &intrin->def);
    return true;
 }
 #endif
-
-static bool
-print_tex_handle(nir_builder *b,
-                 nir_instr *instr,
-                 UNUSED void *cb_data)
-{
-   if (instr->type != nir_instr_type_tex)
-      return false;
-
-   nir_tex_instr *tex = nir_instr_as_tex(instr);
-
-   nir_src tex_src = {};
-   for (unsigned i = 0; i < tex->num_srcs; i++) {
-      if (tex->src[i].src_type == nir_tex_src_texture_handle)
-         tex_src = tex->src[i].src;
-   }
-
-   b->cursor = nir_before_instr(instr);
-   nir_printf_fmt(b, true, 64, "starting pos=%02.2fx%02.2f tex=0x%08x\n",
-                  nir_channel(b, nir_load_frag_coord(b), 0),
-                  nir_channel(b, nir_load_frag_coord(b), 1),
-                  tex_src.ssa);
-
-   b->cursor = nir_after_instr(instr);
-   nir_printf_fmt(b, true, 64, "done pos=%02.2fx%02.2f tex=0x%08x\n",
-                  nir_channel(b, nir_load_frag_coord(b), 0),
-                  nir_channel(b, nir_load_frag_coord(b), 1),
-                  tex_src.ssa);
-
-   return true;
-}
 
 static void
 anv_pipeline_lower_nir(struct anv_pipeline *pipeline,
@@ -1197,7 +1170,7 @@ anv_pipeline_lower_nir(struct anv_pipeline *pipeline,
 #if DEBUG_PRINTF_EXAMPLE
    if (stage->stage == MESA_SHADER_FRAGMENT) {
       nir_shader_intrinsics_pass(nir, print_ubo_load,
-                                 nir_metadata_control_flow,
+                                 nir_metadata_none,
                                  NULL);
    }
 #endif
@@ -3053,6 +3026,7 @@ anv_graphics_pipeline_import_lib(struct anv_graphics_base_pipeline *pipeline,
          continue;
 
       stages[s].stage = s;
+      stages[s].pipeline_flags = pipeline->base.flags;
       stages[s].feedback_idx = shader_count + lib->base.feedback_index[s];
       stages[s].robust_flags = lib->base.robust_flags[s];
 

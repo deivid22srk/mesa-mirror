@@ -15,10 +15,12 @@
 #endif
 #include <sys/stat.h>
 
+#include "spirv/nir_spirv.h"
 #include "util/mesa-sha1.h"
 #include "util/os_time.h"
 #include "ac_debug.h"
 #include "ac_descriptors.h"
+#include "git_sha1.h"
 #include "radv_buffer.h"
 #include "radv_debug.h"
 #include "radv_descriptor_set.h"
@@ -27,7 +29,9 @@
 #include "radv_pipeline_rt.h"
 #include "radv_shader.h"
 #include "sid.h"
-#include "spirv/nir_spirv.h"
+
+#include "vk_common_entrypoints.h"
+#include "vk_enum_to_str.h"
 
 #define COLOR_RESET  "\033[0m"
 #define COLOR_RED    "\033[31m"
@@ -36,6 +40,145 @@
 #define COLOR_CYAN   "\033[1;36m"
 
 #define RADV_DUMP_DIR "radv_dumps"
+
+static void
+radv_dump_address_binding_report(const struct radv_address_binding_report *report, FILE *f)
+{
+   fprintf(f, "timestamp=%llu, VA=%.16llx-%.16llx, binding_type=%s, object_type=%s, object_handle=0x%llx\n",
+           (long long)report->timestamp, (long long)report->va, (long long)(report->va + report->size),
+           (report->binding_type == VK_DEVICE_ADDRESS_BINDING_TYPE_BIND_EXT) ? "bind" : "unbind",
+           vk_ObjectType_to_str(report->object_type), (long long)report->object_handle);
+}
+
+static void
+radv_dump_address_binding_reports(struct radv_device *device, FILE *f)
+{
+   struct radv_address_binding_tracker *tracker = device->addr_binding_tracker;
+
+   simple_mtx_lock(&tracker->mtx);
+   util_dynarray_foreach (&tracker->reports, struct radv_address_binding_report, report)
+      radv_dump_address_binding_report(report, f);
+   simple_mtx_unlock(&tracker->mtx);
+}
+
+static void
+radv_dump_address_binding_report_check(struct radv_device *device, uint64_t va, FILE *f)
+{
+   struct radv_address_binding_tracker *tracker = device->addr_binding_tracker;
+   bool va_found = false;
+   bool va_valid = false;
+
+   if (!tracker)
+      return;
+
+   fprintf(f, "\nPerforming some verifications with address binding report...\n");
+
+   simple_mtx_lock(&tracker->mtx);
+
+   util_dynarray_foreach (&tracker->reports, struct radv_address_binding_report, report) {
+      if (va < report->va || va >= report->va + report->size)
+         continue;
+
+      if (report->object_type == VK_OBJECT_TYPE_DEVICE_MEMORY) {
+         if (report->binding_type == VK_DEVICE_ADDRESS_BINDING_TYPE_BIND_EXT) {
+            va_valid = true; /* BO alloc */
+         } else {
+            va_valid = false; /* BO destroy */
+         }
+      }
+
+      radv_dump_address_binding_report(report, f);
+      va_found = true;
+   }
+
+   simple_mtx_unlock(&tracker->mtx);
+
+   if (va_found) {
+      if (!va_valid)
+         fprintf(f, "\nPotential use-after-free detected! See addr_binding_report.log for more info.\n");
+   } else {
+      fprintf(f, "VA not found!\n");
+   }
+}
+
+static VkBool32 VKAPI_PTR
+radv_address_binding_callback(VkDebugUtilsMessageSeverityFlagBitsEXT message_severity,
+                              VkDebugUtilsMessageTypeFlagsEXT message_types,
+                              const VkDebugUtilsMessengerCallbackDataEXT *callback_data, void *userdata)
+{
+   struct radv_address_binding_tracker *tracker = userdata;
+   const VkDeviceAddressBindingCallbackDataEXT *data;
+
+   if (!callback_data)
+      return VK_FALSE;
+
+   data = vk_find_struct_const(callback_data->pNext, DEVICE_ADDRESS_BINDING_CALLBACK_DATA_EXT);
+   if (!data)
+      return VK_FALSE;
+
+   simple_mtx_lock(&tracker->mtx);
+
+   for (uint32_t i = 0; i < callback_data->objectCount; i++) {
+      struct radv_address_binding_report report = {
+         .timestamp = os_time_get_nano(),
+         .va = data->baseAddress & ((1ull << 48) - 1),
+         .size = data->size,
+         .flags = data->flags,
+         .binding_type = data->bindingType,
+         .object_handle = callback_data->pObjects[i].objectHandle,
+         .object_type = callback_data->pObjects[i].objectType,
+      };
+
+      util_dynarray_append(&tracker->reports, struct radv_address_binding_report, report);
+   }
+
+   simple_mtx_unlock(&tracker->mtx);
+
+   return VK_FALSE;
+}
+
+static bool
+radv_init_adress_binding_report(struct radv_device *device)
+{
+   struct radv_physical_device *pdev = radv_device_physical(device);
+   struct radv_instance *instance = radv_physical_device_instance(pdev);
+   VkResult result;
+
+   device->addr_binding_tracker = calloc(1, sizeof(*device->addr_binding_tracker));
+   if (!device->addr_binding_tracker)
+      return false;
+
+   simple_mtx_init(&device->addr_binding_tracker->mtx, mtx_plain);
+   util_dynarray_init(&device->addr_binding_tracker->reports, NULL);
+
+   VkDebugUtilsMessengerCreateInfoEXT create_info = {
+      .messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT,
+      .pUserData = device->addr_binding_tracker,
+      .pfnUserCallback = radv_address_binding_callback,
+      .messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_DEVICE_ADDRESS_BINDING_BIT_EXT,
+   };
+
+   result = vk_common_CreateDebugUtilsMessengerEXT(radv_instance_to_handle(instance), &create_info, NULL,
+                                                   &device->addr_binding_tracker->messenger);
+   if (result != VK_SUCCESS)
+      return false;
+
+   return true;
+}
+
+static void
+radv_finish_address_binding_report(struct radv_device *device)
+{
+   struct radv_physical_device *pdev = radv_device_physical(device);
+   struct radv_instance *instance = radv_physical_device_instance(pdev);
+   struct radv_address_binding_tracker *tracker = device->addr_binding_tracker;
+
+   util_dynarray_fini(&tracker->reports);
+   simple_mtx_destroy(&tracker->mtx);
+
+   vk_common_DestroyDebugUtilsMessengerEXT(radv_instance_to_handle(instance), tracker->messenger, NULL);
+   free(device->addr_binding_tracker);
+}
 
 bool
 radv_init_trace(struct radv_device *device)
@@ -58,6 +201,9 @@ radv_init_trace(struct radv_device *device)
    if (!device->trace_data)
       return false;
 
+   if (!radv_init_adress_binding_report(device))
+      return false;
+
    return true;
 }
 
@@ -65,6 +211,9 @@ void
 radv_finish_trace(struct radv_device *device)
 {
    struct radeon_winsys *ws = device->ws;
+
+   if (device->addr_binding_tracker)
+      radv_finish_address_binding_report(device);
 
    if (unlikely(device->trace_bo)) {
       ws->buffer_make_resident(ws, device->trace_bo, false);
@@ -642,20 +791,16 @@ radv_dump_app_info(const struct radv_device *device, FILE *f)
 static void
 radv_dump_device_name(const struct radv_device *device, FILE *f)
 {
+#ifndef _WIN32
    const struct radv_physical_device *pdev = radv_device_physical(device);
    const struct radeon_info *gpu_info = &pdev->info;
-#ifndef _WIN32
    char kernel_version[128] = {0};
    struct utsname uname_data;
-#endif
 
-#ifdef _WIN32
-   fprintf(f, "Device name: %s (DRM %i.%i.%i)\n\n", pdev->marketing_name, gpu_info->drm_major, gpu_info->drm_minor,
-           gpu_info->drm_patchlevel);
-#else
    if (uname(&uname_data) == 0)
       snprintf(kernel_version, sizeof(kernel_version), " / %s", uname_data.release);
 
+   fprintf(f, "Mesa version: " PACKAGE_VERSION MESA_GIT_SHA1 "\n");
    fprintf(f, "Device name: %s (DRM %i.%i.%i%s)\n\n", pdev->marketing_name, gpu_info->drm_major, gpu_info->drm_minor,
            gpu_info->drm_patchlevel, kernel_version);
 #endif
@@ -685,6 +830,18 @@ static void
 radv_dump_umr_waves(struct radv_queue *queue, const char *wave_dump, FILE *f)
 {
    fprintf(f, "\nUMR GFX waves:\n\n%s", wave_dump ? wave_dump : "");
+}
+
+static void
+radv_dump_vm_fault(struct radv_device *device, const struct radv_winsys_gpuvm_fault_info *fault_info, FILE *f)
+{
+   struct radv_physical_device *pdev = radv_device_physical(device);
+
+   fprintf(f, "VM fault report.\n\n");
+   fprintf(f, "Failing VM page: 0x%08" PRIx64 "\n", fault_info->addr);
+   ac_print_gpuvm_fault_status(f, pdev->info.gfx_level, fault_info->status);
+
+   radv_dump_address_binding_report_check(device, fault_info->addr, f);
 }
 
 static bool
@@ -718,6 +875,7 @@ enum radv_device_fault_chunk {
    RADV_DEVICE_FAULT_CHUNK_REGISTERS,
    RADV_DEVICE_FAULT_CHUNK_BO_RANGES,
    RADV_DEVICE_FAULT_CHUNK_BO_HISTORY,
+   RADV_DEVICE_FAULT_CHUNK_ADDR_BINDING_REPORT,
    RADV_DEVICE_FAULT_CHUNK_VM_FAULT,
    RADV_DEVICE_FAULT_CHUNK_APP_INFO,
    RADV_DEVICE_FAULT_CHUNK_GPU_INFO,
@@ -791,8 +949,9 @@ radv_check_gpu_hangs(struct radv_queue *queue, const struct radv_winsys_submit_i
       char *ptr;
       size_t size;
    } chunks[RADV_DEVICE_FAULT_CHUNK_COUNT] = {
-      {"trace"},      {"pipeline"}, {"umr_waves"}, {"umr_ring"}, {"registers"}, {"bo_ranges"},
-      {"bo_history"}, {"vm_fault"}, {"app_info"},  {"gpu_info"}, {"dmesg"},
+      {"trace"},     {"pipeline"},  {"umr_waves"},  {"umr_ring"},
+      {"registers"}, {"bo_ranges"}, {"bo_history"}, {"addr_binding_report"},
+      {"vm_fault"},  {"app_info"},  {"gpu_info"},   {"dmesg"},
    };
 
    char *wave_dump = NULL;
@@ -836,12 +995,12 @@ radv_check_gpu_hangs(struct radv_queue *queue, const struct radv_winsys_submit_i
       case RADV_DEVICE_FAULT_CHUNK_BO_HISTORY:
          device->ws->dump_bo_log(device->ws, f);
          break;
+      case RADV_DEVICE_FAULT_CHUNK_ADDR_BINDING_REPORT:
+         radv_dump_address_binding_reports(device, f);
+         break;
       case RADV_DEVICE_FAULT_CHUNK_VM_FAULT:
-         if (vm_fault_occurred) {
-            fprintf(f, "VM fault report.\n\n");
-            fprintf(f, "Failing VM page: 0x%08" PRIx64 "\n", fault_info.addr);
-            ac_print_gpuvm_fault_status(f, pdev->info.gfx_level, fault_info.status);
-         }
+         if (vm_fault_occurred)
+            radv_dump_vm_fault(device, &fault_info, f);
          break;
       case RADV_DEVICE_FAULT_CHUNK_APP_INFO:
          radv_dump_app_info(device, f);

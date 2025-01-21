@@ -141,6 +141,8 @@ struct ir3_context {
 
    unsigned prefetch_limit;
 
+   bool has_relative_load_const_ir3;
+
    /* set if we encounter something we can't handle yet, so we
     * can bail cleanly and fallback to TGSI compiler f/e
     */
@@ -151,6 +153,9 @@ struct ir3_context_funcs {
    void (*emit_intrinsic_load_ssbo)(struct ir3_context *ctx,
                                     nir_intrinsic_instr *intr,
                                     struct ir3_instruction **dst);
+   void (*emit_intrinsic_load_uav)(struct ir3_context *ctx,
+                                   nir_intrinsic_instr *intr,
+                                   struct ir3_instruction **dst);
    void (*emit_intrinsic_store_ssbo)(struct ir3_context *ctx,
                                      nir_intrinsic_instr *intr);
    struct ir3_instruction *(*emit_intrinsic_atomic_ssbo)(

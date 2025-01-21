@@ -99,9 +99,10 @@ const struct pan_blendable_format
       BFMT2(R5G6B5_UNORM, R5G6B5A0, R5G6B5, 0),
       BFMT2(B5G6R5_UNORM, R5G6B5A0, R5G6B5, 0),
 
-      BFMT(A4B4G4R4_UNORM, R4G4B4A4),
-      BFMT(B4G4R4A4_UNORM, R4G4B4A4),
       BFMT(R4G4B4A4_UNORM, R4G4B4A4),
+      BFMT(B4G4R4A4_UNORM, R4G4B4A4),
+      BFMT(A4R4G4B4_UNORM, R4G4B4A4),
+      BFMT(A4B4G4R4_UNORM, R4G4B4A4),
 
       BFMT(R10G10B10A2_UNORM, R10G10B10A2),
       BFMT(B10G10R10A2_UNORM, R10G10B10A2),
@@ -422,6 +423,8 @@ const struct panfrost_format GENX(panfrost_pipe_format)[PIPE_FORMAT_COUNT] = {
    FMT(R16G16B16_UINT,          RGB16UI,         RGB1, L, V___),
    FMT(R4G4B4A4_UNORM,          RGBA4_UNORM,     RGBA, L, VTR_),
    FMT(B4G4R4A4_UNORM,          RGBA4_UNORM,     BGRA, L, VTR_),
+   FMT(A4R4G4B4_UNORM,          RGBA4_UNORM,     ARGB, L, VTR_),
+   FMT(A4B4G4R4_UNORM,          RGBA4_UNORM,     ABGR, L, VTR_),
    FMT(R16G16B16A16_UNORM,      RGBA16_UNORM,    RGBA, L, VTR_),
    FMT(B8G8R8A8_UNORM,          RGBA8_UNORM,     BGRA, L, VTR_),
    FMT(B8G8R8X8_UNORM,          RGBA8_UNORM,     BGR1, L, VTR_),
@@ -488,7 +491,7 @@ const struct panfrost_format GENX(panfrost_pipe_format)[PIPE_FORMAT_COUNT] = {
    FMT(Z32_FLOAT_S8X24_UINT,    RG32F,           RRRR, L, _T_Z),
    FMT(X32_S8X24_UINT,          X32_S8X24,       GGGG, L, _T_Z),
    FMT(X24S8_UINT,              RGBA8UI,         AAAA, L, _T_Z),
-   FMT(S8_UINT,                 R8UI,            RRRR, L, _T__),
+   FMT(S8_UINT,                 R8UI,            RRRR, L, _T_Z),
 
    FMT(A8_UNORM,                R8_UNORM,        000R, L, VTR_),
    FMT(L8A8_UNORM,              RG8_UNORM,       RRRG, L, VTR_),
@@ -521,9 +524,9 @@ const struct panfrost_format GENX(panfrost_pipe_format)[PIPE_FORMAT_COUNT] = {
     * we want stencil in the red channel, so we use the GRBA swizzles.
     */
    FMT(Z32_FLOAT_S8X24_UINT,    R32F,            GRBA, L, _T_Z),
-   FMT(X32_S8X24_UINT,          S8,              GRBA, L, _T__),
+   FMT(X32_S8X24_UINT,          S8,              GRBA, L, _T_Z),
    FMT(X24S8_UINT,              S8,              GRBA, L, _T_Z),
-   FMT(S8_UINT,                 S8,              GRBA, L, _T__),
+   FMT(S8_UINT,                 S8,              GRBA, L, _T_Z),
 
    /* similarly, the interchange format is RGBA8, but we only
       actually store 1 component in memory here */
@@ -531,9 +534,9 @@ const struct panfrost_format GENX(panfrost_pipe_format)[PIPE_FORMAT_COUNT] = {
 #else
    /* Specify real formats on Bifrost */
    FMT(Z32_FLOAT_S8X24_UINT,    Z32_X32,         RGBA, L, _T_Z),
-   FMT(X32_S8X24_UINT,          X32_S8X24,       GRBA, L, _T__),
+   FMT(X32_S8X24_UINT,          X32_S8X24,       GRBA, L, _T_Z),
    FMT(X24S8_UINT,              X24S8,           GRBA, L, _T_Z),
-   FMT(S8_UINT,                 S8,              GRBA, L, _T__),
+   FMT(S8_UINT,                 S8,              GRBA, L, _T_Z),
 
    /* Obsolete formats removed in Valhall */
    FMT(A8_UNORM,                A8_UNORM,        000A, L, VTR_),

@@ -79,6 +79,10 @@ const struct nir_shader_compiler_options brw_scalar_nir_options = {
    .vectorize_tess_levels = true,
    .vertex_id_zero_based = true,
    .scalarize_ddx = true,
+   .support_indirect_inputs = (uint8_t)BITFIELD_MASK(PIPE_SHADER_TYPES),
+   .support_indirect_outputs = (uint8_t)BITFIELD_MASK(PIPE_SHADER_TYPES),
+   .per_view_unique_driver_locations = true,
+   .compact_view_index = true,
 };
 
 struct brw_compiler *

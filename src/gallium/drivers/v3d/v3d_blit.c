@@ -48,7 +48,7 @@ v3d_blitter_save(struct v3d_context *v3d, enum v3d_blitter_op op)
         util_blitter_save_vertex_shader(v3d->blitter, v3d->prog.bind_vs);
         util_blitter_save_geometry_shader(v3d->blitter, v3d->prog.bind_gs);
         util_blitter_save_so_targets(v3d->blitter, v3d->streamout.num_targets,
-                                     v3d->streamout.targets);
+                                     v3d->streamout.targets, MESA_PRIM_UNKNOWN);
         util_blitter_save_rasterizer(v3d->blitter, v3d->rasterizer);
         util_blitter_save_viewport(v3d->blitter, &v3d->viewport);
         util_blitter_save_fragment_shader(v3d->blitter, v3d->prog.bind_fs);
@@ -57,7 +57,7 @@ v3d_blitter_save(struct v3d_context *v3d, enum v3d_blitter_op op)
         util_blitter_save_stencil_ref(v3d->blitter, &v3d->stencil_ref);
         util_blitter_save_sample_mask(v3d->blitter, v3d->sample_mask, 0);
         util_blitter_save_so_targets(v3d->blitter, v3d->streamout.num_targets,
-                                     v3d->streamout.targets);
+                                     v3d->streamout.targets, MESA_PRIM_UNKNOWN);
 
         if (op & V3D_SAVE_FRAMEBUFFER)
                 util_blitter_save_framebuffer(v3d->blitter, &v3d->framebuffer);
@@ -260,6 +260,7 @@ v3d_tfu_blit(struct pipe_context *pctx, struct pipe_blit_info *info)
                 return;
 
         if (info->scissor_enable ||
+            info->swizzle_enable ||
             info->dst.box.x != 0 ||
             info->dst.box.y != 0 ||
             info->dst.box.width != dst_width ||
@@ -328,7 +329,7 @@ check_tlb_blit_ok(struct v3d_device_info *devinfo, struct pipe_blit_info *info)
         assert ((is_color_blit && !is_depth_blit && !is_stencil_blit) ||
                 (!is_color_blit && (is_depth_blit || is_stencil_blit)));
 
-        if (info->scissor_enable)
+        if (info->scissor_enable || info->swizzle_enable)
                 return false;
 
         if (info->src.box.x != info->dst.box.x ||
@@ -1101,7 +1102,8 @@ v3d_sand30_blit(struct pipe_context *pctx, struct pipe_blit_info *info)
                 return;
         if (!(info->mask & PIPE_MASK_RGBA))
                 return;
-
+        if (info->swizzle_enable)
+                return;
         assert(dst->base.format == src->base.format);
         assert(dst->tiled);
 

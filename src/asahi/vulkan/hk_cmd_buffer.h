@@ -204,11 +204,10 @@ struct hk_index_buffer_state {
  * shaders_dirty.
  */
 enum hk_dirty {
-   HK_DIRTY_INDEX = BITFIELD_BIT(0),
-   HK_DIRTY_VB = BITFIELD_BIT(1),
-   HK_DIRTY_OCCLUSION = BITFIELD_BIT(2),
-   HK_DIRTY_PROVOKING = BITFIELD_BIT(3),
-   HK_DIRTY_VARYINGS = BITFIELD_BIT(4),
+   HK_DIRTY_VB = BITFIELD_BIT(0),
+   HK_DIRTY_OCCLUSION = BITFIELD_BIT(1),
+   HK_DIRTY_PROVOKING = BITFIELD_BIT(2),
+   HK_DIRTY_VARYINGS = BITFIELD_BIT(3),
 };
 
 struct hk_graphics_state {
@@ -301,6 +300,19 @@ struct hk_scratch_req {
 };
 
 /*
+ * Represents a firmware timestamp request.  Handle is a kernel timestamp object
+ * handle, not a GEM handle.
+ *
+ * The kernel/firmware uses the handle/offset_B to write. We use the address to
+ * read the results back. We could deduplicate this, but this is convenient.
+ */
+struct agx_timestamp_req {
+   uint64_t addr;
+   uint32_t handle;
+   uint32_t offset_B;
+};
+
+/*
  * hk_cs represents a single control stream, to be enqueued either to the
  * CDM or VDM for compute/3D respectively.
  */
@@ -320,6 +332,9 @@ struct hk_cs {
 
    /* Address of the root control stream for the job */
    uint64_t addr;
+
+   /* Fat pointer to the start of the current chunk of the control stream */
+   struct agx_ptr chunk;
 
    /* Start pointer of the root control stream */
    void *start;
@@ -353,6 +368,14 @@ struct hk_cs {
       uint32_t calls, cmds, flushes;
    } stats;
 
+   /* Timestamp writes. Currently just compute end / fragment end. We could
+    * flesh this out later if we want finer info. (We will, but it's not
+    * required for conformance.)
+    */
+   struct {
+      struct agx_timestamp_req end;
+   } timestamp;
+
    /* Remaining state is for graphics only, ignored for compute */
    struct agx_tilebuffer_layout tib;
 
@@ -369,7 +392,20 @@ struct hk_cs {
    uint32_t ppp_multisamplectl;
 
    struct hk_render_registers cr;
+
+   /* Active restart index if one is set. Zero if there is no restart index set
+    * yet, since Vulkan does not allow zero restart indices (unlike OpenGL).
+    * This is used in place of dirty tracking, because dirty tracking
+    * restart indices is complicated and just checking the saved value is cheap.
+    */
+   uint32_t restart_index;
 };
+
+static inline uint64_t
+hk_cs_current_addr(struct hk_cs *cs)
+{
+   return cs->chunk.gpu + ((uint8_t *)cs->current - (uint8_t *)cs->chunk.cpu);
+}
 
 struct hk_uploader {
    /** List of hk_cmd_bo */
@@ -530,6 +566,7 @@ hk_cmd_buffer_get_cs_general(struct hk_cmd_buffer *cmd, struct hk_cs **ptr,
          .type = compute ? HK_CS_CDM : HK_CS_VDM,
          .addr = root.gpu,
          .start = root.cpu,
+         .chunk = root,
          .current = root.cpu,
          .end = root.cpu + initial_size,
       };
@@ -569,6 +606,16 @@ hk_cmd_buffer_get_cs(struct hk_cmd_buffer *cmd, bool compute)
 
 void hk_ensure_cs_has_space(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                             size_t space);
+
+static inline uint64_t
+hk_cs_alloc_for_indirect(struct hk_cs *cs, size_t size_B)
+{
+   hk_ensure_cs_has_space(cs->cmd, cs, size_B);
+
+   uint64_t addr = hk_cs_current_addr(cs);
+   cs->current += size_B;
+   return addr;
+}
 
 static void
 hk_cmd_buffer_dirty_all(struct hk_cmd_buffer *cmd)
@@ -756,8 +803,9 @@ hk_dispatch_with_local_size(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    hk_dispatch_with_usc(dev, cs, &s->b.info, usc, grid, local_size);
 }
 
-void hk_dispatch_precomp(struct hk_cs *cs, struct agx_grid gird,
-                         enum libagx_program idx, void *data, size_t data_size);
+void hk_dispatch_precomp(struct hk_cs *cs, struct agx_grid grid,
+                         enum agx_barrier barrier, enum libagx_program idx,
+                         void *data, size_t data_size);
 
 #define MESA_DISPATCH_PRECOMP hk_dispatch_precomp
 

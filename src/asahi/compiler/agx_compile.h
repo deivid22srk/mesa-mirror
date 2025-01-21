@@ -305,7 +305,7 @@ bool agx_nir_lower_cull_distance_fs(struct nir_shader *s,
                                     unsigned nr_distances);
 bool agx_mem_vectorize_cb(unsigned align_mul, unsigned align_offset,
                           unsigned bit_size, unsigned num_components,
-                          unsigned hole_size, nir_intrinsic_instr *low,
+                          int64_t hole_size, nir_intrinsic_instr *low,
                           nir_intrinsic_instr *high, void *data);
 
 void agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
@@ -369,6 +369,8 @@ static const nir_shader_compiler_options agx_nir_options = {
    .lower_int64_options =
       (nir_lower_int64_options) ~(nir_lower_iadd64 | nir_lower_imul_2x32_64),
    .lower_doubles_options = (nir_lower_doubles_options)(~0),
+   .support_indirect_inputs = (uint8_t)BITFIELD_MASK(PIPE_SHADER_TYPES),
+   .support_indirect_outputs = (uint8_t)BITFIELD_MASK(PIPE_SHADER_TYPES),
    .lower_fquantize2f16 = true,
    .compact_arrays = true,
    .discard_is_demote = true,

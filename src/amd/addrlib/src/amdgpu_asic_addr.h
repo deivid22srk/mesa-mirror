@@ -1,7 +1,7 @@
 /*
 ************************************************************************************************************************
 *
-*  Copyright (C) 2017-2022 Advanced Micro Devices, Inc.  All rights reserved.
+*  Copyright (C) 2017-2024 Advanced Micro Devices, Inc. All rights reserved.
 *  SPDX-License-Identifier: MIT
 *
 ***********************************************************************************************************************/
@@ -81,7 +81,7 @@
 
 #define AMDGPU_VEGA10_RANGE     0x01, 0x14 //#  1 <= x < 20
 #define AMDGPU_VEGA12_RANGE     0x14, 0x28 //# 20 <= x < 40
-#define AMDGPU_VEGA20_RANGE     0x28, 0x32 //# 40 <= x < max
+#define AMDGPU_VEGA20_RANGE     0x28, 0xFF //# 40 <= x < max
 
 #define AMDGPU_RAVEN_RANGE      0x01, 0x81 //#   1 <= x < 129
 #define AMDGPU_RAVEN2_RANGE     0x81, 0x90 //# 129 <= x < 144
@@ -103,6 +103,7 @@
 #define AMDGPU_GFX1150_RANGE    0x01, 0x40 //# 1 <= x < 64
 #define AMDGPU_GFX1151_RANGE    0xC0, 0xFF //# 192 <= x < 255
 #define AMDGPU_GFX1152_RANGE    0x40, 0x50 //# 64 <= x < 80
+#define AMDGPU_GFX1153_RANGE    0x50, 0xC0 //# 80 <= x < 192
 #define AMDGPU_PHOENIX1_RANGE      0x01, 0x80 //# 1 <= x < 128
 #define AMDGPU_PHOENIX2_RANGE      0x80, 0xC0 //# 128 <= x < 192
 #define AMDGPU_HAWK_POINT1_RANGE   0xC0, 0xF0 //# 192 <= x < 240
@@ -181,8 +182,8 @@
 #define ASICREV_IS_GFX1150(r)          ASICREV_IS(r, GFX1150)
 #define ASICREV_IS_GFX1151(r)          ASICREV_IS(r, GFX1151)
 #define ASICREV_IS_GFX1152(r)          ASICREV_IS(r, GFX1152)
-
-#define ASICREV_IS_PHOENIX1(r)         ASICREV_IS(r, PHOENIX1)
+#define ASICREV_IS_GFX1153(r)          ASICREV_IS(r, GFX1153)
+#define ASICREV_IS_PHOENIX(r)          ASICREV_IS(r, PHOENIX)
 #define ASICREV_IS_PHOENIX2(r)         ASICREV_IS(r, PHOENIX2)
 #define ASICREV_IS_HAWK_POINT1(r)      ASICREV_IS(r, HAWK_POINT1)
 #define ASICREV_IS_HAWK_POINT2(r)      ASICREV_IS(r, HAWK_POINT2)

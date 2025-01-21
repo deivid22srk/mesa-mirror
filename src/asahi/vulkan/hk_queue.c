@@ -68,7 +68,8 @@ queue_submit_empty(struct hk_device *dev, struct hk_queue *queue,
 
 static void
 asahi_fill_cdm_command(struct hk_device *dev, struct hk_cs *cs,
-                       struct drm_asahi_cmd_compute *cmd)
+                       struct drm_asahi_cmd_compute *cmd,
+                       struct drm_asahi_cmd_compute_user_timestamps *timestamps)
 {
    size_t len = cs->stream_linked ? 65536 /* XXX */ : (cs->current - cs->start);
 
@@ -87,6 +88,18 @@ asahi_fill_cdm_command(struct hk_device *dev, struct hk_cs *cs,
       .unk_mask = 0xffffffff,
    };
 
+   if (cs->timestamp.end.handle) {
+      assert(agx_supports_timestamps(&dev->dev));
+
+      *timestamps = (struct drm_asahi_cmd_compute_user_timestamps){
+         .type = ASAHI_COMPUTE_EXT_TIMESTAMPS,
+         .end_handle = cs->timestamp.end.handle,
+         .end_offset = cs->timestamp.end.offset_B,
+      };
+
+      cmd->extensions = (uint64_t)(uintptr_t)timestamps;
+   }
+
    if (cs->scratch.cs.main || cs->scratch.cs.preamble) {
       cmd->helper_arg = dev->scratch.cs.buf->va->addr;
       cmd->helper_cfg = cs->scratch.cs.preamble ? (1 << 16) : 0;
@@ -96,7 +109,8 @@ asahi_fill_cdm_command(struct hk_device *dev, struct hk_cs *cs,
 
 static void
 asahi_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
-                       struct drm_asahi_cmd_render *c)
+                       struct drm_asahi_cmd_render *c,
+                       struct drm_asahi_cmd_render_user_timestamps *timestamps)
 {
    unsigned cmd_ta_id = agx_get_global_id(&dev->dev);
    unsigned cmd_3d_id = agx_get_global_id(&dev->dev);
@@ -186,6 +200,18 @@ asahi_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
    c->samples = MAX2(cs->tib.nr_samples, 1);
    c->layers = cs->cr.layers;
 
+   /* Drawing max size will OOM and fail submission. But vkd3d-proton does this
+    * for emulating no-attachment rendering. Clamp to something reasonable and
+    * hope this is good enough in practice. This only affects a case that would
+    * otherwise be guaranteed broken.
+    *
+    * XXX: Hack for vkd3d-proton.
+    */
+   if (c->layers == 2048 && c->fb_width == 16384 && c->fb_height == 16384) {
+      mesa_log(MESA_LOG_WARN, MESA_LOG_TAG, "Clamping massive framebuffer");
+      c->layers = 32;
+   }
+
    c->ppp_multisamplectl = cs->ppp_multisamplectl;
    c->sample_size = cs->tib.sample_size_B;
    c->tib_blocks = ALIGN_POT(agx_tilebuffer_total_size(&cs->tib), 2048) / 2048;
@@ -239,6 +265,18 @@ asahi_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
       c->fragment_helper_cfg = cs->scratch.fs.preamble ? (1 << 16) : 0;
       c->fragment_helper_program = agx_helper_program(&dev->bg_eot);
    }
+
+   if (cs->timestamp.end.handle) {
+      assert(agx_supports_timestamps(&dev->dev));
+
+      c->extensions = (uint64_t)(uintptr_t)timestamps;
+
+      *timestamps = (struct drm_asahi_cmd_render_user_timestamps){
+         .type = ASAHI_RENDER_EXT_TIMESTAMPS,
+         .frg_end_handle = cs->timestamp.end.handle,
+         .frg_end_offset = cs->timestamp.end.offset_B,
+      };
+   }
 }
 
 static void
@@ -264,6 +302,11 @@ asahi_fill_sync(struct drm_asahi_sync *sync, struct vk_sync *vk_sync,
 union drm_asahi_cmd {
    struct drm_asahi_cmd_compute compute;
    struct drm_asahi_cmd_render render;
+};
+
+union drm_asahi_user_timestamps {
+   struct drm_asahi_cmd_compute_user_timestamps compute;
+   struct drm_asahi_cmd_render_user_timestamps render;
 };
 
 /* XXX: Batching multiple commands per submission is causing rare (7ppm) flakes
@@ -454,6 +497,8 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
    struct drm_asahi_command *cmds = alloca(sizeof(*cmds) * command_count);
    union drm_asahi_cmd *cmds_inner =
       alloca(sizeof(*cmds_inner) * command_count);
+   union drm_asahi_user_timestamps *ts_inner =
+      alloca(sizeof(*ts_inner) * command_count);
 
    unsigned cmd_it = 0;
    unsigned nr_vdm = 0, nr_cdm = 0;
@@ -479,24 +524,33 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
                "%u: Submitting CDM with %u API calls, %u dispatches, %u flushes",
                i, cs->stats.calls, cs->stats.cmds, cs->stats.flushes);
 
-            assert(cs->stats.cmds > 0 || cs->stats.flushes > 0);
+            assert(cs->stats.cmds > 0 || cs->stats.flushes > 0 ||
+                   cs->timestamp.end.handle);
 
             cmd.cmd_type = DRM_ASAHI_CMD_COMPUTE;
             cmd.cmd_buffer_size = sizeof(struct drm_asahi_cmd_compute);
             nr_cdm++;
 
-            asahi_fill_cdm_command(dev, cs, &cmds_inner[cmd_it].compute);
+            asahi_fill_cdm_command(dev, cs, &cmds_inner[cmd_it].compute,
+                                   &ts_inner[cmd_it].compute);
+
+            /* Work around for shipping 6.11.8 kernels, remove when we bump uapi
+             */
+            if (!agx_supports_timestamps(&dev->dev))
+               cmd.cmd_buffer_size -= 8;
          } else {
             assert(cs->type == HK_CS_VDM);
             perf_debug(dev, "%u: Submitting VDM with %u API draws, %u draws", i,
                        cs->stats.calls, cs->stats.cmds);
-            assert(cs->stats.cmds > 0 || cs->cr.process_empty_tiles);
+            assert(cs->stats.cmds > 0 || cs->cr.process_empty_tiles ||
+                   cs->timestamp.end.handle);
 
             cmd.cmd_type = DRM_ASAHI_CMD_RENDER;
             cmd.cmd_buffer_size = sizeof(struct drm_asahi_cmd_render);
             nr_vdm++;
 
-            asahi_fill_vdm_command(dev, cs, &cmds_inner[cmd_it].render);
+            asahi_fill_vdm_command(dev, cs, &cmds_inner[cmd_it].render,
+                                   &ts_inner[cmd_it].render);
          }
 
          cmds[cmd_it++] = cmd;
@@ -552,13 +606,28 @@ hk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
 
    VkResult result = queue_submit(dev, queue, submit);
    if (result != VK_SUCCESS)
-      return vk_queue_set_lost(&queue->vk, "Submit failed");
+      result = vk_queue_set_lost(&queue->vk, "Submit failed");
 
-   return VK_SUCCESS;
+   if (dev->dev.debug & AGX_DBG_SYNC) {
+      /* Wait for completion */
+      int err = drmSyncobjTimelineWait(
+         dev->dev.fd, &queue->drm.syncobj, &queue->drm.timeline_value, 1,
+         INT64_MAX, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, NULL);
+
+      if (err) {
+         result = vk_queue_set_lost(&queue->vk, "Wait failed");
+      } else {
+         VkResult res = dev->vk.check_status(&dev->vk);
+         if (result == VK_SUCCESS)
+            result = res;
+      }
+   }
+
+   return result;
 }
 
 static uint32_t
-translate_priority(enum VkQueueGlobalPriorityKHR prio)
+translate_priority(VkQueueGlobalPriorityKHR prio)
 {
    /* clang-format off */
    switch (prio) {
@@ -584,7 +653,7 @@ hk_queue_init(struct hk_device *dev, struct hk_queue *queue,
    const VkDeviceQueueGlobalPriorityCreateInfoKHR *priority_info =
       vk_find_struct_const(pCreateInfo->pNext,
                            DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR);
-   const enum VkQueueGlobalPriorityKHR priority =
+   const VkQueueGlobalPriorityKHR priority =
       priority_info ? priority_info->globalPriority
                     : VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR;
 

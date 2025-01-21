@@ -5,8 +5,9 @@
 
 #include "brw_eu.h"
 #include "brw_fs.h"
-#include "brw_fs_builder.h"
+#include "brw_builder.h"
 #include "brw_fs_live_variables.h"
+#include "brw_generator.h"
 #include "brw_nir.h"
 #include "brw_cfg.h"
 #include "brw_private.h"
@@ -20,7 +21,7 @@
 using namespace brw;
 
 static fs_inst *
-brw_emit_single_fb_write(fs_visitor &s, const fs_builder &bld,
+brw_emit_single_fb_write(fs_visitor &s, const brw_builder &bld,
                          brw_reg color0, brw_reg color1,
                          brw_reg src0_alpha, unsigned components,
                          bool null_rt)
@@ -29,7 +30,7 @@ brw_emit_single_fb_write(fs_visitor &s, const fs_builder &bld,
    struct brw_wm_prog_data *prog_data = brw_wm_prog_data(s.prog_data);
 
    /* Hand over gl_FragDepth or the payload depth. */
-   const brw_reg dst_depth = fetch_payload_reg(bld, s.fs_payload().dest_depth_reg);
+   const brw_reg dst_depth = brw_fetch_payload_reg(bld, s.fs_payload().dest_depth_reg);
 
    brw_reg sources[FB_WRITE_LOGICAL_NUM_SRCS];
    sources[FB_WRITE_LOGICAL_SRC_COLOR0]     = color0;
@@ -60,7 +61,7 @@ brw_emit_single_fb_write(fs_visitor &s, const fs_builder &bld,
 static void
 brw_do_emit_fb_writes(fs_visitor &s, int nr_color_regions, bool replicate_alpha)
 {
-   const fs_builder bld = fs_builder(&s).at_end();
+   const brw_builder bld = brw_builder(&s).at_end();
    fs_inst *inst = NULL;
 
    for (int target = 0; target < nr_color_regions; target++) {
@@ -68,7 +69,7 @@ brw_do_emit_fb_writes(fs_visitor &s, int nr_color_regions, bool replicate_alpha)
       if (s.outputs[target].file == BAD_FILE)
          continue;
 
-      const fs_builder abld = bld.annotate(
+      const brw_builder abld = bld.annotate(
          ralloc_asprintf(s.mem_ctx, "FB write target %d", target));
 
       brw_reg src0_alpha;
@@ -183,8 +184,8 @@ static void
 brw_emit_interpolation_setup(fs_visitor &s)
 {
    const struct intel_device_info *devinfo = s.devinfo;
-   const fs_builder bld = fs_builder(&s).at_end();
-   fs_builder abld = bld.annotate("compute pixel centers");
+   const brw_builder bld = brw_builder(&s).at_end();
+   brw_builder abld = bld.annotate("compute pixel centers");
 
    s.pixel_x = bld.vgrf(BRW_TYPE_F);
    s.pixel_y = bld.vgrf(BRW_TYPE_F);
@@ -254,7 +255,7 @@ brw_emit_interpolation_setup(fs_visitor &s)
        */
       struct brw_reg r1_0 = retype(brw_vec1_reg(FIXED_GRF, 1, 0), BRW_TYPE_UB);
 
-      const fs_builder dbld =
+      const brw_builder dbld =
          abld.exec_all().group(MIN2(16, s.dispatch_width) * 2, 0);
 
       if (devinfo->verx10 >= 125) {
@@ -304,11 +305,11 @@ brw_emit_interpolation_setup(fs_visitor &s)
       break;
 
    case INTEL_SOMETIMES: {
-      const fs_builder dbld =
+      const brw_builder dbld =
          abld.exec_all().group(MIN2(16, s.dispatch_width) * 2, 0);
 
-      check_dynamic_msaa_flag(dbld, wm_prog_data,
-                              INTEL_MSAA_FLAG_COARSE_RT_WRITES);
+      brw_check_dynamic_msaa_flag(dbld, wm_prog_data,
+                                  INTEL_MSAA_FLAG_COARSE_RT_WRITES);
 
       int_pixel_offset_x = dbld.vgrf(BRW_TYPE_UW);
       set_predicate(BRW_PREDICATE_NORMAL,
@@ -352,7 +353,7 @@ brw_emit_interpolation_setup(fs_visitor &s)
    }
 
    for (unsigned i = 0; i < DIV_ROUND_UP(s.dispatch_width, 16); i++) {
-      const fs_builder hbld = abld.group(MIN2(16, s.dispatch_width), i);
+      const brw_builder hbld = abld.group(MIN2(16, s.dispatch_width), i);
       /* According to the "PS Thread Payload for Normal Dispatch"
        * pages on the BSpec, subspan X/Y coordinates are stored in
        * R1.2-R1.5/R2.2-R2.5 on gfx6+, and on R0.10-R0.13/R1.10-R1.13
@@ -364,7 +365,7 @@ brw_emit_interpolation_setup(fs_visitor &s)
       const struct brw_reg gi_uw = retype(gi_reg, BRW_TYPE_UW);
 
       if (devinfo->verx10 >= 125) {
-         const fs_builder dbld =
+         const brw_builder dbld =
             abld.exec_all().group(hbld.dispatch_width() * 2, 0);
          const brw_reg int_pixel_x = dbld.vgrf(BRW_TYPE_UW);
          const brw_reg int_pixel_y = dbld.vgrf(BRW_TYPE_UW);
@@ -401,7 +402,7 @@ brw_emit_interpolation_setup(fs_visitor &s)
           * Thus we can do a single add(16) in SIMD8 or an add(32) in SIMD16
           * to compute our pixel centers.
           */
-         const fs_builder dbld =
+         const brw_builder dbld =
             abld.exec_all().group(hbld.dispatch_width() * 2, 0);
          brw_reg int_pixel_xy = dbld.vgrf(BRW_TYPE_UW);
 
@@ -426,11 +427,21 @@ brw_emit_interpolation_setup(fs_visitor &s)
        * in X & Y axis.
        */
       brw_reg coef_payload = brw_vec8_grf(payload.depth_w_coef_reg, 0);
-      const brw_reg x_start = brw_vec1_grf(coef_payload.nr, 2);
-      const brw_reg y_start = brw_vec1_grf(coef_payload.nr, 6);
-      const brw_reg z_cx    = brw_vec1_grf(coef_payload.nr, 1);
-      const brw_reg z_cy    = brw_vec1_grf(coef_payload.nr, 0);
-      const brw_reg z_c0    = brw_vec1_grf(coef_payload.nr, 3);
+      const brw_reg x_start = devinfo->ver >= 20 ?
+         brw_vec1_grf(coef_payload.nr, 6) :
+         brw_vec1_grf(coef_payload.nr, 2);
+      const brw_reg y_start = devinfo->ver >= 20 ?
+         brw_vec1_grf(coef_payload.nr, 7) :
+         brw_vec1_grf(coef_payload.nr, 6);
+      const brw_reg z_cx    = devinfo->ver >= 20 ?
+         brw_vec1_grf(coef_payload.nr + 1, 1) :
+         brw_vec1_grf(coef_payload.nr, 1);
+      const brw_reg z_cy    = devinfo->ver >= 20 ?
+         brw_vec1_grf(coef_payload.nr + 1, 0) :
+         brw_vec1_grf(coef_payload.nr, 0);
+      const brw_reg z_c0    = devinfo->ver >= 20 ?
+         brw_vec1_grf(coef_payload.nr + 1, 2) :
+         brw_vec1_grf(coef_payload.nr, 3);
 
       const brw_reg float_pixel_x = abld.vgrf(BRW_TYPE_F);
       const brw_reg float_pixel_y = abld.vgrf(BRW_TYPE_F);
@@ -453,8 +464,8 @@ brw_emit_interpolation_setup(fs_visitor &s)
       abld.MOV(f_cps_height, u32_cps_height);
 
       /* Center in the middle of the coarse pixel. */
-      abld.MAD(float_pixel_x, float_pixel_x, brw_imm_f(0.5f), f_cps_width);
-      abld.MAD(float_pixel_y, float_pixel_y, brw_imm_f(0.5f), f_cps_height);
+      abld.MAD(float_pixel_x, float_pixel_x, f_cps_width, brw_imm_f(0.5f));
+      abld.MAD(float_pixel_y, float_pixel_y, f_cps_height, brw_imm_f(0.5f));
 
       coarse_z = abld.vgrf(BRW_TYPE_F);
       abld.MAD(coarse_z, z_c0, z_cx, float_pixel_x);
@@ -462,7 +473,7 @@ brw_emit_interpolation_setup(fs_visitor &s)
    }
 
    if (wm_prog_data->uses_src_depth)
-      s.pixel_z = fetch_payload_reg(bld, payload.source_depth_reg);
+      s.pixel_z = brw_fetch_payload_reg(bld, payload.source_depth_reg);
 
    if (wm_prog_data->uses_depth_w_coefficients ||
        wm_prog_data->uses_src_depth) {
@@ -492,7 +503,7 @@ brw_emit_interpolation_setup(fs_visitor &s)
 
    if (wm_prog_data->uses_src_w) {
       abld = bld.annotate("compute pos.w");
-      s.pixel_w = fetch_payload_reg(abld, payload.source_w_reg);
+      s.pixel_w = brw_fetch_payload_reg(abld, payload.source_w_reg);
       s.wpos_w = bld.vgrf(BRW_TYPE_F);
       abld.emit(SHADER_OPCODE_RCP, s.wpos_w, s.pixel_w);
    }
@@ -500,7 +511,7 @@ brw_emit_interpolation_setup(fs_visitor &s)
    if (wm_key->persample_interp == INTEL_SOMETIMES) {
       assert(!devinfo->needs_unlit_centroid_workaround);
 
-      const fs_builder ubld = bld.exec_all().group(16, 0);
+      const brw_builder ubld = bld.exec_all().group(16, 0);
       bool loaded_flag = false;
 
       for (int i = 0; i < INTEL_BARYCENTRIC_MODE_COUNT; ++i) {
@@ -533,8 +544,8 @@ brw_emit_interpolation_setup(fs_visitor &s)
          assert(barys[0] && sample_barys[0]);
 
          if (!loaded_flag) {
-            check_dynamic_msaa_flag(ubld, wm_prog_data,
-                                    INTEL_MSAA_FLAG_PERSAMPLE_INTERP);
+            brw_check_dynamic_msaa_flag(ubld, wm_prog_data,
+                                        INTEL_MSAA_FLAG_PERSAMPLE_INTERP);
          }
 
          for (unsigned j = 0; j < s.dispatch_width / 8; j++) {
@@ -547,7 +558,7 @@ brw_emit_interpolation_setup(fs_visitor &s)
    }
 
    for (int i = 0; i < INTEL_BARYCENTRIC_MODE_COUNT; ++i) {
-      s.delta_xy[i] = fetch_barycentric_reg(
+      s.delta_xy[i] = brw_fetch_barycentric_reg(
          bld, payload.barycentric_coord_reg[i]);
    }
 
@@ -612,7 +623,7 @@ brw_emit_repclear_shader(fs_visitor &s)
               BRW_VERTICAL_STRIDE_8, BRW_WIDTH_2, BRW_HORIZONTAL_STRIDE_4,
               BRW_SWIZZLE_XYZW, WRITEMASK_XYZW);
 
-   const fs_builder bld = fs_builder(&s).at_end();
+   const brw_builder bld = brw_builder(&s).at_end();
    bld.exec_all().group(4, 0).MOV(color_output, color_input);
 
    if (key->nr_color_regions > 1) {
@@ -627,15 +638,23 @@ brw_emit_repclear_shader(fs_visitor &s)
 
       write = bld.emit(SHADER_OPCODE_SEND);
       write->resize_sources(3);
+
+      /* We can use a headerless message for the first render target */
+      write->header_size = i == 0 ? 0 : 2;
+      write->mlen = 1 + write->header_size;
+
       write->sfid = GFX6_SFID_DATAPORT_RENDER_CACHE;
-      write->src[0] = brw_imm_ud(0);
+      write->src[0] = brw_imm_ud(
+         brw_fb_write_desc(
+            s.devinfo, i,
+            BRW_DATAPORT_RENDER_TARGET_WRITE_SIMD16_SINGLE_SOURCE_REPLICATED,
+            i == key->nr_color_regions - 1, false) |
+         brw_message_desc(s.devinfo, write->mlen,
+                          0 /* rlen */, write->header_size));
       write->src[1] = brw_imm_ud(0);
       write->src[2] = i == 0 ? color_output : header;
       write->check_tdr = true;
       write->send_has_side_effects = true;
-      write->desc = brw_fb_write_desc(s.devinfo, i,
-         BRW_DATAPORT_RENDER_TARGET_WRITE_SIMD16_SINGLE_SOURCE_REPLICATED,
-         i == key->nr_color_regions - 1, false);
 
       /* We can use a headerless message for the first render target */
       write->header_size = i == 0 ? 0 : 2;
@@ -648,7 +667,7 @@ brw_emit_repclear_shader(fs_visitor &s)
 
    s.first_non_payload_grf = s.payload().num_regs;
 
-   brw_fs_lower_scoreboard(s);
+   brw_lower_scoreboard(s);
 }
 
 /**
@@ -1441,7 +1460,7 @@ run_fs(fs_visitor &s, bool allow_spilling, bool do_rep_send)
    const struct intel_device_info *devinfo = s.devinfo;
    struct brw_wm_prog_data *wm_prog_data = brw_wm_prog_data(s.prog_data);
    brw_wm_prog_key *wm_key = (brw_wm_prog_key *) s.key;
-   const fs_builder bld = fs_builder(&s).at_end();
+   const brw_builder bld = brw_builder(&s).at_end();
    const nir_shader *nir = s.nir;
 
    assert(s.stage == MESA_SHADER_FRAGMENT);
@@ -1493,7 +1512,7 @@ run_fs(fs_visitor &s, bool allow_spilling, bool do_rep_send)
 
       brw_calculate_cfg(s);
 
-      brw_fs_optimize(s);
+      brw_optimize(s);
 
       s.assign_curb_setup();
 
@@ -1502,13 +1521,13 @@ run_fs(fs_visitor &s, bool allow_spilling, bool do_rep_send)
 
       brw_assign_urb_setup(s);
 
-      brw_fs_lower_3src_null_dest(s);
-      brw_fs_workaround_memory_fence_before_eot(s);
-      brw_fs_workaround_emit_dummy_mov_instruction(s);
+      brw_lower_3src_null_dest(s);
+      brw_workaround_memory_fence_before_eot(s);
+      brw_workaround_emit_dummy_mov_instruction(s);
 
       brw_allocate_registers(s, allow_spilling);
 
-      brw_fs_workaround_source_arf_before_eot(s);
+      brw_workaround_source_arf_before_eot(s);
    }
 
    return !s.failed;
@@ -1734,7 +1753,7 @@ brw_compile_fs(const struct brw_compiler *compiler,
    if (params->use_rep_send)
       simd8_cfg = NULL;
 
-   fs_generator g(compiler, &params->base, &prog_data->base,
+   brw_generator g(compiler, &params->base, &prog_data->base,
                   MESA_SHADER_FRAGMENT);
 
    if (unlikely(debug_enabled)) {

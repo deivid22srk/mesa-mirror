@@ -337,8 +337,8 @@ mi_builder_test::SetUp()
             break;
          }
       }
-      ASSERT_TRUE(found_engine);
       free(engines_info);
+      ASSERT_TRUE(found_engine);
 
       struct drm_xe_exec_queue_create queue_create = {
          .width          = 1,
@@ -437,7 +437,7 @@ mi_builder_test::TearDown()
 
    if (batch_bo_handle) {
       struct drm_gem_close gem_close = { .handle = batch_bo_handle };
-      intel_ioctl(fd, DRM_IOCTL_GEM_CLOSE, &gem_close);
+      err = intel_ioctl(fd, DRM_IOCTL_GEM_CLOSE, &gem_close);
       EXPECT_EQ(err, 0) << "close batch bo failed";
    }
 

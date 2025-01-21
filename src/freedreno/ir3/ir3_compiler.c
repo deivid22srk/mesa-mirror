@@ -98,6 +98,8 @@ static const nir_shader_compiler_options ir3_base_options = {
    .lower_pack_split = true,
    .lower_to_scalar = true,
    .has_imul24 = true,
+   .has_icsel_eqz32 = true,
+   .has_icsel_eqz16 = true,
    .has_fsub = true,
    .has_isub = true,
    .force_indirect_unrolling_sampler = true,
@@ -116,6 +118,9 @@ static const nir_shader_compiler_options ir3_base_options = {
 
    .divergence_analysis_options = nir_divergence_uniform_load_tears,
    .scalarize_ddx = true,
+
+   .per_view_unique_driver_locations = true,
+   .compact_view_index = true,
 };
 
 struct ir3_compiler *
@@ -295,6 +300,7 @@ ir3_compiler_create(struct fd_device *dev, const struct fd_dev_id *dev_id,
 
    /* Set up nir shader compiler options, using device-specific overrides of our base settings. */
    compiler->nir_options = ir3_base_options;
+   compiler->nir_options.has_iadd3 = dev_info->a6xx.has_sad;
 
    if (compiler->gen >= 6) {
       compiler->nir_options.vectorize_io = true,
@@ -328,6 +334,9 @@ ir3_compiler_create(struct fd_device *dev, const struct fd_dev_id *dev_id,
     */
    if (compiler->gen >= 5 && !(ir3_shader_debug & IR3_DBG_NOFP16))
       compiler->nir_options.support_16bit_alu = true;
+
+   compiler->nir_options.support_indirect_inputs = (uint8_t)BITFIELD_MASK(PIPE_SHADER_TYPES);
+   compiler->nir_options.support_indirect_outputs = (uint8_t)BITFIELD_MASK(PIPE_SHADER_TYPES);
 
    if (!options->disable_cache)
       ir3_disk_cache_init(compiler);

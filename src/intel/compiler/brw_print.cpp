@@ -13,7 +13,7 @@
 using namespace brw;
 
 void
-brw_print_instructions_to_file(const fs_visitor &s, FILE *file)
+brw_print_instructions(const fs_visitor &s, FILE *file)
 {
    if (s.cfg && s.grf_used == 0) {
       const brw::def_analysis &defs = s.def_analysis.require();
@@ -67,23 +67,6 @@ brw_print_instructions_to_file(const fs_visitor &s, FILE *file)
       foreach_in_list(fs_inst, inst, &s.instructions) {
          brw_print_instruction(s, inst, file);
       }
-   }
-}
-
-void
-brw_print_instructions(const fs_visitor &s, const char *name)
-{
-   FILE *file = stderr;
-   if (name && __normal_user()) {
-      file = fopen(name, "w");
-      if (!file)
-         file = stderr;
-   }
-
-   brw_print_instructions_to_file(s, file);
-
-   if (file != stderr) {
-      fclose(file);
    }
 }
 
@@ -307,6 +290,10 @@ brw_instruction_name(const struct brw_isa_info *isa, enum opcode op)
       return "ballot";
    case SHADER_OPCODE_QUAD_SWAP:
       return "quad_swap";
+   case SHADER_OPCODE_READ_FROM_LIVE_CHANNEL:
+      return "read_from_live_channel";
+   case SHADER_OPCODE_READ_FROM_CHANNEL:
+      return "read_from_channel";
    }
 
    unreachable("not reached");
@@ -337,6 +324,7 @@ print_memory_logical_source(FILE *file, const fs_inst *inst, unsigned i)
          [MEMORY_MODE_UNTYPED]      = "untyped",
          [MEMORY_MODE_SHARED_LOCAL] = "shared",
          [MEMORY_MODE_SCRATCH]      = "scratch",
+         [MEMORY_MODE_CONSTANT]     = "const",
       };
       assert(inst->src[i].ud < ARRAY_SIZE(modes));
       fprintf(file, " %s", modes[inst->src[i].ud]);
@@ -384,7 +372,7 @@ print_memory_logical_source(FILE *file, const fs_inst *inst, unsigned i)
 }
 
 void
-brw_print_instruction_to_file(const fs_visitor &s, const fs_inst *inst, FILE *file, const brw::def_analysis *defs)
+brw_print_instruction(const fs_visitor &s, const fs_inst *inst, FILE *file, const brw::def_analysis *defs)
 {
    if (inst->predicate) {
       fprintf(file, "(%cf%d.%d) ",
@@ -445,20 +433,22 @@ brw_print_instruction_to_file(const fs_visitor &s, const fs_inst *inst, FILE *fi
    case ATTR:
       fprintf(file, "***attr%d***", inst->dst.nr);
       break;
+   case ADDRESS:
+      if (inst->dst.nr == 0)
+         fprintf(file, "a0.%d", inst->dst.subnr);
+      else
+         fprintf(file, "va%u.%d", inst->dst.nr, inst->dst.subnr);
+      break;
    case ARF:
       switch (inst->dst.nr & 0xF0) {
       case BRW_ARF_NULL:
          fprintf(file, "null");
-         break;
-      case BRW_ARF_ADDRESS:
-         fprintf(file, "a0.%d", inst->dst.subnr);
          break;
       case BRW_ARF_ACCUMULATOR:
          if (inst->dst.subnr == 0)
             fprintf(file, "acc%d", inst->dst.nr & 0x0F);
          else
             fprintf(file, "acc%d.%d", inst->dst.nr & 0x0F, inst->dst.subnr);
-
          break;
       case BRW_ARF_FLAG:
          fprintf(file, "f%d.%d", inst->dst.nr & 0xf, inst->dst.subnr);
@@ -509,6 +499,12 @@ brw_print_instruction_to_file(const fs_visitor &s, const fs_inst *inst, FILE *fi
          break;
       case FIXED_GRF:
          fprintf(file, "g%d", inst->src[i].nr);
+         break;
+      case ADDRESS:
+         if (inst->src[i].nr == 0)
+            fprintf(file, "a0.%d", inst->src[i].subnr);
+         else
+            fprintf(file, "va%u.%d", inst->src[i].nr, inst->src[i].subnr);
          break;
       case ATTR:
          fprintf(file, "attr%d", inst->src[i].nr);
@@ -570,9 +566,6 @@ brw_print_instruction_to_file(const fs_visitor &s, const fs_inst *inst, FILE *fi
          case BRW_ARF_NULL:
             fprintf(file, "null");
             break;
-         case BRW_ARF_ADDRESS:
-            fprintf(file, "a0.%d", inst->src[i].subnr);
-            break;
          case BRW_ARF_ACCUMULATOR:
             if (inst->src[i].subnr == 0)
                fprintf(file, "acc%d", inst->src[i].nr & 0x0F);
@@ -596,7 +589,7 @@ brw_print_instruction_to_file(const fs_visitor &s, const fs_inst *inst, FILE *fi
          fprintf(file, ".%d", inst->src[i].subnr / brw_type_size_bytes(inst->src[i].type));
       } else if (inst->src[i].offset ||
           (!s.grf_used && inst->src[i].file == VGRF &&
-           s.alloc.sizes[inst->src[i].nr] * REG_SIZE != inst->size_read(i))) {
+           s.alloc.sizes[inst->src[i].nr] * REG_SIZE != inst->size_read(s.devinfo, i))) {
          const unsigned reg_size = (inst->src[i].file == UNIFORM ? 4 : REG_SIZE);
          fprintf(file, "+%d.%d", inst->src[i].offset / reg_size,
                  inst->src[i].offset % reg_size);
@@ -668,7 +661,8 @@ brw_print_swsb(FILE *f, const struct intel_device_info *devinfo, const tgl_swsb 
                swsb.pipe == TGL_PIPE_INT ? "I" :
                swsb.pipe == TGL_PIPE_LONG ? "L" :
                swsb.pipe == TGL_PIPE_ALL ? "A"  :
-               swsb.pipe == TGL_PIPE_MATH ? "M" : "" ),
+               swsb.pipe == TGL_PIPE_MATH ? "M" :
+               swsb.pipe == TGL_PIPE_SCALAR ? "S" : "" ),
               swsb.regdist);
    }
 
@@ -681,4 +675,3 @@ brw_print_swsb(FILE *f, const struct intel_device_info *devinfo, const tgl_swsb 
                swsb.mode & TGL_SBID_DST ? ".dst" : ".src"));
    }
 }
-

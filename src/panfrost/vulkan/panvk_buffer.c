@@ -29,18 +29,30 @@ panvk_GetBufferOpaqueCaptureAddress(VkDevice _device,
 }
 
 VKAPI_ATTR void VKAPI_CALL
-panvk_GetBufferMemoryRequirements2(VkDevice device,
-                                   const VkBufferMemoryRequirementsInfo2 *pInfo,
-                                   VkMemoryRequirements2 *pMemoryRequirements)
+panvk_GetDeviceBufferMemoryRequirements(VkDevice device,
+                                        const VkDeviceBufferMemoryRequirements *pInfo,
+                                        VkMemoryRequirements2 *pMemoryRequirements)
 {
-   VK_FROM_HANDLE(panvk_buffer, buffer, pInfo->buffer);
-
    const uint64_t align = 64;
-   const uint64_t size = align64(buffer->vk.size, align);
+   const uint64_t size = align64(pInfo->pCreateInfo->size, align);
 
    pMemoryRequirements->memoryRequirements.memoryTypeBits = 1;
    pMemoryRequirements->memoryRequirements.alignment = align;
    pMemoryRequirements->memoryRequirements.size = size;
+
+   vk_foreach_struct_const(ext, pMemoryRequirements->pNext) {
+      switch (ext->sType) {
+      case VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS: {
+         VkMemoryDedicatedRequirements *dedicated = (void *)ext;
+         dedicated->requiresDedicatedAllocation = false;
+         dedicated->prefersDedicatedAllocation = dedicated->requiresDedicatedAllocation;
+         break;
+      }
+      default:
+         vk_debug_ignored_stype(ext->sType);
+         break;
+      }
+   }
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL

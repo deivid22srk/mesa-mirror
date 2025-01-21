@@ -62,12 +62,8 @@ panvk_per_arch(cmd_meta_compute_end)(
       push_set0->desc_count = save_ctx->push_set0.desc_count;
    }
 
-   if (memcmp(cmdbuf->state.push_constants.data, save_ctx->push_constants.data,
-              sizeof(cmdbuf->state.push_constants.data))) {
-      cmdbuf->state.push_constants = save_ctx->push_constants;
-      compute_state_set_dirty(cmdbuf, PUSH_UNIFORMS);
-      gfx_state_set_dirty(cmdbuf, PUSH_UNIFORMS);
-   }
+   cmdbuf->state.push_constants = save_ctx->push_constants;
+   compute_state_set_dirty(cmdbuf, PUSH_UNIFORMS);
 
    cmdbuf->state.compute.shader = save_ctx->cs.shader;
    cmdbuf->state.compute.cs.desc = save_ctx->cs.desc;
@@ -127,12 +123,9 @@ panvk_per_arch(cmd_meta_gfx_end)(
       push_set0->desc_count = save_ctx->push_set0.desc_count;
    }
 
-   if (memcmp(cmdbuf->state.push_constants.data, save_ctx->push_constants.data,
-              sizeof(cmdbuf->state.push_constants.data))) {
-      cmdbuf->state.push_constants = save_ctx->push_constants;
-      compute_state_set_dirty(cmdbuf, PUSH_UNIFORMS);
-      gfx_state_set_dirty(cmdbuf, PUSH_UNIFORMS);
-   }
+   cmdbuf->state.push_constants = save_ctx->push_constants;
+   gfx_state_set_dirty(cmdbuf, VS_PUSH_UNIFORMS);
+   gfx_state_set_dirty(cmdbuf, FS_PUSH_UNIFORMS);
 
    cmdbuf->state.gfx.fs.shader = save_ctx->fs.shader;
    cmdbuf->state.gfx.fs.desc = save_ctx->fs.desc;
@@ -202,12 +195,14 @@ panvk_per_arch(CmdClearAttachments)(VkCommandBuffer commandBuffer,
    struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
    struct panvk_cmd_meta_graphics_save_ctx save = {0};
    struct vk_meta_rendering_info render = {
-      .view_mask = 0,
+      .view_mask = cmdbuf->state.gfx.render.view_mask,
       .samples = fbinfo->nr_samples,
       .color_attachment_count = fbinfo->rt_count,
       .depth_attachment_format = cmdbuf->state.gfx.render.z_attachment.fmt,
       .stencil_attachment_format = cmdbuf->state.gfx.render.s_attachment.fmt,
    };
+   /* Multiview is not supported pre-v10 */
+   assert(cmdbuf->state.gfx.render.view_mask == 0 || PAN_ARCH >= 10);
 
    for (uint32_t i = 0; i < render.color_attachment_count; i++) {
        render.color_attachment_formats[i] =

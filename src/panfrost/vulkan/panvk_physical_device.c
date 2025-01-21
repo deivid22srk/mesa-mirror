@@ -68,20 +68,10 @@ create_kmod_dev(struct panvk_physical_device *device,
    if (strcmp(version->name, "panfrost") && strcmp(version->name, "panthor")) {
       drmFreeVersion(version);
       close(fd);
-      return panvk_errorf(instance, VK_ERROR_INCOMPATIBLE_DRIVER,
-                          "device %s does not use the panfrost kernel driver",
-                          path);
+      return VK_ERROR_INCOMPATIBLE_DRIVER;
    }
 
    drmFreeVersion(version);
-
-   if (!getenv("PAN_I_WANT_A_BROKEN_VULKAN_DRIVER")) {
-      close(fd);
-      return panvk_errorf(
-         instance, VK_ERROR_INCOMPATIBLE_DRIVER,
-         "WARNING: panvk is not a conformant vulkan implementation, "
-         "pass PAN_I_WANT_A_BROKEN_VULKAN_DRIVER=1 if you know what you're doing.");
-   }
 
    if (instance->debug_flags & PANVK_DEBUG_STARTUP)
       vk_logi(VK_LOG_NO_OBJS(instance), "Found compatible device '%s'.", path);
@@ -187,13 +177,15 @@ get_device_extensions(const struct panvk_physical_device *device,
    const unsigned arch = pan_arch(device->kmod.props.gpu_prod_id);
 
    *ext = (struct vk_device_extension_table){
+      .KHR_8bit_storage = true,
       .KHR_16bit_storage = true,
       .KHR_bind_memory2 = true,
       .KHR_buffer_device_address = true,
       .KHR_copy_commands2 = true,
       .KHR_create_renderpass2 = true,
-      .KHR_device_group = true,
+      .KHR_dedicated_allocation = true,
       .KHR_descriptor_update_template = true,
+      .KHR_device_group = true,
       .KHR_driver_properties = true,
       .KHR_dynamic_rendering = true,
       .KHR_external_fence = true,
@@ -210,12 +202,15 @@ get_device_extensions(const struct panvk_physical_device *device,
       .KHR_maintenance2 = true,
       .KHR_maintenance3 = true,
       .KHR_map_memory2 = true,
+      .KHR_multiview = arch >= 10,
       .KHR_pipeline_executable_properties = true,
       .KHR_pipeline_library = true,
       .KHR_push_descriptor = true,
       .KHR_relaxed_block_layout = true,
       .KHR_sampler_mirror_clamp_to_edge = true,
+      .KHR_shader_draw_parameters = true,
       .KHR_shader_expect_assume = true,
+      .KHR_shader_float16_int8 = true,
       .KHR_shader_non_semantic_info = true,
       .KHR_shader_relaxed_extended_instruction = true,
       .KHR_storage_buffer_storage_class = true,
@@ -227,6 +222,7 @@ get_device_extensions(const struct panvk_physical_device *device,
       .KHR_variable_pointers = true,
       .KHR_vertex_attribute_divisor = true,
       .KHR_zero_initialize_workgroup_memory = true,
+      .EXT_4444_formats = true,
       .EXT_buffer_device_address = true,
       .EXT_custom_border_color = true,
       .EXT_depth_clip_enable = true,
@@ -243,8 +239,10 @@ get_device_extensions(const struct panvk_physical_device *device,
       .EXT_pipeline_creation_feedback = true,
       .EXT_pipeline_robustness = true,
       .EXT_private_data = true,
+      .EXT_provoking_vertex = true,
       .EXT_queue_family_foreign = true,
       .EXT_sampler_filter_minmax = arch >= 10,
+      .EXT_scalar_block_layout = true,
       .EXT_shader_module_identifier = true,
       .EXT_tooling_info = true,
       .GOOGLE_decorate_string = true,
@@ -265,6 +263,7 @@ get_features(const struct panvk_physical_device *device,
       .depthBiasClamp = true,
       .robustBufferAccess = true,
       .fullDrawIndexUint32 = true,
+      .imageCubeArray = true,
       .independentBlend = true,
       .sampleRateShading = true,
       .logicOp = true,
@@ -274,37 +273,39 @@ get_features(const struct panvk_physical_device *device,
       .samplerAnisotropy = true,
       .textureCompressionETC2 = true,
       .textureCompressionASTC_LDR = true,
+      .fragmentStoresAndAtomics = arch >= 10,
       .shaderUniformBufferArrayDynamicIndexing = true,
       .shaderSampledImageArrayDynamicIndexing = true,
       .shaderStorageBufferArrayDynamicIndexing = true,
       .shaderStorageImageArrayDynamicIndexing = true,
       .shaderInt16 = true,
       .shaderInt64 = true,
+      .drawIndirectFirstInstance = true,
 
       /* Vulkan 1.1 */
       .storageBuffer16BitAccess = true,
       .uniformAndStorageBuffer16BitAccess = true,
       .storagePushConstant16 = false,
       .storageInputOutput16 = false,
-      .multiview = false,
+      .multiview = arch >= 10,
       .multiviewGeometryShader = false,
       .multiviewTessellationShader = false,
       .variablePointersStorageBuffer = true,
       .variablePointers = true,
       .protectedMemory = false,
       .samplerYcbcrConversion = false,
-      .shaderDrawParameters = false,
+      .shaderDrawParameters = true,
 
       /* Vulkan 1.2 */
       .samplerMirrorClampToEdge = true,
       .drawIndirectCount = false,
-      .storageBuffer8BitAccess = false,
+      .storageBuffer8BitAccess = true,
       .uniformAndStorageBuffer8BitAccess = false,
       .storagePushConstant8 = false,
       .shaderBufferInt64Atomics = false,
       .shaderSharedInt64Atomics = false,
       .shaderFloat16 = false,
-      .shaderInt8 = false,
+      .shaderInt8 = true,
 
       .descriptorIndexing = false,
       .shaderInputAttachmentArrayDynamicIndexing = false,
@@ -329,7 +330,7 @@ get_features(const struct panvk_physical_device *device,
       .runtimeDescriptorArray = false,
 
       .samplerFilterMinmax = arch >= 10,
-      .scalarBlockLayout = false,
+      .scalarBlockLayout = true,
       .imagelessFramebuffer = false,
       .uniformBufferStandardLayout = false,
       .shaderSubgroupExtendedTypes = false,
@@ -386,6 +387,10 @@ get_features(const struct panvk_physical_device *device,
       /* VK_EXT_custom_border_color */
       .customBorderColors = true,
 
+      /* VK_EXT_provoking_vertex */
+      .provokingVertexLast = true,
+      .transformFeedbackPreservesProvokingVertex = false,
+
       /* v7 doesn't support AFBC(BGR). We need to tweak the texture swizzle to
        * make it work, which forces us to apply the same swizzle on the border
        * color, meaning we need to know the format when preparing the border
@@ -410,6 +415,15 @@ get_features(const struct panvk_physical_device *device,
    };
 }
 
+static uint32_t
+get_vk_version()
+{
+   const uint32_t version_override = vk_get_version_override();
+   if (version_override)
+      return version_override;
+   return VK_MAKE_API_VERSION(0, 1, 0, VK_HEADER_VERSION);
+}
+
 static void
 get_device_properties(const struct panvk_instance *instance,
                       const struct panvk_physical_device *device,
@@ -428,7 +442,7 @@ get_device_properties(const struct panvk_instance *instance,
    assert(arch > 8 || device->kmod.props.max_threads_per_wg <= 1024);
 
    *properties = (struct vk_properties){
-      .apiVersion = panvk_get_vk_version(),
+      .apiVersion = get_vk_version(),
       .driverVersion = vk_get_driver_version(),
       .vendorID = ARM_VENDOR_ID,
 
@@ -659,17 +673,12 @@ get_device_properties(const struct panvk_instance *instance,
       /* Vulkan 1.1 properties */
       /* XXX: 1.1 support */
       .subgroupSize = 8,
-      .subgroupSupportedStages = VK_SHADER_STAGE_ALL,
-      .subgroupSupportedOperations =
-         VK_SUBGROUP_FEATURE_ARITHMETIC_BIT | VK_SUBGROUP_FEATURE_BALLOT_BIT |
-         VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_CLUSTERED_BIT |
-         VK_SUBGROUP_FEATURE_QUAD_BIT | VK_SUBGROUP_FEATURE_SHUFFLE_BIT |
-         VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT |
-         VK_SUBGROUP_FEATURE_VOTE_BIT,
+      .subgroupSupportedStages = 0,
+      .subgroupSupportedOperations = 0,
       .subgroupQuadOperationsInAllStages = false,
       .pointClippingBehavior = VK_POINT_CLIPPING_BEHAVIOR_ALL_CLIP_PLANES,
-      .maxMultiviewViewCount = 0,
-      .maxMultiviewInstanceIndex = 0,
+      .maxMultiviewViewCount = arch >= 10 ? 8 : 0,
+      .maxMultiviewInstanceIndex = arch >= 10 ? UINT32_MAX : 0,
       .protectedNoFault = false,
       .maxPerSetDescriptors = UINT16_MAX,
       /* Our buffer size fields allow only this much */
@@ -781,6 +790,10 @@ get_device_properties(const struct panvk_instance *instance,
       .defaultRobustnessImages =
          VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_ROBUST_IMAGE_ACCESS_EXT,
 
+      /* VK_EXT_provoking_vertex */
+      .provokingVertexModePerPipeline = false,
+      .transformFeedbackPreservesTriangleFanProvokingVertex = false,
+
       /* VK_KHR_vertex_attribute_divisor */
       /* We will have to restrict this a bit for multiview */
       .maxVertexAttribDivisor = UINT32_MAX,
@@ -864,6 +877,15 @@ panvk_physical_device_init(struct panvk_physical_device *device,
    switch (arch) {
    case 6:
    case 7:
+      if (!getenv("PAN_I_WANT_A_BROKEN_VULKAN_DRIVER")) {
+         result = panvk_errorf(instance, VK_ERROR_INCOMPATIBLE_DRIVER,
+                               "WARNING: panvk is not well-tested on v%d, "
+                               "pass PAN_I_WANT_A_BROKEN_VULKAN_DRIVER=1 "
+                               "if you know what you're doing.", arch);
+         goto fail;
+      }
+      break;
+
    case 10:
       break;
 
@@ -1091,17 +1113,6 @@ get_format_properties(struct panvk_physical_device *physical_device,
    enum pipe_format pfmt = vk_format_to_pipe_format(format);
    unsigned arch = pan_arch(physical_device->kmod.props.gpu_prod_id);
 
-   /* FIXME: Valhall doesn't support interleaved D32_S8X24. Implement it as
-    * a multi-plane format, and we probably want to switch Bifrost to this
-    * layout too, since:
-    * - it's more cache-friendly (you load more samples on a cache-line if you don't
-    *   have those 24 dummy bits)
-    * - it takes less memory (you don't lose those 24bits per texel)
-    * - we can use AFBC
-    */
-   if (arch >= 9 && format == VK_FORMAT_D32_SFLOAT_S8_UINT)
-      goto end;
-
    if (pfmt == PIPE_FORMAT_NONE)
       goto end;
 
@@ -1126,6 +1137,9 @@ get_format_properties(struct panvk_physical_device *physical_device,
              VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
              VK_FORMAT_FEATURE_COSITED_CHROMA_SAMPLES_BIT |
              VK_FORMAT_FEATURE_MIDPOINT_CHROMA_SAMPLES_BIT;
+
+      if (arch >= 10)
+         tex |= VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_MINMAX_BIT;
 
       /* Integer formats only support nearest filtering */
       if (!util_format_is_scaled(pfmt) && !util_format_is_pure_integer(pfmt))
@@ -1334,7 +1348,7 @@ get_image_format_properties(struct panvk_physical_device *physical_device,
 
       /* We need to limit images to 32-bit range, because the maximum
        * slice-stride is 32-bit wide, meaning that if we allocate an image
-       * with the maximum widht and height, we end up overflowing it.
+       * with the maximum width and height, we end up overflowing it.
        *
        * We get around this by simply limiting the maximum resource size.
        */

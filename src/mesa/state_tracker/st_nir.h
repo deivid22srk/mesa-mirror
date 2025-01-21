@@ -64,14 +64,12 @@ st_nir_finish_builtin_shader(struct st_context *st,
                              struct nir_shader *nir);
 
 void *
-st_nir_make_passthrough_shader(struct st_context *st,
-                               const char *shader_name,
-                               gl_shader_stage stage,
-                               unsigned num_vars,
-                               const unsigned *input_locations,
-                               const gl_varying_slot *output_locations,
-                               unsigned *interpolation_modes,
-                               unsigned sysval_mask);
+st_nir_make_passthrough_vs(struct st_context *st,
+                           const char *shader_name,
+                           unsigned num_vars,
+                           const unsigned *input_locations,
+                           const gl_varying_slot *output_locations,
+                           unsigned sysval_mask);
 
 void *
 st_nir_make_clearcolor_shader(struct st_context *st);
@@ -85,6 +83,8 @@ bool st_nir_lower_fog(struct nir_shader *s, enum gl_fog_mode fog_mode,
                       struct gl_program_parameter_list *paramList);
 bool st_nir_lower_position_invariant(struct nir_shader *s, bool aos,
                                      struct gl_program_parameter_list *paramList);
+
+bool st_nir_unlower_io_to_vars(struct nir_shader *nir);
 
 #ifdef __cplusplus
 }

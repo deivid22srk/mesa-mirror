@@ -796,8 +796,8 @@ void agx_launch(struct agx_batch *batch, struct agx_grid grid,
                 unsigned variable_shared_mem);
 
 void agx_launch_precomp(struct agx_batch *batch, struct agx_grid grid,
-                        enum libagx_program program, void *args,
-                        size_t arg_size);
+                        enum agx_barrier barrier, enum libagx_program program,
+                        void *args, size_t arg_size);
 
 #define MESA_DISPATCH_PRECOMP agx_launch_precomp
 
@@ -887,6 +887,8 @@ struct agx_screen {
    struct agx_device dev;
    struct disk_cache *disk_cache;
 
+   struct agx_bo *rodata;
+
    /* Shared timeline syncobj and value to serialize flushes across contexts */
    uint32_t flush_syncobj;
    uint64_t flush_cur_seqid;
@@ -974,7 +976,7 @@ agx_resource_valid(struct agx_resource *rsrc, int level)
 static inline void *
 agx_map_texture_cpu(struct agx_resource *rsrc, unsigned level, unsigned z)
 {
-   return ((uint8_t *)rsrc->bo->map) +
+   return ((uint8_t *)agx_bo_map(rsrc->bo)) +
           ail_get_layer_level_B(&rsrc->layout, z, level);
 }
 
@@ -1046,10 +1048,10 @@ agx_batch_uses_bo(struct agx_batch *batch, struct agx_bo *bo)
 }
 
 static inline void
-agx_batch_add_bo(struct agx_batch *batch, struct agx_bo *bo)
+agx_batch_add_bo_internal(struct agx_batch *batch, struct agx_bo *bo)
 {
    /* Double the size of the BO list if we run out, this is amortized O(1) */
-   if (unlikely(bo->handle > batch->bo_list.bit_count)) {
+   if (unlikely(bo->handle >= batch->bo_list.bit_count)) {
       const unsigned bits_per_word = sizeof(BITSET_WORD) * 8;
 
       unsigned bit_count =
@@ -1070,6 +1072,13 @@ agx_batch_add_bo(struct agx_batch *batch, struct agx_bo *bo)
     */
    agx_bo_reference(bo);
    BITSET_SET(batch->bo_list.set, bo->handle);
+}
+
+static inline void
+agx_batch_add_bo(struct agx_batch *batch, struct agx_bo *bo)
+{
+   agx_batch_add_bo_internal(batch, bo);
+   assert(agx_batch_uses_bo(batch, bo));
 }
 
 #define AGX_BATCH_FOREACH_BO_HANDLE(batch, handle)                             \
@@ -1138,9 +1147,24 @@ void agx_add_timestamp_end_query(struct agx_context *ctx, struct agx_query *q);
 void agx_query_increment_cpu(struct agx_context *ctx, struct agx_query *query,
                              uint64_t increment);
 
-/* Blit shaders */
+enum asahi_blitter_op /* bitmask */
+{
+   ASAHI_SAVE_TEXTURES = 1,
+   ASAHI_SAVE_FRAMEBUFFER = 2,
+   ASAHI_SAVE_FRAGMENT_STATE = 4,
+   ASAHI_SAVE_FRAGMENT_CONSTANT = 8,
+   ASAHI_DISABLE_RENDER_COND = 16,
+};
+
+enum {
+   ASAHI_CLEAR = ASAHI_SAVE_FRAGMENT_STATE | ASAHI_SAVE_FRAGMENT_CONSTANT,
+
+   ASAHI_BLIT =
+      ASAHI_SAVE_FRAMEBUFFER | ASAHI_SAVE_TEXTURES | ASAHI_SAVE_FRAGMENT_STATE,
+};
+
 void agx_blitter_save(struct agx_context *ctx, struct blitter_context *blitter,
-                      bool render_cond);
+                      enum asahi_blitter_op op);
 
 void agx_blit(struct pipe_context *pipe, const struct pipe_blit_info *info);
 

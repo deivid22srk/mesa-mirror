@@ -5,24 +5,43 @@
 
 #pragma once
 
+#include "compiler/libcl/libcl.h"
+#include "compiler/shader_enums.h"
 #include "agx_pack.h"
-#include "libagx.h"
-
-#ifdef __OPENCL_VERSION__
-#define NDEBUG
-#define memcpy        __builtin_memcpy
-#define STATIC_ASSERT AGX_STATIC_ASSERT
-#endif
 
 #define agx_push(ptr, T, cfg)                                                  \
    for (unsigned _loop = 0; _loop < 1;                                         \
-        ++_loop, ptr = (global_ void *)(((uintptr_t)ptr) + AGX_##T##_LENGTH))  \
+        ++_loop, ptr = (GLOBAL void *)(((uintptr_t)ptr) + AGX_##T##_LENGTH))   \
       agx_pack(ptr, T, cfg)
 
 #define agx_push_packed(ptr, src, T)                                           \
-   STATIC_ASSERT(sizeof(src) == AGX_##T##_LENGTH);                             \
+   static_assert(sizeof(src) == AGX_##T##_LENGTH);                             \
    memcpy(ptr, &src, sizeof(src));                                             \
-   ptr = (global_ void *)(((uintptr_t)ptr) + sizeof(src));
+   ptr = (GLOBAL void *)(((uintptr_t)ptr) + sizeof(src));
+
+static inline enum agx_index_size
+agx_translate_index_size(uint8_t size_B)
+{
+   /* Index sizes are encoded logarithmically */
+   static_assert(__builtin_ctz(1) == AGX_INDEX_SIZE_U8);
+   static_assert(__builtin_ctz(2) == AGX_INDEX_SIZE_U16);
+   static_assert(__builtin_ctz(4) == AGX_INDEX_SIZE_U32);
+
+   assert((size_B == 1) || (size_B == 2) || (size_B == 4));
+   return __builtin_ctz(size_B);
+}
+
+static inline unsigned
+agx_indices_to_B(unsigned x, enum agx_index_size size)
+{
+   return x << size;
+}
+
+static inline uint8_t
+agx_index_size_to_B(enum agx_index_size size)
+{
+   return agx_indices_to_B(1, size);
+}
 
 struct agx_workgroup {
    uint32_t x, y, z;
@@ -78,6 +97,110 @@ agx_is_indirect(struct agx_grid grid)
    return grid.mode != AGX_CDM_MODE_DIRECT;
 }
 
+enum agx_barrier {
+   /* No barrier/cache operations needed */
+   AGX_BARRIER_NONE = 0,
+
+   /* Catch-all for all defined barriers. Because we have not yet
+    * reverse-engineered the finer details here, this is the only barrier we
+    * have....
+    */
+   AGX_BARRIER_ALL = (1 << 0),
+};
+
+struct agx_draw {
+   struct agx_grid b;
+   uint64_t index_buffer;
+   uint32_t index_buffer_range_B;
+   uint32_t start;
+   uint32_t index_bias;
+   uint32_t start_instance;
+
+   /* Primitive restart enabled. If true, implies indexed */
+   bool restart;
+   enum agx_index_size index_size;
+
+   /* TODO: Optimize this boolean. We can't just check if index_buffer != 0
+    * because that breaks with null index buffers.
+    */
+   bool indexed;
+};
+
+static inline struct agx_draw
+agx_draw_indirect(uint64_t ptr)
+{
+   return (struct agx_draw){.b = agx_grid_indirect(ptr)};
+}
+
+static inline struct agx_draw
+agx_draw_indexed(uint32_t index_count, uint32_t instance_count,
+                 uint32_t first_index, uint32_t index_bias,
+                 uint32_t first_instance, uint64_t buf, uint32_t range_B,
+                 enum agx_index_size index_size, bool restart)
+{
+   return (struct agx_draw){
+      .b = agx_3d(index_count, instance_count, 1),
+      .index_buffer = buf,
+      .index_buffer_range_B = range_B,
+      .start = first_index,
+      .index_bias = index_bias,
+      .start_instance = first_instance,
+      .index_size = index_size,
+      .restart = restart,
+      .indexed = true,
+   };
+}
+
+static inline struct agx_draw
+agx_draw_indexed_indirect(uint64_t ptr, uint64_t buf, uint32_t range_B,
+                          enum agx_index_size index_size, bool restart)
+{
+   return (struct agx_draw){
+      .b = agx_grid_indirect(ptr),
+      .index_buffer = buf,
+      .index_buffer_range_B = range_B,
+      .index_size = index_size,
+      .restart = restart,
+      .indexed = true,
+   };
+}
+
+static inline unsigned
+agx_draw_index_range_B(struct agx_draw d)
+{
+   uint range_B = d.index_buffer_range_B;
+   if (!agx_is_indirect(d.b))
+      range_B -= agx_indices_to_B(d.start, d.index_size);
+
+   return range_B;
+}
+
+static inline unsigned
+agx_draw_index_range_el(struct agx_draw d)
+{
+   assert(d.indexed);
+   return agx_draw_index_range_B(d) >> d.index_size;
+}
+
+static inline uint64_t
+agx_draw_index_buffer(struct agx_draw d)
+{
+   assert(d.indexed);
+
+   uint64_t ib = d.index_buffer;
+   if (!agx_is_indirect(d.b))
+      ib += agx_indices_to_B(d.start, d.index_size);
+
+   return ib;
+}
+
+static bool
+agx_direct_draw_overreads_indices(struct agx_draw d)
+{
+   uint32_t range_B = agx_indices_to_B(d.start + d.b.count[0], d.index_size);
+   return range_B > d.index_buffer_range_B;
+}
+
 enum agx_chip {
    AGX_CHIP_G13G,
    AGX_CHIP_G13X,
@@ -85,8 +208,8 @@ enum agx_chip {
    AGX_CHIP_G14X,
 };
 
-static inline global_ uint32_t *
-agx_cdm_launch(global_ uint32_t *out, enum agx_chip chip, struct agx_grid grid,
+static inline GLOBAL uint32_t *
+agx_cdm_launch(GLOBAL uint32_t *out, enum agx_chip chip, struct agx_grid grid,
                struct agx_workgroup wg,
                struct agx_cdm_launch_word_0_packed launch, uint32_t usc)
 {
@@ -134,8 +257,90 @@ agx_cdm_launch(global_ uint32_t *out, enum agx_chip chip, struct agx_grid grid,
    return out;
 }
 
-static inline global_ uint32_t *
-agx_cdm_barrier(global_ uint32_t *out, enum agx_chip chip)
+static inline GLOBAL uint32_t *
+agx_vdm_draw(GLOBAL uint32_t *out, enum agx_chip chip, struct agx_draw draw,
+             enum agx_primitive topology)
+{
+   uint64_t ib = draw.indexed ? agx_draw_index_buffer(draw) : 0;
+
+   agx_push(out, INDEX_LIST, cfg) {
+      cfg.primitive = topology;
+
+      if (agx_is_indirect(draw.b)) {
+         cfg.indirect_buffer_present = true;
+      } else {
+         cfg.instance_count_present = true;
+         cfg.index_count_present = true;
+         cfg.start_present = true;
+      }
+
+      if (draw.indexed) {
+         cfg.restart_enable = draw.restart;
+         cfg.index_buffer_hi = ib >> 32;
+         cfg.index_size = draw.index_size;
+
+         cfg.index_buffer_present = true;
+         cfg.index_buffer_size_present = true;
+      }
+   }
+
+   if (draw.indexed) {
+      agx_push(out, INDEX_LIST_BUFFER_LO, cfg) {
+         cfg.buffer_lo = ib;
+      }
+   }
+
+   if (agx_is_indirect(draw.b)) {
+      agx_push(out, INDEX_LIST_INDIRECT_BUFFER, cfg) {
+         cfg.address_hi = draw.b.ptr >> 32;
+         cfg.address_lo = draw.b.ptr & BITFIELD_MASK(32);
+      }
+   } else {
+      agx_push(out, INDEX_LIST_COUNT, cfg) {
+         cfg.count = draw.b.count[0];
+      }
+
+      agx_push(out, INDEX_LIST_INSTANCES, cfg) {
+         cfg.count = draw.b.count[1];
+      }
+
+      agx_push(out, INDEX_LIST_START, cfg) {
+         cfg.start = draw.indexed ? draw.index_bias : draw.start;
+      }
+   }
+
+   if (draw.indexed) {
+      agx_push(out, INDEX_LIST_BUFFER_SIZE, cfg) {
+         cfg.size = align(agx_draw_index_range_B(draw), 4);
+      }
+   }
+
+   return out;
+}
+
+static inline uint32_t
+agx_vdm_draw_size(enum agx_chip chip, struct agx_draw draw)
+{
+   uint32_t size = AGX_INDEX_LIST_LENGTH;
+
+   if (agx_is_indirect(draw.b)) {
+      size += AGX_INDEX_LIST_INDIRECT_BUFFER_LENGTH;
+   } else {
+      size += AGX_INDEX_LIST_COUNT_LENGTH;
+      size += AGX_INDEX_LIST_INSTANCES_LENGTH;
+      size += AGX_INDEX_LIST_START_LENGTH;
+   }
+
+   if (draw.indexed) {
+      size += AGX_INDEX_LIST_BUFFER_LO_LENGTH;
+      size += AGX_INDEX_LIST_BUFFER_SIZE_LENGTH;
+   }
+
+   return size;
+}
+
+static inline GLOBAL uint32_t *
+agx_cdm_barrier(GLOBAL uint32_t *out, enum agx_chip chip)
 {
    agx_push(out, CDM_BARRIER, cfg) {
       cfg.unk_5 = true;
@@ -181,8 +386,18 @@ agx_cdm_barrier(global_ uint32_t *out, enum agx_chip chip)
    return out;
 }
 
-static inline global_ uint32_t *
-agx_cdm_return(global_ uint32_t *out)
+static inline GLOBAL uint32_t *
+agx_vdm_return(GLOBAL uint32_t *out)
+{
+   agx_push(out, VDM_BARRIER, cfg) {
+      cfg.returns = true;
+   }
+
+   return out;
+}
+
+static inline GLOBAL uint32_t *
+agx_cdm_return(GLOBAL uint32_t *out)
 {
    agx_push(out, CDM_STREAM_RETURN, cfg)
       ;
@@ -190,8 +405,8 @@ agx_cdm_return(global_ uint32_t *out)
    return out;
 }
 
-static inline global_ uint32_t *
-agx_cdm_terminate(global_ uint32_t *out)
+static inline GLOBAL uint32_t *
+agx_cdm_terminate(GLOBAL uint32_t *out)
 {
    agx_push(out, CDM_STREAM_TERMINATE, _)
       ;
@@ -199,8 +414,8 @@ agx_cdm_terminate(global_ uint32_t *out)
    return out;
 }
 
-static inline global_ uint32_t *
-agx_vdm_terminate(global_ uint32_t *out)
+static inline GLOBAL uint32_t *
+agx_vdm_terminate(GLOBAL uint32_t *out)
 {
    agx_push(out, VDM_STREAM_TERMINATE, _)
       ;
@@ -208,8 +423,8 @@ agx_vdm_terminate(global_ uint32_t *out)
    return out;
 }
 
-static inline global_ uint32_t *
-agx_cdm_jump(global_ uint32_t *out, uint64_t target)
+static inline GLOBAL uint32_t *
+agx_cdm_jump(GLOBAL uint32_t *out, uint64_t target)
 {
    agx_push(out, CDM_STREAM_LINK, cfg) {
       cfg.target_lo = target & BITFIELD_MASK(32);
@@ -219,8 +434,8 @@ agx_cdm_jump(global_ uint32_t *out, uint64_t target)
    return out;
 }
 
-static inline global_ uint32_t *
-agx_vdm_jump(global_ uint32_t *out, uint64_t target)
+static inline GLOBAL uint32_t *
+agx_vdm_jump(GLOBAL uint32_t *out, uint64_t target)
 {
    agx_push(out, VDM_STREAM_LINK, cfg) {
       cfg.target_lo = target & BITFIELD_MASK(32);
@@ -230,8 +445,14 @@ agx_vdm_jump(global_ uint32_t *out, uint64_t target)
    return out;
 }
 
-static inline global_ uint32_t *
-agx_cdm_call(global_ uint32_t *out, uint64_t target)
+static inline GLOBAL uint32_t *
+agx_cs_jump(GLOBAL uint32_t *out, uint64_t target, bool vdm)
+{
+   return vdm ? agx_vdm_jump(out, target) : agx_cdm_jump(out, target);
+}
+
+static inline GLOBAL uint32_t *
+agx_cdm_call(GLOBAL uint32_t *out, uint64_t target)
 {
    agx_push(out, CDM_STREAM_LINK, cfg) {
       cfg.target_lo = target & BITFIELD_MASK(32);
@@ -242,8 +463,8 @@ agx_cdm_call(global_ uint32_t *out, uint64_t target)
    return out;
 }
 
-static inline global_ uint32_t *
-agx_vdm_call(global_ uint32_t *out, uint64_t target)
+static inline GLOBAL uint32_t *
+agx_vdm_call(GLOBAL uint32_t *out, uint64_t target)
 {
    agx_push(out, VDM_STREAM_LINK, cfg) {
       cfg.target_lo = target & BITFIELD_MASK(32);
@@ -279,7 +500,7 @@ struct agx_shader {
 
 /* Opaque structure representing a USC program being constructed */
 struct agx_usc_builder {
-   global_ uint8_t *head;
+   GLOBAL uint8_t *head;
 
 #ifndef NDEBUG
    uint8_t *begin;
@@ -287,12 +508,8 @@ struct agx_usc_builder {
 #endif
 } PACKED;
 
-#ifdef __OPENCL_VERSION__
-AGX_STATIC_ASSERT(sizeof(struct agx_usc_builder) == 8);
-#endif
-
 static struct agx_usc_builder
-agx_usc_builder(global_ void *out, ASSERTED size_t size)
+agx_usc_builder(GLOBAL void *out, ASSERTED size_t size)
 {
    return (struct agx_usc_builder){
       .head = out,
@@ -352,11 +569,34 @@ agx_usc_uniform(struct agx_usc_builder *b, unsigned start_halfs,
 }
 
 static inline void
-agx_usc_words_precomp(global_ uint32_t *out, constant_ struct agx_shader *s,
+agx_usc_words_precomp(GLOBAL uint32_t *out, CONST struct agx_shader *s,
                       uint64_t data, unsigned data_size)
 {
    /* Map the data directly as uniforms starting at u0 */
    struct agx_usc_builder b = agx_usc_builder(out, sizeof(s->usc.data));
    agx_usc_uniform(&b, 0, DIV_ROUND_UP(data_size, 2), data);
    agx_usc_push_blob(&b, s->usc.data, s->usc.size);
+}
+
+/* This prototype is sufficient for sizing the output */
+static inline unsigned
+libagx_draw_robust_index_vdm_size()
+{
+   struct agx_draw draw = agx_draw_indexed(0, 0, 0, 0, 0, 0, 0, 0, 0);
+   return agx_vdm_draw_size(0, draw);
+}
+
+static inline unsigned
+libagx_remap_adj_count(unsigned count, enum mesa_prim prim)
+{
+   if (prim == MESA_PRIM_TRIANGLE_STRIP_ADJACENCY) {
+      /* Spec gives formula for # of primitives in a tri strip adj */
+      unsigned c4 = count >= 4 ? count - 4 : 0;
+      return 3 * (c4 / 2);
+   } else if (prim == MESA_PRIM_LINE_STRIP_ADJACENCY) {
+      return 2 * (count >= 3 ? count - 3 : 0);
+   } else {
+      /* Adjacency lists just drop half the vertices. */
+      return count / 2;
+   }
 }

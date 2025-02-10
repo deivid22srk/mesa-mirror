@@ -36,11 +36,9 @@
 #include "util/u_math.h"
 #include "util/rb_tree.h"
 #include "brw_fs.h"
-#include "brw_fs_live_variables.h"
+#include "brw_analysis.h"
 #include "brw_cfg.h"
 #include "brw_eu.h"
-
-using namespace brw;
 
 namespace { /* avoid conflict with opt_copy_propagation_elements */
 struct acp_entry {
@@ -268,7 +266,7 @@ class fs_copy_prop_dataflow
 {
 public:
    fs_copy_prop_dataflow(linear_ctx *lin_ctx, cfg_t *cfg,
-                         const fs_live_variables &live,
+                         const brw_live_variables &live,
                          struct acp *out_acp);
 
    void setup_initial_values();
@@ -277,7 +275,7 @@ public:
    void dump_block_data() const UNUSED;
 
    cfg_t *cfg;
-   const fs_live_variables &live;
+   const brw_live_variables &live;
 
    acp_entry **acp;
    int num_acp;
@@ -288,7 +286,7 @@ public:
 } /* anonymous namespace */
 
 fs_copy_prop_dataflow::fs_copy_prop_dataflow(linear_ctx *lin_ctx, cfg_t *cfg,
-                                             const fs_live_variables &live,
+                                             const brw_live_variables &live,
                                              struct acp *out_acp)
    : cfg(cfg), live(live)
 {
@@ -376,7 +374,7 @@ fs_copy_prop_dataflow::setup_initial_values()
          acp_table.add(acp[i]);
 
       foreach_block (block, cfg) {
-         foreach_inst_in_block(fs_inst, inst, block) {
+         foreach_inst_in_block(brw_inst, inst, block) {
             if (inst->dst.file != VGRF &&
                 inst->dst.file != FIXED_GRF)
                continue;
@@ -579,7 +577,7 @@ is_logic_op(enum opcode opcode)
 }
 
 static bool
-can_take_stride(fs_inst *inst, brw_reg_type dst_type,
+can_take_stride(brw_inst *inst, brw_reg_type dst_type,
                 unsigned arg, unsigned stride,
                 const struct brw_compiler *compiler)
 {
@@ -643,7 +641,7 @@ can_take_stride(fs_inst *inst, brw_reg_type dst_type,
 }
 
 static bool
-instruction_requires_packed_data(fs_inst *inst)
+instruction_requires_packed_data(brw_inst *inst)
 {
    switch (inst->opcode) {
    case FS_OPCODE_DDX_FINE:
@@ -659,15 +657,14 @@ instruction_requires_packed_data(fs_inst *inst)
 }
 
 static bool
-try_copy_propagate(const brw_compiler *compiler, fs_inst *inst,
+try_copy_propagate(fs_visitor &s, brw_inst *inst,
                    acp_entry *entry, int arg,
-                   const brw::simple_allocator &alloc,
                    uint8_t max_polygons)
 {
    if (inst->src[arg].file != VGRF)
       return false;
 
-   const struct intel_device_info *devinfo = compiler->devinfo;
+   const struct intel_device_info *devinfo = s.devinfo;
 
    assert(entry->src.file == VGRF || entry->src.file == UNIFORM ||
           entry->src.file == ATTR || entry->src.file == FIXED_GRF);
@@ -687,7 +684,7 @@ try_copy_propagate(const brw_compiler *compiler, fs_inst *inst,
     * temporaries which should match is_coalescing_payload().
     */
    if (entry->opcode == SHADER_OPCODE_LOAD_PAYLOAD &&
-       (is_coalescing_payload(devinfo, alloc, inst) ||
+       (is_coalescing_payload(s, inst) ||
         is_multi_copy_payload(devinfo, inst)))
       return false;
 
@@ -720,9 +717,9 @@ try_copy_propagate(const brw_compiler *compiler, fs_inst *inst,
           entry->src.file == VGRF) {
          int other_src = arg == 2 ? 3 : 2;
          unsigned other_size = inst->src[other_src].file == VGRF ?
-                               alloc.sizes[inst->src[other_src].nr] :
+                               s.alloc.sizes[inst->src[other_src].nr] :
                                inst->size_read(devinfo, other_src);
-         unsigned prop_src_size = alloc.sizes[entry->src.nr];
+         unsigned prop_src_size = s.alloc.sizes[entry->src.nr];
          if (other_size + prop_src_size > 15)
             return false;
       }
@@ -767,7 +764,7 @@ try_copy_propagate(const brw_compiler *compiler, fs_inst *inst,
     */
    if (!can_take_stride(inst, dst_type, arg,
                         entry_stride * inst->src[arg].stride,
-                        compiler))
+                        s.compiler))
       return false;
 
    /* From the Cherry Trail/Braswell PRMs, Volume 7: 3D Media GPGPU:
@@ -808,7 +805,7 @@ try_copy_propagate(const brw_compiler *compiler, fs_inst *inst,
    if (entry->src.file == ATTR && max_polygons > 1 &&
        (has_dst_aligned_region_restriction(devinfo, inst, dst_type) ||
 	instruction_requires_packed_data(inst) ||
-	(inst->is_3src(compiler) && arg == 2) ||
+	(inst->is_3src(s.compiler) && arg == 2) ||
 	entry->dst.type != inst->src[arg].type))
       return false;
 
@@ -940,7 +937,7 @@ try_copy_propagate(const brw_compiler *compiler, fs_inst *inst,
 
 static bool
 try_constant_propagate_value(brw_reg val, brw_reg_type dst_type,
-                             fs_inst *inst, int arg)
+                             brw_inst *inst, int arg)
 {
    bool progress = false;
 
@@ -1212,7 +1209,7 @@ try_constant_propagate_value(brw_reg val, brw_reg_type dst_type,
 
 static bool
 try_constant_propagate(const struct intel_device_info *devinfo,
-                       fs_inst *inst, acp_entry *entry, int arg)
+                       brw_inst *inst, acp_entry *entry, int arg)
 {
    if (inst->src[arg].file != VGRF)
       return false;
@@ -1240,7 +1237,7 @@ try_constant_propagate(const struct intel_device_info *devinfo,
 }
 
 static bool
-can_propagate_from(const struct intel_device_info *devinfo, fs_inst *inst)
+can_propagate_from(const struct intel_device_info *devinfo, brw_inst *inst)
 {
    return (inst->opcode == BRW_OPCODE_MOV &&
            inst->dst.file == VGRF &&
@@ -1264,7 +1261,7 @@ can_propagate_from(const struct intel_device_info *devinfo, fs_inst *inst)
 }
 
 static void
-swap_srcs(fs_inst *inst, unsigned a, unsigned b)
+swap_srcs(brw_inst *inst, unsigned a, unsigned b)
 {
    const auto tmp = inst->src[a];
    inst->src[a] = inst->src[b];
@@ -1272,7 +1269,7 @@ swap_srcs(fs_inst *inst, unsigned a, unsigned b)
 }
 
 static void
-commute_immediates(fs_inst *inst)
+commute_immediates(brw_inst *inst)
 {
    /* ADD3 can have the immediate as src0 or src2. Using one or the other
     * consistently makes assembly dumps more readable, so we arbitrarily
@@ -1309,15 +1306,14 @@ commute_immediates(fs_inst *inst)
  * list.
  */
 static bool
-opt_copy_propagation_local(const brw_compiler *compiler, linear_ctx *lin_ctx,
+opt_copy_propagation_local(fs_visitor &s, linear_ctx *lin_ctx,
                            bblock_t *block, struct acp &acp,
-                           const brw::simple_allocator &alloc,
                            uint8_t max_polygons)
 {
-   const struct intel_device_info *devinfo = compiler->devinfo;
+   const struct intel_device_info *devinfo = s.devinfo;
    bool progress = false;
 
-   foreach_inst_in_block(fs_inst, inst, block) {
+   foreach_inst_in_block(brw_inst, inst, block) {
       /* Try propagating into this instruction. */
       bool constant_progress = false;
       for (int i = inst->sources - 1; i >= 0; i--) {
@@ -1333,8 +1329,7 @@ opt_copy_propagation_local(const brw_compiler *compiler, linear_ctx *lin_ctx,
                   break;
                }
             } else {
-               if (try_copy_propagate(compiler, inst, *iter, i, alloc,
-                                      max_polygons)) {
+               if (try_copy_propagate(s, inst, *iter, i, max_polygons)) {
                   progress = true;
                   break;
                }
@@ -1344,7 +1339,7 @@ opt_copy_propagation_local(const brw_compiler *compiler, linear_ctx *lin_ctx,
 
       if (constant_progress) {
          commute_immediates(inst);
-         brw_opt_constant_fold_instruction(compiler->devinfo, inst);
+         brw_opt_constant_fold_instruction(devinfo, inst);
          progress = true;
       }
 
@@ -1424,14 +1419,14 @@ brw_opt_copy_propagation(fs_visitor &s)
    linear_ctx *lin_ctx = linear_context(copy_prop_ctx);
    struct acp *out_acp = new (lin_ctx) acp[s.cfg->num_blocks];
 
-   const fs_live_variables &live = s.live_analysis.require();
+   const brw_live_variables &live = s.live_analysis.require();
 
    /* First, walk through each block doing local copy propagation and getting
     * the set of copies available at the end of the block.
     */
    foreach_block (block, s.cfg) {
-      progress = opt_copy_propagation_local(s.compiler, lin_ctx, block,
-                                            out_acp[block->num], s.alloc,
+      progress = opt_copy_propagation_local(s, lin_ctx, block,
+                                            out_acp[block->num],
                                             s.max_polygons) || progress;
 
       /* If the destination of an ACP entry exists only within this block,
@@ -1471,28 +1466,27 @@ brw_opt_copy_propagation(fs_visitor &s)
          }
       }
 
-      progress = opt_copy_propagation_local(s.compiler, lin_ctx, block,
-                                            in_acp, s.alloc, s.max_polygons) ||
+      progress = opt_copy_propagation_local(s, lin_ctx, block,
+                                            in_acp, s.max_polygons) ||
                  progress;
    }
 
    ralloc_free(copy_prop_ctx);
 
    if (progress)
-      s.invalidate_analysis(DEPENDENCY_INSTRUCTION_DATA_FLOW |
-                            DEPENDENCY_INSTRUCTION_DETAIL);
+      s.invalidate_analysis(BRW_DEPENDENCY_INSTRUCTION_DATA_FLOW |
+                            BRW_DEPENDENCY_INSTRUCTION_DETAIL);
 
    return progress;
 }
 
 static bool
-try_copy_propagate_def(const brw_compiler *compiler,
-                       const brw::simple_allocator &alloc,
-                       fs_inst *def, const brw_reg &val,
-                       fs_inst *inst, int arg,
+try_copy_propagate_def(fs_visitor &s,
+                       brw_inst *def, const brw_reg &val,
+                       brw_inst *inst, int arg,
                        uint8_t max_polygons)
 {
-   const struct intel_device_info *devinfo = compiler->devinfo;
+   const struct intel_device_info *devinfo = s.devinfo;
 
    assert(val.file != BAD_FILE);
 
@@ -1548,9 +1542,9 @@ try_copy_propagate_def(const brw_compiler *compiler,
           val.file == VGRF) {
          int other_src = arg == 2 ? 3 : 2;
          unsigned other_size = inst->src[other_src].file == VGRF ?
-                               alloc.sizes[inst->src[other_src].nr] :
+                               s.alloc.sizes[inst->src[other_src].nr] :
                                inst->size_read(devinfo, other_src);
-         unsigned prop_src_size = alloc.sizes[val.nr];
+         unsigned prop_src_size = s.alloc.sizes[val.nr];
          if (other_size + prop_src_size > 15)
             return false;
       }
@@ -1584,7 +1578,7 @@ try_copy_propagate_def(const brw_compiler *compiler,
     */
    if (!can_take_stride(inst, dst_type, arg,
                         entry_stride * inst->src[arg].stride,
-                        compiler))
+                        s.compiler))
       return false;
 
    /* Bail if the source FIXED_GRF region of the copy cannot be trivially
@@ -1646,7 +1640,7 @@ try_copy_propagate_def(const brw_compiler *compiler,
    if (max_polygons > 1 && val.file == ATTR &&
        (has_dst_aligned_region_restriction(devinfo, inst, dst_type) ||
         instruction_requires_packed_data(inst) ||
-        (inst->is_3src(compiler) && arg == 2) ||
+        (inst->is_3src(s.compiler) && arg == 2) ||
         def->dst.type != inst->src[arg].type))
       return false;
 
@@ -1723,7 +1717,7 @@ try_copy_propagate_def(const brw_compiler *compiler,
 
 static bool
 try_constant_propagate_def(const struct intel_device_info *devinfo,
-                           fs_inst *def, brw_reg val, fs_inst *inst, int arg)
+                           brw_inst *def, brw_reg val, brw_inst *inst, int arg)
 {
    /* Bail if inst is reading more than a single vector component of entry */
    if (inst->size_read(devinfo, arg) > def->dst.component_size(inst->exec_size))
@@ -1753,7 +1747,7 @@ extract_imm(brw_reg val, brw_reg_type type, unsigned offset)
 }
 
 static brw_reg
-find_value_for_offset(fs_inst *def, const brw_reg &src, unsigned src_size)
+find_value_for_offset(brw_inst *def, const brw_reg &src, unsigned src_size)
 {
    brw_reg val;
 
@@ -1812,16 +1806,16 @@ find_value_for_offset(fs_inst *def, const brw_reg &src, unsigned src_size)
 bool
 brw_opt_copy_propagation_defs(fs_visitor &s)
 {
-   const brw::def_analysis &defs = s.def_analysis.require();
+   const brw_def_analysis &defs = s.def_analysis.require();
    unsigned *uses_deleted = new unsigned[defs.count()]();
    bool progress = false;
 
-   foreach_block_and_inst_safe(block, fs_inst, inst, s.cfg) {
+   foreach_block_and_inst_safe(block, brw_inst, inst, s.cfg) {
       /* Try propagating into this instruction. */
       bool constant_progress = false;
 
       for (int i = inst->sources - 1; i >= 0; i--) {
-         fs_inst *def = defs.get(inst->src[i]);
+         brw_inst *def = defs.get(inst->src[i]);
 
          if (!def || def->saturate)
             continue;
@@ -1833,7 +1827,7 @@ brw_opt_copy_propagation_defs(fs_visitor &s)
                 def->src[0].file != BAD_FILE && def->src[0].file != IMM &&
                 is_identity_payload(s.devinfo, def->src[0].file, def)) {
                source_progress =
-                  try_copy_propagate_def(s.compiler, s.alloc, def, def->src[0],
+                  try_copy_propagate_def(s, def, def->src[0],
                                          inst, i, s.max_polygons);
 
                if (source_progress) {
@@ -1859,8 +1853,7 @@ brw_opt_copy_propagation_defs(fs_visitor &s)
                     val.file == ATTR || val.file == UNIFORM ||
                     (val.file == FIXED_GRF && val.is_contiguous())) {
             source_progress =
-               try_copy_propagate_def(s.compiler, s.alloc, def, val, inst, i,
-                                      s.max_polygons);
+               try_copy_propagate_def(s, def, val, inst, i, s.max_polygons);
          }
 
          if (source_progress) {
@@ -1888,8 +1881,8 @@ brw_opt_copy_propagation_defs(fs_visitor &s)
 
    if (progress) {
       s.cfg->adjust_block_ips();
-      s.invalidate_analysis(DEPENDENCY_INSTRUCTION_DATA_FLOW |
-                            DEPENDENCY_INSTRUCTION_DETAIL);
+      s.invalidate_analysis(BRW_DEPENDENCY_INSTRUCTION_DATA_FLOW |
+                            BRW_DEPENDENCY_INSTRUCTION_DETAIL);
    }
 
    delete [] uses_deleted;

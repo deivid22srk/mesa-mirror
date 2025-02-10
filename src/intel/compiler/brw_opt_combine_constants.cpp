@@ -33,8 +33,6 @@
 #include "brw_cfg.h"
 #include "util/half_float.h"
 
-using namespace brw;
-
 static const bool debug = false;
 
 enum PACKED interpreted_type {
@@ -759,12 +757,12 @@ brw_combine_constants(struct value *candidates, unsigned num_candidates)
 }
 
 /**
- * Box for storing fs_inst and some other necessary data
+ * Box for storing brw_inst and some other necessary data
  *
  * \sa box_instruction
  */
-struct fs_inst_box {
-   fs_inst *inst;
+struct brw_inst_box {
+   brw_inst *inst;
    unsigned ip;
    bblock_t *block;
 };
@@ -773,18 +771,18 @@ struct fs_inst_box {
 struct reg_link {
    DECLARE_RALLOC_CXX_OPERATORS(reg_link)
 
-   reg_link(fs_inst *inst, unsigned src, bool negate, enum interpreted_type type)
+   reg_link(brw_inst *inst, unsigned src, bool negate, enum interpreted_type type)
    : inst(inst), src(src), negate(negate), type(type) {}
 
    struct exec_node link;
-   fs_inst *inst;
+   brw_inst *inst;
    uint8_t src;
    bool negate;
    enum interpreted_type type;
 };
 
 static struct exec_node *
-link(void *mem_ctx, fs_inst *inst, unsigned src, bool negate,
+link(void *mem_ctx, brw_inst *inst, unsigned src, bool negate,
      enum interpreted_type type)
 {
    reg_link *l = new(mem_ctx) reg_link(inst, src, negate, type);
@@ -802,7 +800,7 @@ struct imm {
     * The instruction generating the immediate value, if all uses are contained
     * within a single basic block. Otherwise, NULL.
     */
-   fs_inst *inst;
+   brw_inst *inst;
 
    /**
     * A list of fs_regs that refer to this immediate.  If we promote it, we'll
@@ -847,7 +845,7 @@ struct table {
    struct imm *imm;
    int len;
 
-   struct fs_inst_box *boxes;
+   struct brw_inst_box *boxes;
    unsigned num_boxes;
    unsigned size_boxes;
 };
@@ -868,7 +866,7 @@ new_value(struct table *table, void *mem_ctx)
  * \returns the index into the dynamic array of boxes for the instruction.
  */
 static unsigned
-box_instruction(struct table *table, void *mem_ctx, fs_inst *inst,
+box_instruction(struct table *table, void *mem_ctx, brw_inst *inst,
                 unsigned ip, bblock_t *block)
 {
    /* It is common for box_instruction to be called consecutively for each
@@ -885,14 +883,14 @@ box_instruction(struct table *table, void *mem_ctx, fs_inst *inst,
 
    if (table->num_boxes == table->size_boxes) {
       table->size_boxes *= 2;
-      table->boxes = reralloc(mem_ctx, table->boxes, fs_inst_box,
+      table->boxes = reralloc(mem_ctx, table->boxes, brw_inst_box,
                               table->size_boxes);
    }
 
    assert(table->num_boxes < table->size_boxes);
 
    const unsigned idx = table->num_boxes++;
-   fs_inst_box *ib =  &table->boxes[idx];
+   brw_inst_box *ib =  &table->boxes[idx];
 
    ib->inst = inst;
    ib->block = block;
@@ -989,7 +987,7 @@ representable_as_uw(unsigned ud, uint16_t *uw)
 }
 
 static bool
-supports_src_as_imm(const struct intel_device_info *devinfo, const fs_inst *inst,
+supports_src_as_imm(const struct intel_device_info *devinfo, const brw_inst *inst,
                     unsigned src_idx)
 {
    switch (inst->opcode) {
@@ -1051,7 +1049,7 @@ supports_src_as_imm(const struct intel_device_info *devinfo, const fs_inst *inst
 }
 
 static bool
-can_promote_src_as_imm(const struct intel_device_info *devinfo, fs_inst *inst,
+can_promote_src_as_imm(const struct intel_device_info *devinfo, brw_inst *inst,
                        unsigned src_idx)
 {
    bool can_promote = false;
@@ -1107,7 +1105,7 @@ can_promote_src_as_imm(const struct intel_device_info *devinfo, fs_inst *inst,
 }
 
 static void
-add_candidate_immediate(struct table *table, fs_inst *inst, unsigned ip,
+add_candidate_immediate(struct table *table, brw_inst *inst, unsigned ip,
                         unsigned i,
                         bool allow_one_constant,
                         bblock_t *block,
@@ -1185,16 +1183,15 @@ struct register_allocation {
 };
 
 static brw_reg
-allocate_slots(const intel_device_info *devinfo,
+allocate_slots(fs_visitor &s,
                struct register_allocation *regs, unsigned num_regs,
-               unsigned bytes, unsigned align_bytes,
-               brw::simple_allocator &alloc)
+               unsigned bytes, unsigned align_bytes)
 {
    assert(bytes == 2 || bytes == 4 || bytes == 8);
    assert(align_bytes == 2 || align_bytes == 4 || align_bytes == 8);
 
    const unsigned slots_per_reg =
-      REG_SIZE * reg_unit(devinfo) / sizeof(uint16_t);
+      REG_SIZE * reg_unit(s.devinfo) / sizeof(uint16_t);
 
    const unsigned words = bytes / 2;
    const unsigned align_words = align_bytes / 2;
@@ -1206,7 +1203,7 @@ allocate_slots(const intel_device_info *devinfo,
 
          if ((x & mask) == mask) {
             if (regs[i].nr == UINT_MAX)
-               regs[i].nr = alloc.allocate(reg_unit(devinfo));
+               regs[i].nr = brw_allocate_vgrf_units(s, reg_unit(s.devinfo)).nr;
 
             regs[i].avail &= ~(mask << j);
 
@@ -1245,10 +1242,9 @@ deallocate_slots(const struct intel_device_info *devinfo,
 }
 
 static void
-parcel_out_registers(const intel_device_info *devinfo,
+parcel_out_registers(fs_visitor &s,
                      struct imm *imm, unsigned len, const bblock_t *cur_block,
-                     struct register_allocation *regs, unsigned num_regs,
-                     brw::simple_allocator &alloc)
+                     struct register_allocation *regs, unsigned num_regs)
 {
    /* Each basic block has two distinct set of constants.  There is the set of
     * constants that only have uses in that block, and there is the set of
@@ -1269,10 +1265,9 @@ parcel_out_registers(const intel_device_info *devinfo,
       for (unsigned i = 0; i < len; i++) {
          if (imm[i].block == cur_block &&
              imm[i].used_in_single_block == used_in_single_block) {
-            const brw_reg reg = allocate_slots(devinfo, regs, num_regs,
+            const brw_reg reg = allocate_slots(s, regs, num_regs,
                                                imm[i].size,
-                                               get_alignment_for_imm(&imm[i]),
-                                               alloc);
+                                               get_alignment_for_imm(&imm[i]));
 
             imm[i].nr = reg.nr;
             imm[i].subreg_offset = reg.offset;
@@ -1282,7 +1277,7 @@ parcel_out_registers(const intel_device_info *devinfo,
 
    for (unsigned i = 0; i < len; i++) {
       if (imm[i].block == cur_block && imm[i].used_in_single_block) {
-         deallocate_slots(devinfo, regs, num_regs, imm[i].nr,
+         deallocate_slots(s.devinfo, regs, num_regs, imm[i].nr,
                           imm[i].subreg_offset, imm[i].size);
       }
    }
@@ -1297,26 +1292,26 @@ brw_opt_combine_constants(fs_visitor &s)
    struct table table;
 
    /* For each of the dynamic arrays in the table, allocate about a page of
-    * memory.  On LP64 systems, this gives 126 value objects 169 fs_inst_box
+    * memory.  On LP64 systems, this gives 126 value objects 169 brw_inst_box
     * objects.  Even larger shaders that have been obverved rarely need more
     * than 20 or 30 values.  Most smaller shaders, which is most shaders, need
-    * at most a couple dozen fs_inst_box.
+    * at most a couple dozen brw_inst_box.
     */
    table.size = (4096 - (5 * sizeof(void *))) / sizeof(struct value);
    table.num_values = 0;
    table.values = ralloc_array(const_ctx, struct value, table.size);
 
-   table.size_boxes = (4096 - (5 * sizeof(void *))) / sizeof(struct fs_inst_box);
+   table.size_boxes = (4096 - (5 * sizeof(void *))) / sizeof(struct brw_inst_box);
    table.num_boxes = 0;
-   table.boxes = ralloc_array(const_ctx, fs_inst_box, table.size_boxes);
+   table.boxes = ralloc_array(const_ctx, brw_inst_box, table.size_boxes);
 
-   const brw::idom_tree &idom = s.idom_analysis.require();
+   const brw_idom_tree &idom = s.idom_analysis.require();
    unsigned ip = -1;
 
    /* Make a pass through all instructions and mark each constant is used in
     * instruction sources that cannot legally be immediate values.
     */
-   foreach_block_and_inst(block, fs_inst, inst, s.cfg) {
+   foreach_block_and_inst(block, brw_inst, inst, s.cfg) {
       ip++;
 
       switch (inst->opcode) {
@@ -1452,7 +1447,7 @@ brw_opt_combine_constants(fs_visitor &s)
 
       for (unsigned j = first_user; j < last_user; j++) {
          const unsigned idx = table.values[result->user_map[j].index].instr_index;
-         fs_inst_box *const ib = &table.boxes[idx];
+         brw_inst_box *const ib = &table.boxes[idx];
 
          const unsigned src = table.values[result->user_map[j].index].src;
 
@@ -1531,8 +1526,7 @@ brw_opt_combine_constants(fs_visitor &s)
    }
 
    foreach_block(block, s.cfg) {
-      parcel_out_registers(devinfo, table.imm, table.len, block, regs,
-                           table.len, s.alloc);
+      parcel_out_registers(s, table.imm, table.len, block, regs, table.len);
    }
 
    free(regs);
@@ -1718,7 +1712,7 @@ brw_opt_combine_constants(fs_visitor &s)
     * so the other source (and destination) must be changed to match.
     */
    for (unsigned i = 0; i < table.num_boxes; i++) {
-      fs_inst *inst = table.boxes[i].inst;
+      brw_inst *inst = table.boxes[i].inst;
 
       if (inst->opcode != BRW_OPCODE_SEL)
          continue;
@@ -1794,8 +1788,8 @@ brw_opt_combine_constants(fs_visitor &s)
 
    ralloc_free(const_ctx);
 
-   s.invalidate_analysis(DEPENDENCY_INSTRUCTIONS | DEPENDENCY_VARIABLES |
-                         (rebuild_cfg ? DEPENDENCY_BLOCKS : DEPENDENCY_NOTHING));
+   s.invalidate_analysis(BRW_DEPENDENCY_INSTRUCTIONS | BRW_DEPENDENCY_VARIABLES |
+                         (rebuild_cfg ? BRW_DEPENDENCY_BLOCKS : BRW_DEPENDENCY_NOTHING));
 
    return true;
 }

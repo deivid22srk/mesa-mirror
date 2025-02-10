@@ -223,6 +223,9 @@ struct intel_perf_query_result;
 
 #define ANV_GRAPHICS_SHADER_STAGE_COUNT (MESA_SHADER_MESH + 1)
 
+/* Defines where various values are defined in the inline parameter register.
+ */
+#define ANV_INLINE_PARAM_PUSH_ADDRESS_OFFSET (0)
 #define ANV_INLINE_PARAM_NUM_WORKGROUPS_OFFSET (8)
 
 /* RENDER_SURFACE_STATE is a bit smaller (48b) but since it is aligned to 64
@@ -1146,6 +1149,10 @@ struct anv_physical_device {
 
     struct {
        /**
+        * Unused
+        */
+       struct anv_va_range                      first_2mb;
+       /**
         * General state pool
         */
        struct anv_va_range                      general_state_pool;
@@ -1311,6 +1318,7 @@ struct anv_instance {
     bool                                        compression_control_enabled;
     bool                                        anv_fake_nonlocal_memory;
     bool                                        anv_upper_bound_descriptor_pool_sampler;
+    bool                                        custom_border_colors_without_format;
 
     /* HW workarounds */
     bool                                        no_16bit;
@@ -1524,6 +1532,7 @@ struct anv_gfx_dynamic_state {
 
          bool     ColorBufferBlendEnable;
          uint32_t ColorClampRange;
+         bool     SimpleFloatBlendEnable;
          bool     PreBlendColorClampEnable;
          bool     PostBlendColorClampEnable;
          uint32_t SourceBlendFactor;
@@ -2130,20 +2139,7 @@ struct anv_device {
        struct hash_table                        *map;
     }                                            embedded_samplers;
 
-    struct {
-       /**
-        * Mutex for the printfs array
-        */
-       simple_mtx_t                              mutex;
-       /**
-        * Buffer in which the shader printfs are stored
-        */
-       struct anv_bo                            *bo;
-       /**
-        * Array of pointers to u_printf_info
-        */
-       struct util_dynarray                      prints;
-    } printf;
+    struct u_printf_ctx printf;
 
     struct {
        simple_mtx_t  mutex;
@@ -2313,7 +2309,6 @@ VkResult anv_device_wait(struct anv_device *device, struct anv_bo *bo,
 
 VkResult anv_device_print_init(struct anv_device *device);
 void anv_device_print_fini(struct anv_device *device);
-void anv_device_print_shader_prints(struct anv_device *device);
 
 void anv_dump_bvh_to_files(struct anv_device *device);
 
@@ -2341,9 +2336,6 @@ anv_queue_post_submit(struct anv_queue *queue, VkResult submit_result)
       if (result != VK_SUCCESS)
          result = vk_queue_set_lost(&queue->vk, "sync wait failed");
    }
-
-   if (INTEL_DEBUG(DEBUG_SHADER_PRINT))
-      anv_device_print_shader_prints(queue->device);
 
 #if ANV_SUPPORT_RT && !ANV_SUPPORT_RT_GRL
    /* The recorded bvh is dumped to files upon command buffer completion */
@@ -4498,6 +4490,14 @@ anv_cmd_buffer_temporary_state_address(struct anv_cmd_buffer *cmd_buffer,
       &cmd_buffer->device->dynamic_state_pool, state);
 }
 
+static inline struct anv_address
+anv_cmd_buffer_gfx_push_constants_state_address(struct anv_cmd_buffer *cmd_buffer,
+                                                struct anv_state state)
+{
+   return anv_state_pool_state_address(
+      &cmd_buffer->device->dynamic_state_pool, state);
+}
+
 void
 anv_cmd_buffer_chain_command_buffers(struct anv_cmd_buffer **cmd_buffers,
                                      uint32_t num_cmd_buffers);
@@ -5207,12 +5207,20 @@ struct anv_format_plane {
    VkImageAspectFlags aspect;
 };
 
+enum anv_format_flag {
+   /* Format supports YCbCr */
+   ANV_FORMAT_FLAG_CAN_YCBCR = BITFIELD_BIT(0),
+   /* Format supports video API */
+   ANV_FORMAT_FLAG_CAN_VIDEO = BITFIELD_BIT(1),
+   /* Format works if custom border colors without format is disabled */
+   ANV_FORMAT_FLAG_NO_CBCWF  = BITFIELD_BIT(2),
+};
+
 struct anv_format {
    struct anv_format_plane planes[3];
    VkFormat vk_format;
    uint8_t n_planes;
-   bool can_ycbcr;
-   bool can_video;
+   enum anv_format_flag flags:8;
 };
 
 static inline void
@@ -5262,37 +5270,38 @@ anv_aspect_to_plane(VkImageAspectFlags all_aspects,
    u_foreach_bit(b, vk_image_expand_aspect_mask(&(image)->vk, aspects))
 
 const struct anv_format *
-anv_get_format(VkFormat format);
+anv_get_format(const struct anv_physical_device *device, VkFormat format);
 
 static inline uint32_t
-anv_get_format_planes(VkFormat vk_format)
+anv_get_format_planes(const struct anv_physical_device *device,
+                      VkFormat vk_format)
 {
-   const struct anv_format *format = anv_get_format(vk_format);
+   const struct anv_format *format = anv_get_format(device, vk_format);
 
    return format != NULL ? format->n_planes : 0;
 }
 
 struct anv_format_plane
-anv_get_format_plane(const struct intel_device_info *devinfo,
+anv_get_format_plane(const struct anv_physical_device *device,
                      VkFormat vk_format, uint32_t plane,
                      VkImageTiling tiling);
 
 struct anv_format_plane
-anv_get_format_aspect(const struct intel_device_info *devinfo,
+anv_get_format_aspect(const struct anv_physical_device *device,
                       VkFormat vk_format,
                       VkImageAspectFlagBits aspect, VkImageTiling tiling);
 
 static inline enum isl_format
-anv_get_isl_format(const struct intel_device_info *devinfo, VkFormat vk_format,
+anv_get_isl_format(const struct anv_physical_device *device, VkFormat vk_format,
                    VkImageAspectFlags aspect, VkImageTiling tiling)
 {
-   return anv_get_format_aspect(devinfo, vk_format, aspect, tiling).isl_format;
+   return anv_get_format_aspect(device, vk_format, aspect, tiling).isl_format;
 }
 
-bool anv_format_supports_ccs_e(const struct intel_device_info *devinfo,
+bool anv_format_supports_ccs_e(const struct anv_physical_device *device,
                                const enum isl_format format);
 
-bool anv_formats_ccs_e_compatible(const struct intel_device_info *devinfo,
+bool anv_formats_ccs_e_compatible(const struct anv_physical_device *device,
                                   VkImageCreateFlags create_flags,
                                   VkFormat vk_format, VkImageTiling vk_tiling,
                                   VkImageUsageFlags vk_usage,
@@ -5421,6 +5430,12 @@ struct anv_image {
     * Image is a WSI image
     */
    bool from_wsi;
+
+   /**
+    * Image is a WSI blit src image, it will never be scanout directly to
+    * display but will be copied to a dma-buf that can be scanout.
+    */
+   bool wsi_blit_src;
 
    /**
     * Image was imported from an struct AHardwareBuffer.  We have to delay

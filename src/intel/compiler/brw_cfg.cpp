@@ -35,8 +35,6 @@
  * blocks with successor/predecessor edges connecting them.
  */
 
-using namespace brw;
-
 static bblock_t *
 pop_stack(exec_list *list)
 {
@@ -106,7 +104,7 @@ bblock_t::is_successor_of(const bblock_t *block,
 }
 
 static bool
-ends_block(const fs_inst *inst)
+ends_block(const brw_inst *inst)
 {
    enum opcode op = inst->opcode;
 
@@ -119,7 +117,7 @@ ends_block(const fs_inst *inst)
 }
 
 static bool
-starts_block(const fs_inst *inst)
+starts_block(const brw_inst *inst)
 {
    enum opcode op = inst->opcode;
 
@@ -160,7 +158,7 @@ bblock_t::dump(FILE *file) const
    const fs_visitor *s = this->cfg->s;
 
    int ip = this->start_ip;
-   foreach_inst_in_block(fs_inst, inst, this) {
+   foreach_inst_in_block(brw_inst, inst, this) {
       fprintf(file, "%5d: ", ip);
       brw_print_instruction(*s, inst, file);
       ip++;
@@ -210,7 +208,7 @@ cfg_t::cfg_t(const fs_visitor *s, exec_list *instructions) :
 
    set_next_block(&cur, entry, ip);
 
-   foreach_in_list_safe(fs_inst, inst, instructions) {
+   foreach_in_list_safe(brw_inst, inst, instructions) {
       /* set_next_block wants the post-incremented ip */
       ip++;
 
@@ -617,7 +615,7 @@ sort_links(util_dynarray *scratch, exec_list *list)
 void
 cfg_t::dump(FILE *file)
 {
-   const idom_tree *idom = (s ? &s->idom_analysis.require() : NULL);
+   const brw_idom_tree *idom = (s ? &s->idom_analysis.require() : NULL);
 
    /* Temporary storage to sort the lists of blocks.  This normalizes the
     * output, making it possible to use it for certain tests.
@@ -648,76 +646,6 @@ cfg_t::dump(FILE *file)
    }
 
    util_dynarray_fini(&scratch);
-}
-
-/* Calculates the immediate dominator of each block, according to "A Simple,
- * Fast Dominance Algorithm" by Keith D. Cooper, Timothy J. Harvey, and Ken
- * Kennedy.
- *
- * The authors claim that for control flow graphs of sizes normally encountered
- * (less than 1000 nodes) that this algorithm is significantly faster than
- * others like Lengauer-Tarjan.
- */
-idom_tree::idom_tree(const fs_visitor *s) :
-   num_parents(s->cfg->num_blocks),
-   parents(new bblock_t *[num_parents]())
-{
-   bool changed;
-
-   parents[0] = s->cfg->blocks[0];
-
-   do {
-      changed = false;
-
-      foreach_block(block, s->cfg) {
-         if (block->num == 0)
-            continue;
-
-         bblock_t *new_idom = NULL;
-         foreach_list_typed(bblock_link, parent_link, link, &block->parents) {
-            if (parent(parent_link->block)) {
-               new_idom = (new_idom ? intersect(new_idom, parent_link->block) :
-                           parent_link->block);
-            }
-         }
-
-         if (parent(block) != new_idom) {
-            parents[block->num] = new_idom;
-            changed = true;
-         }
-      }
-   } while (changed);
-}
-
-idom_tree::~idom_tree()
-{
-   delete[] parents;
-}
-
-bblock_t *
-idom_tree::intersect(bblock_t *b1, bblock_t *b2) const
-{
-   /* Note, the comparisons here are the opposite of what the paper says
-    * because we index blocks from beginning -> end (i.e. reverse post-order)
-    * instead of post-order like they assume.
-    */
-   while (b1->num != b2->num) {
-      while (b1->num > b2->num)
-         b1 = parent(b1);
-      while (b2->num > b1->num)
-         b2 = parent(b2);
-   }
-   assert(b1);
-   return b1;
-}
-
-void
-idom_tree::dump(FILE *file) const
-{
-   fprintf(file, "digraph DominanceTree {\n");
-   for (unsigned i = 0; i < num_parents; i++)
-      fprintf(file, "\t%d -> %d\n", parents[i]->num, i);
-   fprintf(file, "}\n");
 }
 
 void
@@ -808,7 +736,7 @@ cfg_t::validate(const char *stage_abbrev)
          }
       }
 
-      fs_inst *first_inst = block->start();
+      brw_inst *first_inst = block->start();
       if (first_inst->opcode == BRW_OPCODE_DO) {
          /* DO instructions both begin and end a block, so the DO instruction
           * must be the only instruction in the block.

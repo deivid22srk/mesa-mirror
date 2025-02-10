@@ -277,6 +277,10 @@ radv_probe_video_decode(struct radv_physical_device *pdev)
 
    pdev->video_decode_enabled = false;
 
+   /* TODO: Add VCN 5.0+. */
+   if (pdev->info.vcn_ip_version >= VCN_5_0_0)
+      return;
+
    /* The support for decode events are available at the same time as encode */
    if (pdev->info.vcn_ip_version >= VCN_4_0_0) {
       if (pdev->info.vcn_enc_major_version > 1)
@@ -747,8 +751,8 @@ radv_GetPhysicalDeviceVideoCapabilitiesKHR(VkPhysicalDevice physicalDevice, cons
       ext->maxLevelIdc = cap ? cap->max_level : 0;
       ext->maxSliceCount = 1;
       ext->maxPPictureL0ReferenceCount = 1;
-      ext->maxBPictureL0ReferenceCount = 0;
-      ext->maxL1ReferenceCount = 0;
+      ext->maxBPictureL0ReferenceCount = pdev->enc_hw_ver >= RADV_VIDEO_ENC_HW_3 ? 1 : 0;
+      ext->maxL1ReferenceCount = pdev->enc_hw_ver >= RADV_VIDEO_ENC_HW_3 ? 1 : 0;
       ext->maxTemporalLayerCount = 4;
       ext->expectDyadicTemporalLayerPattern = false;
       ext->minQp = 0;
@@ -1519,6 +1523,7 @@ static rvcn_dec_message_av1_t
 get_av1_msg(struct radv_device *device, struct radv_video_session *vid, struct radv_video_session_params *params,
             const struct VkVideoDecodeInfoKHR *frame_info, void *probs_ptr, int *update_reference_slot)
 {
+   const struct radv_physical_device *pdev = radv_device_physical(device);
    rvcn_dec_message_av1_t result;
    unsigned i, j;
    const struct VkVideoDecodeAV1PictureInfoKHR *av1_pic_info =
@@ -1875,7 +1880,7 @@ get_av1_msg(struct radv_device *device, struct radv_video_session *vid, struct r
 
       fg_params->overlap_flag = pi->pFilmGrain->flags.overlap_flag;
       fg_params->clip_to_restricted_range = pi->pFilmGrain->flags.clip_to_restricted_range;
-      ac_vcn_av1_init_film_grain_buffer(fg_params, fg_buf);
+      ac_vcn_av1_init_film_grain_buffer(pdev->av1_version, fg_params, fg_buf);
    }
 
    result.uncompressed_header_size = 0;

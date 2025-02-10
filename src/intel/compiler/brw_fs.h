@@ -27,116 +27,16 @@
 
 #pragma once
 
+#include "brw_analysis.h"
 #include "brw_cfg.h"
 #include "brw_compiler.h"
-#include "brw_ir_allocator.h"
-#include "brw_ir_fs.h"
-#include "brw_fs_live_variables.h"
-#include "brw_ir_performance.h"
+#include "brw_inst.h"
 #include "compiler/nir/nir.h"
-
-struct bblock_t;
-namespace {
-   struct acp_entry;
-}
+#include "brw_analysis.h"
 
 struct fs_visitor;
 
-namespace brw {
-   /**
-    * Register pressure analysis of a shader.  Estimates how many registers
-    * are live at any point of the program in GRF units.
-    */
-   struct register_pressure {
-      register_pressure(const fs_visitor *v);
-      ~register_pressure();
-
-      analysis_dependency_class
-      dependency_class() const
-      {
-         return (DEPENDENCY_INSTRUCTION_IDENTITY |
-                 DEPENDENCY_INSTRUCTION_DATA_FLOW |
-                 DEPENDENCY_VARIABLES);
-      }
-
-      bool
-      validate(const fs_visitor *) const
-      {
-         /* FINISHME */
-         return true;
-      }
-
-      unsigned *regs_live_at_ip;
-   };
-
-   class def_analysis {
-   public:
-      def_analysis(const fs_visitor *v);
-      ~def_analysis();
-
-      fs_inst *
-      get(const brw_reg &reg) const
-      {
-         return reg.file == VGRF && reg.nr < def_count ?
-                def_insts[reg.nr] : NULL;
-      }
-
-      bblock_t *
-      get_block(const brw_reg &reg) const
-      {
-         return reg.file == VGRF && reg.nr < def_count ?
-                def_blocks[reg.nr] : NULL;
-      }
-
-      uint32_t
-      get_use_count(const brw_reg &reg) const
-      {
-         return reg.file == VGRF && reg.nr < def_count ?
-                def_use_counts[reg.nr] : 0;
-      }
-
-      unsigned count() const { return def_count; }
-      unsigned ssa_count() const;
-
-      void print_stats(const fs_visitor *) const;
-
-      analysis_dependency_class
-      dependency_class() const
-      {
-         return DEPENDENCY_INSTRUCTION_IDENTITY |
-                DEPENDENCY_INSTRUCTION_DATA_FLOW |
-                DEPENDENCY_VARIABLES |
-                DEPENDENCY_BLOCKS;
-      }
-
-      bool validate(const fs_visitor *) const;
-
-   private:
-      void mark_invalid(int);
-      bool fully_defines(const fs_visitor *v, fs_inst *);
-      void update_for_reads(const idom_tree &idom, bblock_t *block, fs_inst *);
-      void update_for_write(const fs_visitor *v, bblock_t *block, fs_inst *);
-
-      fs_inst **def_insts;
-      bblock_t **def_blocks;
-      uint32_t *def_use_counts;
-      unsigned def_count;
-   };
-}
-
 #define UBO_START ((1 << 16) - 4)
-
-/**
- * Scratch data used when compiling a GLSL geometry shader.
- */
-struct brw_gs_compile
-{
-   struct brw_gs_prog_key key;
-   struct intel_vue_map input_vue_map;
-
-   unsigned control_data_bits_per_vertex;
-   unsigned control_data_header_size_bits;
-};
 
 class brw_builder;
 
@@ -200,7 +100,6 @@ struct fs_thread_payload : public thread_payload {
    uint8_t source_depth_reg[2];
    uint8_t source_w_reg[2];
    uint8_t aa_dest_stencil_reg[2];
-   uint8_t dest_depth_reg[2];
    uint8_t sample_pos_reg[2];
    uint8_t sample_mask_in_reg[2];
    uint8_t barycentric_coord_reg[INTEL_BARYCENTRIC_MODE_COUNT][2];
@@ -239,21 +138,13 @@ struct task_mesh_thread_payload : public cs_thread_payload {
 struct bs_thread_payload : public thread_payload {
    bs_thread_payload(const fs_visitor &v);
 
+   brw_reg inline_parameter;
+
    brw_reg global_arg_ptr;
    brw_reg local_arg_ptr;
 
    void load_shader_type(const brw_builder &bld, brw_reg &dest) const;
 };
-
-enum instruction_scheduler_mode {
-   SCHEDULE_PRE,
-   SCHEDULE_PRE_NON_LIFO,
-   SCHEDULE_PRE_LIFO,
-   SCHEDULE_POST,
-   SCHEDULE_NONE,
-};
-
-class instruction_scheduler;
 
 enum brw_shader_phase {
    BRW_SHADER_PHASE_INITIAL = 0,
@@ -293,24 +184,17 @@ public:
               unsigned num_polygons,
               bool needs_register_pressure,
               bool debug_enabled);
-   fs_visitor(const struct brw_compiler *compiler,
-              const struct brw_compile_params *params,
-              struct brw_gs_compile *gs_compile,
-              struct brw_gs_prog_data *prog_data,
-              const nir_shader *shader,
-              bool needs_register_pressure,
-              bool debug_enabled);
    void init();
    ~fs_visitor();
 
    void import_uniforms(fs_visitor *v);
 
    void assign_curb_setup();
-   void convert_attr_sources_to_hw_regs(fs_inst *inst);
+   void convert_attr_sources_to_hw_regs(brw_inst *inst);
    void calculate_payload_ranges(bool allow_spilling,
                                  unsigned payload_node_count,
                                  int *payload_last_use_ip) const;
-   void invalidate_analysis(brw::analysis_dependency_class c);
+   void invalidate_analysis(brw_analysis_dependency_class c);
 
    void vfail(const char *msg, va_list args);
    void fail(const char *msg, ...);
@@ -332,7 +216,7 @@ public:
    /** ralloc context for temporary data used during compile */
    void *mem_ctx;
 
-   /** List of fs_inst. */
+   /** List of brw_inst. */
    exec_list instructions;
 
    cfg_t *cfg;
@@ -340,19 +224,26 @@ public:
    gl_shader_stage stage;
    bool debug_enabled;
 
-   brw::simple_allocator alloc;
+   /* VGRF allocation. */
+   struct {
+      /** Array of sizes for each allocation, in REG_SIZE units. */
+      unsigned *sizes;
+
+      /** Total number of VGRFs allocated. */
+      unsigned count;
+
+      unsigned capacity;
+   } alloc;
 
    const brw_base_prog_key *const key;
 
-   struct brw_gs_compile *gs_compile;
-
    struct brw_stage_prog_data *prog_data;
 
-   brw_analysis<brw::fs_live_variables, fs_visitor> live_analysis;
-   brw_analysis<brw::register_pressure, fs_visitor> regpressure_analysis;
-   brw_analysis<brw::performance, fs_visitor> performance_analysis;
-   brw_analysis<brw::idom_tree, fs_visitor> idom_analysis;
-   brw_analysis<brw::def_analysis, fs_visitor> def_analysis;
+   brw_analysis<brw_live_variables, fs_visitor> live_analysis;
+   brw_analysis<brw_register_pressure, fs_visitor> regpressure_analysis;
+   brw_analysis<brw_performance, fs_visitor> performance_analysis;
+   brw_analysis<brw_idom_tree, fs_visitor> idom_analysis;
+   brw_analysis<brw_def_analysis, fs_visitor> def_analysis;
 
    /** Number of uniform variable components visited. */
    unsigned uniforms;
@@ -435,6 +326,11 @@ public:
    brw_reg control_data_bits;
    brw_reg invocation_id;
 
+   struct {
+      unsigned control_data_bits_per_vertex;
+      unsigned control_data_header_size_bits;
+   } gs;
+
    unsigned grf_used;
    bool spilled_any_registers;
    bool needs_register_pressure;
@@ -457,9 +353,9 @@ public:
 
 void brw_print_instructions(const fs_visitor &s, FILE *file = stderr);
 
-void brw_print_instruction(const fs_visitor &s, const fs_inst *inst,
+void brw_print_instruction(const fs_visitor &s, const brw_inst *inst,
                            FILE *file = stderr,
-                           const brw::def_analysis *defs = nullptr);
+                           const brw_def_analysis *defs = nullptr);
 
 void brw_print_swsb(FILE *f, const struct intel_device_info *devinfo, const tgl_swsb swsb);
 
@@ -475,18 +371,16 @@ sample_mask_flag_subreg(const fs_visitor &s)
    return 2;
 }
 
-namespace brw {
-   inline brw_reg
-   dynamic_msaa_flags(const struct brw_wm_prog_data *wm_prog_data)
-   {
-      return brw_uniform_reg(wm_prog_data->msaa_flags_param, BRW_TYPE_UD);
-   }
+inline brw_reg
+brw_dynamic_msaa_flags(const struct brw_wm_prog_data *wm_prog_data)
+{
+   return brw_uniform_reg(wm_prog_data->msaa_flags_param, BRW_TYPE_UD);
 }
 
 enum intel_barycentric_mode brw_barycentric_mode(const struct brw_wm_prog_key *key,
                                                  nir_intrinsic_instr *intr);
 
-uint32_t brw_fb_write_msg_control(const fs_inst *inst,
+uint32_t brw_fb_write_msg_control(const brw_inst *inst,
                                   const struct brw_wm_prog_data *prog_data);
 
 void brw_compute_urb_setup_index(struct brw_wm_prog_data *wm_prog_data);
@@ -494,7 +388,7 @@ void brw_compute_urb_setup_index(struct brw_wm_prog_data *wm_prog_data);
 int brw_get_subgroup_id_param_index(const intel_device_info *devinfo,
                                     const brw_stage_prog_data *prog_data);
 
-void nir_to_brw(fs_visitor *s);
+void brw_from_nir(fs_visitor *s);
 
 void brw_shader_phase_update(fs_visitor &s, enum brw_shader_phase phase);
 
@@ -508,9 +402,19 @@ void brw_calculate_cfg(fs_visitor &s);
 
 void brw_optimize(fs_visitor &s);
 
-instruction_scheduler *brw_prepare_scheduler(fs_visitor &s, void *mem_ctx);
-void brw_schedule_instructions_pre_ra(fs_visitor &s, instruction_scheduler *sched,
-                                      instruction_scheduler_mode mode);
+enum brw_instruction_scheduler_mode {
+   BRW_SCHEDULE_PRE,
+   BRW_SCHEDULE_PRE_NON_LIFO,
+   BRW_SCHEDULE_PRE_LIFO,
+   BRW_SCHEDULE_POST,
+   BRW_SCHEDULE_NONE,
+};
+
+class brw_instruction_scheduler;
+
+brw_instruction_scheduler *brw_prepare_scheduler(fs_visitor &s, void *mem_ctx);
+void brw_schedule_instructions_pre_ra(fs_visitor &s, brw_instruction_scheduler *sched,
+                                      brw_instruction_scheduler_mode mode);
 void brw_schedule_instructions_post_ra(fs_visitor &s);
 
 void brw_allocate_registers(fs_visitor &s, bool allow_spilling);
@@ -535,9 +439,10 @@ bool brw_lower_regioning(fs_visitor &s);
 bool brw_lower_scalar_fp64_MAD(fs_visitor &s);
 bool brw_lower_scoreboard(fs_visitor &s);
 bool brw_lower_send_descriptors(fs_visitor &s);
+bool brw_lower_send_gather(fs_visitor &s);
 bool brw_lower_sends_overlapping_payload(fs_visitor &s);
 bool brw_lower_simd_width(fs_visitor &s);
-bool brw_lower_src_modifiers(fs_visitor &s, bblock_t *block, fs_inst *inst, unsigned i);
+bool brw_lower_src_modifiers(fs_visitor &s, bblock_t *block, brw_inst *inst, unsigned i);
 bool brw_lower_sub_sat(fs_visitor &s);
 bool brw_lower_subgroup_ops(fs_visitor &s);
 bool brw_lower_uniform_pull_constant_loads(fs_visitor &s);
@@ -550,7 +455,7 @@ bool brw_opt_cmod_propagation(fs_visitor &s);
 bool brw_opt_combine_constants(fs_visitor &s);
 bool brw_opt_combine_convergent_txf(fs_visitor &s);
 bool brw_opt_compact_virtual_grfs(fs_visitor &s);
-bool brw_opt_constant_fold_instruction(const intel_device_info *devinfo, fs_inst *inst);
+bool brw_opt_constant_fold_instruction(const intel_device_info *devinfo, brw_inst *inst);
 bool brw_opt_copy_propagation(fs_visitor &s);
 bool brw_opt_copy_propagation_defs(fs_visitor &s);
 bool brw_opt_cse_defs(fs_visitor &s);
@@ -560,6 +465,8 @@ bool brw_opt_register_coalesce(fs_visitor &s);
 bool brw_opt_remove_extra_rounding_modes(fs_visitor &s);
 bool brw_opt_remove_redundant_halts(fs_visitor &s);
 bool brw_opt_saturate_propagation(fs_visitor &s);
+bool brw_opt_send_gather_to_send(fs_visitor &s);
+bool brw_opt_send_to_send_gather(fs_visitor &s);
 bool brw_opt_split_sends(fs_visitor &s);
 bool brw_opt_split_virtual_grfs(fs_visitor &s);
 bool brw_opt_zero_samples(fs_visitor &s);
@@ -571,4 +478,7 @@ bool brw_workaround_source_arf_before_eot(fs_visitor &s);
 
 /* Helpers. */
 unsigned brw_get_lowered_simd_width(const fs_visitor *shader,
-                                    const fs_inst *inst);
+                                    const brw_inst *inst);
+
+brw_reg brw_allocate_vgrf(fs_visitor &s, brw_reg_type type, unsigned count);
+brw_reg brw_allocate_vgrf_units(fs_visitor &s, unsigned units_of_REGSIZE);

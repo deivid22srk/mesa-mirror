@@ -34,53 +34,6 @@
 
 #include <memory>
 
-using namespace brw;
-
-static bool
-brw_nir_lower_load_uniforms_filter(const nir_instr *instr,
-                                   UNUSED const void *data)
-{
-   if (instr->type != nir_instr_type_intrinsic)
-      return false;
-   nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
-   return intrin->intrinsic == nir_intrinsic_load_uniform;
-}
-
-static nir_def *
-brw_nir_lower_load_uniforms_impl(nir_builder *b, nir_instr *instr,
-                                 void *data)
-{
-   assert(instr->type == nir_instr_type_intrinsic);
-   nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
-   assert(intrin->intrinsic == nir_intrinsic_load_uniform);
-
-   /* Use the first few bytes of InlineData as push constants. */
-   if (nir_src_is_const(intrin->src[0])) {
-      int offset =
-         BRW_TASK_MESH_PUSH_CONSTANTS_START_DW * 4 +
-         nir_intrinsic_base(intrin) + nir_src_as_uint(intrin->src[0]);
-      int range = intrin->def.num_components * intrin->def.bit_size / 8;
-      if ((offset + range) <= (int)(BRW_TASK_MESH_INLINE_DATA_SIZE_DW * 4)) {
-         return nir_load_inline_data_intel(b,
-                                           intrin->def.num_components,
-                                           intrin->def.bit_size,
-                                           .base = offset);
-      }
-   }
-
-   return brw_nir_load_global_const(b, intrin,
-                                    nir_load_inline_data_intel(b, 1, 64, 0), 0);
-}
-
-static bool
-brw_nir_lower_load_uniforms(nir_shader *nir,
-                            const struct intel_device_info *devinfo)
-{
-   return nir_shader_lower_instructions(nir, brw_nir_lower_load_uniforms_filter,
-                                        brw_nir_lower_load_uniforms_impl,
-                                        (void *)devinfo);
-}
-
 static inline int
 type_size_scalar_dwords(const struct glsl_type *type, bool bindless)
 {
@@ -265,15 +218,83 @@ brw_nir_align_launch_mesh_workgroups(nir_shader *nir)
                                        NULL);
 }
 
+static bool
+lower_set_vtx_and_prim_to_temp_write(nir_builder *b,
+                                     nir_intrinsic_instr *intrin,
+                                     void *data)
+{
+   if (intrin->intrinsic != nir_intrinsic_set_vertex_and_primitive_count)
+      return false;
+
+   /* Detect some cases of invalid primitive count. They might lead to URB
+    * memory corruption, where workgroups overwrite each other output memory.
+    */
+   if (nir_src_is_const(intrin->src[1]) &&
+       nir_src_as_uint(intrin->src[1]) > b->shader->info.mesh.max_primitives_out)
+      unreachable("number of primitives bigger than max specified");
+
+   b->cursor = nir_instr_remove(&intrin->instr);
+
+   nir_variable *temporary_primitive_count = (nir_variable *)data;
+   nir_store_var(b, temporary_primitive_count, intrin->src[1].ssa, 0x1);
+
+   return true;
+}
+
+static bool
+brw_nir_lower_mesh_primitive_count(nir_shader *nir)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+
+   nir_variable *temporary_primitive_count =
+      nir_local_variable_create(impl,
+                                glsl_uint_type(),
+                                "__temp_primitive_count");
+
+   nir_shader_intrinsics_pass(nir,
+                              lower_set_vtx_and_prim_to_temp_write,
+                              nir_metadata_control_flow,
+                              temporary_primitive_count);
+
+   nir_builder _b = nir_builder_at(nir_before_impl(impl)), *b = &_b;
+
+   nir_store_var(b, temporary_primitive_count, nir_imm_int(b, 0), 0x1);
+
+   b->cursor = nir_after_impl(impl);
+
+   /* Have a single lane write the primitive count */
+   nir_def *local_invocation_index = nir_load_local_invocation_index(b);
+   nir_push_if(b, nir_ieq_imm(b, local_invocation_index, 0));
+   {
+      nir_variable *final_primitive_count =
+         nir_create_variable_with_location(nir, nir_var_shader_out,
+                                           VARYING_SLOT_PRIMITIVE_COUNT,
+                                           glsl_uint_type());
+      final_primitive_count->name = ralloc_strdup(final_primitive_count,
+                                                  "gl_PrimitiveCountNV");
+      final_primitive_count->data.interpolation = INTERP_MODE_NONE;
+
+      nir_store_var(b, final_primitive_count,
+                    nir_load_var(b, temporary_primitive_count), 0x1);
+   }
+   nir_pop_if(b, NULL);
+
+   nir_metadata_preserve(impl, nir_metadata_none);
+
+   nir->info.outputs_written |= VARYING_BIT_PRIMITIVE_COUNT;
+
+   return true;
+}
+
 static void
 brw_emit_urb_fence(fs_visitor &s)
 {
    const brw_builder bld1 = brw_builder(&s).at_end().exec_all().group(1, 0);
    brw_reg dst = bld1.vgrf(BRW_TYPE_UD);
-   fs_inst *fence = bld1.emit(SHADER_OPCODE_MEMORY_FENCE, dst,
+   brw_inst *fence = bld1.emit(SHADER_OPCODE_MEMORY_FENCE, dst,
                               brw_vec8_grf(0, 0),
-                              brw_imm_ud(true),
-                              brw_imm_ud(0));
+                              brw_imm_ud(true));
+   fence->size_written = REG_SIZE * reg_unit(s.devinfo);
    fence->sfid = BRW_SFID_URB;
    /* The logical thing here would likely be a THREADGROUP fence but that's
     * still failing some tests like in dEQP-VK.mesh_shader.ext.query.*
@@ -300,7 +321,7 @@ run_task_mesh(fs_visitor &s, bool allow_spilling)
 
    s.payload_ = new task_mesh_thread_payload(s);
 
-   nir_to_brw(&s);
+   brw_from_nir(&s);
 
    if (s.failed)
       return false;
@@ -330,6 +351,7 @@ const unsigned *
 brw_compile_task(const struct brw_compiler *compiler,
                  struct brw_compile_task_params *params)
 {
+   const struct intel_device_info *devinfo = compiler->devinfo;
    struct nir_shader *nir = params->base.nir;
    const struct brw_task_prog_key *key = params->key;
    struct brw_task_prog_data *prog_data = params->prog_data;
@@ -362,8 +384,8 @@ brw_compile_task(const struct brw_compiler *compiler,
    prog_data->uses_drawid =
       BITSET_TEST(nir->info.system_values_read, SYSTEM_VALUE_DRAW_ID);
 
-   NIR_PASS(_, nir, brw_nir_lower_load_uniforms, compiler->devinfo);
-   prog_data->base.uses_inline_data = brw_nir_uses_inline_data(nir);
+   prog_data->base.uses_inline_data = brw_nir_uses_inline_data(nir) ||
+                                      key->base.uses_inline_push_addr;
 
    brw_simd_selection_state simd_state{
       .devinfo = compiler->devinfo,
@@ -373,7 +395,9 @@ brw_compile_task(const struct brw_compiler *compiler,
 
    std::unique_ptr<fs_visitor> v[3];
 
-   for (unsigned simd = 0; simd < 3; simd++) {
+   for (unsigned i = 0; i < 3; i++) {
+      const unsigned simd = devinfo->ver >= 30 ? 2 - i : i;
+
       if (!brw_simd_should_compile(simd_state, simd))
          continue;
 
@@ -399,11 +423,16 @@ brw_compile_task(const struct brw_compiler *compiler,
          v[simd]->import_uniforms(v[first].get());
       }
 
-      const bool allow_spilling = !brw_simd_any_compiled(simd_state);
-      if (run_task_mesh(*v[simd], allow_spilling))
+      const bool allow_spilling = simd == 0 ||
+         (!simd_state.compiled[simd - 1] && !brw_simd_should_compile(simd_state, simd - 1));
+      if (run_task_mesh(*v[simd], allow_spilling)) {
          brw_simd_mark_compiled(simd_state, simd, v[simd]->spilled_any_registers);
-      else
+
+         if (devinfo->ver >= 30 && !v[simd]->spilled_any_registers)
+            break;
+      } else {
          simd_state.error[simd] = ralloc_strdup(params->base.mem_ctx, v[simd]->fail_msg);
+      }
    }
 
    int selected_simd = brw_simd_select(simd_state);
@@ -419,6 +448,8 @@ brw_compile_task(const struct brw_compiler *compiler,
 
    fs_visitor *selected = v[selected_simd].get();
    prog_data->base.prog_mask = 1 << selected_simd;
+   prog_data->base.base.grf_used = MAX2(prog_data->base.base.grf_used,
+                                        selected->grf_used);
 
    if (unlikely(debug_enabled)) {
       fprintf(stderr, "Task Output ");
@@ -1620,6 +1651,7 @@ const unsigned *
 brw_compile_mesh(const struct brw_compiler *compiler,
                  struct brw_compile_mesh_params *params)
 {
+   const struct intel_device_info *devinfo = compiler->devinfo;
    struct nir_shader *nir = params->base.nir;
    const struct brw_mesh_prog_key *key = params->key;
    struct brw_mesh_prog_data *prog_data = params->prog_data;
@@ -1651,6 +1683,10 @@ brw_compile_mesh(const struct brw_compiler *compiler,
    prog_data->uses_drawid =
       BITSET_TEST(nir->info.system_values_read, SYSTEM_VALUE_DRAW_ID);
 
+   NIR_PASS(_, nir, brw_nir_lower_mesh_primitive_count);
+   NIR_PASS(_, nir, nir_opt_dce);
+   NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_shader_out, NULL);
+
    brw_nir_lower_tue_inputs(nir, params->tue_map);
 
    brw_compute_mue_map(compiler, nir, &prog_data->map,
@@ -1659,8 +1695,8 @@ brw_compile_mesh(const struct brw_compiler *compiler,
 
    prog_data->autostrip_enable = brw_mesh_autostrip_enable(compiler, nir, &prog_data->map);
 
-   NIR_PASS(_, nir, brw_nir_lower_load_uniforms, compiler->devinfo);
-   prog_data->base.uses_inline_data = brw_nir_uses_inline_data(nir);
+   prog_data->base.uses_inline_data = brw_nir_uses_inline_data(nir) ||
+                                      key->base.uses_inline_push_addr;
 
    brw_simd_selection_state simd_state{
       .devinfo = compiler->devinfo,
@@ -1670,7 +1706,9 @@ brw_compile_mesh(const struct brw_compiler *compiler,
 
    std::unique_ptr<fs_visitor> v[3];
 
-   for (int simd = 0; simd < 3; simd++) {
+   for (unsigned i = 0; i < 3; i++) {
+      const unsigned simd = devinfo->ver >= 30 ? 2 - i : i;
+
       if (!brw_simd_should_compile(simd_state, simd))
          continue;
 
@@ -1708,11 +1746,16 @@ brw_compile_mesh(const struct brw_compiler *compiler,
          v[simd]->import_uniforms(v[first].get());
       }
 
-      const bool allow_spilling = !brw_simd_any_compiled(simd_state);
-      if (run_task_mesh(*v[simd], allow_spilling))
+      const bool allow_spilling = simd == 0 ||
+         (!simd_state.compiled[simd - 1] && !brw_simd_should_compile(simd_state, simd - 1));
+      if (run_task_mesh(*v[simd], allow_spilling)) {
          brw_simd_mark_compiled(simd_state, simd, v[simd]->spilled_any_registers);
-      else
+
+         if (devinfo->ver >= 30 && !v[simd]->spilled_any_registers)
+            break;
+      } else {
          simd_state.error[simd] = ralloc_strdup(params->base.mem_ctx, v[simd]->fail_msg);
+      }
    }
 
    int selected_simd = brw_simd_select(simd_state);
@@ -1728,6 +1771,8 @@ brw_compile_mesh(const struct brw_compiler *compiler,
 
    fs_visitor *selected = v[selected_simd].get();
    prog_data->base.prog_mask = 1 << selected_simd;
+   prog_data->base.base.grf_used = MAX2(prog_data->base.base.grf_used,
+                                        selected->grf_used);
 
    if (unlikely(debug_enabled)) {
       if (params->tue_map) {

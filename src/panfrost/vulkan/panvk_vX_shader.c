@@ -30,10 +30,12 @@
 #include "genxml/gen_macros.h"
 
 #include "panvk_cmd_buffer.h"
+#include "panvk_descriptor_set_layout.h"
 #include "panvk_device.h"
 #include "panvk_instance.h"
 #include "panvk_mempool.h"
 #include "panvk_physical_device.h"
+#include "panvk_sampler.h"
 #include "panvk_shader.h"
 
 #include "spirv/nir_spirv.h"
@@ -45,7 +47,9 @@
 #include "nir_deref.h"
 
 #include "vk_graphics_state.h"
+#include "vk_nir_convert_ycbcr.h"
 #include "vk_shader_module.h"
+#include "vk_ycbcr_conversion.h"
 
 #include "compiler/bifrost_nir.h"
 #include "pan_shader.h"
@@ -620,6 +624,37 @@ lower_load_push_consts(nir_shader *nir, struct panvk_shader *shader)
             nir_metadata_control_flow, shader);
 }
 
+struct lower_ycbcr_state {
+   uint32_t set_layout_count;
+   struct vk_descriptor_set_layout *const *set_layouts;
+};
+
+static const struct vk_ycbcr_conversion_state *
+lookup_ycbcr_conversion(const void *_state, uint32_t set,
+                        uint32_t binding, uint32_t array_index)
+{
+   const struct lower_ycbcr_state *state = _state;
+   assert(set < state->set_layout_count);
+   assert(state->set_layouts[set] != NULL);
+   const struct panvk_descriptor_set_layout *set_layout =
+      to_panvk_descriptor_set_layout(state->set_layouts[set]);
+   assert(binding < set_layout->binding_count);
+
+   const struct panvk_descriptor_set_binding_layout *bind_layout =
+      &set_layout->bindings[binding];
+
+   if (bind_layout->immutable_samplers == NULL)
+      return NULL;
+
+   array_index = MIN2(array_index, bind_layout->desc_count - 1);
+
+   const struct panvk_sampler *sampler =
+      bind_layout->immutable_samplers[array_index];
+
+   return sampler && sampler->vk.ycbcr_conversion ?
+          &sampler->vk.ycbcr_conversion->state : NULL;
+}
+
 static void
 panvk_lower_nir(struct panvk_device *dev, nir_shader *nir,
                 uint32_t set_layout_count,
@@ -648,6 +683,26 @@ panvk_lower_nir(struct panvk_device *dev, nir_shader *nir,
       NIR_PASS(_, nir, nir_lower_io_to_temporaries,
                nir_shader_get_entrypoint(nir), true, false);
    }
+#endif
+
+   /* Lower input intrinsics for fragment shaders early to get the max
+    * number of varying loads, as this number is required during descriptor
+    * lowering for v9+. */
+   if (stage == MESA_SHADER_FRAGMENT) {
+      nir_assign_io_var_locations(nir, nir_var_shader_in, &nir->num_inputs,
+                                  stage);
+#if PAN_ARCH >= 9
+      shader->desc_info.max_varying_loads = nir->num_inputs;
+#endif
+   }
+
+#if PAN_ARCH >= 10
+   const struct lower_ycbcr_state ycbcr_state = {
+      .set_layout_count = set_layout_count,
+      .set_layouts = set_layouts,
+   };
+   NIR_PASS(_, nir, nir_vk_lower_ycbcr_tex, lookup_ycbcr_conversion,
+            &ycbcr_state);
 #endif
 
    panvk_per_arch(nir_lower_descriptors)(nir, dev, rs, set_layout_count,
@@ -706,7 +761,8 @@ panvk_lower_nir(struct panvk_device *dev, nir_shader *nir,
                 var->data.location <= VERT_ATTRIB_GENERIC15);
          var->data.driver_location = var->data.location - VERT_ATTRIB_GENERIC0;
       }
-   } else {
+   } else if (stage != MESA_SHADER_FRAGMENT) {
+      /* Input varyings in fragment shader have been lowered early. */
       nir_assign_io_var_locations(nir, nir_var_shader_in, &nir->num_inputs,
                                   stage);
    }
@@ -1050,6 +1106,12 @@ panvk_compile_shader(struct panvk_device *dev,
    panvk_lower_nir(dev, nir, info->set_layout_count, info->set_layouts,
                    info->robustness, noperspective_varyings, &inputs, shader);
 
+#if PAN_ARCH >= 9
+   if (info->stage == MESA_SHADER_FRAGMENT)
+      /* Use LD_VAR_BUF[_IMM] for varyings if possible. */
+      inputs.valhall.use_ld_var_buf = panvk_use_ld_var_buf(shader);
+#endif
+
    result = panvk_compile_nir(dev, nir, info->flags, &inputs, shader);
 
    /* We need to update info.push.count because it's used to initialize the
@@ -1097,9 +1159,6 @@ panvk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
                                     pAllocator,
                                     &shaders_out[i]);
 
-      /* Clean up NIR for the current shader */
-      ralloc_free(infos[i].nir);
-
       if (result != VK_SUCCESS)
          goto err_cleanup;
 
@@ -1112,6 +1171,9 @@ panvk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
          use_static_noperspective = true;
          noperspective_varyings = shader->info.varyings.noperspective;
       }
+
+      /* Clean up NIR for the current shader */
+      ralloc_free(infos[i].nir);
    }
 
    /* TODO: If we get multiple shaders here, we can perform part of the link
@@ -1121,11 +1183,11 @@ panvk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
 
 err_cleanup:
    /* Clean up all the shaders before this point */
-   for (uint32_t j = 0; j < i; j++)
+   for (int32_t j = shader_count - 1; j > i; j--)
       panvk_shader_destroy(&dev->vk, shaders_out[j], pAllocator);
 
-   /* Clean up all the NIR after this point */
-   for (uint32_t j = i + 1; j < shader_count; j++)
+   /* Clean up all the NIR from this point */
+   for (int32_t j = i; j >= 0; j--)
       ralloc_free(infos[j].nir);
 
    /* Memset the output array */
@@ -1173,6 +1235,7 @@ shader_desc_info_deserialize(struct blob_reader *blob,
 #else
    shader->desc_info.dyn_bufs.count = blob_read_uint32(blob);
    blob_copy_bytes(blob, shader->desc_info.dyn_bufs.map,
+                   sizeof(*shader->desc_info.dyn_bufs.map) *
                    shader->desc_info.dyn_bufs.count);
 #endif
 
@@ -1273,7 +1336,7 @@ shader_desc_info_serialize(struct blob *blob, const struct panvk_shader *shader)
    blob_write_uint32(blob, shader->desc_info.dyn_bufs.count);
    blob_write_bytes(blob, shader->desc_info.dyn_bufs.map,
                     sizeof(*shader->desc_info.dyn_bufs.map) *
-                       shader->desc_info.dyn_bufs.count);
+                    shader->desc_info.dyn_bufs.count);
 #endif
 }
 

@@ -694,6 +694,10 @@ blorp_emit_vs_config(struct blorp_batch *batch,
 #if GFX_VER < 20
          vs.SIMD8DispatchEnable = true;
 #endif
+
+#if GFX_VER >= 30
+         vs.RegistersPerThread = ptl_register_blocks(vs_prog_data->base.base.grf_used);
+#endif
       }
    }
 }
@@ -890,6 +894,10 @@ blorp_emit_ps_config(struct blorp_batch *batch,
          ps.KernelStartPointer2 = params->wm_prog_kernel +
                                   brw_wm_prog_data_prog_offset(prog_data, ps, 2);
 #endif
+
+#if GFX_VER >= 30
+         ps.RegistersPerThread = ptl_register_blocks(prog_data->base.grf_used);
+#endif
       }
    }
 
@@ -967,6 +975,9 @@ blorp_emit_blend_state(struct blorp_batch *batch,
             .WriteDisableGreen = params->color_write_disable & 2,
             .WriteDisableBlue = params->color_write_disable & 4,
             .WriteDisableAlpha = params->color_write_disable & 8,
+#if GFX_VER >= 30
+            .SimpleFloatBlendEnable = true,
+#endif
          };
          GENX(BLEND_STATE_ENTRY_pack)(NULL, pos, &entry);
          pos += GENX(BLEND_STATE_ENTRY_length);
@@ -1740,6 +1751,9 @@ blorp_exec_compute(struct blorp_batch *batch, const struct blorp_params *params)
                                                          dispatch.group_size,
                                                          dispatch.simd_size),
          .NumberOfBarriers = cs_prog_data->uses_barrier,
+#if GFX_VER >= 30
+         .RegistersPerThread = ptl_register_blocks(prog_data->grf_used),
+#endif
       },
    };
 

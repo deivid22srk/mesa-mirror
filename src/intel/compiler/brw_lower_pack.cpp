@@ -26,14 +26,12 @@
 #include "brw_cfg.h"
 #include "brw_builder.h"
 
-using namespace brw;
-
 bool
 brw_lower_pack(fs_visitor &s)
 {
    bool progress = false;
 
-   foreach_block_and_inst_safe(block, fs_inst, inst, s.cfg) {
+   foreach_block_and_inst_safe(block, brw_inst, inst, s.cfg) {
       if (inst->opcode != FS_OPCODE_PACK &&
           inst->opcode != FS_OPCODE_PACK_HALF_2x16_SPLIT)
          continue;
@@ -79,7 +77,7 @@ brw_lower_pack(fs_visitor &s)
    }
 
    if (progress)
-      s.invalidate_analysis(DEPENDENCY_INSTRUCTIONS);
+      s.invalidate_analysis(BRW_DEPENDENCY_INSTRUCTIONS);
 
    return progress;
 }

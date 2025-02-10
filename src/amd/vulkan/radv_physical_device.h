@@ -80,6 +80,8 @@ struct radv_physical_device {
    uint8_t device_uuid[VK_UUID_SIZE];
    uint8_t cache_uuid[VK_UUID_SIZE];
 
+   struct disk_cache *disk_cache_meta;
+
    struct ac_addrlib *addrlib;
 
    int local_fd;
@@ -193,13 +195,13 @@ radv_physical_device_instance(const struct radv_physical_device *pdev)
 }
 
 static inline bool
-radv_sparse_queue_enabled(const struct radv_physical_device *pdev)
+radv_dedicated_sparse_queue_enabled(const struct radv_physical_device *pdev)
 {
    const struct radv_instance *instance = radv_physical_device_instance(pdev);
 
    /* Dedicated sparse queue requires VK_QUEUE_SUBMIT_MODE_THREADED, which is incompatible with
     * VK_DEVICE_TIMELINE_MODE_EMULATED. */
-   return pdev->info.has_timeline_syncobj && !instance->drirc.legacy_sparse_binding;
+   return pdev->info.has_timeline_syncobj && !instance->drirc.disable_dedicated_sparse_queue;
 }
 
 static inline bool

@@ -72,29 +72,39 @@ static void
 end_debug_marker(VkCommandBuffer commandBuffer)
 {
    ANV_FROM_HANDLE(anv_cmd_buffer, cmd_buffer, commandBuffer);
+   struct anv_cmd_compute_state *comp_state = &cmd_buffer->state.compute;
+   struct anv_compute_pipeline *pipeline =
+      anv_pipeline_to_compute(comp_state->base.pipeline);
 
    cmd_buffer->state.rt.debug_marker_count--;
    switch (cmd_buffer->state.rt.debug_markers[cmd_buffer->state.rt.debug_marker_count]) {
    case VK_ACCELERATION_STRUCTURE_BUILD_STEP_TOP:
-      trace_intel_end_as_build(&cmd_buffer->trace);
+      trace_intel_end_as_build(&cmd_buffer->trace,
+                               pipeline->source_hash);
       break;
    case VK_ACCELERATION_STRUCTURE_BUILD_STEP_BUILD_LEAVES:
-      trace_intel_end_as_build_leaves(&cmd_buffer->trace);
+      trace_intel_end_as_build_leaves(&cmd_buffer->trace,
+                                      pipeline->source_hash);
       break;
    case VK_ACCELERATION_STRUCTURE_BUILD_STEP_MORTON_GENERATE:
-      trace_intel_end_as_morton_generate(&cmd_buffer->trace);
+      trace_intel_end_as_morton_generate(&cmd_buffer->trace,
+                                         pipeline->source_hash);
       break;
    case VK_ACCELERATION_STRUCTURE_BUILD_STEP_MORTON_SORT:
-      trace_intel_end_as_morton_sort(&cmd_buffer->trace);
+      trace_intel_end_as_morton_sort(&cmd_buffer->trace,
+                                     pipeline->source_hash);
       break;
    case VK_ACCELERATION_STRUCTURE_BUILD_STEP_LBVH_BUILD_INTERNAL:
-      trace_intel_end_as_lbvh_build_internal(&cmd_buffer->trace);
+      trace_intel_end_as_lbvh_build_internal(&cmd_buffer->trace,
+                                             pipeline->source_hash);
       break;
    case VK_ACCELERATION_STRUCTURE_BUILD_STEP_PLOC_BUILD_INTERNAL:
-      trace_intel_end_as_ploc_build_internal(&cmd_buffer->trace);
+      trace_intel_end_as_ploc_build_internal(&cmd_buffer->trace,
+                                             pipeline->source_hash);
       break;
    case VK_ACCELERATION_STRUCTURE_BUILD_STEP_ENCODE:
-      trace_intel_end_as_encode(&cmd_buffer->trace);
+      trace_intel_end_as_encode(&cmd_buffer->trace,
+                                pipeline->source_hash);
       break;
    default:
       unreachable("Invalid build step");
@@ -693,18 +703,6 @@ genX(CmdBuildAccelerationStructuresKHR)(
 }
 
 void
-genX(CmdBuildAccelerationStructuresIndirectKHR)(
-    VkCommandBuffer                             commandBuffer,
-    uint32_t                                    infoCount,
-    const VkAccelerationStructureBuildGeometryInfoKHR* pInfos,
-    const VkDeviceAddress*                      pIndirectDeviceAddresses,
-    const uint32_t*                             pIndirectStrides,
-    const uint32_t* const*                      ppMaxPrimitiveCounts)
-{
-   unreachable("Unimplemented");
-}
-
-void
 genX(CmdCopyAccelerationStructureKHR)(
     VkCommandBuffer                             commandBuffer,
     const VkCopyAccelerationStructureInfoKHR*   pInfo)
@@ -724,6 +722,10 @@ genX(CmdCopyAccelerationStructureKHR)(
       vk_command_buffer_set_error(&cmd_buffer->vk, result);
       return;
    }
+
+   ANV_FROM_HANDLE(anv_pipeline, anv_pipeline, pipeline);
+   struct anv_compute_pipeline *compute_pipeline =
+      anv_pipeline_to_compute(anv_pipeline);
 
    struct anv_cmd_saved_state saved;
    anv_cmd_buffer_save_state(cmd_buffer,
@@ -767,7 +769,8 @@ genX(CmdCopyAccelerationStructureKHR)(
 
    anv_cmd_buffer_restore_state(cmd_buffer, &saved);
 
-   trace_intel_end_as_copy(&cmd_buffer->trace);
+   trace_intel_end_as_copy(&cmd_buffer->trace,
+                           compute_pipeline->source_hash);
 }
 
 void
@@ -791,6 +794,10 @@ genX(CmdCopyAccelerationStructureToMemoryKHR)(
       vk_command_buffer_set_error(&cmd_buffer->vk, result);
       return;
    }
+
+   ANV_FROM_HANDLE(anv_pipeline, anv_pipeline, pipeline);
+   struct anv_compute_pipeline *compute_pipeline =
+      anv_pipeline_to_compute(anv_pipeline);
 
    struct anv_cmd_saved_state saved;
    anv_cmd_buffer_save_state(cmd_buffer,
@@ -838,7 +845,8 @@ genX(CmdCopyAccelerationStructureToMemoryKHR)(
 
    anv_cmd_buffer_restore_state(cmd_buffer, &saved);
 
-   trace_intel_end_as_copy(&cmd_buffer->trace);
+   trace_intel_end_as_copy(&cmd_buffer->trace,
+                           compute_pipeline->source_hash);
 }
 
 void
@@ -861,6 +869,10 @@ genX(CmdCopyMemoryToAccelerationStructureKHR)(
       vk_command_buffer_set_error(&cmd_buffer->vk, result);
       return;
    }
+
+   ANV_FROM_HANDLE(anv_pipeline, anv_pipeline, pipeline);
+   struct anv_compute_pipeline *compute_pipeline =
+      anv_pipeline_to_compute(anv_pipeline);
 
    struct anv_cmd_saved_state saved;
    anv_cmd_buffer_save_state(cmd_buffer,
@@ -891,70 +903,8 @@ genX(CmdCopyMemoryToAccelerationStructureKHR)(
    vk_common_CmdDispatch(commandBuffer, 512, 1, 1);
    anv_cmd_buffer_restore_state(cmd_buffer, &saved);
 
-   trace_intel_end_as_copy(&cmd_buffer->trace);
-}
-
-/* TODO: Host commands */
-
-VkResult
-genX(BuildAccelerationStructuresKHR)(
-    VkDevice                                    _device,
-    VkDeferredOperationKHR                      deferredOperation,
-    uint32_t                                    infoCount,
-    const VkAccelerationStructureBuildGeometryInfoKHR* pInfos,
-    const VkAccelerationStructureBuildRangeInfoKHR* const* ppBuildRangeInfos)
-{
-   ANV_FROM_HANDLE(anv_device, device, _device);
-   unreachable("Unimplemented");
-   return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
-}
-
-VkResult
-genX(CopyAccelerationStructureKHR)(
-    VkDevice                                    _device,
-    VkDeferredOperationKHR                      deferredOperation,
-    const VkCopyAccelerationStructureInfoKHR*   pInfo)
-{
-   ANV_FROM_HANDLE(anv_device, device, _device);
-   unreachable("Unimplemented");
-   return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
-}
-
-VkResult
-genX(CopyAccelerationStructureToMemoryKHR)(
-    VkDevice                                    _device,
-    VkDeferredOperationKHR                      deferredOperation,
-    const VkCopyAccelerationStructureToMemoryInfoKHR* pInfo)
-{
-   ANV_FROM_HANDLE(anv_device, device, _device);
-   unreachable("Unimplemented");
-   return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
-}
-
-VkResult
-genX(CopyMemoryToAccelerationStructureKHR)(
-    VkDevice                                    _device,
-    VkDeferredOperationKHR                      deferredOperation,
-    const VkCopyMemoryToAccelerationStructureInfoKHR* pInfo)
-{
-   ANV_FROM_HANDLE(anv_device, device, _device);
-   unreachable("Unimplemented");
-   return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
-}
-
-VkResult
-genX(WriteAccelerationStructuresPropertiesKHR)(
-    VkDevice                                    _device,
-    uint32_t                                    accelerationStructureCount,
-    const VkAccelerationStructureKHR*           pAccelerationStructures,
-    VkQueryType                                 queryType,
-    size_t                                      dataSize,
-    void*                                       pData,
-    size_t                                      stride)
-{
-   ANV_FROM_HANDLE(anv_device, device, _device);
-   unreachable("Unimplemented");
-   return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
+   trace_intel_end_as_copy(&cmd_buffer->trace,
+                           compute_pipeline->source_hash);
 }
 
 void

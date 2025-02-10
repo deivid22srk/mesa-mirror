@@ -34,8 +34,6 @@
 #include "compiler/glsl_types.h"
 #include "dev/intel_device_info.h"
 
-using namespace brw;
-
 void
 fs_visitor::emit_urb_writes(const brw_reg &gs_vertex_count)
 {
@@ -132,8 +130,8 @@ fs_visitor::emit_urb_writes(const brw_reg &gs_vertex_count)
             break;
          }
 
-         brw_reg zero = brw_vgrf(alloc.allocate(dispatch_width / 8),
-                                BRW_TYPE_UD);
+         brw_reg zero =
+            retype(brw_allocate_vgrf_units(*this, dispatch_width / 8), BRW_TYPE_UD);
          bld.MOV(zero, brw_imm_ud(0u));
 
          if (vue_map->slots_valid & VARYING_BIT_PRIMITIVE_SHADING_RATE &&
@@ -141,8 +139,8 @@ fs_visitor::emit_urb_writes(const brw_reg &gs_vertex_count)
             sources[length++] = this->outputs[VARYING_SLOT_PRIMITIVE_SHADING_RATE];
          } else if (devinfo->has_coarse_pixel_primitive_and_cb) {
             uint32_t one_fp16 = 0x3C00;
-            brw_reg one_by_one_fp16 = brw_vgrf(alloc.allocate(dispatch_width / 8),
-                                              BRW_TYPE_UD);
+            brw_reg one_by_one_fp16 =
+               retype(brw_allocate_vgrf_units(*this, dispatch_width / 8), BRW_TYPE_UD);
             bld.MOV(one_by_one_fp16, brw_imm_ud((one_fp16 << 16) | one_fp16));
             sources[length++] = one_by_one_fp16;
          } else {
@@ -215,12 +213,12 @@ fs_visitor::emit_urb_writes(const brw_reg &gs_vertex_count)
 
          srcs[URB_LOGICAL_SRC_HANDLE] = urb_handle;
          srcs[URB_LOGICAL_SRC_PER_SLOT_OFFSETS] = per_slot_offsets;
-         srcs[URB_LOGICAL_SRC_DATA] = brw_vgrf(alloc.allocate((dispatch_width / 8) * length),
-                                               BRW_TYPE_F);
+         srcs[URB_LOGICAL_SRC_DATA] =
+            retype(brw_allocate_vgrf_units(*this, (dispatch_width / 8) * length), BRW_TYPE_F);
          srcs[URB_LOGICAL_SRC_COMPONENTS] = brw_imm_ud(length);
          abld.LOAD_PAYLOAD(srcs[URB_LOGICAL_SRC_DATA], sources, length, 0);
 
-         fs_inst *inst = abld.emit(SHADER_OPCODE_URB_WRITE_LOGICAL, reg_undef,
+         brw_inst *inst = abld.emit(SHADER_OPCODE_URB_WRITE_LOGICAL, reg_undef,
                                    srcs, ARRAY_SIZE(srcs));
 
          /* For Wa_1805992985 one needs additional write in the end. */
@@ -255,10 +253,10 @@ fs_visitor::emit_urb_writes(const brw_reg &gs_vertex_count)
       if (stage == MESA_SHADER_GEOMETRY)
          return;
 
-      brw_reg uniform_urb_handle = brw_vgrf(alloc.allocate(dispatch_width / 8),
-                                           BRW_TYPE_UD);
-      brw_reg payload = brw_vgrf(alloc.allocate(dispatch_width / 8),
-                                BRW_TYPE_UD);
+      brw_reg uniform_urb_handle =
+         retype(brw_allocate_vgrf_units(*this, dispatch_width / 8), BRW_TYPE_UD);
+      brw_reg payload =
+         retype(brw_allocate_vgrf_units(*this, dispatch_width / 8), BRW_TYPE_UD);
 
       bld.exec_all().MOV(uniform_urb_handle, urb_handle);
 
@@ -267,7 +265,7 @@ fs_visitor::emit_urb_writes(const brw_reg &gs_vertex_count)
       srcs[URB_LOGICAL_SRC_DATA] = payload;
       srcs[URB_LOGICAL_SRC_COMPONENTS] = brw_imm_ud(1);
 
-      fs_inst *inst = bld.emit(SHADER_OPCODE_URB_WRITE_LOGICAL, reg_undef,
+      brw_inst *inst = bld.emit(SHADER_OPCODE_URB_WRITE_LOGICAL, reg_undef,
                                srcs, ARRAY_SIZE(srcs));
       inst->eot = true;
       inst->offset = 1;
@@ -282,9 +280,9 @@ fs_visitor::emit_urb_writes(const brw_reg &gs_vertex_count)
     */
    if (intel_needs_workaround(devinfo, 1805992985) && stage == MESA_SHADER_TESS_EVAL) {
       assert(dispatch_width == 8);
-      brw_reg uniform_urb_handle = brw_vgrf(alloc.allocate(1), BRW_TYPE_UD);
-      brw_reg uniform_mask = brw_vgrf(alloc.allocate(1), BRW_TYPE_UD);
-      brw_reg payload = brw_vgrf(alloc.allocate(4), BRW_TYPE_UD);
+      brw_reg uniform_urb_handle = retype(brw_allocate_vgrf_units(*this, 1), BRW_TYPE_UD);
+      brw_reg uniform_mask = retype(brw_allocate_vgrf_units(*this, 1), BRW_TYPE_UD);
+      brw_reg payload = retype(brw_allocate_vgrf_units(*this, 4), BRW_TYPE_UD);
 
       /* Workaround requires all 8 channels (lanes) to be valid. This is
        * understood to mean they all need to be alive. First trick is to find
@@ -319,7 +317,7 @@ fs_visitor::emit_urb_writes(const brw_reg &gs_vertex_count)
       srcs[URB_LOGICAL_SRC_DATA] = payload;
       srcs[URB_LOGICAL_SRC_COMPONENTS] = brw_imm_ud(4);
 
-      fs_inst *inst = bld.exec_all().emit(SHADER_OPCODE_URB_WRITE_LOGICAL,
+      brw_inst *inst = bld.exec_all().emit(SHADER_OPCODE_URB_WRITE_LOGICAL,
                                           reg_undef, srcs, ARRAY_SIZE(srcs));
       inst->eot = true;
       inst->offset = 0;
@@ -336,8 +334,8 @@ fs_visitor::emit_cs_terminate()
     * make sure it uses the appropriate register range.
     */
    struct brw_reg g0 = retype(brw_vec8_grf(0, 0), BRW_TYPE_UD);
-   brw_reg payload = brw_vgrf(alloc.allocate(reg_unit(devinfo)),
-                             BRW_TYPE_UD);
+   brw_reg payload =
+      retype(brw_allocate_vgrf_units(*this, reg_unit(devinfo)), BRW_TYPE_UD);
    ubld.group(8 * reg_unit(devinfo), 0).MOV(payload, g0);
 
    /* Set the descriptor to "Dereference Resource" and "Root Thread" */
@@ -359,7 +357,7 @@ fs_visitor::emit_cs_terminate()
       brw_reg(),      /* payload2 */
    };
 
-   fs_inst *send = ubld.emit(SHADER_OPCODE_SEND, reg_undef, srcs, 4);
+   brw_inst *send = ubld.emit(SHADER_OPCODE_SEND, reg_undef, srcs, 4);
 
    /* On Alchemist and later, send an EOT message to the message gateway to
     * terminate a compute shader.  For older GPUs, send to the thread spawner.
@@ -383,7 +381,7 @@ fs_visitor::fs_visitor(const struct brw_compiler *compiler,
      mem_ctx(params->mem_ctx),
      cfg(NULL), stage(shader->info.stage),
      debug_enabled(debug_enabled),
-     key(key), gs_compile(NULL), prog_data(prog_data),
+     key(key), prog_data(prog_data),
      live_analysis(this), regpressure_analysis(this),
      performance_analysis(this), idom_analysis(this), def_analysis(this),
      needs_register_pressure(needs_register_pressure),
@@ -407,40 +405,12 @@ fs_visitor::fs_visitor(const struct brw_compiler *compiler,
      mem_ctx(params->mem_ctx),
      cfg(NULL), stage(shader->info.stage),
      debug_enabled(debug_enabled),
-     key(&key->base), gs_compile(NULL), prog_data(&prog_data->base),
+     key(&key->base), prog_data(&prog_data->base),
      live_analysis(this), regpressure_analysis(this),
      performance_analysis(this), idom_analysis(this), def_analysis(this),
      needs_register_pressure(needs_register_pressure),
      dispatch_width(dispatch_width),
      max_polygons(max_polygons),
-     api_subgroup_size(brw_nir_api_subgroup_size(shader, dispatch_width))
-{
-   init();
-   assert(api_subgroup_size == 0 ||
-          api_subgroup_size == 8 ||
-          api_subgroup_size == 16 ||
-          api_subgroup_size == 32);
-}
-
-fs_visitor::fs_visitor(const struct brw_compiler *compiler,
-                       const struct brw_compile_params *params,
-                       struct brw_gs_compile *c,
-                       struct brw_gs_prog_data *prog_data,
-                       const nir_shader *shader,
-                       bool needs_register_pressure,
-                       bool debug_enabled)
-   : compiler(compiler), log_data(params->log_data),
-     devinfo(compiler->devinfo), nir(shader),
-     mem_ctx(params->mem_ctx),
-     cfg(NULL), stage(shader->info.stage),
-     debug_enabled(debug_enabled),
-     key(&c->key.base), gs_compile(c),
-     prog_data(&prog_data->base.base),
-     live_analysis(this), regpressure_analysis(this),
-     performance_analysis(this), idom_analysis(this), def_analysis(this),
-     needs_register_pressure(needs_register_pressure),
-     dispatch_width(compiler->devinfo->ver >= 20 ? 16 : 8),
-     max_polygons(0),
      api_subgroup_size(brw_nir_api_subgroup_size(shader, dispatch_width))
 {
    init();
@@ -473,6 +443,13 @@ fs_visitor::init()
    this->phase = BRW_SHADER_PHASE_INITIAL;
 
    this->next_address_register_nr = 1;
+
+   this->gs.control_data_bits_per_vertex = 0;
+   this->gs.control_data_header_size_bits = 0;
+
+   this->alloc.capacity = 0;
+   this->alloc.sizes = NULL;
+   this->alloc.count = 0;
 }
 
 fs_visitor::~fs_visitor()

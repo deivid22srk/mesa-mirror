@@ -40,14 +40,12 @@
  * mul vgrf5:F, vgrf5:F, vgrf4:F
  */
 
+#include "brw_analysis.h"
 #include "brw_fs.h"
 #include "brw_cfg.h"
-#include "brw_fs_live_variables.h"
-
-using namespace brw;
 
 static bool
-is_nop_mov(const fs_inst *inst)
+is_nop_mov(const brw_inst *inst)
 {
    if (inst->opcode == SHADER_OPCODE_LOAD_PAYLOAD) {
       brw_reg dst = inst->dst;
@@ -68,7 +66,7 @@ is_nop_mov(const fs_inst *inst)
 }
 
 static bool
-is_coalesce_candidate(const fs_visitor *v, const fs_inst *inst)
+is_coalesce_candidate(const fs_visitor *v, const brw_inst *inst)
 {
    if ((inst->opcode != BRW_OPCODE_MOV &&
         inst->opcode != SHADER_OPCODE_LOAD_PAYLOAD) ||
@@ -88,7 +86,7 @@ is_coalesce_candidate(const fs_visitor *v, const fs_inst *inst)
       return false;
 
    if (inst->opcode == SHADER_OPCODE_LOAD_PAYLOAD) {
-      if (!is_coalescing_payload(v->devinfo, v->alloc, inst)) {
+      if (!is_coalescing_payload(*v, inst)) {
          return false;
       }
    }
@@ -98,8 +96,8 @@ is_coalesce_candidate(const fs_visitor *v, const fs_inst *inst)
 
 static bool
 can_coalesce_vars(const intel_device_info *devinfo,
-                  const fs_live_variables &live, const cfg_t *cfg,
-                  const bblock_t *block, const fs_inst *inst,
+                  const brw_live_variables &live, const cfg_t *cfg,
+                  const bblock_t *block, const brw_inst *inst,
                   int dst_var, int src_var)
 {
    if (!live.vars_interfere(src_var, dst_var))
@@ -129,7 +127,7 @@ can_coalesce_vars(const intel_device_info *devinfo,
 
       bool seen_src_write = false;
       bool seen_copy = false;
-      foreach_inst_in_block(fs_inst, scan_inst, scan_block) {
+      foreach_inst_in_block(brw_inst, scan_inst, scan_block) {
          scan_ip++;
 
          /* Ignore anything before the intersection of the live ranges */
@@ -194,12 +192,12 @@ can_coalesce_vars(const intel_device_info *devinfo,
  * SEND instruction's payload to more than would fit in g112-g127.
  */
 static bool
-would_violate_eot_restriction(const brw::simple_allocator &alloc,
+would_violate_eot_restriction(fs_visitor &s,
                               const cfg_t *cfg,
                               unsigned dst_reg, unsigned src_reg)
 {
-   if (alloc.sizes[dst_reg] > alloc.sizes[src_reg]) {
-      foreach_inst_in_block_reverse(fs_inst, send, cfg->last_block()) {
+   if (s.alloc.sizes[dst_reg] > s.alloc.sizes[src_reg]) {
+      foreach_inst_in_block_reverse(brw_inst, send, cfg->last_block()) {
          if (send->opcode != SHADER_OPCODE_SEND || !send->eot)
             continue;
 
@@ -207,13 +205,13 @@ would_violate_eot_restriction(const brw::simple_allocator &alloc,
              (send->sources >= 4 &&
               send->src[3].file == VGRF && send->src[3].nr == src_reg)) {
             const unsigned s2 =
-               send->src[2].file == VGRF ? alloc.sizes[send->src[2].nr] : 0;
+               send->src[2].file == VGRF ? s.alloc.sizes[send->src[2].nr] : 0;
             const unsigned s3 = send->sources >= 4 &&
                send->src[3].file == VGRF ?
-               alloc.sizes[send->src[3].nr] : 0;
+               s.alloc.sizes[send->src[3].nr] : 0;
 
             const unsigned increase =
-               alloc.sizes[dst_reg] - alloc.sizes[src_reg];
+               s.alloc.sizes[dst_reg] - s.alloc.sizes[src_reg];
 
             if (s2 + s3 + increase > 15)
                return true;
@@ -231,16 +229,16 @@ brw_opt_register_coalesce(fs_visitor &s)
    const intel_device_info *devinfo = s.devinfo;
 
    bool progress = false;
-   fs_live_variables &live = s.live_analysis.require();
+   brw_live_variables &live = s.live_analysis.require();
    int src_size = 0;
    int channels_remaining = 0;
    unsigned src_reg = ~0u, dst_reg = ~0u;
    int *dst_reg_offset = new int[MAX_VGRF_SIZE(devinfo)];
-   fs_inst **mov = new fs_inst *[MAX_VGRF_SIZE(devinfo)];
+   brw_inst **mov = new brw_inst *[MAX_VGRF_SIZE(devinfo)];
    int *dst_var = new int[MAX_VGRF_SIZE(devinfo)];
    int *src_var = new int[MAX_VGRF_SIZE(devinfo)];
 
-   foreach_block_and_inst(block, fs_inst, inst, s.cfg) {
+   foreach_block_and_inst(block, brw_inst, inst, s.cfg) {
       if (!is_coalesce_candidate(&s, inst))
          continue;
 
@@ -305,7 +303,7 @@ brw_opt_register_coalesce(fs_visitor &s)
          src_var[i] = live.var_from_vgrf[src_reg] + i;
 
          if (!can_coalesce_vars(devinfo, live, s.cfg, block, inst, dst_var[i], src_var[i]) ||
-             would_violate_eot_restriction(s.alloc, s.cfg, dst_reg, src_reg)) {
+             would_violate_eot_restriction(s, s.cfg, dst_reg, src_reg)) {
             can_coalesce = false;
             src_reg = ~0u;
             break;
@@ -341,7 +339,7 @@ brw_opt_register_coalesce(fs_visitor &s)
          }
       }
 
-      foreach_block_and_inst(block, fs_inst, scan_inst, s.cfg) {
+      foreach_block_and_inst(block, brw_inst, scan_inst, s.cfg) {
          if (scan_inst->dst.file == VGRF &&
              scan_inst->dst.nr == src_reg) {
             scan_inst->dst.nr = dst_reg;
@@ -369,7 +367,7 @@ brw_opt_register_coalesce(fs_visitor &s)
    }
 
    if (progress) {
-      foreach_block_and_inst_safe (block, fs_inst, inst, s.cfg) {
+      foreach_block_and_inst_safe (block, brw_inst, inst, s.cfg) {
          if (inst->opcode == BRW_OPCODE_NOP) {
             inst->remove(block, true);
          }
@@ -377,7 +375,7 @@ brw_opt_register_coalesce(fs_visitor &s)
 
       s.cfg->adjust_block_ips();
 
-      s.invalidate_analysis(DEPENDENCY_INSTRUCTIONS);
+      s.invalidate_analysis(BRW_DEPENDENCY_INSTRUCTIONS);
    }
 
    delete[] src_var;

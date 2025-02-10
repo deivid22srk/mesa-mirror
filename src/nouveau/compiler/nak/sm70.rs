@@ -2265,6 +2265,14 @@ impl SM70Op for OpR2UR {
 }
 
 impl SM70Encoder<'_> {
+    fn set_tex_cb_ref(&mut self, range: Range<usize>, cb: TexCBufRef) {
+        assert!(range.len() == 19);
+        let mut v = BitMutView::new_subset(self, range);
+        assert!(cb.offset % 4 == 0);
+        v.set_field(0..14, cb.offset / 4);
+        v.set_field(14..19, cb.idx);
+    }
+
     fn set_tex_dim(&mut self, range: Range<usize>, dim: TexDim) {
         assert!(range.len() == 3);
         self.set_field(
@@ -2318,8 +2326,19 @@ impl SM70Op for OpTex {
     }
 
     fn encode(&self, e: &mut SM70Encoder<'_>) {
-        e.set_opcode(0x361);
-        e.set_bit(59, true); // .B
+        match self.tex {
+            TexRef::Bound(_) => {
+                panic!("SM70+ doesn't have legacy bound textures");
+            }
+            TexRef::CBuf(cb) => {
+                e.set_opcode(0xb60);
+                e.set_tex_cb_ref(40..59, cb);
+            }
+            TexRef::Bindless => {
+                e.set_opcode(0x361);
+                e.set_bit(59, true); // .B
+            }
+        }
 
         e.set_dst(self.dsts[0]);
         if let Dst::Reg(reg) = self.dsts[1] {
@@ -2337,7 +2356,7 @@ impl SM70Op for OpTex {
         e.set_bit(76, self.offset);
         e.set_bit(77, false); // ToDo: NDV
         e.set_bit(78, self.z_cmpr);
-        e.set_field(84..87, 1);
+        e.set_eviction_priority(&self.mem_eviction_priority);
         e.set_tex_lod_mode(87..90, self.lod_mode);
         e.set_bit(90, false); // TODO: .NODEP
     }
@@ -2349,8 +2368,19 @@ impl SM70Op for OpTld {
     }
 
     fn encode(&self, e: &mut SM70Encoder<'_>) {
-        e.set_opcode(0x367);
-        e.set_bit(59, true); // .B
+        match self.tex {
+            TexRef::Bound(_) => {
+                panic!("SM70+ doesn't have legacy bound textures");
+            }
+            TexRef::CBuf(cb) => {
+                e.set_opcode(0xb66);
+                e.set_tex_cb_ref(40..59, cb);
+            }
+            TexRef::Bindless => {
+                e.set_opcode(0x367);
+                e.set_bit(59, true); // .B
+            }
+        }
 
         e.set_dst(self.dsts[0]);
         if let Dst::Reg(reg) = self.dsts[1] {
@@ -2373,6 +2403,7 @@ impl SM70Op for OpTld {
             self.lod_mode == TexLodMode::Zero
                 || self.lod_mode == TexLodMode::Lod
         );
+        e.set_eviction_priority(&self.mem_eviction_priority);
         e.set_tex_lod_mode(87..90, self.lod_mode);
         e.set_bit(90, false); // TODO: .NODEP
     }
@@ -2384,8 +2415,19 @@ impl SM70Op for OpTld4 {
     }
 
     fn encode(&self, e: &mut SM70Encoder<'_>) {
-        e.set_opcode(0x364);
-        e.set_bit(59, true); // .B
+        match self.tex {
+            TexRef::Bound(_) => {
+                panic!("SM70+ doesn't have legacy bound textures");
+            }
+            TexRef::CBuf(cb) => {
+                e.set_opcode(0xb63);
+                e.set_tex_cb_ref(40..59, cb);
+            }
+            TexRef::Bindless => {
+                e.set_opcode(0x364);
+                e.set_bit(59, true); // .B
+            }
+        }
 
         e.set_dst(self.dsts[0]);
         if let Dst::Reg(reg) = self.dsts[1] {
@@ -2410,7 +2452,7 @@ impl SM70Op for OpTld4 {
         );
         // bit 77: .CL
         e.set_bit(78, self.z_cmpr);
-        e.set_bit(84, true); // !.EF
+        e.set_eviction_priority(&self.mem_eviction_priority);
         e.set_field(87..89, self.comp);
         e.set_bit(90, false); // TODO: .NODEP
     }
@@ -2422,8 +2464,19 @@ impl SM70Op for OpTmml {
     }
 
     fn encode(&self, e: &mut SM70Encoder<'_>) {
-        e.set_opcode(0x36a);
-        e.set_bit(59, true); // .B
+        match self.tex {
+            TexRef::Bound(_) => {
+                panic!("SM70+ doesn't have legacy bound textures");
+            }
+            TexRef::CBuf(cb) => {
+                e.set_opcode(0xb69);
+                e.set_tex_cb_ref(40..59, cb);
+            }
+            TexRef::Bindless => {
+                e.set_opcode(0x36a);
+                e.set_bit(59, true); // .B
+            }
+        }
 
         e.set_dst(self.dsts[0]);
         if let Dst::Reg(reg) = self.dsts[1] {
@@ -2448,8 +2501,19 @@ impl SM70Op for OpTxd {
     }
 
     fn encode(&self, e: &mut SM70Encoder<'_>) {
-        e.set_opcode(0x36d);
-        e.set_bit(59, true); // .B
+        match self.tex {
+            TexRef::Bound(_) => {
+                panic!("SM70+ doesn't have legacy bound textures");
+            }
+            TexRef::CBuf(cb) => {
+                e.set_opcode(0xb6c);
+                e.set_tex_cb_ref(40..59, cb);
+            }
+            TexRef::Bindless => {
+                e.set_opcode(0x36d);
+                e.set_bit(59, true); // .B
+            }
+        }
 
         e.set_dst(self.dsts[0]);
         if let Dst::Reg(reg) = self.dsts[1] {
@@ -2466,6 +2530,7 @@ impl SM70Op for OpTxd {
         e.set_field(72..76, self.mask);
         e.set_bit(76, self.offset);
         e.set_bit(77, false); // ToDo: NDV
+        e.set_eviction_priority(&self.mem_eviction_priority);
         e.set_bit(90, false); // TODO: .NODEP
     }
 }
@@ -2476,8 +2541,19 @@ impl SM70Op for OpTxq {
     }
 
     fn encode(&self, e: &mut SM70Encoder<'_>) {
-        e.set_opcode(0x370);
-        e.set_bit(59, true); // .B
+        match self.tex {
+            TexRef::Bound(_) => {
+                panic!("SM70+ doesn't have legacy bound textures");
+            }
+            TexRef::CBuf(cb) => {
+                e.set_opcode(0xb6f);
+                e.set_tex_cb_ref(40..59, cb);
+            }
+            TexRef::Bindless => {
+                e.set_opcode(0x370);
+                e.set_bit(59, true); // .B
+            }
+        }
 
         e.set_dst(self.dsts[0]);
         if let Dst::Reg(reg) = self.dsts[1] {
@@ -2541,12 +2617,14 @@ impl SM70Encoder<'_> {
 
     fn set_eviction_priority(&mut self, pri: &MemEvictionPriority) {
         self.set_field(
-            84..86,
+            84..87,
             match pri {
                 MemEvictionPriority::First => 0_u8,
                 MemEvictionPriority::Normal => 1_u8,
                 MemEvictionPriority::Last => 2_u8,
-                MemEvictionPriority::Unchanged => 3_u8,
+                MemEvictionPriority::LastUse => 3_u8,
+                MemEvictionPriority::Unchanged => 4_u8,
+                MemEvictionPriority::NoAllocate => 5_u8,
             },
         );
     }

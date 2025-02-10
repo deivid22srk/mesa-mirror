@@ -2035,6 +2035,32 @@ impl fmt::Display for FRndMode {
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
+pub struct TexCBufRef {
+    pub idx: u8,
+    pub offset: u16,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum TexRef {
+    Bound(u16),
+    CBuf(TexCBufRef),
+    Bindless,
+}
+
+impl fmt::Display for TexRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TexRef::Bound(idx) => write!(f, "tex[{idx}]"),
+            TexRef::CBuf(TexCBufRef { idx, offset }) => {
+                write!(f, "c[{idx:#x}][{offset:#x}]")
+            }
+            TexRef::Bindless => write!(f, "bindless"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub enum TexDim {
     _1D,
     Array1D,
@@ -2376,7 +2402,9 @@ pub enum MemEvictionPriority {
     First,
     Normal,
     Last,
+    LastUse,
     Unchanged,
+    NoAllocate,
 }
 
 impl fmt::Display for MemEvictionPriority {
@@ -2385,7 +2413,9 @@ impl fmt::Display for MemEvictionPriority {
             MemEvictionPriority::First => write!(f, ".ef"),
             MemEvictionPriority::Normal => Ok(()),
             MemEvictionPriority::Last => write!(f, ".el"),
-            MemEvictionPriority::Unchanged => write!(f, ".lu"),
+            MemEvictionPriority::LastUse => write!(f, ".lu"),
+            MemEvictionPriority::Unchanged => write!(f, ".eu"),
+            MemEvictionPriority::NoAllocate => write!(f, ".na"),
         }
     }
 }
@@ -4636,6 +4666,8 @@ pub struct OpTex {
     pub dsts: [Dst; 2],
     pub fault: Dst,
 
+    pub tex: TexRef,
+
     #[src_type(SSA)]
     pub srcs: [Src; 2],
 
@@ -4643,12 +4675,13 @@ pub struct OpTex {
     pub lod_mode: TexLodMode,
     pub z_cmpr: bool,
     pub offset: bool,
+    pub mem_eviction_priority: MemEvictionPriority,
     pub mask: u8,
 }
 
 impl DisplayOp for OpTex {
     fn fmt_op(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "tex.b{}", self.dim)?;
+        write!(f, "tex{}", self.dim)?;
         if self.lod_mode != TexLodMode::Auto {
             write!(f, ".{}", self.lod_mode)?;
         }
@@ -4658,7 +4691,8 @@ impl DisplayOp for OpTex {
         if self.z_cmpr {
             write!(f, ".dc")?;
         }
-        write!(f, " {} {}", self.srcs[0], self.srcs[1])
+        write!(f, "{}", self.mem_eviction_priority)?;
+        write!(f, " {} {} {}", self.tex, self.srcs[0], self.srcs[1])
     }
 }
 impl_display_for_op!(OpTex);
@@ -4669,6 +4703,8 @@ pub struct OpTld {
     pub dsts: [Dst; 2],
     pub fault: Dst,
 
+    pub tex: TexRef,
+
     #[src_type(SSA)]
     pub srcs: [Src; 2],
 
@@ -4676,12 +4712,13 @@ pub struct OpTld {
     pub is_ms: bool,
     pub lod_mode: TexLodMode,
     pub offset: bool,
+    pub mem_eviction_priority: MemEvictionPriority,
     pub mask: u8,
 }
 
 impl DisplayOp for OpTld {
     fn fmt_op(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "tld.b{}", self.dim)?;
+        write!(f, "tld{}", self.dim)?;
         if self.lod_mode != TexLodMode::Auto {
             write!(f, ".{}", self.lod_mode)?;
         }
@@ -4691,7 +4728,8 @@ impl DisplayOp for OpTld {
         if self.is_ms {
             write!(f, ".ms")?;
         }
-        write!(f, " {} {}", self.srcs[0], self.srcs[1])
+        write!(f, "{}", self.mem_eviction_priority)?;
+        write!(f, " {} {} {}", self.tex, self.srcs[0], self.srcs[1])
     }
 }
 impl_display_for_op!(OpTld);
@@ -4702,6 +4740,8 @@ pub struct OpTld4 {
     pub dsts: [Dst; 2],
     pub fault: Dst,
 
+    pub tex: TexRef,
+
     #[src_type(SSA)]
     pub srcs: [Src; 2],
 
@@ -4709,16 +4749,21 @@ pub struct OpTld4 {
     pub comp: u8,
     pub offset_mode: Tld4OffsetMode,
     pub z_cmpr: bool,
+    pub mem_eviction_priority: MemEvictionPriority,
     pub mask: u8,
 }
 
 impl DisplayOp for OpTld4 {
     fn fmt_op(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "tld4.g.b{}", self.dim)?;
+        write!(f, "tld4.g{}", self.dim)?;
         if self.offset_mode != Tld4OffsetMode::None {
             write!(f, ".{}", self.offset_mode)?;
         }
-        write!(f, " {} {}", self.srcs[0], self.srcs[1])
+        if self.z_cmpr {
+            write!(f, ".dc")?;
+        }
+        write!(f, "{}", self.mem_eviction_priority)?;
+        write!(f, " {} {} {}", self.tex, self.srcs[0], self.srcs[1])
     }
 }
 impl_display_for_op!(OpTld4);
@@ -4727,6 +4772,8 @@ impl_display_for_op!(OpTld4);
 #[derive(SrcsAsSlice, DstsAsSlice)]
 pub struct OpTmml {
     pub dsts: [Dst; 2],
+
+    pub tex: TexRef,
 
     #[src_type(SSA)]
     pub srcs: [Src; 2],
@@ -4739,8 +4786,8 @@ impl DisplayOp for OpTmml {
     fn fmt_op(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "tmml.b.lod{} {} {}",
-            self.dim, self.srcs[0], self.srcs[1]
+            "tmml.lod{} {} {} {}",
+            self.dim, self.tex, self.srcs[0], self.srcs[1]
         )
     }
 }
@@ -4752,21 +4799,25 @@ pub struct OpTxd {
     pub dsts: [Dst; 2],
     pub fault: Dst,
 
+    pub tex: TexRef,
+
     #[src_type(SSA)]
     pub srcs: [Src; 2],
 
     pub dim: TexDim,
     pub offset: bool,
+    pub mem_eviction_priority: MemEvictionPriority,
     pub mask: u8,
 }
 
 impl DisplayOp for OpTxd {
     fn fmt_op(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "txd.b{}", self.dim)?;
+        write!(f, "txd{}", self.dim)?;
         if self.offset {
             write!(f, ".aoffi")?;
         }
-        write!(f, " {} {}", self.srcs[0], self.srcs[1])
+        write!(f, "{}", self.mem_eviction_priority)?;
+        write!(f, " {} {} {}", self.tex, self.srcs[0], self.srcs[1])
     }
 }
 impl_display_for_op!(OpTxd);
@@ -4775,6 +4826,8 @@ impl_display_for_op!(OpTxd);
 #[derive(SrcsAsSlice, DstsAsSlice)]
 pub struct OpTxq {
     pub dsts: [Dst; 2],
+
+    pub tex: TexRef,
 
     #[src_type(SSA)]
     pub src: Src,
@@ -4785,7 +4838,7 @@ pub struct OpTxq {
 
 impl DisplayOp for OpTxq {
     fn fmt_op(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "txq.b {} {}", self.src, self.query)
+        write!(f, "txq {} {} {}", self.tex, self.src, self.query)
     }
 }
 impl_display_for_op!(OpTxq);

@@ -25,6 +25,7 @@
 #include "nv_push_cla097.h"
 #include "nv_push_clb097.h"
 #include "nv_push_clb197.h"
+#include "nv_push_clc197.h"
 #include "nv_push_clc397.h"
 #include "nv_push_clc597.h"
 #include "drf.h"
@@ -3793,18 +3794,27 @@ nvk_mme_build_draw_loop(struct mme_builder *b,
 {
    struct mme_value begin = nvk_mme_load_scratch(b, DRAW_BEGIN);
 
-   mme_loop(b, instance_count) {
-      mme_mthd(b, NV9097_BEGIN);
-      mme_emit(b, begin);
+   if (b->devinfo->cls_eng3d < PASCAL_B) {
+      mme_start_loop(b, instance_count);
+   } else {
+      mme_mthd(b, NVC197_SET_INSTANCE_COUNT);
+      mme_emit(b, instance_count);
+      mme_set_field_enum(b, begin, NVC197_BEGIN_INSTANCE_ITERATE_ENABLE, TRUE);
+   }
 
-      mme_mthd(b, NV9097_SET_VERTEX_ARRAY_START);
-      mme_emit(b, first_vertex);
-      mme_emit(b, vertex_count);
+   mme_mthd(b, NV9097_BEGIN);
+   mme_emit(b, begin);
 
-      mme_mthd(b, NV9097_END);
-      mme_emit(b, mme_zero());
+   mme_mthd(b, NV9097_SET_VERTEX_ARRAY_START);
+   mme_emit(b, first_vertex);
+   mme_emit(b, vertex_count);
 
+   mme_mthd(b, NV9097_END);
+   mme_emit(b, mme_zero());
+
+   if (b->devinfo->cls_eng3d < PASCAL_B) {
       mme_set_field_enum(b, begin, NV9097_BEGIN_INSTANCE_ID, SUBSEQUENT);
+      mme_end_loop(b);
    }
 
    mme_free_reg(b, begin);
@@ -3929,18 +3939,27 @@ nvk_mme_build_draw_indexed_loop(struct mme_builder *b,
 {
    struct mme_value begin = nvk_mme_load_scratch(b, DRAW_BEGIN);
 
-   mme_loop(b, instance_count) {
-      mme_mthd(b, NV9097_BEGIN);
-      mme_emit(b, begin);
+   if (b->devinfo->cls_eng3d < PASCAL_B) {
+      mme_start_loop(b, instance_count);
+   } else {
+      mme_mthd(b, NVC197_SET_INSTANCE_COUNT);
+      mme_emit(b, instance_count);
+      mme_set_field_enum(b, begin, NVC197_BEGIN_INSTANCE_ITERATE_ENABLE, TRUE);
+   }
 
-      mme_mthd(b, NV9097_SET_INDEX_BUFFER_F);
-      mme_emit(b, first_index);
-      mme_emit(b, index_count);
+   mme_mthd(b, NV9097_BEGIN);
+   mme_emit(b, begin);
 
-      mme_mthd(b, NV9097_END);
-      mme_emit(b, mme_zero());
+   mme_mthd(b, NV9097_SET_INDEX_BUFFER_F);
+   mme_emit(b, first_index);
+   mme_emit(b, index_count);
 
+   mme_mthd(b, NV9097_END);
+   mme_emit(b, mme_zero());
+
+   if (b->devinfo->cls_eng3d < PASCAL_B) {
       mme_set_field_enum(b, begin, NV9097_BEGIN_INSTANCE_ID, SUBSEQUENT);
+      mme_end_loop(b);
    }
 
    mme_free_reg(b, begin);
@@ -4398,6 +4417,10 @@ nvk_mme_xfb_draw_indirect_loop(struct mme_builder *b,
 {
    struct mme_value begin = nvk_mme_load_scratch(b, DRAW_BEGIN);
 
+   /* NVC197_BEGIN_INSTANCE_ITERATE_ENABLE seems to be incompatible with xfb.
+    * Always use an mme loop instead.
+    */
+
    mme_loop(b, instance_count) {
       mme_mthd(b, NV9097_BEGIN);
       mme_emit(b, begin);
@@ -4578,7 +4601,7 @@ nvk_CmdBeginTransformFeedbackEXT(VkCommandBuffer commandBuffer,
    }
 
    for (uint32_t i = 0; i < counterBufferCount; ++i) {
-      if (pCounterBuffers[i] == VK_NULL_HANDLE)
+      if (pCounterBuffers == NULL || pCounterBuffers[i] == VK_NULL_HANDLE)
          continue;
 
       VK_FROM_HANDLE(nvk_buffer, buffer, pCounterBuffers[i]);
@@ -4618,7 +4641,7 @@ nvk_CmdEndTransformFeedbackEXT(VkCommandBuffer commandBuffer,
    P_IMMD(p, NV9097, SET_STREAM_OUTPUT, ENABLE_FALSE);
 
    for (uint32_t i = 0; i < counterBufferCount; ++i) {
-      if (pCounterBuffers[i] == VK_NULL_HANDLE)
+      if (pCounterBuffers == NULL || pCounterBuffers[i] == VK_NULL_HANDLE)
          continue;
 
       VK_FROM_HANDLE(nvk_buffer, buffer, pCounterBuffers[i]);

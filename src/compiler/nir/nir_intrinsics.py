@@ -340,6 +340,10 @@ intrinsic("convert_alu_types", dest_comp=0, src_comp=[0],
 
 intrinsic("load_param", dest_comp=0, indices=[PARAM_IDX], flags=[CAN_ELIMINATE])
 
+# Store a scalar value to be used as a return value. Usually store_deref is used
+# for this, but vtn_bindgen needs to lower derefs.
+intrinsic("bindgen_return", src_comp=[0])
+
 intrinsic("load_deref", dest_comp=0, src_comp=[-1],
           indices=[ACCESS], flags=[CAN_ELIMINATE])
 intrinsic("store_deref", src_comp=[-1, 0], indices=[WRITE_MASK, ACCESS])
@@ -1281,10 +1285,6 @@ intrinsic("printf", src_comp=[1, 1], dest_comp=1, bit_sizes=[32])
 # the driver to at least provide a base location and size
 system_value("printf_buffer_address", 1, bit_sizes=[32,64])
 system_value("printf_buffer_size", 1, bit_sizes=[32])
-# If driver wants to have all printfs from various shaders merged into a
-# single output buffer, it needs each shader to have its own base identifier
-# from which each printf is indexed.
-system_value("printf_base_identifier", 1, bit_sizes=[32])
 # Abort the program, triggering device fault. The invoking thread halts
 # immediately. Other threads eventually terminate.
 #
@@ -1591,9 +1591,9 @@ intrinsic("unit_test_divergent_amd", dest_comp=0, indices=[BASE])
 # src[] = { descriptor, vector byte offset, scalar byte offset, index offset }
 # The index offset is multiplied by the stride in the descriptor.
 # The vector/scalar offsets are in bytes, BASE is a constant byte offset.
-intrinsic("load_buffer_amd", src_comp=[4, 1, 1, 1], dest_comp=0, indices=[BASE, MEMORY_MODES, ACCESS], flags=[CAN_ELIMINATE])
+intrinsic("load_buffer_amd", src_comp=[4, 1, 1, 1], dest_comp=0, indices=[BASE, MEMORY_MODES, ACCESS, ALIGN_MUL, ALIGN_OFFSET], flags=[CAN_ELIMINATE])
 # src[] = { store value, descriptor, vector byte offset, scalar byte offset, index offset }
-intrinsic("store_buffer_amd", src_comp=[0, 4, 1, 1, 1], indices=[BASE, WRITE_MASK, MEMORY_MODES, ACCESS])
+intrinsic("store_buffer_amd", src_comp=[0, 4, 1, 1, 1], indices=[BASE, WRITE_MASK, MEMORY_MODES, ACCESS, ALIGN_MUL, ALIGN_OFFSET])
 
 # Typed buffer load of arbitrary length, using a specified format.
 # src[] = { descriptor, vector byte offset, scalar byte offset, index offset }
@@ -1782,7 +1782,7 @@ intrinsic("load_scalar_arg_amd", dest_comp=0, bit_sizes=[32],
           indices=[BASE, ARG_UPPER_BOUND_U32_AMD],
           flags=[CAN_ELIMINATE, CAN_REORDER])
 intrinsic("load_vector_arg_amd", dest_comp=0, bit_sizes=[32],
-          indices=[BASE, ARG_UPPER_BOUND_U32_AMD, FLAGS],
+          indices=[BASE, ARG_UPPER_BOUND_U32_AMD],
           flags=[CAN_ELIMINATE, CAN_REORDER])
 store("scalar_arg_amd", [], [BASE])
 store("vector_arg_amd", [], [BASE])
@@ -1820,6 +1820,9 @@ system_value("num_vertices_per_primitive_amd", 1)
 # Load streamout buffer desc
 # BASE = buffer index
 intrinsic("load_streamout_buffer_amd", dest_comp=4, indices=[BASE], bit_sizes=[32], flags=[CAN_ELIMINATE, CAN_REORDER])
+
+# Polygon stipple buffer descriptor
+system_value("polygon_stipple_buffer_amd", 4)
 
 # An ID for each workgroup ordered by primitve sequence
 system_value("ordered_id_amd", 1)
@@ -1901,7 +1904,7 @@ system_value("barycentric_optimize_amd", dest_comp=1, bit_sizes=[1])
 intrinsic("strict_wqm_coord_amd", src_comp=[0], dest_comp=0, bit_sizes=[32], indices=[BASE],
           flags=[CAN_ELIMINATE])
 
-intrinsic("cmat_muladd_amd", src_comp=[16, 16, 0], dest_comp=0, bit_sizes=src2,
+intrinsic("cmat_muladd_amd", src_comp=[-1, -1, 0], dest_comp=0, bit_sizes=src2,
           indices=[SATURATE, CMAT_SIGNED_MASK], flags=[CAN_ELIMINATE])
 
 # Get the debug log buffer descriptor.
@@ -1914,6 +1917,11 @@ intrinsic("sleep_amd", indices=[BASE])
 
 # s_nop BASE (sleep for BASE+1 cycles, BASE must be in [0, 15]).
 intrinsic("nop_amd", indices=[BASE])
+
+# Return the FMASK descriptor of color buffer 0.
+system_value("fbfetch_image_fmask_desc_amd", 8)
+# Return the image descriptor of color buffer 0.
+system_value("fbfetch_image_desc_amd", 8)
 
 system_value("ray_tracing_stack_base_lvp", 1)
 

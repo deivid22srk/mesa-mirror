@@ -166,12 +166,9 @@ genX(streamout_prologue)(struct anv_cmd_buffer *cmd_buffer)
 
 #if GFX_VER >= 12 && GFX_VER < 30
 static uint32_t
-get_cps_state_offset(const struct anv_device *device, bool cps_enabled,
+get_cps_state_offset(const struct anv_device *device,
                      const struct vk_fragment_shading_rate_state *fsr)
 {
-   if (!cps_enabled)
-      return device->cps_states.offset;
-
    uint32_t offset;
    static const uint32_t size_index[] = {
       [1] = 0,
@@ -981,13 +978,6 @@ update_cps(struct anv_gfx_dynamic_state *hw_state,
            const struct vk_dynamic_graphics_state *dyn,
            const struct anv_graphics_pipeline *pipeline)
 {
-   const struct brw_wm_prog_data *wm_prog_data = get_wm_prog_data(pipeline);
-   if (!wm_prog_data)
-      return;
-
-   UNUSED const bool cps_enable =
-      brw_wm_prog_data_is_coarse(wm_prog_data, hw_state->fs_msaa_flags);
-
 #if GFX_VER >= 30
    SET(COARSE_PIXEL, coarse_pixel.CPSizeX,
        get_cps_size(dyn->fsr.fragment_size.width));
@@ -999,11 +989,10 @@ update_cps(struct anv_gfx_dynamic_state *hw_state,
        vk_to_intel_shading_rate_combiner_op[dyn->fsr.combiner_ops[1]]);
 #elif GFX_VER >= 12
    SET(CPS, cps.CoarsePixelShadingStateArrayPointer,
-       get_cps_state_offset(device, cps_enable, &dyn->fsr));
+       get_cps_state_offset(device, &dyn->fsr));
 #else
    STATIC_ASSERT(GFX_VER == 11);
-   SET(CPS, cps.CoarsePixelShadingMode,
-            cps_enable ? CPS_MODE_CONSTANT : CPS_MODE_NONE);
+   SET(CPS, cps.CoarsePixelShadingMode, CPS_MODE_CONSTANT);
    SET(CPS, cps.MinCPSizeX, dyn->fsr.fragment_size.width);
    SET(CPS, cps.MinCPSizeY, dyn->fsr.fragment_size.height);
 #endif
@@ -1369,14 +1358,29 @@ update_blend_state(struct anv_gfx_dynamic_state *hw_state,
        *
        *   "Enabling LogicOp and Color Buffer Blending at the same time is
        *   UNDEFINED"
+       *
+       * The Vulkan spec also says:
+       *   "Logical operations are not applied to floating-point or sRGB format
+       *   color attachments."
+       * and
+       *   "Any attachments using color formats for which logical operations
+       *   are not supported simply pass through the color values unmodified."
        */
+      bool ignores_logic_op =
+         vk_format_is_float(gfx->color_att[att].vk_format) ||
+         vk_format_is_srgb(gfx->color_att[att].vk_format);
       SET(BLEND_STATE, blend.rts[rt].LogicOpFunction,
                        vk_to_intel_logic_op[dyn->cb.logic_op]);
-      SET(BLEND_STATE, blend.rts[rt].LogicOpEnable, dyn->cb.logic_op_enable);
+      SET(BLEND_STATE, blend.rts[rt].LogicOpEnable,
+                       dyn->cb.logic_op_enable && !ignores_logic_op);
 
       SET(BLEND_STATE, blend.rts[rt].ColorClampRange, COLORCLAMP_RTFORMAT);
       SET(BLEND_STATE, blend.rts[rt].PreBlendColorClampEnable, true);
       SET(BLEND_STATE, blend.rts[rt].PostBlendColorClampEnable, true);
+
+#if GFX_VER >= 30
+      SET(BLEND_STATE, blend.rts[rt].SimpleFloatBlendEnable, true);
+#endif
 
       /* Setup blend equation. */
       SET(BLEND_STATE, blend.rts[rt].ColorBlendFunction,
@@ -1841,9 +1845,7 @@ cmd_buffer_flush_gfx_runtime_state(struct anv_gfx_dynamic_state *hw_state,
 
 #if GFX_VER >= 11
    if (device->vk.enabled_extensions.KHR_fragment_shading_rate &&
-       ((gfx->dirty & ANV_CMD_DIRTY_PIPELINE) ||
-        BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_FSR) ||
-        BITSET_TEST(hw_state->dirty, ANV_GFX_STATE_FS_MSAA_FLAGS)))
+       BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_FSR))
       update_cps(hw_state, device, dyn, pipeline);
 #endif /* GFX_VER >= 11 */
 
@@ -2747,6 +2749,9 @@ cmd_buffer_gfx_state_emission(struct anv_cmd_buffer *cmd_buffer)
             INIT(blend.rts[i], LogicOpEnable),
             INIT(blend.rts[i], ColorBufferBlendEnable),
             INIT(blend.rts[i], ColorClampRange),
+#if GFX_VER >= 30
+            INIT(blend.rts[i], SimpleFloatBlendEnable),
+#endif
             INIT(blend.rts[i], PreBlendColorClampEnable),
             INIT(blend.rts[i], PostBlendColorClampEnable),
             INIT(blend.rts[i], SourceBlendFactor),
@@ -2833,6 +2838,15 @@ genX(cmd_buffer_flush_gfx_hw_state)(struct anv_cmd_buffer *cmd_buffer)
     * Put potential workarounds here if you need to reemit an instruction
     * because of another one is changing.
     */
+
+   /* Reproduce the programming done on Windows drivers.
+    * Fixes flickering issues with multiple workloads.
+    */
+   if (BITSET_TEST(hw_state->dirty, ANV_GFX_STATE_VIEWPORT_SF_CLIP) ||
+       BITSET_TEST(hw_state->dirty, ANV_GFX_STATE_VIEWPORT_CC_PTR)) {
+      BITSET_SET(hw_state->dirty, ANV_GFX_STATE_VIEWPORT_SF_CLIP);
+      BITSET_SET(hw_state->dirty, ANV_GFX_STATE_VIEWPORT_CC_PTR);
+   }
 
    /* Wa_16012775297 - Emit dummy VF statistics before each 3DSTATE_VF. */
 #if INTEL_WA_16012775297_GFX_VER

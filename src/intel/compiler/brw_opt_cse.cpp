@@ -33,10 +33,17 @@
  * Support for SSA-based global Common Subexpression Elimination (CSE).
  */
 
-using namespace brw;
+struct remap_entry {
+   brw_inst *inst;
+   bblock_t *block;
+   enum brw_reg_type type;
+   unsigned nr;
+   bool negate;
+   bool still_used;
+};
 
 static bool
-is_expression(const fs_visitor *v, const fs_inst *const inst)
+is_expression(const fs_visitor *v, const brw_inst *const inst)
 {
    switch (inst->opcode) {
    case BRW_OPCODE_MOV:
@@ -124,7 +131,7 @@ is_expression(const fs_visitor *v, const fs_inst *const inst)
    case SHADER_OPCODE_MEMORY_LOAD_LOGICAL:
       return inst->src[MEMORY_LOGICAL_MODE].ud == MEMORY_MODE_CONSTANT;
    case SHADER_OPCODE_LOAD_PAYLOAD:
-      return !is_coalescing_payload(v->devinfo, v->alloc, inst);
+      return !is_coalescing_payload(*v, inst);
    default:
       return inst->is_send_from_grf() && !inst->has_side_effects() &&
          !inst->is_volatile();
@@ -135,7 +142,7 @@ is_expression(const fs_visitor *v, const fs_inst *const inst)
  * True if the instruction should only be CSE'd within their local block.
  */
 bool
-local_only(const fs_inst *inst)
+local_only(const brw_inst *inst)
 {
    switch (inst->opcode) {
    case SHADER_OPCODE_FIND_LIVE_CHANNEL:
@@ -163,7 +170,7 @@ local_only(const fs_inst *inst)
 }
 
 static bool
-operands_match(const fs_inst *a, const fs_inst *b, bool *negate)
+operands_match(const brw_inst *a, const brw_inst *b, bool *negate)
 {
    brw_reg *xs = a->src;
    brw_reg *ys = b->src;
@@ -226,7 +233,7 @@ operands_match(const fs_inst *a, const fs_inst *b, bool *negate)
 }
 
 static bool
-instructions_match(fs_inst *a, fs_inst *b, bool *negate)
+instructions_match(brw_inst *a, brw_inst *b, bool *negate)
 {
    return a->opcode == b->opcode &&
           a->exec_size == b->exec_size &&
@@ -243,7 +250,6 @@ instructions_match(fs_inst *a, fs_inst *b, bool *negate)
           a->size_written == b->size_written &&
           a->check_tdr == b->check_tdr &&
           a->header_size == b->header_size &&
-          a->target == b->target &&
           a->sources == b->sources &&
           a->bits == b->bits &&
           operands_match(a, b, negate);
@@ -272,7 +278,7 @@ hash_reg(uint32_t hash, const brw_reg &r)
 static uint32_t
 hash_inst(const void *v)
 {
-   const fs_inst *inst = static_cast<const fs_inst *>(v);
+   const brw_inst *inst = static_cast<const brw_inst *>(v);
    uint32_t hash = 0;
 
    /* Skip dst - that would make nothing ever match */
@@ -287,7 +293,6 @@ hash_inst(const void *v)
       inst->ex_mlen,
       inst->sfid,
       inst->header_size,
-      inst->target,
 
       inst->conditional_mod,
       inst->predicate,
@@ -350,75 +355,62 @@ static bool
 cmp_func(const void *data1, const void *data2)
 {
    bool negate;
-   return instructions_match((fs_inst *) data1, (fs_inst *) data2, &negate);
+   return instructions_match((brw_inst *) data1, (brw_inst *) data2, &negate);
 }
 
-/* We set bit 31 in remap_table entries if it needs to be negated. */
-#define REMAP_NEGATE (0x80000000u)
-
-static void
-remap_sources(fs_visitor &s, const brw::def_analysis &defs,
-              fs_inst *inst, unsigned *remap_table)
+static bool
+remap_sources(fs_visitor &s, const brw_def_analysis &defs,
+              brw_inst *inst, struct remap_entry *remap_table)
 {
+   bool progress = false;
+
    for (int i = 0; i < inst->sources; i++) {
       if (inst->src[i].file == VGRF &&
           inst->src[i].nr < defs.count() &&
-          remap_table[inst->src[i].nr] != ~0u) {
+          remap_table[inst->src[i].nr].inst != NULL) {
          const unsigned old_nr = inst->src[i].nr;
-         unsigned new_nr = remap_table[old_nr];
-         const bool need_negate = new_nr & REMAP_NEGATE;
-         new_nr &= ~REMAP_NEGATE;
+         const unsigned new_nr = remap_table[old_nr].nr;
+         const bool need_negate = remap_table[old_nr].negate;
+
+         if (need_negate &&
+             (remap_table[old_nr].type != inst->src[i].type ||
+              !inst->can_do_source_mods(s.devinfo))) {
+            remap_table[old_nr].still_used = true;
+            continue;
+         }
+
          inst->src[i].nr = new_nr;
 
-         if (need_negate) {
-            if ((inst->src[i].type != BRW_TYPE_F &&
-                 !inst->can_change_types()) ||
-                !inst->can_do_source_mods(s.devinfo)) {
-               /* We can't use the negate directly, resolve it just after the
-                * def and use that for any future uses.
-                */
-               fs_inst *def = defs.get(inst->src[i]);
-               bblock_t *def_block = defs.get_block(inst->src[i]);
-               const brw_builder dbld =
-                  brw_builder(&s, def_block, def).at(def_block, def->next);
+         if (!inst->src[i].abs)
+            inst->src[i].negate ^= need_negate;
 
-               /* Resolve any deferred block IP changes before inserting */
-               if (def_block->end_ip_delta)
-                  s.cfg->adjust_block_ips();
-
-               brw_reg neg = brw_vgrf(new_nr, BRW_TYPE_F);
-               brw_reg tmp = dbld.MOV(negate(neg));
-               inst->src[i].nr = tmp.nr;
-               remap_table[old_nr] = tmp.nr;
-            } else {
-               inst->src[i].negate = !inst->src[i].negate;
-               inst->src[i].type = BRW_TYPE_F;
-            }
-         }
+         progress = true;
       }
    }
+
+   return progress;
 }
 
 bool
 brw_opt_cse_defs(fs_visitor &s)
 {
    const intel_device_info *devinfo = s.devinfo;
-   const idom_tree &idom = s.idom_analysis.require();
-   const brw::def_analysis &defs = s.def_analysis.require();
+   const brw_idom_tree &idom = s.idom_analysis.require();
+   const brw_def_analysis &defs = s.def_analysis.require();
    bool progress = false;
    bool need_remaps = false;
 
-   unsigned *remap_table = new unsigned[defs.count()];
-   memset(remap_table, ~0u, defs.count() * sizeof(int));
+   struct remap_entry *remap_table = new remap_entry[defs.count()];
+   memset(remap_table, 0, defs.count() * sizeof(struct remap_entry));
    struct set *set = _mesa_set_create(NULL, NULL, cmp_func);
 
    foreach_block(block, s.cfg) {
-      fs_inst *last_flag_write = NULL;
-      fs_inst *last = NULL;
+      brw_inst *last_flag_write = NULL;
+      brw_inst *last = NULL;
 
-      foreach_inst_in_block_safe(fs_inst, inst, block) {
+      foreach_inst_in_block_safe(brw_inst, inst, block) {
          if (need_remaps)
-            remap_sources(s, defs, inst, remap_table);
+            progress |= remap_sources(s, defs, inst, remap_table);
 
          /* Updating last_flag_written should be at the bottom of the loop,
           * but doing it this way lets us use "continue" more easily.
@@ -452,7 +444,7 @@ brw_opt_cse_defs(fs_visitor &s)
             struct set_entry *e =
                _mesa_set_search_or_add_pre_hashed(set, hash, inst, NULL);
             if (!e) goto out; /* out of memory error */
-            fs_inst *match = (fs_inst *) e->key;
+            brw_inst *match = (brw_inst *) e->key;
 
             /* If there was no match, move on */
             if (match == inst)
@@ -490,13 +482,25 @@ brw_opt_cse_defs(fs_visitor &s)
                }
             }
 
-            progress = true;
             need_remaps = true;
-            remap_table[inst->dst.nr] =
-               match->dst.nr | (negate ? REMAP_NEGATE : 0);
-
-            inst->remove(block, true);
+            remap_table[inst->dst.nr].inst = inst;
+            remap_table[inst->dst.nr].block = block;
+            remap_table[inst->dst.nr].type = match->dst.type;
+            remap_table[inst->dst.nr].nr = match->dst.nr;
+            remap_table[inst->dst.nr].negate = negate;
+            remap_table[inst->dst.nr].still_used = false;
          }
+      }
+   }
+
+   /* Remove instruction now unused */
+   for (unsigned i = 0; i < defs.count(); i++) {
+      if (!remap_table[i].inst)
+         continue;
+
+      if (!remap_table[i].still_used) {
+         remap_table[i].inst->remove(remap_table[i].block, true);
+         progress = true;
       }
    }
 
@@ -506,8 +510,8 @@ out:
 
    if (progress) {
       s.cfg->adjust_block_ips();
-      s.invalidate_analysis(DEPENDENCY_INSTRUCTION_DATA_FLOW |
-                            DEPENDENCY_INSTRUCTION_DETAIL);
+      s.invalidate_analysis(BRW_DEPENDENCY_INSTRUCTION_DATA_FLOW |
+                            BRW_DEPENDENCY_INSTRUCTION_DETAIL);
    }
 
    return progress;

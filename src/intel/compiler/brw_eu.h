@@ -1430,7 +1430,8 @@ brw_send_indirect_message(struct brw_codegen *p,
                           struct brw_reg dst,
                           struct brw_reg payload,
                           struct brw_reg desc,
-                          bool eot);
+                          bool eot,
+                          bool gather);
 
 void
 brw_send_indirect_split_message(struct brw_codegen *p,
@@ -1442,7 +1443,8 @@ brw_send_indirect_split_message(struct brw_codegen *p,
                                 struct brw_reg ex_desc,
                                 unsigned ex_mlen,
                                 bool ex_bso,
-                                bool eot);
+                                bool eot,
+                                bool gather);
 
 void gfx6_math(struct brw_codegen *p,
 	       struct brw_reg dest,
@@ -1515,16 +1517,6 @@ brw_eu_inst *brw_DPAS(struct brw_codegen *p, enum gfx12_systolic_depth sdepth,
                    struct brw_reg src1, struct brw_reg src2);
 
 void
-brw_memory_fence(struct brw_codegen *p,
-                 struct brw_reg dst,
-                 struct brw_reg src,
-                 enum opcode send_op,
-                 enum brw_message_target sfid,
-                 uint32_t desc,
-                 bool commit_enable,
-                 unsigned bti);
-
-void
 brw_broadcast(struct brw_codegen *p,
               struct brw_reg dst,
               struct brw_reg src,
@@ -1552,12 +1544,12 @@ brw_num_sources_from_inst(const struct brw_isa_info *isa,
 void brw_set_src1(struct brw_codegen *p, brw_eu_inst *insn, struct brw_reg reg);
 
 void brw_set_desc_ex(struct brw_codegen *p, brw_eu_inst *insn,
-                     unsigned desc, unsigned ex_desc);
+                     unsigned desc, unsigned ex_desc, bool gather);
 
 static inline void
-brw_set_desc(struct brw_codegen *p, brw_eu_inst *insn, unsigned desc)
+brw_set_desc(struct brw_codegen *p, brw_eu_inst *insn, unsigned desc, bool gather)
 {
-   brw_set_desc_ex(p, insn, desc, 0);
+   brw_set_desc_ex(p, insn, desc, 0, gather);
 }
 
 void brw_set_uip_jip(struct brw_codegen *p, int start_offset);
@@ -1586,8 +1578,10 @@ bool brw_validate_instructions(const struct brw_isa_info *isa,
                                struct disasm_info *disasm);
 
 static inline int
-next_offset(const struct intel_device_info *devinfo, void *store, int offset)
+next_offset(struct brw_codegen *p, void *store, int offset)
 {
+   const struct intel_device_info *devinfo = p->devinfo;
+   assert((char *)store + offset < (char *)p->store + p->next_insn_offset);
    brw_eu_inst *insn = (brw_eu_inst *)((char *)store + offset);
 
    if (brw_eu_inst_cmpt_control(devinfo, insn))

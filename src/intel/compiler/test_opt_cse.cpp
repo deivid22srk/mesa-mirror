@@ -8,8 +8,6 @@
 #include "brw_builder.h"
 #include "brw_cfg.h"
 
-using namespace brw;
-
 class cse_test : public ::testing::Test {
 protected:
    cse_test();
@@ -59,12 +57,12 @@ cse_test::~cse_test()
 }
 
 
-static fs_inst *
+static brw_inst *
 instruction(bblock_t *block, int num)
 {
-   fs_inst *inst = (fs_inst *)block->start();
+   brw_inst *inst = (brw_inst *)block->start();
    for (int i = 0; i < num; i++) {
-      inst = (fs_inst *)inst->next;
+      inst = (brw_inst *)inst->next;
    }
    return inst;
 }

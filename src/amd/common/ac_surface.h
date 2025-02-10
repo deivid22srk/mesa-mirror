@@ -80,12 +80,6 @@ enum radeon_micro_mode
 #define RADEON_SURF_PREFER_64K_ALIGNMENT  (1ull << 37)
 #define RADEON_SURF_VIDEO_REFERENCE       (1ull << 38)
 
-enum radeon_enc_hevc_surface_alignment
-{
-   RADEON_ENC_HEVC_SURFACE_LOG2_WIDTH_ALIGNMENT = 6,
-   RADEON_ENC_HEVC_SURFACE_LOG2_HEIGHT_ALIGNMENT = 4,
-};
-
 struct legacy_surf_level {
    uint32_t offset_256B;   /* divided by 256, the hw can only do 40-bit addresses */
    uint32_t slice_size_dw; /* in dwords; max = 4GB / 4. */
@@ -281,6 +275,7 @@ struct gfx9_surf_layout {
           */
          uint8_t dcc_number_type; /* CB_COLOR0_INFO.NUMBER_TYPE */
          uint8_t dcc_data_format; /* [0:4]:CB_COLOR0_INFO.FORMAT, [5]:MM */
+         bool dcc_write_compress_disable;
 
          /* Displayable DCC. This is always rb_aligned=0 and pipe_aligned=0.
           * The 3D engine doesn't support that layout except for chips with 1 RB.

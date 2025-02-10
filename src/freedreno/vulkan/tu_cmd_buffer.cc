@@ -697,10 +697,6 @@ tu6_emit_render_cntl<A7XX>(struct tu_cmd_buffer *cmd,
                      struct tu_cs *cs,
                      bool binning)
 {
-   tu_cs_emit_regs(
-      cs, RB_RENDER_CNTL(A7XX, .binning = binning, .raster_mode = TYPE_TILED,
-                              .raster_direction = LR_TB));
-   tu_cs_emit_regs(cs, A7XX_GRAS_SU_RENDER_CNTL(.binning = binning));
 }
 
 static void
@@ -1439,9 +1435,11 @@ tu6_init_static_regs(struct tu_device *dev, struct tu_cs *cs)
 
    tu_cs_emit_write_reg(cs, REG_A6XX_SP_UNKNOWN_B183, 0);
 
-   tu_cs_emit_write_reg(cs, REG_A6XX_GRAS_SU_CONSERVATIVE_RAS_CNTL, 0);
    tu_cs_emit_write_reg(cs, REG_A6XX_GRAS_UNKNOWN_80AF, 0);
    if (CHIP == A6XX) {
+      tu_cs_emit_write_reg(cs, REG_A6XX_GRAS_SU_CONSERVATIVE_RAS_CNTL, 0);
+      tu_cs_emit_regs(cs, A6XX_PC_DGEN_SU_CONSERVATIVE_RAS_CNTL());
+
       tu_cs_emit_write_reg(cs, REG_A6XX_VPC_UNKNOWN_9210, 0);
       tu_cs_emit_write_reg(cs, REG_A6XX_VPC_UNKNOWN_9211, 0);
    }
@@ -1934,7 +1932,9 @@ tu_emit_input_attachments(struct tu_cmd_buffer *cmd,
          continue;
 
       /* patched for gmem */
-      dst[0] &= ~(A6XX_TEX_CONST_0_SWAP__MASK | A6XX_TEX_CONST_0_TILE_MODE__MASK);
+      dst[0] &= ~A6XX_TEX_CONST_0_TILE_MODE__MASK;
+      if (!iview->view.is_mutable)
+         dst[0] &= ~A6XX_TEX_CONST_0_SWAP__MASK;
       dst[0] |= A6XX_TEX_CONST_0_TILE_MODE(TILE6_2);
       dst[2] =
          A6XX_TEX_CONST_2_TYPE(A6XX_TEX_2D) |
@@ -2543,7 +2543,9 @@ tu_cmd_buffer_destroy(struct vk_command_buffer *vk_cmd_buffer)
    }
 
    ralloc_free(cmd_buffer->patchpoints_ctx);
+   ralloc_free(cmd_buffer->pre_chain.patchpoints_ctx);
    util_dynarray_fini(&cmd_buffer->fdm_bin_patchpoints);
+   util_dynarray_fini(&cmd_buffer->pre_chain.fdm_bin_patchpoints);
 
    vk_command_buffer_finish(&cmd_buffer->vk);
    vk_free2(&cmd_buffer->device->vk.alloc, &cmd_buffer->vk.pool->alloc,
@@ -2591,8 +2593,11 @@ tu_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
    cmd_buffer->prev_fsr_is_null = false;
 
    ralloc_free(cmd_buffer->patchpoints_ctx);
+   ralloc_free(cmd_buffer->pre_chain.patchpoints_ctx);
    cmd_buffer->patchpoints_ctx = NULL;
+   cmd_buffer->pre_chain.patchpoints_ctx = NULL;
    util_dynarray_clear(&cmd_buffer->fdm_bin_patchpoints);
+   util_dynarray_clear(&cmd_buffer->pre_chain.fdm_bin_patchpoints);
 }
 
 const struct vk_command_buffer_ops tu_cmd_buffer_ops = {

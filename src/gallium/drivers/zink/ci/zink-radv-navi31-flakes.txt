@@ -1,6 +1,7 @@
 KHR-GL46.explicit_uniform_location.uniform-loc-implicit-in-some-stages3
 KHR-GL46.geometry_shader.primitive_counter.lines_to_line_strip
 KHR-GL46.geometry_shader.primitive_counter.lines_to_line_strip_rp
+KHR-GL46.geometry_shader.primitive_counter.lines_to_triangle_strip
 KHR-GL46.geometry_shader.primitive_counter.points_to_line_strip
 KHR-GL46.geometry_shader.primitive_counter.points_to_line_strip_rp
 KHR-GL46.geometry_shader.primitive_counter.triangles_to_line_strip
@@ -59,3 +60,7 @@ spec@glsl-1.50@execution@redeclare-pervertex-out-subset-gs
 
 # First seen on navi10 in https://gitlab.freedesktop.org/mesa/mesa/-/jobs/58636780
 KHR-GL46.sparse_buffer_tests.BufferStorageTest
+
+KHR-GL46.explicit_uniform_location.subroutine-index
+spec@arb_shader_atomic_counters@semantics
+spec@arb_shader_texture_lod@execution@glsl-fs-shadow2dgradarb-cumulative

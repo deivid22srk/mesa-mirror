@@ -23,6 +23,7 @@
 
 #include "lvp_private.h"
 #include "lvp_conv.h"
+#include "lvp_acceleration_structure.h"
 
 #include "pipe-loader/pipe_loader.h"
 #include "git_sha1.h"
@@ -828,9 +829,9 @@ lvp_get_properties(const struct lvp_physical_device *device, struct vk_propertie
       .maxPerStageResources                     = MAX_DESCRIPTORS,
       .maxDescriptorSetSamplers                 = MAX_DESCRIPTORS,
       .maxDescriptorSetUniformBuffers           = MAX_DESCRIPTORS,
-      .maxDescriptorSetUniformBuffersDynamic    = MAX_DESCRIPTORS,
+      .maxDescriptorSetUniformBuffersDynamic    = MAX_DESCRIPTORS / 2,
       .maxDescriptorSetStorageBuffers           = MAX_DESCRIPTORS,
-      .maxDescriptorSetStorageBuffersDynamic    = MAX_DESCRIPTORS,
+      .maxDescriptorSetStorageBuffersDynamic    = MAX_DESCRIPTORS / 2,
       .maxDescriptorSetSampledImages            = MAX_DESCRIPTORS,
       .maxDescriptorSetStorageImages            = MAX_DESCRIPTORS,
       .maxDescriptorSetInputAttachments         = MAX_DESCRIPTORS,
@@ -981,9 +982,9 @@ lvp_get_properties(const struct lvp_physical_device *device, struct vk_propertie
       .maxPerStageUpdateAfterBindResources = MAX_DESCRIPTORS,
       .maxDescriptorSetUpdateAfterBindSamplers = MAX_DESCRIPTORS,
       .maxDescriptorSetUpdateAfterBindUniformBuffers = MAX_DESCRIPTORS,
-      .maxDescriptorSetUpdateAfterBindUniformBuffersDynamic = MAX_DESCRIPTORS,
+      .maxDescriptorSetUpdateAfterBindUniformBuffersDynamic = MAX_DESCRIPTORS / 2,
       .maxDescriptorSetUpdateAfterBindStorageBuffers = MAX_DESCRIPTORS,
-      .maxDescriptorSetUpdateAfterBindStorageBuffersDynamic = MAX_DESCRIPTORS,
+      .maxDescriptorSetUpdateAfterBindStorageBuffersDynamic = MAX_DESCRIPTORS / 2,
       .maxDescriptorSetUpdateAfterBindSampledImages = MAX_DESCRIPTORS,
       .maxDescriptorSetUpdateAfterBindStorageImages = MAX_DESCRIPTORS,
       .maxDescriptorSetUpdateAfterBindInputAttachments = MAX_DESCRIPTORS,
@@ -1236,8 +1237,8 @@ lvp_get_properties(const struct lvp_physical_device *device, struct vk_propertie
    p->maxDescriptorSetTotalUniformBuffersDynamic = MAX_DESCRIPTORS;
    p->maxDescriptorSetTotalStorageBuffersDynamic = MAX_DESCRIPTORS;
    p->maxDescriptorSetTotalBuffersDynamic = MAX_DESCRIPTORS;
-   p->maxDescriptorSetUpdateAfterBindTotalUniformBuffersDynamic = MAX_DESCRIPTORS;
-   p->maxDescriptorSetUpdateAfterBindTotalStorageBuffersDynamic = MAX_DESCRIPTORS;
+   p->maxDescriptorSetUpdateAfterBindTotalUniformBuffersDynamic = MAX_DESCRIPTORS / 2;
+   p->maxDescriptorSetUpdateAfterBindTotalStorageBuffersDynamic = MAX_DESCRIPTORS / 2;
    p->maxDescriptorSetUpdateAfterBindTotalBuffersDynamic = MAX_DESCRIPTORS;
 
    /* VK_EXT_shader_object */
@@ -1761,7 +1762,7 @@ VKAPI_ATTR VkResult VKAPI_CALL lvp_CreateDevice(
       return result;
    }
 
-   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT, NULL, "dummy_frag");
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT, physical_device->drv_options[MESA_SHADER_FRAGMENT], "dummy_frag");
    struct pipe_shader_state shstate = {0};
    shstate.type = PIPE_SHADER_IR_NIR;
    shstate.ir.nir = b.shader;
@@ -1782,6 +1783,14 @@ VKAPI_ATTR VkResult VKAPI_CALL lvp_CreateDevice(
 
    device->group_handle_alloc = 1;
 
+   result = vk_meta_device_init(&device->vk, &device->meta);
+   if (result != VK_SUCCESS) {
+      lvp_DestroyDevice(lvp_device_to_handle(device), pAllocator);
+      return result;
+   }
+
+   lvp_device_init_accel_struct_state(device);
+
    *pDevice = lvp_device_to_handle(device);
 
    return VK_SUCCESS;
@@ -1793,6 +1802,10 @@ VKAPI_ATTR void VKAPI_CALL lvp_DestroyDevice(
    const VkAllocationCallbacks*                pAllocator)
 {
    LVP_FROM_HANDLE(lvp_device, device, _device);
+
+   lvp_device_finish_accel_struct_state(device);
+
+   vk_meta_device_finish(&device->vk, &device->meta);
 
    util_dynarray_foreach(&device->bda_texture_handles, struct lp_texture_handle *, handle)
       device->queue.ctx->delete_texture_handle(device->queue.ctx, (uint64_t)(uintptr_t)*handle);

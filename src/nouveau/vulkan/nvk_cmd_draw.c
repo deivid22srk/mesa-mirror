@@ -34,7 +34,7 @@ static inline uint16_t
 nvk_cmd_buffer_3d_cls(struct nvk_cmd_buffer *cmd)
 {
    struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
-   struct nvk_physical_device *pdev = nvk_device_physical(dev);
+   const struct nvk_physical_device *pdev = nvk_device_physical(dev);
    return pdev->info.cls_eng3d;
 }
 
@@ -107,7 +107,7 @@ VkResult
 nvk_push_draw_state_init(struct nvk_queue *queue, struct nv_push *p)
 {
    struct nvk_device *dev = nvk_queue_device(queue);
-   struct nvk_physical_device *pdev = nvk_device_physical(dev);
+   const struct nvk_physical_device *pdev = nvk_device_physical(dev);
 
    /* 3D state */
    P_MTHD(p, NV9097, SET_OBJECT);
@@ -1651,7 +1651,7 @@ static void
 nvk_flush_vi_state(struct nvk_cmd_buffer *cmd)
 {
    struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
-   struct nvk_physical_device *pdev = nvk_device_physical(dev);
+   const struct nvk_physical_device *pdev = nvk_device_physical(dev);
    const struct vk_dynamic_graphics_state *dyn =
       &cmd->vk.dynamic_graphics_state;
 
@@ -1782,7 +1782,8 @@ nvk_flush_ts_state(struct nvk_cmd_buffer *cmd)
 static void
 nvk_flush_vp_state(struct nvk_cmd_buffer *cmd)
 {
-   const struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+   struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+   const struct nvk_physical_device *pdev = nvk_device_physical(dev);
 
    const struct vk_dynamic_graphics_state *dyn =
       &cmd->vk.dynamic_graphics_state;
@@ -1891,13 +1892,16 @@ nvk_flush_vp_state(struct nvk_cmd_buffer *cmd)
    }
 
    if (BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_VP_SCISSORS)) {
+      const uint32_t sr_max =
+         nvk_image_max_dimension(&pdev->info, VK_IMAGE_TYPE_2D);
+
       for (unsigned i = 0; i < dyn->vp.scissor_count; i++) {
          const VkRect2D *s = &dyn->vp.scissors[i];
 
-         const uint32_t xmin = MIN2(16384, s->offset.x);
-         const uint32_t xmax = MIN2(16384, s->offset.x + s->extent.width);
-         const uint32_t ymin = MIN2(16384, s->offset.y);
-         const uint32_t ymax = MIN2(16384, s->offset.y + s->extent.height);
+         const uint32_t xmin = MIN2(sr_max, s->offset.x);
+         const uint32_t xmax = MIN2(sr_max, s->offset.x + s->extent.width);
+         const uint32_t ymin = MIN2(sr_max, s->offset.y);
+         const uint32_t ymax = MIN2(sr_max, s->offset.y + s->extent.height);
 
          P_MTHD(p, NV9097, SET_SCISSOR_ENABLE(i));
          P_NV9097_SET_SCISSOR_ENABLE(p, i, V_TRUE);
@@ -3301,7 +3305,7 @@ nvk_mme_bind_cbuf_desc(struct mme_builder *b)
 
    struct mme_value cb = mme_alloc_reg(b);
    mme_if(b, ieq, size, mme_zero()) {
-      /* Bottim bit is the valid bit, 8:4 are shader slot */
+      /* Bottom bit is the valid bit, 8:4 are shader slot */
       mme_merge_to(b, cb, mme_zero(), group_slot, 4, 5, 4);
    }
 
@@ -3341,7 +3345,7 @@ void
 nvk_cmd_flush_gfx_cbufs(struct nvk_cmd_buffer *cmd)
 {
    struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
-   struct nvk_physical_device *pdev = nvk_device_physical(dev);
+   const struct nvk_physical_device *pdev = nvk_device_physical(dev);
    const uint32_t min_cbuf_alignment = nvk_min_cbuf_alignment(&pdev->info);
    struct nvk_descriptor_state *desc = &cmd->state.gfx.descriptors;
 

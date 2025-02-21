@@ -26,7 +26,7 @@
  */
 
 #include "brw_eu.h"
-#include "brw_fs.h"
+#include "brw_shader.h"
 #include "brw_builder.h"
 #include "brw_cfg.h"
 #include "util/set.h"
@@ -43,7 +43,7 @@ assign_reg(const struct intel_device_info *devinfo,
 }
 
 void
-brw_assign_regs_trivial(fs_visitor &s)
+brw_assign_regs_trivial(brw_shader &s)
 {
    const struct intel_device_info *devinfo = s.devinfo;
    unsigned *hw_reg_mapping = ralloc_array(NULL, unsigned, s.alloc.count + 1);
@@ -77,7 +77,7 @@ brw_assign_regs_trivial(fs_visitor &s)
 }
 
 extern "C" void
-brw_fs_alloc_reg_sets(struct brw_compiler *compiler)
+brw_alloc_reg_sets(struct brw_compiler *compiler)
 {
    const struct intel_device_info *devinfo = compiler->devinfo;
    int base_reg_count = (devinfo->ver >= 30 ? XE3_MAX_GRF / reg_unit(devinfo) :
@@ -152,7 +152,7 @@ count_to_loop_end(const bblock_t *block)
    unreachable("not reached");
 }
 
-void fs_visitor::calculate_payload_ranges(bool allow_spilling,
+void brw_shader::calculate_payload_ranges(bool allow_spilling,
                                           unsigned payload_node_count,
                                           int *payload_last_use_ip) const
 {
@@ -236,7 +236,7 @@ void fs_visitor::calculate_payload_ranges(bool allow_spilling,
 
 class brw_reg_alloc {
 public:
-   brw_reg_alloc(fs_visitor *fs):
+   brw_reg_alloc(brw_shader *fs):
       fs(fs), devinfo(fs->devinfo), compiler(fs->compiler),
       live(fs->live_analysis.require()), g(NULL),
       have_spill_costs(false)
@@ -308,7 +308,7 @@ private:
    void spill_reg(unsigned spill_reg);
 
    void *mem_ctx;
-   fs_visitor *fs;
+   brw_shader *fs;
    const intel_device_info *devinfo;
    const brw_compiler *compiler;
    const brw_live_variables &live;
@@ -351,7 +351,7 @@ namespace {
     * into multiple (force_writemask_all) scratch messages.
     */
    unsigned
-   spill_max_size(const fs_visitor *s)
+   spill_max_size(const brw_shader *s)
    {
       /* LSC is limited to SIMD16 sends (SIMD32 on Xe2) */
       if (s->devinfo->has_lsc)
@@ -361,10 +361,6 @@ namespace {
        *            altogether by spilling directly from the temporary GRF
        *            allocated to hold the result of the instruction (and the
        *            scratch write header).
-       */
-      /* FINISHME - The shader's dispatch width probably belongs in
-       *            backend_shader (or some nonexistent fs_shader class?)
-       *            rather than in the visitor class.
        */
       return s->dispatch_width / 8;
    }
@@ -1334,7 +1330,7 @@ brw_reg_alloc::assign_regs(bool allow_spilling, bool spill_all)
 }
 
 bool
-brw_assign_regs(fs_visitor &s, bool allow_spilling, bool spill_all)
+brw_assign_regs(brw_shader &s, bool allow_spilling, bool spill_all)
 {
    brw_reg_alloc alloc(&s);
    bool success = alloc.assign_regs(allow_spilling, spill_all);

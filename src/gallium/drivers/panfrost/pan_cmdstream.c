@@ -52,6 +52,7 @@
 #include "pan_jm.h"
 #include "pan_job.h"
 #include "pan_pool.h"
+#include "pan_precomp.h"
 #include "pan_resource.h"
 #include "pan_samples.h"
 #include "pan_shader.h"
@@ -339,14 +340,14 @@ panfrost_emit_blend(struct panfrost_batch *batch, void *rts,
          cfg.alpha_to_one = ctx->blend->base.alpha_to_one;
 #if PAN_ARCH >= 6
          if (!blend_shaders[i])
-            cfg.constant = pack_blend_constant(format, cons);
+            cfg.blend_constant = pack_blend_constant(format, cons);
 #else
          cfg.blend_shader = (blend_shaders[i] != 0);
 
          if (blend_shaders[i])
             cfg.shader_pc = blend_shaders[i];
          else
-            cfg.constant = cons;
+            cfg.blend_constant = cons;
 #endif
       }
 
@@ -1311,6 +1312,9 @@ panfrost_upload_sysvals(struct panfrost_batch *batch, void *ptr_cpu,
          break;
       case PAN_SYSVAL_DRAWID:
          uniforms[i].u[0] = batch->ctx->drawid;
+         break;
+      case PAN_SYSVAL_PRINTF_BUFFER:
+         uniforms[i].du[0] = batch->ctx->printf.bo->ptr.gpu;
          break;
       default:
          assert(0);
@@ -4218,6 +4222,8 @@ GENX(panfrost_cmdstream_screen_init)(struct panfrost_screen *screen)
    GENX(pan_fb_preload_cache_init)
    (&dev->fb_preload_cache, panfrost_device_gpu_id(dev), &dev->blend_shaders,
     &screen->mempools.bin.base, &screen->mempools.desc.base);
+
+   dev->precomp_cache = GENX(panfrost_precomp_cache_init)(screen);
 
 #if PAN_GPU_SUPPORTS_DISPATCH_INDIRECT
    pan_indirect_dispatch_meta_init(

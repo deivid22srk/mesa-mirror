@@ -13,6 +13,7 @@
 #include "nir/nir.h"
 #include "nir/nir_builder.h"
 #include "nir/nir_xfb_info.h"
+#include "nir/radv_meta_nir.h"
 #include "nir/radv_nir.h"
 #include "spirv/nir_spirv.h"
 #include "util/memstream.h"
@@ -183,7 +184,14 @@ radv_optimize_nir(struct nir_shader *shader, bool optimize_conservatively)
       }
       NIR_LOOP_PASS_NOT_IDEMPOTENT(progress, skip, shader, nir_opt_if, nir_opt_if_optimize_phi_true_false);
       NIR_LOOP_PASS(progress, skip, shader, nir_opt_cse);
-      NIR_LOOP_PASS(progress, skip, shader, nir_opt_peephole_select, 8, true, true);
+
+      nir_opt_peephole_select_options peephole_select_options = {
+         .limit = 8,
+         .indirect_load_ok = true,
+         .expensive_alu_ok = true,
+         .discard_ok = true,
+      };
+      NIR_LOOP_PASS(progress, skip, shader, nir_opt_peephole_select, &peephole_select_options);
       NIR_LOOP_PASS(progress, skip, shader, nir_opt_constant_folding);
       NIR_LOOP_PASS(progress, skip, shader, nir_opt_intrinsics);
       NIR_LOOP_PASS_NOT_IDEMPOTENT(progress, skip, shader, nir_opt_algebraic);
@@ -200,10 +208,8 @@ radv_optimize_nir(struct nir_shader *shader, bool optimize_conservatively)
    NIR_PASS(progress, shader, nir_remove_dead_variables,
             nir_var_function_temp | nir_var_shader_in | nir_var_shader_out | nir_var_mem_shared, NULL);
 
-   if (shader->info.stage == MESA_SHADER_FRAGMENT && shader->info.fs.uses_discard) {
-      NIR_PASS(progress, shader, nir_opt_conditional_discard);
+   if (shader->info.stage == MESA_SHADER_FRAGMENT && shader->info.fs.uses_discard)
       NIR_PASS(progress, shader, nir_opt_move_discards_to_top);
-   }
 
    NIR_PASS(progress, shader, nir_opt_move, nir_move_load_ubo);
 }
@@ -218,7 +224,14 @@ radv_optimize_nir_algebraic(nir_shader *nir, bool opt_offsets, bool opt_mqsad)
       NIR_PASS(_, nir, nir_opt_dce);
       NIR_PASS(_, nir, nir_opt_constant_folding);
       NIR_PASS(_, nir, nir_opt_cse);
-      NIR_PASS(_, nir, nir_opt_peephole_select, 3, true, true);
+
+      nir_opt_peephole_select_options peephole_select_options = {
+         .limit = 3,
+         .indirect_load_ok = true,
+         .expensive_alu_ok = true,
+         .discard_ok = true,
+      };
+      NIR_PASS(_, nir, nir_opt_peephole_select, &peephole_select_options);
       NIR_PASS(more_algebraic, nir, nir_opt_algebraic);
       NIR_PASS(_, nir, nir_opt_generate_bfi);
       NIR_PASS(_, nir, nir_opt_remove_phis);
@@ -2478,7 +2491,7 @@ radv_shader_dma_get_submission(struct radv_device *device, struct radeon_winsys_
          goto fail;
    }
 
-   radv_sdma_copy_buffer(device, cs, radv_buffer_get_va(submission->bo), va, size);
+   radv_sdma_copy_memory(device, cs, radv_buffer_get_va(submission->bo), va, size);
    radv_cs_add_buffer(ws, cs, submission->bo);
    radv_cs_add_buffer(ws, cs, bo);
 
@@ -3136,7 +3149,7 @@ radv_create_trap_handler_shader(struct radv_device *device)
    radv_fill_nir_compiler_options(&options, device, NULL, radv_should_use_wgp_mode(device, stage, &info), dump_shader,
                                   false, false);
 
-   nir_builder b = radv_meta_init_shader(device, stage, "meta_trap_handler");
+   nir_builder b = radv_meta_nir_init_shader(device, stage, "meta_trap_handler");
 
    info.wave_size = 64;
    info.workgroup_size = 64;

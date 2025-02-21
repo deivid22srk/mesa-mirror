@@ -572,7 +572,7 @@ lower_1d_image(nir_builder *b, nir_intrinsic_instr *intr)
 static bool
 lower_image_load_robustness(nir_builder *b, nir_intrinsic_instr *intr)
 {
-   if (nir_intrinsic_access(intr) & ACCESS_IN_BOUNDS_AGX)
+   if (nir_intrinsic_access(intr) & ACCESS_IN_BOUNDS)
       return false;
 
    /* We only need to worry about array-like loads */
@@ -781,7 +781,7 @@ agx_nir_lower_texture(nir_shader *s)
    NIR_PASS(progress, s, nir_shader_intrinsics_pass, fence_image,
             nir_metadata_control_flow, NULL);
 
-   NIR_PASS(progress, s, nir_lower_image_atomics_to_global);
+   NIR_PASS(progress, s, nir_lower_image_atomics_to_global, NULL, NULL);
 
    NIR_PASS(progress, s, nir_shader_intrinsics_pass, legalize_image_lod,
             nir_metadata_control_flow, NULL);

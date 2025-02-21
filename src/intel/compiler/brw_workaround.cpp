@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-#include "brw_fs.h"
+#include "brw_shader.h"
 #include "brw_builder.h"
 
 /* Wa_14015360517
@@ -12,7 +12,7 @@
  * Make sure this happens by introducing a dummy mov instruction.
  */
 bool
-brw_workaround_emit_dummy_mov_instruction(fs_visitor &s)
+brw_workaround_emit_dummy_mov_instruction(brw_shader &s)
 {
    if (!intel_needs_workaround(s.devinfo, 14015360517))
       return false;
@@ -81,7 +81,7 @@ needs_dummy_fence(const intel_device_info *devinfo, brw_inst *inst)
  *                We probably need a better criteria in needs_dummy_fence().
  */
 bool
-brw_workaround_memory_fence_before_eot(fs_visitor &s)
+brw_workaround_memory_fence_before_eot(brw_shader &s)
 {
    bool progress = false;
    bool has_ugm_write_or_atomic = false;
@@ -131,7 +131,7 @@ brw_workaround_memory_fence_before_eot(fs_visitor &s)
  * the only SHADER_OPCODE_HALT_TARGET in the program.
  */
 static const brw_inst *
-find_halt_control_flow_region_start(const fs_visitor *v)
+find_halt_control_flow_region_start(const brw_shader *v)
 {
    foreach_block_and_inst(block, brw_inst, inst, v->cfg) {
       if (inst->opcode == BRW_OPCODE_HALT ||
@@ -155,7 +155,7 @@ find_halt_control_flow_region_start(const fs_visitor *v)
  * all channels of the program are disabled.
  */
 bool
-brw_workaround_nomask_control_flow(fs_visitor &s)
+brw_workaround_nomask_control_flow(brw_shader &s)
 {
    if (s.devinfo->ver != 12)
       return false;
@@ -236,7 +236,7 @@ brw_workaround_nomask_control_flow(fs_visitor &s)
                 * and restore the flag register if it's live.
                 */
                const bool save_flag = flag_liveout &
-                                      brw_fs_flag_mask(flag, s.dispatch_width / 8);
+                                      brw_flag_mask(flag, s.dispatch_width / 8);
                const brw_reg tmp = ubld.group(8, 0).vgrf(flag.type);
 
                if (save_flag) {
@@ -299,7 +299,7 @@ bytes_bitmask_to_words(unsigned b)
  * accessed inside the next blocks, but this still should be good enough.
  */
 bool
-brw_workaround_source_arf_before_eot(fs_visitor &s)
+brw_workaround_source_arf_before_eot(brw_shader &s)
 {
    bool progress = false;
 

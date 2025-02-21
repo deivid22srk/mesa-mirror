@@ -40,6 +40,7 @@ rustfmt:
     - .lint-rustfmt-rules
   before_script:
     - shopt -s globstar
+    - source "$HOME/.cargo/env"
     - rustfmt --version
     - rustfmt --verbose src/**/lib.rs
 
@@ -64,7 +65,8 @@ yaml-toml-shell-py-test:
     - !reference [.disable-farm-mr-rules, rules]
     - !reference [.never-post-merge-rules, rules]
     - !reference [.no_scheduled_pipelines-rules, rules]
-    - if: $GITLAB_USER_LOGIN == "marge-bot"
+    # merge pipeline
+    - if: $GITLAB_USER_LOGIN == "marge-bot" && $CI_PIPELINE_SOURCE == "merge_request_event"
       changes: &lint_files
         - .gitlab-ci/test/gitlab-ci.yml
         - .gitlab-ci/**/*.sh
@@ -73,6 +75,14 @@ yaml-toml-shell-py-test:
         - src/**/ci/*.toml
         - .gitlab-ci/tests/**/*
         - bin/ci/**/*
+      when: on_success
+    # direct pushes that bypassed the CI
+    - if: $CI_PROJECT_NAMESPACE == "mesa" && $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH
+      changes: *lint_files
+      when: on_success
+    # direct pushes from release manager
+    - if: $CI_PROJECT_NAMESPACE == "mesa" && $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_REF_NAME =~ /^staging\//
+      changes: *lint_files
       when: on_success
     - changes: *lint_files
       when: manual
@@ -158,7 +168,7 @@ yaml-toml-shell-py-test:
     HWCI_TEST_SCRIPT: "/install/piglit/piglit-runner.sh"
   script:
     - section_start variables "Variables passed through:"
-    - install/common/generate-env.sh
+    - install/common/export-gitlab-job-env-for-dut.sh
     - section_end variables
     - install/piglit/piglit-traces.sh
 
@@ -371,7 +381,7 @@ yaml-toml-shell-py-test:
       # Create a script to regenerate the CI environment when this job
       # begins running on the remote DUT.
       set +x
-      "$CI_COMMON_SCRIPTS"/generate-env.sh > ${JOB_FOLDER}/set-job-env-vars.sh
+      "$CI_COMMON_SCRIPTS"/export-gitlab-job-env-for-dut.sh > ${JOB_FOLDER}/set-job-env-vars.sh
       echo "export SCRIPTS_DIR=./install" >> ${JOB_FOLDER}/set-job-env-vars.sh
       echo "Variables passed through:"
       cat ${JOB_FOLDER}/set-job-env-vars.sh

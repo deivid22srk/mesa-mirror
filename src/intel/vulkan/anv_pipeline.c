@@ -332,6 +332,9 @@ populate_vs_prog_key(struct anv_pipeline_stage *stage,
    memset(&stage->key, 0, sizeof(stage->key));
 
    populate_base_prog_key(stage, device);
+
+   stage->key.vs.vf_component_packing =
+      device->physical->instance->vf_component_packing;
 }
 
 static void
@@ -1009,9 +1012,6 @@ anv_pipeline_lower_nir(struct anv_pipeline *pipeline,
       NIR_PASS(progress, nir, nir_opt_constant_folding);
       NIR_PASS(progress, nir, nir_opt_dce);
    } while (progress);
-
-   /* Needed for anv_nir_lower_ubo_loads. */
-   nir_divergence_analysis(nir);
 
    NIR_PASS(_, nir, anv_nir_lower_ubo_loads);
 

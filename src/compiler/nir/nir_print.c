@@ -33,6 +33,7 @@
 #include "util/half_float.h"
 #include "util/memstream.h"
 #include "util/mesa-blake3.h"
+#include "util/ralloc.h"
 #include "vulkan/vulkan_core.h"
 #include "nir.h"
 #include "nir_builder.h"
@@ -52,6 +53,9 @@ typedef struct {
 
    /** map from nir_variable -> printable name */
    struct hash_table *ht;
+
+   /** sorted list of block's predecessors  */
+   nir_block **preds;
 
    /** set of names used so far for nir_variables */
    struct set *syms;
@@ -79,6 +83,9 @@ typedef struct {
     * them align with the `=` for instructions with destination.
     */
    unsigned padding_for_no_dest;
+
+   /* Whether divergence metadata is valid. */
+   bool divergence_valid;
 
    bool gather_debug_info;
 
@@ -112,7 +119,7 @@ static const char *sizes[] = { "x??", "   ", "x2 ", "x3 ", "x4 ",
 static const char *
 divergence_status(print_state *state, bool divergent)
 {
-   if (state->shader->info.divergence_analysis_run)
+   if (state->divergence_valid)
       return divergent ? "div " : "con ";
 
    return "";
@@ -148,7 +155,7 @@ print_def(nir_def *def, print_state *state)
 static unsigned
 calculate_padding_for_no_dest(print_state *state)
 {
-   const unsigned div = state->shader->info.divergence_analysis_run ? 4 : 0;
+   const unsigned div = state->divergence_valid ? 4 : 0;
    const unsigned ssa_size = 5;
    const unsigned percent = 1;
    const unsigned ssa_index = count_digits(state->max_dest_index);
@@ -210,19 +217,12 @@ print_hex_terse_const_value(const nir_const_value *value, unsigned bit_size, FIL
 static void
 print_float_const_value(const nir_const_value *value, unsigned bit_size, FILE *fp)
 {
-   switch (bit_size) {
-   case 64:
-      fprintf(fp, "%f", value->f64);
-      break;
-   case 32:
-      fprintf(fp, "%f", value->f32);
-      break;
-   case 16:
-      fprintf(fp, "%f", _mesa_half_to_float(value->u16));
-      break;
-   default:
-      unreachable("unhandled bit size");
-   }
+   double dval = nir_const_value_as_float(*value, bit_size);
+
+   if (fabs(dval) >= 1000000.0)
+      fprintf(fp, "%e", dval);
+   else
+      fprintf(fp, "%f", dval);
 }
 
 static void
@@ -822,7 +822,7 @@ print_access(enum gl_access_qualifier access, print_state *state, const char *se
       { ACCESS_FMASK_LOWERED_AMD, "fmask-lowered-amd" },
       { ACCESS_CAN_SPECULATE, "speculatable" },
       { ACCESS_CP_GE_COHERENT_AMD, "cp-ge-coherent-amd" },
-      { ACCESS_IN_BOUNDS_AGX, "in-bounds-agx" },
+      { ACCESS_IN_BOUNDS, "in-bounds" },
       { ACCESS_KEEP_SCALAR, "keep-scalar" },
       { ACCESS_SMEM_AMD, "smem-amd" },
    };
@@ -1998,13 +1998,20 @@ print_phi_instr(nir_phi_instr *instr, print_state *state)
    FILE *fp = state->fp;
    print_def(&instr->def, state);
    fprintf(fp, " = phi ");
-   nir_foreach_phi_src(src, instr) {
-      if (&src->node != exec_list_get_head(&instr->srcs))
+   nir_block **preds =
+      state->preds ? state->preds : nir_block_get_predecessors_sorted(instr->instr.block, NULL);
+
+   for (unsigned i = 0; i < instr->instr.block->predecessors->entries; i++) {
+      nir_phi_src *src = nir_phi_get_src_from_block(instr, preds[i]);
+      if (i != 0)
          fprintf(fp, ", ");
 
-      fprintf(fp, "b%u: ", src->pred->index);
+      fprintf(fp, "b%u: ", preds[i]->index);
       print_src(&src->src, state, nir_type_invalid);
    }
+
+   if (!state->preds)
+      ralloc_free(preds);
 }
 
 static void
@@ -2155,11 +2162,9 @@ static void
 print_block_preds(nir_block *block, print_state *state)
 {
    FILE *fp = state->fp;
-   nir_block **preds = nir_block_get_predecessors_sorted(block, NULL);
    for (unsigned i = 0; i < block->predecessors->entries; i++) {
-      fprintf(fp, " b%u", preds[i]->index);
+      fprintf(fp, " b%u", state->preds[i]->index);
    }
-   ralloc_free(preds);
 }
 
 static void
@@ -2189,12 +2194,14 @@ print_block(nir_block *block, print_state *state, unsigned tabs)
            block->index);
 
    const bool empty_block = exec_list_is_empty(&block->instr_list);
+   state->preds = nir_block_get_predecessors_sorted(block, NULL);
    if (empty_block) {
       fprintf(fp, "  // preds:");
       print_block_preds(block, state);
       fprintf(fp, ", succs:");
       print_block_succs(block, state);
       fprintf(fp, "\n");
+      ralloc_free(state->preds);
       return;
    }
 
@@ -2215,6 +2222,7 @@ print_block(nir_block *block, print_state *state, unsigned tabs)
    fprintf(fp, "%*s// succs:", state->padding_for_no_dest, "");
    print_block_succs(block, state);
    fprintf(fp, "\n");
+   ralloc_free(state->preds);
 }
 
 static void
@@ -2302,6 +2310,7 @@ print_function_impl(nir_function_impl *impl, print_state *state, bool print_name
    FILE *fp = state->fp;
 
    state->max_dest_index = impl->ssa_alloc;
+   state->divergence_valid = impl->valid_metadata & nir_metadata_divergence;
 
    if (print_name) {
       fprintf(fp, "\nimpl %s ", impl->function->name);
@@ -2643,7 +2652,6 @@ print_shader_info(const struct shader_info *info, FILE *fp)
 
    print_nz_bool(fp, "uses_texture_gather", info->uses_texture_gather);
    print_nz_bool(fp, "uses_resource_info_query", info->uses_resource_info_query);
-   print_nz_bool(fp, "divergence_analysis_run", info->divergence_analysis_run);
 
    print_nz_x8(fp, "bit_sizes_float", info->bit_sizes_float);
    print_nz_x8(fp, "bit_sizes_int", info->bit_sizes_int);
@@ -2870,6 +2878,7 @@ nir_print_instr(const nir_instr *instr, FILE *fp)
    if (instr->block) {
       nir_function_impl *impl = nir_cf_node_get_function(&instr->block->cf_node);
       state.shader = impl->function->shader;
+      state.divergence_valid = impl->valid_metadata & nir_metadata_divergence;
    }
 
    print_instr(instr, &state, 0);

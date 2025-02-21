@@ -118,10 +118,10 @@ zink-tu-a618:
     - .lava-sc7180-trogdor-lazor-limozeen:arm64
   variables:
     DEQP_FRACTION: 2
-    DEQP_SUITE: zink-freedreno-a618
+    DEQP_SUITE: zink-tu-a618
     FLAKES_CHANNEL: "#freedreno-ci"
     HWCI_START_WESTON: 1
-    GPU_VERSION: zink-freedreno-a618
+    GPU_VERSION: zink-tu-a618
   parallel: 2
 
 zink-tu-a618-full:
@@ -165,7 +165,7 @@ zink-tu-a750:
     - .zink-turnip-valve-manual-rules
   timeout: 25m  # base runtime 11min total, 9min of testing
   variables:
-    B2C_TIMEOUT_BOOT_MINUTES: 15
+    B2C_TIMEOUT_BOOT_MINUTES: 18
     B2C_TIMEOUT_OVERALL_MINUTES: 20
     DEQP_SUITE: zink-tu-a750
     GPU_VERSION: zink-tu-a750

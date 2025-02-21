@@ -191,6 +191,7 @@
 
 .intel-manual-rules:
   stage: intel-postmerge
+  extends: .no-auto-retry
   rules:
     - !reference [.test, rules]
     - !reference [.iris-manual-rules, rules]
@@ -326,6 +327,8 @@
     - .anv-rules
   variables:
     DRIVER_NAME: anv
+    ANV_VIDEO_DECODE: "true"
+    ANV_VIDEO_ENCODE: "true"
 
 .iris-test:
   extends:
@@ -346,8 +349,6 @@
   variables:
     VK_DRIVER: intel
     USE_ANGLE: 1
-    # ANGLE requires X11 running for some reason.
-    HWCI_START_XORG: 1
 
 ## Iris only
 .iris-apl-test:

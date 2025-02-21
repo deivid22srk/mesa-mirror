@@ -287,6 +287,7 @@ nvk_get_device_extensions(const struct nvk_instance *instance,
       .GOOGLE_decorate_string = true,
       .GOOGLE_hlsl_functionality1 = true,
       .GOOGLE_user_type = true,
+      .MESA_image_alignment_control = true,
       .NV_compute_shader_derivatives = nvk_use_nak(info),
       .NV_shader_sm_builtins = true,
       .VALVE_mutable_descriptor_type = true,
@@ -375,7 +376,8 @@ nvk_get_device_features(const struct nv_device_info *info,
       .storagePushConstant8 = true,
       .shaderBufferInt64Atomics = info->cls_eng3d >= MAXWELL_A &&
                                   nvk_use_nak(info),
-      .shaderSharedInt64Atomics = false, /* TODO */
+      .shaderSharedInt64Atomics = info->cls_eng3d >= MAXWELL_A &&
+                                  nvk_use_nak(info),
       /* TODO: Fp16 is currently busted on Turing and Volta due to instruction
        * scheduling issues.  Re-enable it once those are sorted.
        */
@@ -552,7 +554,7 @@ nvk_get_device_features(const struct nv_device_info *info,
       .descriptorBuffer = true,
       .descriptorBufferCaptureReplay = true,
       .descriptorBufferImageLayoutIgnored = true,
-      .descriptorBufferPushDescriptors = false,
+      .descriptorBufferPushDescriptors = true,
 
       /* VK_EXT_device_generated_commands */
       .deviceGeneratedCommands = true,
@@ -690,6 +692,9 @@ nvk_get_device_features(const struct nv_device_info *info,
 
       /* VK_EXT_ycbcr_image_arrays */
       .ycbcrImageArrays = true,
+
+      /* VK_MESA_image_alignment_control */
+      .imageAlignmentControl = true,
 
       /* VK_NV_shader_sm_builtins */
       .shaderSMBuiltins = true,
@@ -954,7 +959,7 @@ nvk_get_device_properties(const struct nvk_instance *instance,
       .nonStrictSinglePixelWideLinesUseParallelogram = false,
       .nonStrictWideLinesUseParallelogram = false,
       .blockTexelViewCompatibleMultipleLayers = true,
-      .maxCombinedImageSamplerDescriptorCount = 3,
+      .maxCombinedImageSamplerDescriptorCount = NVK_MAX_IMAGE_PLANES,
       .fragmentShadingRateClampCombinerInputs = false, /* TODO */
       .defaultRobustnessStorageBuffers =
          VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT,
@@ -984,7 +989,7 @@ nvk_get_device_properties(const struct nvk_instance *instance,
 
       /* VK_EXT_descriptor_buffer */
       .combinedImageSamplerDescriptorSingleArray = true,
-      .bufferlessPushDescriptors = false,
+      .bufferlessPushDescriptors = true,
       .allowSamplerImageViewPostSubmitCreation = false,
       .descriptorBufferOffsetAlignment = nvk_min_cbuf_alignment(info),
       .maxDescriptorBufferBindings = 32,
@@ -1128,6 +1133,9 @@ nvk_get_device_properties(const struct nvk_instance *instance,
       .fragmentShadingRateWithCustomSampleLocations = true,
       .fragmentShadingRateStrictMultiplyCombiner = true,
 
+      /* VK_MESA_image_alignment_control */
+      .supportedImageAlignmentMask = (4 * 1024) | (16 * 1024) | (64 * 1024),
+
       /* VK_NV_shader_sm_builtins */
       .shaderSMCount = (uint32_t)info->tpc_count * info->mp_per_tpc,
       .shaderWarpsPerSM = info->max_warps_per_mp,
@@ -1198,7 +1206,7 @@ nvk_get_device_properties(const struct nvk_instance *instance,
 static void
 nvk_physical_device_init_pipeline_cache(struct nvk_physical_device *pdev)
 {
-   struct nvk_instance *instance = nvk_physical_device_instance(pdev);
+   const struct nvk_instance *instance = nvk_physical_device_instance(pdev);
 
    struct mesa_sha1 sha_ctx;
    _mesa_sha1_init(&sha_ctx);

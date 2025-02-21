@@ -3,9 +3,9 @@
  * SPDX-License-Identifier: MIT
  */
 
-#include "brw_fs.h"
+#include "brw_shader.h"
 #include "brw_eu.h"
-#include "brw_fs.h"
+#include "brw_shader.h"
 #include "brw_cfg.h"
 #include "brw_compiler.h"
 #include "brw_inst.h"
@@ -481,7 +481,7 @@ brw_inst::components_read(unsigned i) const
          return 1;
 
    case SHADER_OPCODE_MEMORY_LOAD_LOGICAL:
-      if (i == MEMORY_LOGICAL_DATA0 || i == MEMORY_LOGICAL_DATA0)
+      if (i == MEMORY_LOGICAL_DATA0)
          return 0;
       /* fallthrough */
    case SHADER_OPCODE_MEMORY_STORE_LOGICAL:
@@ -643,13 +643,13 @@ brw_inst::flags_read(const intel_device_info *devinfo) const
        * f0.0 and f1.0 on Gfx7+.
        */
       const unsigned shift = 4;
-      return brw_fs_flag_mask(this, 1) << shift | brw_fs_flag_mask(this, 1);
+      return brw_flag_mask(this, 1) << shift | brw_flag_mask(this, 1);
    } else if (predicate) {
-      return brw_fs_flag_mask(this, predicate_width(devinfo, predicate));
+      return brw_flag_mask(this, predicate_width(devinfo, predicate));
    } else {
       unsigned mask = 0;
       for (int i = 0; i < sources; i++) {
-         mask |= brw_fs_flag_mask(src[i], size_read(devinfo, i));
+         mask |= brw_flag_mask(src[i], size_read(devinfo, i));
       }
       return mask;
    }
@@ -662,15 +662,15 @@ brw_inst::flags_written(const intel_device_info *devinfo) const
                            opcode != BRW_OPCODE_CSEL &&
                            opcode != BRW_OPCODE_IF &&
                            opcode != BRW_OPCODE_WHILE)) {
-      return brw_fs_flag_mask(this, 1);
+      return brw_flag_mask(this, 1);
    } else if (opcode == FS_OPCODE_LOAD_LIVE_CHANNELS ||
               opcode == SHADER_OPCODE_BALLOT ||
               opcode == SHADER_OPCODE_VOTE_ANY ||
               opcode == SHADER_OPCODE_VOTE_ALL ||
               opcode == SHADER_OPCODE_VOTE_EQUAL) {
-      return brw_fs_flag_mask(this, 32);
+      return brw_flag_mask(this, 32);
    } else {
-      return brw_fs_flag_mask(dst, size_written);
+      return brw_flag_mask(dst, size_written);
    }
 }
 
@@ -1251,7 +1251,7 @@ is_multi_copy_payload(const struct intel_device_info *devinfo,
  * instruction.
  */
 bool
-is_coalescing_payload(const fs_visitor &s, const brw_inst *inst)
+is_coalescing_payload(const brw_shader &s, const brw_inst *inst)
 {
    return is_identity_payload(s.devinfo, VGRF, inst) &&
           inst->src[0].offset == 0 &&

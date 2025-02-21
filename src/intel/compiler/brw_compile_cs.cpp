@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-#include "brw_fs.h"
+#include "brw_shader.h"
 #include "brw_analysis.h"
 #include "brw_builder.h"
 #include "brw_generator.h"
@@ -59,12 +59,12 @@ cs_fill_push_const_info(const struct intel_device_info *devinfo,
 }
 
 static bool
-run_cs(fs_visitor &s, bool allow_spilling)
+run_cs(brw_shader &s, bool allow_spilling)
 {
    assert(gl_shader_stage_is_compute(s.stage));
    const brw_builder bld = brw_builder(&s).at_end();
 
-   s.payload_ = new cs_thread_payload(s);
+   s.payload_ = new brw_cs_thread_payload(s);
 
    if (s.devinfo->platform == INTEL_PLATFORM_HSW && s.prog_data->total_shared > 0) {
       /* Move SLM index from g0.0[27:24] to sr0.1[11:8] */
@@ -164,7 +164,7 @@ brw_compile_cs(const struct brw_compiler *compiler,
 
    prog_data->uses_sampler = brw_nir_uses_sampler(params->base.nir);
 
-   std::unique_ptr<fs_visitor> v[3];
+   std::unique_ptr<brw_shader> v[3];
 
    for (unsigned i = 0; i < 3; i++) {
       const unsigned simd = devinfo->ver >= 30 ? 2 - i : i;
@@ -187,7 +187,7 @@ brw_compile_cs(const struct brw_compiler *compiler,
       brw_postprocess_nir(shader, compiler, debug_enabled,
                           key->base.robust_flags);
 
-      v[simd] = std::make_unique<fs_visitor>(compiler, &params->base,
+      v[simd] = std::make_unique<brw_shader>(compiler, &params->base,
                                              &key->base,
                                              &prog_data->base,
                                              shader, dispatch_width,

@@ -26,7 +26,7 @@
  */
 
 #include "brw_eu.h"
-#include "brw_fs.h"
+#include "brw_shader.h"
 #include "brw_builder.h"
 
 static void
@@ -283,7 +283,7 @@ static void
 lower_fb_write_logical_send(const brw_builder &bld, brw_inst *inst,
                             const struct brw_wm_prog_data *prog_data,
                             const brw_wm_prog_key *key,
-                            const fs_thread_payload &fs_payload)
+                            const brw_fs_thread_payload &fs_payload)
 {
    assert(inst->src[FB_WRITE_LOGICAL_SRC_COMPONENTS].file == IMM);
    assert(inst->src[FB_WRITE_LOGICAL_SRC_NULL_RT].file == IMM);
@@ -1303,7 +1303,7 @@ emit_predicate_on_vector_mask(const brw_builder &bld, brw_inst *inst)
 
    const brw_builder ubld = bld.exec_all().group(1, 0);
 
-   const fs_visitor &s = *bld.shader;
+   const brw_shader &s = *bld.shader;
    const brw_reg vector_mask = ubld.vgrf(BRW_TYPE_UW);
    ubld.UNDEF(vector_mask);
    ubld.emit(SHADER_OPCODE_READ_ARCH_REG, vector_mask, retype(brw_sr0_reg(3),
@@ -2149,7 +2149,7 @@ lower_interpolator_logical_send(const brw_builder &bld, brw_inst *inst,
       const brw_builder &ubld = bld.exec_all().group(8, 0);
       desc = ubld.vgrf(BRW_TYPE_UD);
 
-      /* The predicate should have been built in brw_fs_nir.cpp when emitting
+      /* The predicate should have been built in brw_from_nir.cpp when emitting
        * NIR code. This guarantees that we do not have incorrect interactions
        * with the flag register holding the predication result.
        */
@@ -2272,7 +2272,7 @@ static void
 lower_trace_ray_logical_send(const brw_builder &bld, brw_inst *inst)
 {
    const intel_device_info *devinfo = bld.shader->devinfo;
-   /* The emit_uniformize() in brw_fs_nir.cpp will generate an horizontal
+   /* The emit_uniformize() in brw_from_nir.cpp will generate an horizontal
     * stride of 0. Below we're doing a MOV() in SIMD2. Since we can't use UQ/Q
     * types in on Gfx12.5, we need to tweak the stride with a value of 1 dword
     * so that the MOV operates on 2 components rather than twice the same
@@ -2308,7 +2308,7 @@ lower_trace_ray_logical_send(const brw_builder &bld, brw_inst *inst)
        * optimization. This occurs in many Vulkan CTS tests.
        *
        * Many places in the late compiler, including but not limited to an
-       * assertion in fs_visitor::assign_curb_setup, assume that all uses of a
+       * assertion in brw_shader::assign_curb_setup, assume that all uses of a
        * UNIFORM will be uniform (i.e., <0,1,0>). The clever SIMD2
        * optimization violates that assumption.
        */
@@ -2370,7 +2370,7 @@ lower_get_buffer_size(const brw_builder &bld, brw_inst *inst)
 {
    const intel_device_info *devinfo = bld.shader->devinfo;
    /* Since we can only execute this instruction on uniform bti/surface
-    * handles, brw_fs_nir.cpp should already have limited this to SIMD8.
+    * handles, brw_from_nir.cpp should already have limited this to SIMD8.
     */
    assert(inst->exec_size == (devinfo->ver < 20 ? 8 : 16));
 
@@ -2512,7 +2512,7 @@ lower_hdc_memory_fence_and_interlock(const brw_builder &bld, brw_inst *inst)
 }
 
 bool
-brw_lower_logical_sends(fs_visitor &s)
+brw_lower_logical_sends(brw_shader &s)
 {
    const intel_device_info *devinfo = s.devinfo;
    bool progress = false;
@@ -2648,7 +2648,7 @@ brw_lower_logical_sends(fs_visitor &s)
  * source operand for all 8 or 16 of its channels.
  */
 bool
-brw_lower_uniform_pull_constant_loads(fs_visitor &s)
+brw_lower_uniform_pull_constant_loads(brw_shader &s)
 {
    const intel_device_info *devinfo = s.devinfo;
    bool progress = false;
@@ -2740,7 +2740,7 @@ brw_lower_uniform_pull_constant_loads(fs_visitor &s)
 }
 
 bool
-brw_lower_send_descriptors(fs_visitor &s)
+brw_lower_send_descriptors(brw_shader &s)
 {
    const intel_device_info *devinfo = s.devinfo;
    bool progress = false;

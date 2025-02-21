@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-#include "brw_fs.h"
+#include "brw_shader.h"
 #include "brw_builder.h"
 
 static void
@@ -269,7 +269,7 @@ int8_using_mul_add(const brw_builder &bld, brw_inst *inst)
 }
 
 bool
-brw_lower_dpas(fs_visitor &v)
+brw_lower_dpas(brw_shader &v)
 {
    bool progress = false;
 

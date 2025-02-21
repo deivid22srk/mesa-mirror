@@ -10,7 +10,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "amd_family.h"
-#include "nir.h"
+#include "nir_defines.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -89,6 +89,8 @@ typedef struct radv_nir_opt_tid_function_options {
 } radv_nir_opt_tid_function_options;
 
 bool radv_nir_opt_tid_function(nir_shader *shader, const radv_nir_opt_tid_function_options *options);
+
+bool radv_nir_opt_fs_builtins(nir_shader *shader, const struct radv_graphics_state_key *gfx_state);
 
 #ifdef __cplusplus
 }

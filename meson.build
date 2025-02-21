@@ -230,7 +230,7 @@ if _vulkan_drivers.contains('auto')
     if host_machine.cpu_family().startswith('x86')
       _vulkan_drivers = ['amd', 'intel', 'intel_hasvk', 'nouveau', 'swrast']
     elif ['arm', 'aarch64'].contains(host_machine.cpu_family())
-      _vulkan_drivers = ['swrast', 'intel', 'panfrost']
+      _vulkan_drivers = ['swrast', 'intel', 'panfrost', 'freedreno']
     elif ['mips', 'mips64', 'ppc', 'ppc64', 'riscv32', 'riscv64'].contains(host_machine.cpu_family())
       _vulkan_drivers = ['amd', 'swrast']
     elif ['loongarch64'].contains(host_machine.cpu_family())
@@ -833,8 +833,11 @@ else
   with_drivers_clc = false
 endif
 
-with_driver_using_cl = with_gallium_iris or with_intel_vk or \
-                       with_gallium_asahi or with_asahi_vk
+with_driver_using_cl = [
+  with_gallium_iris, with_intel_vk,
+  with_gallium_asahi, with_asahi_vk,
+  with_gallium_panfrost, with_panfrost_vk,
+].contains(true)
 
 if get_option('mesa-clc') == 'system'
   prog_mesa_clc = find_program('mesa_clc', native : true)

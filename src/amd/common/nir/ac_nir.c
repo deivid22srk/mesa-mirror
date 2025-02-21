@@ -333,8 +333,6 @@ ac_nir_optimize_uniform_atomics(nir_shader *nir)
 {
    bool progress = false;
    NIR_PASS(progress, nir, ac_nir_opt_shared_append);
-
-   nir_divergence_analysis(nir);
    NIR_PASS(progress, nir, nir_opt_uniform_atomics, false);
 
    return progress;
@@ -472,6 +470,7 @@ ac_nir_mem_vectorize_callback(unsigned align_mul, unsigned align_offset, unsigne
                     low->intrinsic == nir_intrinsic_store_shared ||
                     low->intrinsic == nir_intrinsic_load_deref ||
                     low->intrinsic == nir_intrinsic_store_deref;
+   unsigned swizzle_element_size = config->gfx_level <= GFX8 ? 4 : 16;
 
    assert(!is_store || hole_size <= 0);
 
@@ -525,7 +524,7 @@ ac_nir_mem_vectorize_callback(unsigned align_mul, unsigned align_offset, unsigne
          return false;
 
       /* GFX6-8 only support 32-bit scratch loads/stores. */
-      if (config->gfx_level <= GFX8 && swizzled && aligned_new_size > 32)
+      if (swizzled && aligned_new_size > (swizzle_element_size * 8))
          return false;
    }
 
@@ -589,6 +588,15 @@ ac_nir_mem_vectorize_callback(unsigned align_mul, unsigned align_offset, unsigne
       align = 1 << (ffs(align_offset) - 1);
    else
       align = align_mul;
+
+   /* Don't cross swizzle elements. stack/scratch intrinsics use scratch_* instructions, which
+    * seem to work fine.
+    */
+   if ((low->intrinsic == nir_intrinsic_load_buffer_amd ||
+        low->intrinsic == nir_intrinsic_store_buffer_amd) && swizzled &&
+       (align_offset % swizzle_element_size + unaligned_new_size / 8u) > MIN2(align_mul, swizzle_element_size)) {
+      return false;
+   }
 
    /* Validate the alignment and number of components. */
    if (!is_shared) {

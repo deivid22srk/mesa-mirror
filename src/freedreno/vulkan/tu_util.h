@@ -67,6 +67,7 @@ enum tu_debug_flags
    TU_DEBUG_NO_CONCURRENT_RESOLVES = 1 << 27,
    TU_DEBUG_NO_CONCURRENT_UNRESOLVES = 1 << 28,
    TU_DEBUG_DUMPAS = 1 << 29,
+   TU_DEBUG_NO_BIN_MERGING = 1 << 30,
 };
 
 struct tu_env {
@@ -81,6 +82,10 @@ extern struct tu_env tu_env;
  */
 void
 tu_env_init(void);
+
+/* Returns a pointer to the internal static tmp buffer, do not free. */
+const char *
+tu_env_debug_as_string(void);
 
 /* Whenever we generate an error, pass it through this function. Useful for
  * debugging, where we can break on it. Only call at error site, not when

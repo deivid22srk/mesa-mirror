@@ -146,6 +146,13 @@ struct intel_perf_query_result;
 #define CLOCK_MONOTONIC_RAW CLOCK_MONOTONIC_FAST
 #endif
 
+#define ANV_RT_STAGE_BITS (VK_SHADER_STAGE_RAYGEN_BIT_KHR |             \
+                           VK_SHADER_STAGE_ANY_HIT_BIT_KHR |            \
+                           VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR |        \
+                           VK_SHADER_STAGE_MISS_BIT_KHR |               \
+                           VK_SHADER_STAGE_INTERSECTION_BIT_KHR |       \
+                           VK_SHADER_STAGE_CALLABLE_BIT_KHR)
+
 #define NSEC_PER_SEC 1000000000ull
 
 #define BINDING_TABLE_POOL_BLOCK_SIZE (65536)
@@ -1319,6 +1326,7 @@ struct anv_instance {
     bool                                        anv_fake_nonlocal_memory;
     bool                                        anv_upper_bound_descriptor_pool_sampler;
     bool                                        custom_border_colors_without_format;
+    bool                                        vf_component_packing;
 
     /* HW workarounds */
     bool                                        no_16bit;
@@ -1444,6 +1452,7 @@ enum anv_gfx_state_bits {
    ANV_GFX_STATE_VF_SGVS_2,
    ANV_GFX_STATE_VF_SGVS_VI, /* 3DSTATE_VERTEX_ELEMENTS for sgvs elements */
    ANV_GFX_STATE_VF_SGVS_INSTANCING, /* 3DSTATE_VF_INSTANCING for sgvs elements */
+   ANV_GFX_STATE_VF_COMPONENT_PACKING,
    ANV_GFX_STATE_PRIMITIVE_REPLICATION,
    ANV_GFX_STATE_SBE,
    ANV_GFX_STATE_SBE_SWIZ,
@@ -3701,9 +3710,6 @@ struct anv_push_constants {
     */
    uint32_t surfaces_base_offset;
 
-   /* Robust access pushed registers. */
-   uint64_t push_reg_mask[MESA_SHADER_STAGES];
-
    /** Ray query globals (RT_DISPATCH_GLOBALS) */
    uint64_t ray_query_globals;
 
@@ -3714,6 +3720,9 @@ struct anv_push_constants {
 
          /** Dynamic TCS input vertices */
          uint32_t tcs_input_vertices;
+
+         /** Robust access pushed registers. */
+         uint64_t push_reg_mask[MESA_SHADER_STAGES];
       } gfx;
 
       struct {
@@ -4945,6 +4954,7 @@ struct anv_graphics_pipeline {
       struct anv_gfx_state_ptr                  vf_sgvs_2;
       struct anv_gfx_state_ptr                  vf_sgvs_instancing;
       struct anv_gfx_state_ptr                  vf_instancing;
+      struct anv_gfx_state_ptr                  vf_component_packing;
       struct anv_gfx_state_ptr                  primitive_replication;
       struct anv_gfx_state_ptr                  sbe;
       struct anv_gfx_state_ptr                  sbe_swiz;
@@ -5019,7 +5029,16 @@ struct anv_compute_pipeline {
 
    struct anv_shader_bin *                      cs;
    uint32_t                                     batch_data[9];
-   uint32_t                                     interface_descriptor_data[8];
+
+   union {
+      struct {
+         uint32_t                               interface_descriptor_data[8];
+         uint32_t                               gpgpu_walker[15];
+      } gfx9;
+      struct {
+         uint32_t                               compute_walker[40];
+      } gfx125;
+   };
 
    /* A small hash based of shader_info::source_sha1 for identifying shaders
     * in renderdoc/shader-db.

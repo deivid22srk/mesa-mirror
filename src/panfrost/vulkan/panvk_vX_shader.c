@@ -118,6 +118,13 @@ panvk_lower_sysvals(nir_builder *b, nir_instr *instr, void *data)
       val = nir_imm_int(b, 0);
       break;
 
+   case nir_intrinsic_load_printf_buffer_address:
+      if (b->shader->info.stage == MESA_SHADER_COMPUTE)
+         val = load_sysval(b, compute, bit_size, printf_buffer_address);
+      else
+         val = load_sysval(b, graphics, bit_size, printf_buffer_address);
+      break;
+
    default:
       return false;
    }
@@ -582,7 +589,12 @@ lower_load_push_consts(nir_shader *nir, struct panvk_shader *shader)
       NIR_PASS(progress, nir, nir_opt_dce);
       NIR_PASS(progress, nir, nir_opt_dead_cf);
       NIR_PASS(progress, nir, nir_opt_cse);
-      NIR_PASS(progress, nir, nir_opt_peephole_select, 64, false, true);
+
+      nir_opt_peephole_select_options peephole_select_options = {
+         .limit = 64,
+         .expensive_alu_ok = true,
+      };
+      NIR_PASS(progress, nir, nir_opt_peephole_select, &peephole_select_options);
       NIR_PASS(progress, nir, nir_opt_algebraic);
       NIR_PASS(progress, nir, nir_opt_constant_folding);
    } while (progress);
@@ -1065,7 +1077,9 @@ panvk_shader_destroy(struct vk_device *vk_dev, struct vk_shader *vk_shader,
    }
 #endif
 
-   free((void *)shader->bin_ptr);
+   if (shader->own_bin)
+      free((void *)shader->bin_ptr);
+
    vk_shader_free(&dev->vk, pAllocator, &shader->vk);
 }
 
@@ -1093,6 +1107,7 @@ panvk_compile_shader(struct panvk_device *dev,
    if (shader == NULL)
       return panvk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
+   shader->own_bin = true;
    struct panfrost_compile_inputs inputs = {
       .gpu_id = phys_dev->kmod.props.gpu_prod_id,
       .no_ubo_to_push = true,
@@ -1131,6 +1146,41 @@ panvk_compile_shader(struct panvk_device *dev,
    }
 
    *shader_out = &shader->vk;
+
+   return result;
+}
+
+VkResult
+panvk_per_arch(create_shader_from_binary)(struct panvk_device *dev,
+                                          const struct pan_shader_info *info,
+                                          struct pan_compute_dim local_size,
+                                          const void *bin_ptr, size_t bin_size,
+                                          struct panvk_shader **shader_out)
+{
+   struct panvk_shader *shader;
+   VkResult result;
+
+   shader = vk_shader_zalloc(&dev->vk, &panvk_shader_ops, info->stage,
+                             &dev->vk.alloc, sizeof(*shader));
+   if (shader == NULL)
+      return panvk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   shader->info = *info;
+   shader->local_size = local_size;
+   shader->bin_ptr = bin_ptr;
+   shader->bin_size = bin_size;
+   shader->own_bin = false;
+   shader->nir_str = NULL;
+   shader->asm_str = NULL;
+
+   result = panvk_shader_upload(dev, shader, &dev->vk.alloc);
+
+   if (result != VK_SUCCESS) {
+      panvk_shader_destroy(&dev->vk, &shader->vk, &dev->vk.alloc);
+      return result;
+   }
+
+   *shader_out = shader;
 
    return result;
 }

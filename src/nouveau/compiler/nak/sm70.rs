@@ -83,6 +83,8 @@ impl ShaderModel for ShaderModel70 {
             | Op::IMad(_)
             | Op::IMad64(_)
             | Op::ISetP(_)
+            | Op::Lea(_)
+            | Op::LeaX(_)
             | Op::Lop3(_)
             | Op::Mov(_)
             | Op::PLop3(_)
@@ -1747,6 +1749,114 @@ impl SM70Op for OpISetP {
     }
 }
 
+impl SM70Op for OpLea {
+    fn legalize(&mut self, b: &mut LegalizeBuilder) {
+        let gpr = op_gpr(self);
+        b.copy_alu_src_if_not_reg(&mut self.a, gpr, SrcType::ALU);
+        if self.dst_high {
+            b.copy_alu_src_if_both_not_reg(
+                &self.b,
+                &mut self.a_high,
+                gpr,
+                SrcType::ALU,
+            );
+        }
+    }
+
+    fn encode(&self, e: &mut SM70Encoder<'_>) {
+        assert!(self.a.src_mod == SrcMod::None);
+        assert!(
+            self.intermediate_mod == SrcMod::None
+                || self.b.src_mod == SrcMod::None
+        );
+
+        let c = if self.dst_high {
+            Some(&self.a_high)
+        } else {
+            None
+        };
+
+        if self.is_uniform() {
+            e.encode_ualu(
+                0x091,
+                Some(&self.dst),
+                Some(&self.a),
+                Some(&self.b),
+                c,
+            );
+        } else {
+            e.encode_alu(
+                0x011,
+                Some(&self.dst),
+                Some(&self.a),
+                Some(&self.b),
+                c,
+            );
+        }
+
+        e.set_bit(72, self.intermediate_mod.is_ineg());
+        e.set_field(75..80, self.shift);
+        e.set_bit(80, self.dst_high);
+        e.set_pred_dst(81..84, self.overflow);
+        e.set_bit(74, false); // .X
+    }
+}
+
+impl SM70Op for OpLeaX {
+    fn legalize(&mut self, b: &mut LegalizeBuilder) {
+        let gpr = op_gpr(self);
+        b.copy_alu_src_if_not_reg(&mut self.a, gpr, SrcType::ALU);
+        if self.dst_high {
+            b.copy_alu_src_if_both_not_reg(
+                &self.b,
+                &mut self.a_high,
+                gpr,
+                SrcType::ALU,
+            );
+        }
+    }
+
+    fn encode(&self, e: &mut SM70Encoder<'_>) {
+        assert!(self.a.src_mod == SrcMod::None);
+        assert!(
+            self.intermediate_mod == SrcMod::None
+                || self.b.src_mod == SrcMod::None
+        );
+
+        let c = if self.dst_high {
+            Some(&self.a_high)
+        } else {
+            None
+        };
+
+        if self.is_uniform() {
+            e.encode_ualu(
+                0x091,
+                Some(&self.dst),
+                Some(&self.a),
+                Some(&self.b),
+                c,
+            );
+            e.set_upred_src(87..90, 90, self.carry);
+        } else {
+            e.encode_alu(
+                0x011,
+                Some(&self.dst),
+                Some(&self.a),
+                Some(&self.b),
+                c,
+            );
+            e.set_pred_src(87..90, 90, self.carry);
+        }
+
+        e.set_bit(72, self.intermediate_mod.is_bnot());
+        e.set_field(75..80, self.shift);
+        e.set_bit(80, self.dst_high);
+        e.set_pred_dst(81..84, self.overflow);
+        e.set_bit(74, true); // .X
+    }
+}
+
 fn src_as_lop_imm(src: &Src) -> Option<bool> {
     let x = match src.src_ref {
         SrcRef::Zero => false,
@@ -2967,6 +3077,11 @@ impl SM70Op for OpAtom {
                     e.set_opcode(0x38c);
 
                     e.set_reg_src(32..40, self.data);
+                    assert!(
+                        self.atom_type != AtomType::U64
+                            || self.atom_op == AtomOp::Exch,
+                        "64-bit Shared atomics only support CmpExch or Exch"
+                    );
                     e.set_atom_op(87..91, self.atom_op);
                 }
 
@@ -3501,6 +3616,8 @@ macro_rules! as_sm70_op_match {
             Op::IMad64(op) => op,
             Op::IMnMx(op) => op,
             Op::ISetP(op) => op,
+            Op::Lea(op) => op,
+            Op::LeaX(op) => op,
             Op::Lop3(op) => op,
             Op::PopC(op) => op,
             Op::Shf(op) => op,

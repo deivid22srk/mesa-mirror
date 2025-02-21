@@ -198,6 +198,7 @@ get_device_extensions(const struct panvk_physical_device *device,
       .KHR_get_memory_requirements2 = true,
       .KHR_global_priority = true,
       .KHR_image_format_list = true,
+      .KHR_imageless_framebuffer = true,
       .KHR_index_type_uint8 = true,
       .KHR_maintenance1 = true,
       .KHR_maintenance2 = true,
@@ -223,10 +224,12 @@ get_device_extensions(const struct panvk_physical_device *device,
 #endif
       .KHR_synchronization2 = true,
       .KHR_timeline_semaphore = true,
+      .KHR_uniform_buffer_standard_layout = true,
       .KHR_variable_pointers = true,
       .KHR_vertex_attribute_divisor = true,
       .KHR_zero_initialize_workgroup_memory = true,
       .EXT_4444_formats = true,
+      .EXT_border_color_swizzle = true,
       .EXT_buffer_device_address = true,
       .EXT_custom_border_color = true,
       .EXT_depth_clip_enable = true,
@@ -339,8 +342,8 @@ get_features(const struct panvk_physical_device *device,
 
       .samplerFilterMinmax = arch >= 10,
       .scalarBlockLayout = true,
-      .imagelessFramebuffer = false,
-      .uniformBufferStandardLayout = false,
+      .imagelessFramebuffer = true,
+      .uniformBufferStandardLayout = true,
       .shaderSubgroupExtendedTypes = false,
       .separateDepthStencilLayouts = true,
       .hostQueryReset = true,
@@ -399,6 +402,10 @@ get_features(const struct panvk_physical_device *device,
       /* VK_EXT_custom_border_color */
       .customBorderColors = true,
 
+      /* VK_EXT_border_color_swizzle */
+      .borderColorSwizzle = true,
+      .borderColorSwizzleFromImage = true,
+
       /* VK_EXT_provoking_vertex */
       .provokingVertexLast = true,
       .transformFeedbackPreservesProvokingVertex = false,
@@ -434,7 +441,7 @@ get_features(const struct panvk_physical_device *device,
 }
 
 static uint32_t
-get_vk_version(unsigned arch)
+get_api_version(unsigned arch)
 {
    const uint32_t version_override = vk_get_version_override();
    if (version_override)
@@ -444,6 +451,15 @@ get_vk_version(unsigned arch)
       return VK_MAKE_API_VERSION(0, 1, 1, VK_HEADER_VERSION);
 
    return VK_MAKE_API_VERSION(0, 1, 0, VK_HEADER_VERSION);
+}
+
+static VkConformanceVersion
+get_conformance_version(unsigned arch)
+{
+   if (arch == 10)
+      return (VkConformanceVersion){1, 4, 1, 2};
+
+   return (VkConformanceVersion){0, 0, 0, 0};
 }
 
 static void
@@ -464,7 +480,7 @@ get_device_properties(const struct panvk_instance *instance,
    assert(arch > 8 || device->kmod.props.max_threads_per_wg <= 1024);
 
    *properties = (struct vk_properties){
-      .apiVersion = get_vk_version(arch),
+      .apiVersion = get_api_version(arch),
       .driverVersion = vk_get_driver_version(),
       .vendorID = ARM_VENDOR_ID,
 
@@ -739,7 +755,7 @@ get_device_properties(const struct panvk_instance *instance,
       .independentResolve = true,
       /* VK_KHR_driver_properties */
       .driverID = VK_DRIVER_ID_MESA_PANVK,
-      .conformanceVersion = (VkConformanceVersion){0, 0, 0, 0},
+      .conformanceVersion = get_conformance_version(arch),
       /* XXX: VK_KHR_shader_float_controls */
       .denormBehaviorIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL,
       .roundingModeIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL,

@@ -853,12 +853,10 @@ zink_program_finish(struct zink_context *ctx, struct zink_program *pg)
    if (pg->is_compute)
       return;
    struct zink_gfx_program *prog = (struct zink_gfx_program*)pg;
-   for (int r = 0; r < ARRAY_SIZE(prog->pipelines); ++r) {
-      for (int i = 0; i < ARRAY_SIZE(prog->pipelines[0]); ++i) {
-         hash_table_foreach(&prog->pipelines[r][i], entry) {
-            struct zink_gfx_pipeline_cache_entry *pc_entry = entry->data;
-            util_queue_fence_wait(&pc_entry->fence);
-         }
+   for (int i = 0; i < ARRAY_SIZE(prog->pipelines); ++i) {
+      hash_table_foreach(&prog->pipelines[i], entry) {
+         struct zink_gfx_pipeline_cache_entry *pc_entry = entry->data;
+         util_queue_fence_wait(&pc_entry->fence);
       }
    }
 }
@@ -994,11 +992,12 @@ zink_pipeline_layout_create(struct zink_screen *screen, VkDescriptorSetLayout *d
 static void *
 create_program(struct zink_context *ctx, bool is_compute)
 {
-   struct zink_program *pg = rzalloc_size(NULL, is_compute ? sizeof(struct zink_compute_program) : sizeof(struct zink_gfx_program));
+   struct zink_program *pg = is_compute ? (void*)CALLOC_STRUCT_CL(zink_compute_program) : (void*)CALLOC_STRUCT_CL(zink_gfx_program);
    if (!pg)
       return NULL;
 
    pipe_reference_init(&pg->reference, 1);
+   pg->ralloc_ctx = ralloc_context(NULL);
    u_rwlock_init(&pg->pipeline_cache_lock);
    util_queue_fence_init(&pg->cache_fence);
    pg->is_compute = is_compute;
@@ -1108,10 +1107,10 @@ gfx_program_create(struct zink_context *ctx,
    prog->has_edgeflags = prog->shaders[MESA_SHADER_VERTEX] &&
                          prog->shaders[MESA_SHADER_VERTEX]->has_edgeflags;
    for (int i = 0; i < ZINK_GFX_SHADER_COUNT; ++i) {
-      util_dynarray_init(&prog->shader_cache[i][0][0], prog);
-      util_dynarray_init(&prog->shader_cache[i][0][1], prog);
-      util_dynarray_init(&prog->shader_cache[i][1][0], prog);
-      util_dynarray_init(&prog->shader_cache[i][1][1], prog);
+      util_dynarray_init(&prog->shader_cache[i][0][0], prog->base.ralloc_ctx);
+      util_dynarray_init(&prog->shader_cache[i][0][1], prog->base.ralloc_ctx);
+      util_dynarray_init(&prog->shader_cache[i][1][0], prog->base.ralloc_ctx);
+      util_dynarray_init(&prog->shader_cache[i][1][1], prog->base.ralloc_ctx);
       if (stages[i]) {
          prog->shaders[i] = stages[i];
          prog->stages_present |= BITFIELD_BIT(i);
@@ -1145,14 +1144,12 @@ gfx_program_create(struct zink_context *ctx,
    else
       prog->last_vertex_stage = stages[MESA_SHADER_VERTEX];
 
-   for (int r = 0; r < ARRAY_SIZE(prog->pipelines); ++r) {
-      for (int i = 0; i < ARRAY_SIZE(prog->pipelines[0]); ++i) {
-         _mesa_hash_table_init(&prog->pipelines[r][i], prog, NULL, zink_get_gfx_pipeline_eq_func(screen, prog));
-         /* only need first 3/4 for point/line/tri/patch */
-         if (screen->info.have_EXT_extended_dynamic_state &&
-             i == (prog->last_vertex_stage->info.stage == MESA_SHADER_TESS_EVAL ? 4 : 3))
-            break;
-      }
+   for (int i = 0; i < ARRAY_SIZE(prog->pipelines); ++i) {
+      _mesa_hash_table_init(&prog->pipelines[i], prog->base.ralloc_ctx, NULL, zink_get_gfx_pipeline_eq_func(screen, prog));
+      /* only need first 3/4 for point/line/tri/patch */
+      if (screen->info.have_EXT_extended_dynamic_state &&
+            i == (prog->last_vertex_stage->info.stage == MESA_SHADER_TESS_EVAL ? 4 : 3))
+         break;
    }
    return prog;
 
@@ -1309,14 +1306,12 @@ create_gfx_program_separable(struct zink_context *ctx, struct zink_shader **stag
    */
    p_atomic_add(&prog->base.reference.count, refs - 1);
 
-   for (int r = 0; r < ARRAY_SIZE(prog->pipelines); ++r) {
-      for (int i = 0; i < ARRAY_SIZE(prog->pipelines[0]); ++i) {
-         _mesa_hash_table_init(&prog->pipelines[r][i], prog, NULL, zink_get_gfx_pipeline_eq_func(screen, prog));
-         /* only need first 3/4 for point/line/tri/patch */
-         if (screen->info.have_EXT_extended_dynamic_state &&
-             i == (prog->last_vertex_stage->info.stage == MESA_SHADER_TESS_EVAL ? 4 : 3))
-            break;
-      }
+   for (int i = 0; i < ARRAY_SIZE(prog->pipelines); ++i) {
+      _mesa_hash_table_init(&prog->pipelines[i], prog->base.ralloc_ctx, NULL, zink_get_gfx_pipeline_eq_func(screen, prog));
+      /* only need first 3/4 for point/line/tri/patch */
+      if (screen->info.have_EXT_extended_dynamic_state &&
+            i == (prog->last_vertex_stage->info.stage == MESA_SHADER_TESS_EVAL ? 4 : 3))
+         break;
    }
 
    for (int i = 0; i < ZINK_GFX_SHADER_COUNT; ++i) {
@@ -1506,8 +1501,8 @@ precompile_compute_job(void *data, void *gdata, int thread_index)
    /* comp->nir will be freed by zink_shader_compile */
    comp->nir = NULL;
    assert(comp->module->obj.spirv);
-   util_dynarray_init(&comp->shader_cache[0], comp);
-   util_dynarray_init(&comp->shader_cache[1], comp);
+   util_dynarray_init(&comp->shader_cache[0], comp->base.ralloc_ctx);
+   util_dynarray_init(&comp->shader_cache[1], comp->base.ralloc_ctx);
 
    struct mesa_blake3 blake3_ctx;
    _mesa_blake3_init(&blake3_ctx);
@@ -1542,7 +1537,7 @@ create_compute_program(struct zink_context *ctx, nir_shader *nir)
    comp->base.can_precompile = !comp->use_local_size &&
                                (screen->info.have_EXT_non_seamless_cube_map || !zink_shader_has_cubes(nir)) &&
                                (screen->info.rb2_feats.robustImageAccess2 || !(ctx->flags & PIPE_CONTEXT_ROBUST_BUFFER_ACCESS));
-   _mesa_hash_table_init(&comp->pipelines, comp, NULL, comp->use_local_size ?
+   _mesa_hash_table_init(&comp->pipelines, comp->base.ralloc_ctx, NULL, comp->use_local_size ?
                                                        equals_compute_pipeline_state_local_size :
                                                        equals_compute_pipeline_state);
 
@@ -1643,7 +1638,7 @@ void
 zink_destroy_gfx_program(struct zink_screen *screen,
                          struct zink_gfx_program *prog)
 {
-   unsigned max_idx = ARRAY_SIZE(prog->pipelines[0]);
+   unsigned max_idx = ARRAY_SIZE(prog->pipelines);
    if (screen->info.have_EXT_extended_dynamic_state) {
       /* only need first 3/4 for point/line/tri/patch */
       if ((prog->stages_present &
@@ -1657,16 +1652,14 @@ zink_destroy_gfx_program(struct zink_screen *screen,
 
    if (prog->is_separable)
       zink_gfx_program_reference(screen, &prog->full_prog, NULL);
-   for (unsigned r = 0; r < ARRAY_SIZE(prog->pipelines); r++) {
-      for (int i = 0; i < max_idx; ++i) {
-         hash_table_foreach(&prog->pipelines[r][i], entry) {
-            struct zink_gfx_pipeline_cache_entry *pc_entry = entry->data;
+   for (int i = 0; i < max_idx; ++i) {
+      hash_table_foreach(&prog->pipelines[i], entry) {
+         struct zink_gfx_pipeline_cache_entry *pc_entry = entry->data;
 
-            util_queue_fence_wait(&pc_entry->fence);
-            VKSCR(DestroyPipeline)(screen->dev, pc_entry->pipeline, NULL);
-            VKSCR(DestroyPipeline)(screen->dev, pc_entry->gpl.unoptimized_pipeline, NULL);
-            free(pc_entry);
-         }
+         util_queue_fence_wait(&pc_entry->fence);
+         VKSCR(DestroyPipeline)(screen->dev, pc_entry->pipeline, NULL);
+         VKSCR(DestroyPipeline)(screen->dev, pc_entry->gpl.unoptimized_pipeline, NULL);
+         free(pc_entry);
       }
    }
 
@@ -1688,7 +1681,8 @@ zink_destroy_gfx_program(struct zink_screen *screen,
    if (prog->libs)
       zink_gfx_lib_cache_unref(screen, prog->libs);
 
-   ralloc_free(prog);
+   ralloc_free(prog->base.ralloc_ctx);
+   FREE_CL(prog);
 }
 
 void
@@ -1714,7 +1708,8 @@ zink_destroy_compute_program(struct zink_screen *screen,
    VKSCR(DestroyPipeline)(screen->dev, comp->base_pipeline, NULL);
    zink_destroy_shader_module(screen, comp->module);
 
-   ralloc_free(comp);
+   ralloc_free(comp->base.ralloc_ctx);
+   FREE_CL(comp);
 }
 
 ALWAYS_INLINE static bool

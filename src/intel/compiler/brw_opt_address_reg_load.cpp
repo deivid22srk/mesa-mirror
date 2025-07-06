@@ -37,14 +37,14 @@ opt_address_reg_load_local(brw_shader &s, bblock_t *block, const brw_def_analysi
           src_inst->sources > 2)
          continue;
 
-      brw_builder ubld = brw_builder(&s).at(block, inst).exec_all().group(1, 0);
+      brw_builder ubld = brw_builder(&s).at(block, inst).uniform();
       brw_reg sources[3];
       for (unsigned i = 0; i < src_inst->sources; i++) {
          sources[i] = inst->src[i].file == VGRF ? component(src_inst->src[i], 0) : src_inst->src[i];
       }
       ubld.emit(src_inst->opcode, inst->dst, sources, src_inst->sources);
 
-      inst->remove(block);
+      inst->remove();
 
       progress = true;
    }
@@ -65,7 +65,6 @@ brw_opt_address_reg_load(brw_shader &s)
    }
 
    if (progress) {
-      s.cfg->adjust_block_ips();
       s.invalidate_analysis(BRW_DEPENDENCY_INSTRUCTIONS);
    }
 

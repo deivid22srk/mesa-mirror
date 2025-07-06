@@ -62,16 +62,8 @@ static bool
 run_cs(brw_shader &s, bool allow_spilling)
 {
    assert(gl_shader_stage_is_compute(s.stage));
-   const brw_builder bld = brw_builder(&s).at_end();
 
    s.payload_ = new brw_cs_thread_payload(s);
-
-   if (s.devinfo->platform == INTEL_PLATFORM_HSW && s.prog_data->total_shared > 0) {
-      /* Move SLM index from g0.0[27:24] to sr0.1[11:8] */
-      const brw_builder abld = bld.exec_all().group(1, 0);
-      abld.MOV(retype(brw_sr0_reg(1), BRW_TYPE_UW),
-               suboffset(retype(brw_vec1_grf(0, 0), BRW_TYPE_UW), 1));
-   }
 
    brw_from_nir(&s);
 
@@ -87,7 +79,6 @@ run_cs(brw_shader &s, bool allow_spilling)
    s.assign_curb_setup();
 
    brw_lower_3src_null_dest(s);
-   brw_workaround_memory_fence_before_eot(s);
    brw_workaround_emit_dummy_mov_instruction(s);
 
    brw_allocate_registers(s, allow_spilling);
@@ -140,12 +131,10 @@ brw_compile_cs(const struct brw_compiler *compiler,
 
    const bool debug_enabled =
       brw_should_print_shader(nir, params->base.debug_flag ?
-                                   params->base.debug_flag : DEBUG_CS);
+                                   params->base.debug_flag : DEBUG_CS,
+                                   params->base.source_hash);
 
-   prog_data->base.stage = MESA_SHADER_COMPUTE;
-   prog_data->base.total_shared = nir->info.shared_size;
-   prog_data->base.ray_queries = nir->info.ray_queries;
-   prog_data->base.total_scratch = 0;
+   brw_prog_data_init(&prog_data->base, &params->base);
    prog_data->uses_inline_data = brw_nir_uses_inline_data(nir) ||
                                  key->base.uses_inline_push_addr;
    assert(compiler->devinfo->verx10 >= 125 || !prog_data->uses_inline_data);

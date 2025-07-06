@@ -79,12 +79,14 @@ struct ac_llvm_context {
    LLVMTypeRef i64;
    LLVMTypeRef i128;
    LLVMTypeRef intptr;
+   LLVMTypeRef bf16;
    LLVMTypeRef f16;
    LLVMTypeRef f32;
    LLVMTypeRef f64;
    LLVMTypeRef v4i8;
    LLVMTypeRef v2i16;
    LLVMTypeRef v4i16;
+   LLVMTypeRef v2bf16;
    LLVMTypeRef v2f16;
    LLVMTypeRef v4f16;
    LLVMTypeRef v2i32;
@@ -429,6 +431,9 @@ LLVMValueRef ac_unpack_param(struct ac_llvm_context *ctx, LLVMValueRef param, un
                              unsigned bitwidth);
 
 LLVMValueRef ac_build_ds_swizzle(struct ac_llvm_context *ctx, LLVMValueRef src, unsigned mask);
+
+LLVMValueRef ac_build_readlane_no_opt_barrier(struct ac_llvm_context *ctx, LLVMValueRef src,
+                                              LLVMValueRef lane);
 
 LLVMValueRef ac_build_readlane(struct ac_llvm_context *ctx, LLVMValueRef src, LLVMValueRef lane);
 

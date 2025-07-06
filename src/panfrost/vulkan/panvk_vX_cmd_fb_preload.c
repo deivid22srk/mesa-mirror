@@ -43,7 +43,7 @@ texel_fetch(nir_builder *b, VkImageViewType view_type,
    if (sample_id)
       tex->src[2] = nir_tex_src_for_ssa(nir_tex_src_ms_index, sample_id);
 
-#if PAN_ARCH <= 7
+#if PAN_ARCH < 9
    tex->sampler_index = 0;
    tex->texture_index = tex_idx;
 #else
@@ -82,7 +82,7 @@ color_output_var(nir_builder *b, VkImageViewType view_type,
 static nir_def *
 get_layer_id(nir_builder *b)
 {
-#if PAN_ARCH <= 7
+#if PAN_ARCH < 9
    return nir_load_push_constant(b, 1, 32, nir_imm_int(b, 0));
 #else
    return nir_load_layer_id(b);
@@ -93,7 +93,7 @@ static nir_shader *
 get_preload_nir_shader(const struct panvk_fb_preload_shader_key *key)
 {
    nir_builder builder = nir_builder_init_simple_shader(
-      MESA_SHADER_FRAGMENT, GENX(pan_shader_get_compiler_options)(),
+      MESA_SHADER_FRAGMENT, pan_shader_get_compiler_options(PAN_ARCH),
       "panvk-meta-preload");
    nir_builder *b = &builder;
    nir_def *sample_id =
@@ -169,9 +169,8 @@ get_preload_shader(struct panvk_device *dev,
 
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
 
-   struct panfrost_compile_inputs inputs = {
+   struct pan_compile_inputs inputs = {
       .gpu_id = phys_dev->kmod.props.gpu_prod_id,
-      .no_ubo_to_push = true,
       .is_blit = true,
    };
 
@@ -218,7 +217,7 @@ alloc_pre_post_dcds(struct panvk_cmd_buffer *cmdbuf, struct pan_fb_info *fbinfo)
       return VK_SUCCESS;
 
    uint32_t dcd_count =
-      3 * (PAN_ARCH <= 7 ? cmdbuf->state.gfx.render.layer_count : 1);
+      3 * (PAN_ARCH < 9 ? cmdbuf->state.gfx.render.layer_count : 1);
 
    fbinfo->bifrost.pre_post.dcds = panvk_cmd_alloc_desc_array(cmdbuf, dcd_count, DRAW);
    if (!fbinfo->bifrost.pre_post.dcds.cpu)
@@ -313,10 +312,10 @@ fill_bds(struct pan_fb_info *fbinfo,
          cfg.equation.color_mask = 0xf;
 
          cfg.internal.fixed_function.num_comps = 4;
-         cfg.internal.fixed_function.conversion.memory_format = GENX(
-            panfrost_dithered_format_from_pipe_format)(pview->format, false);
+         cfg.internal.fixed_function.conversion.memory_format =
+            GENX(pan_dithered_format_from_pipe_format)(pview->format, false);
          cfg.internal.fixed_function.rt = i;
-#if PAN_ARCH <= 7
+#if PAN_ARCH < 9
          cfg.internal.fixed_function.conversion.register_format =
             get_reg_fmt(key->color[i].type);
 #endif
@@ -324,7 +323,7 @@ fill_bds(struct pan_fb_info *fbinfo,
    }
 }
 
-#if PAN_ARCH <= 7
+#if PAN_ARCH < 9
 static VkResult
 cmd_emit_dcd(struct panvk_cmd_buffer *cmdbuf, struct pan_fb_info *fbinfo,
              const struct panvk_fb_preload_shader_key *key)
@@ -341,7 +340,7 @@ cmd_emit_dcd(struct panvk_cmd_buffer *cmdbuf, struct pan_fb_info *fbinfo,
                            : util_bitcount(key->aspects);
    uint32_t bd_count = MAX2(fbinfo->rt_count, 1);
 
-   struct panfrost_ptr rsd = panvk_cmd_alloc_desc_aggregate(
+   struct pan_ptr rsd = panvk_cmd_alloc_desc_aggregate(
       cmdbuf, PAN_DESC(RENDERER_STATE),
       PAN_DESC_ARRAY(bd_count, BLEND));
    if (!rsd.cpu)
@@ -406,7 +405,7 @@ cmd_emit_dcd(struct panvk_cmd_buffer *cmdbuf, struct pan_fb_info *fbinfo,
    maxx = MIN2(ALIGN_POT(fbinfo->extent.maxx + 1, 32), fbinfo->width) - 1;
    maxy = MIN2(ALIGN_POT(fbinfo->extent.maxy + 1, 32), fbinfo->height) - 1;
 
-   struct panfrost_ptr vpd = panvk_cmd_alloc_desc(cmdbuf, VIEWPORT);
+   struct pan_ptr vpd = panvk_cmd_alloc_desc(cmdbuf, VIEWPORT);
    if (!vpd.cpu)
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
 
@@ -417,7 +416,7 @@ cmd_emit_dcd(struct panvk_cmd_buffer *cmdbuf, struct pan_fb_info *fbinfo,
       cfg.scissor_maximum_y = maxy;
    }
 
-   struct panfrost_ptr sampler = panvk_cmd_alloc_desc(cmdbuf, SAMPLER);
+   struct pan_ptr sampler = panvk_cmd_alloc_desc(cmdbuf, SAMPLER);
    if (!sampler.cpu)
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
 
@@ -429,7 +428,7 @@ cmd_emit_dcd(struct panvk_cmd_buffer *cmdbuf, struct pan_fb_info *fbinfo,
       cfg.magnify_nearest = true;
    }
 
-   struct panfrost_ptr textures =
+   struct pan_ptr textures =
       panvk_cmd_alloc_desc_array(cmdbuf, tex_count, TEXTURE);
    if (!textures.cpu)
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
@@ -462,7 +461,7 @@ cmd_emit_dcd(struct panvk_cmd_buffer *cmdbuf, struct pan_fb_info *fbinfo,
    uint32_t dcd_idx = key->aspects == VK_IMAGE_ASPECT_COLOR_BIT ? 0 : 1;
 
    if (key->needs_layer_id) {
-      struct panfrost_ptr layer_ids = panvk_cmd_alloc_dev_mem(
+      struct pan_ptr layer_ids = panvk_cmd_alloc_dev_mem(
          cmdbuf, desc,
          cmdbuf->state.gfx.render.layer_count * sizeof(uint64_t),
          sizeof(uint64_t));
@@ -478,8 +477,8 @@ cmd_emit_dcd(struct panvk_cmd_buffer *cmdbuf, struct pan_fb_info *fbinfo,
             cfg.push_uniforms = layer_ids.gpu + (sizeof(uint64_t) * l);
          };
 
-         pan_merge(dcd_layer, dcd_base, DRAW);
-	 dcds[(l * 3) + dcd_idx] = dcd_layer;
+         pan_merge(&dcd_layer, &dcd_base, DRAW);
+         dcds[(l * 3) + dcd_idx] = dcd_layer;
       }
    } else {
       dcds[dcd_idx] = dcd_base;
@@ -489,11 +488,18 @@ cmd_emit_dcd(struct panvk_cmd_buffer *cmdbuf, struct pan_fb_info *fbinfo,
       fbinfo->bifrost.pre_post.modes[dcd_idx] =
          MALI_PRE_POST_FRAME_SHADER_MODE_INTERSECT;
    } else {
-      const struct pan_image *plane =
+      const struct pan_image_plane_ref pref =
          fbinfo->zs.view.zs ? pan_image_view_get_zs_plane(fbinfo->zs.view.zs)
                             : pan_image_view_get_s_plane(fbinfo->zs.view.s);
-      enum pipe_format fmt = plane->layout.format;
-      bool always = false;
+      enum pipe_format fmt = pref.image->props.format;
+      /* On some GPUs (e.g. G31), we must use SHADER_MODE_ALWAYS rather than
+       * SHADER_MODE_INTERSECT for full screen operations. Since the full
+       * screen rectangle will always intersect, this won't affect
+       * performance.
+       */
+      bool always = !fbinfo->extent.minx && !fbinfo->extent.miny &&
+                    fbinfo->extent.maxx == (fbinfo->width - 1) &&
+                    fbinfo->extent.maxy == (fbinfo->height - 1);
 
       /* If we're dealing with a combined ZS resource and only one
        * component is cleared, we need to reload the whole surface
@@ -511,11 +517,21 @@ cmd_emit_dcd(struct panvk_cmd_buffer *cmdbuf, struct pan_fb_info *fbinfo,
        * Thing's haven't been benchmarked to determine what's
        * preferable (saving bandwidth vs having ZS preloaded
        * earlier), so let's leave it like that for now.
+       * HOWEVER, EARLY_ZS_ALWAYS doesn't exist on 7.0, only on
+       * 7.2 and later, so check for that!
        */
-      fbinfo->bifrost.pre_post.modes[dcd_idx] =
-         PAN_ARCH > 6
-            ? MALI_PRE_POST_FRAME_SHADER_MODE_EARLY_ZS_ALWAYS
-         : always ? MALI_PRE_POST_FRAME_SHADER_MODE_ALWAYS
+      struct panvk_physical_device *pdev =
+         to_panvk_physical_device(dev->vk.physical);
+      unsigned gpu_id = pdev->kmod.props.gpu_prod_id;
+
+      /* the PAN_ARCH check is redundant but allows compiler optimization
+         when PAN_ARCH <= 6 */
+      if (PAN_ARCH > 6 && gpu_id >= 0x7200)
+         fbinfo->bifrost.pre_post.modes[dcd_idx] =
+            MALI_PRE_POST_FRAME_SHADER_MODE_EARLY_ZS_ALWAYS;
+      else
+         fbinfo->bifrost.pre_post.modes[dcd_idx] = always
+                  ? MALI_PRE_POST_FRAME_SHADER_MODE_ALWAYS
                   : MALI_PRE_POST_FRAME_SHADER_MODE_INTERSECT;
    }
 
@@ -535,8 +551,7 @@ cmd_emit_dcd(struct panvk_cmd_buffer *cmdbuf, struct pan_fb_info *fbinfo,
 
    uint32_t bd_count =
       key->aspects == VK_IMAGE_ASPECT_COLOR_BIT ? fbinfo->rt_count : 0;
-   struct panfrost_ptr bds =
-      panvk_cmd_alloc_desc_array(cmdbuf, bd_count, BLEND);
+   struct pan_ptr bds = panvk_cmd_alloc_desc_array(cmdbuf, bd_count, BLEND);
    if (bd_count > 0 && !bds.cpu)
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
 
@@ -545,7 +560,7 @@ cmd_emit_dcd(struct panvk_cmd_buffer *cmdbuf, struct pan_fb_info *fbinfo,
                            : util_bitcount(key->aspects);
    uint32_t desc_count = tex_count + 1;
 
-   struct panfrost_ptr descs = panvk_cmd_alloc_dev_mem(
+   struct pan_ptr descs = panvk_cmd_alloc_dev_mem(
       cmdbuf, desc, desc_count * PANVK_DESCRIPTOR_SIZE, PANVK_DESCRIPTOR_SIZE);
    if (!descs.cpu)
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
@@ -562,19 +577,33 @@ cmd_emit_dcd(struct panvk_cmd_buffer *cmdbuf, struct pan_fb_info *fbinfo,
 
    fill_textures(cmdbuf, fbinfo, key, descs.cpu + PANVK_DESCRIPTOR_SIZE);
 
+   uint32_t rt_written = 0;
+   if (key->aspects == VK_IMAGE_ASPECT_COLOR_BIT) {
+      for (unsigned i = 0; i < fbinfo->rt_count; i++) {
+         if (fbinfo->rts[i].preload)
+            rt_written |= BITFIELD_BIT(i);
+      }
+   }
+
    if (key->aspects == VK_IMAGE_ASPECT_COLOR_BIT)
       fill_bds(fbinfo, key, bds.cpu);
 
-   struct panfrost_ptr res_table = panvk_cmd_alloc_desc(cmdbuf, RESOURCE);
+   /* Resource table sizes need to be multiples of 4. We use only one
+    * element here though.
+    */
+   const uint32_t res_table_size = MALI_RESOURCE_TABLE_SIZE_ALIGNMENT;
+   struct pan_ptr res_table =
+      panvk_cmd_alloc_desc_array(cmdbuf, res_table_size, RESOURCE);
    if (!res_table.cpu)
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   memset(res_table.cpu, 0, pan_size(RESOURCE) * res_table_size);
 
    pan_cast_and_pack(res_table.cpu, RESOURCE, cfg) {
       cfg.address = descs.gpu;
       cfg.size = desc_count * PANVK_DESCRIPTOR_SIZE;
    }
 
-   struct panfrost_ptr zsd = panvk_cmd_alloc_desc(cmdbuf, DEPTH_STENCIL);
+   struct pan_ptr zsd = panvk_cmd_alloc_desc(cmdbuf, DEPTH_STENCIL);
    if (!zsd.cpu)
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
 
@@ -620,32 +649,41 @@ cmd_emit_dcd(struct panvk_cmd_buffer *cmdbuf, struct pan_fb_info *fbinfo,
    pan_pack(&dcds[dcd_idx], DRAW, cfg) {
       if (key->aspects == VK_IMAGE_ASPECT_COLOR_BIT) {
          /* Skipping ATEST requires forcing Z/S */
-         cfg.zs_update_operation = MALI_PIXEL_KILL_FORCE_EARLY;
-         cfg.pixel_kill_operation = MALI_PIXEL_KILL_FORCE_EARLY;
+         cfg.flags_0.zs_update_operation = MALI_PIXEL_KILL_FORCE_EARLY;
+         cfg.flags_0.pixel_kill_operation = MALI_PIXEL_KILL_FORCE_EARLY;
 
          cfg.blend = bds.gpu;
          cfg.blend_count = bd_count;
-         cfg.render_target_mask = cmdbuf->state.gfx.render.bound_attachments &
-                                  MESA_VK_RP_ATTACHMENT_ANY_COLOR_BITS;
+         cfg.flags_1.render_target_mask =
+            cmdbuf->state.gfx.render.bound_attachments &
+            MESA_VK_RP_ATTACHMENT_ANY_COLOR_BITS;
       } else {
          /* ZS_EMIT requires late update/kill */
-         cfg.zs_update_operation = MALI_PIXEL_KILL_FORCE_LATE;
-         cfg.pixel_kill_operation = MALI_PIXEL_KILL_FORCE_LATE;
+         cfg.flags_0.zs_update_operation = MALI_PIXEL_KILL_FORCE_LATE;
+         cfg.flags_0.pixel_kill_operation = MALI_PIXEL_KILL_FORCE_LATE;
          cfg.blend_count = 0;
       }
 
-      cfg.allow_forward_pixel_to_kill =
+      cfg.flags_0.allow_forward_pixel_to_kill =
          key->aspects == VK_IMAGE_ASPECT_COLOR_BIT;
-      cfg.allow_forward_pixel_to_be_killed = true;
+      cfg.flags_0.allow_forward_pixel_to_be_killed = true;
       cfg.depth_stencil = zsd.gpu;
-      cfg.sample_mask = 0xFFFF;
-      cfg.multisample_enable = key->samples > 1;
-      cfg.evaluate_per_sample = key->samples > 1;
+      cfg.flags_1.sample_mask = 0xFFFF;
+      cfg.flags_0.multisample_enable = key->samples > 1;
+      cfg.flags_0.evaluate_per_sample = key->samples > 1;
+      cfg.flags_0.clean_fragment_write = true;
+
+#if PAN_ARCH >= 12
+      cfg.fragment_resources = res_table.gpu | res_table_size;
+      cfg.fragment_shader = panvk_priv_mem_dev_addr(shader->spd);
+      cfg.thread_storage = cmdbuf->state.gfx.tsd;
+#else
       cfg.maximum_z = 1.0;
-      cfg.clean_fragment_write = true;
-      cfg.shader.resources = res_table.gpu | 1;
+      cfg.shader.resources = res_table.gpu | res_table_size;
       cfg.shader.shader = panvk_priv_mem_dev_addr(shader->spd);
       cfg.shader.thread_storage = cmdbuf->state.gfx.tsd;
+#endif
+      cfg.flags_2.write_mask = rt_written;
    }
 
    if (key->aspects == VK_IMAGE_ASPECT_COLOR_BIT) {
@@ -659,9 +697,17 @@ cmd_emit_dcd(struct panvk_cmd_buffer *cmdbuf, struct pan_fb_info *fbinfo,
        * Thing's haven't been benchmarked to determine what's
        * preferable (saving bandwidth vs having ZS preloaded
        * earlier), so let's leave it like that for now.
+       *
+       * On v13+, we don't have EARLY_ZS_ALWAYS instead we use
+       * PREPASS_ALWAYS.
        */
+#if PAN_ARCH >= 13
+      fbinfo->bifrost.pre_post.modes[dcd_idx] =
+         MALI_PRE_POST_FRAME_SHADER_MODE_PREPASS_ALWAYS;
+#else
       fbinfo->bifrost.pre_post.modes[dcd_idx] =
          MALI_PRE_POST_FRAME_SHADER_MODE_EARLY_ZS_ALWAYS;
+#endif
    }
 
    return VK_SUCCESS;

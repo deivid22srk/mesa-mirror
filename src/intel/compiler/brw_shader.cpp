@@ -44,8 +44,6 @@ brw_shader::emit_urb_writes(const brw_reg &gs_vertex_count)
    int starting_urb_offset = 0;
    const struct brw_vue_prog_data *vue_prog_data =
       brw_vue_prog_data(this->prog_data);
-   const GLbitfield64 psiz_mask =
-      VARYING_BIT_LAYER | VARYING_BIT_VIEWPORT | VARYING_BIT_PSIZ | VARYING_BIT_PRIMITIVE_SHADING_RATE;
    const struct intel_vue_map *vue_map = &vue_prog_data->vue_map;
    bool flush;
    brw_reg sources[8];
@@ -65,7 +63,7 @@ brw_shader::emit_urb_writes(const brw_reg &gs_vertex_count)
       unreachable("invalid stage");
    }
 
-   const brw_builder bld = brw_builder(this).at_end();
+   const brw_builder bld = brw_builder(this);
 
    brw_reg per_slot_offsets;
 
@@ -123,16 +121,40 @@ brw_shader::emit_urb_writes(const brw_reg &gs_vertex_count)
       switch (varying) {
       case VARYING_SLOT_PSIZ: {
          /* The point size varying slot is the vue header and is always in the
-          * vue map.  But often none of the special varyings that live there
-          * are written and in that case we can skip writing to the vue
-          * header, provided the corresponding state properly clamps the
-          * values further down the pipeline. */
-         if ((vue_map->slots_valid & psiz_mask) == 0) {
-            assert(length == 0);
-            urb_offset++;
-            break;
-         }
-
+          * vue map. If anything in the header is going to be read back by HW,
+          * we need to initialize it, in particular the viewport & layer
+          * values.
+          *
+          * SKL PRMs, Volume 7: 3D-Media-GPGPU, Vertex URB Entry (VUE)
+          * Formats:
+          *
+          *    "VUEs are written in two ways:
+          *
+          *       - At the top of the 3D Geometry pipeline, the VF's
+          *         InputAssembly function creates VUEs and initializes them
+          *         from data extracted from Vertex Buffers as well as
+          *         internally generated data.
+          *
+          *       - VS, GS, HS and DS threads can compute, format, and write
+          *         new VUEs as thread output."
+          *
+          *    "Software must ensure that any VUEs subject to readback by the
+          *     3D pipeline start with a valid Vertex Header. This extends to
+          *     all VUEs with the following exceptions:
+          *
+          *       - If the VS function is enabled, the VF-written VUEs are not
+          *         required to have Vertex Headers, as the VS-incoming
+          *         vertices are guaranteed to be consumed by the VS (i.e.,
+          *         the VS thread is responsible for overwriting the input
+          *         vertex data).
+          *
+          *       - If the GS FF is enabled, neither VF-written VUEs nor VS
+          *         thread-generated VUEs are required to have Vertex Headers,
+          *         as the GS will consume all incoming vertices.
+          *
+          *       - If Rendering is disabled, VertexHeaders are not required
+          *         anywhere."
+          */
          brw_reg zero =
             retype(brw_allocate_vgrf_units(*this, dispatch_width / 8), BRW_TYPE_UD);
          bld.MOV(zero, brw_imm_ud(0u));
@@ -330,7 +352,7 @@ brw_shader::emit_urb_writes(const brw_reg &gs_vertex_count)
 void
 brw_shader::emit_cs_terminate()
 {
-   const brw_builder ubld = brw_builder(this).at_end().exec_all();
+   const brw_builder ubld = brw_builder(this).exec_all();
 
    /* We can't directly send from g0, since sends with EOT have to use
     * g112-127. So, copy it to a virtual register, The register allocator will
@@ -387,6 +409,7 @@ brw_shader::brw_shader(const struct brw_compiler *compiler,
      key(key), prog_data(prog_data),
      live_analysis(this), regpressure_analysis(this),
      performance_analysis(this), idom_analysis(this), def_analysis(this),
+     ip_ranges_analysis(this),
      needs_register_pressure(needs_register_pressure),
      dispatch_width(dispatch_width),
      max_polygons(0),
@@ -411,6 +434,7 @@ brw_shader::brw_shader(const struct brw_compiler *compiler,
      key(&key->base), prog_data(&prog_data->base),
      live_analysis(this), regpressure_analysis(this),
      performance_analysis(this), idom_analysis(this), def_analysis(this),
+     ip_ranges_analysis(this),
      needs_register_pressure(needs_register_pressure),
      dispatch_width(dispatch_width),
      max_polygons(max_polygons),
@@ -453,6 +477,9 @@ brw_shader::init()
 
    this->gs.control_data_bits_per_vertex = 0;
    this->gs.control_data_header_size_bits = 0;
+
+   memset(&this->fs.per_primitive_offsets, -1,
+          sizeof(this->fs.per_primitive_offsets));
 }
 
 brw_shader::~brw_shader()
@@ -522,6 +549,16 @@ void
 brw_shader::import_uniforms(brw_shader *v)
 {
    this->uniforms = v->uniforms;
+}
+
+/* For SIMD16, we need to follow from the uniform setup of SIMD8 dispatch.
+ * This brings in those uniform definitions
+ */
+void
+brw_shader::import_per_primitive_offsets(const int *per_primitive_offsets)
+{
+   memcpy(this->fs.per_primitive_offsets, per_primitive_offsets,
+          sizeof(this->fs.per_primitive_offsets));
 }
 
 enum intel_barycentric_mode
@@ -700,7 +737,7 @@ brw_shader::assign_curb_setup()
                               BRW_TYPE_UD);
          brw_inst *send = ubld.emit(SHADER_OPCODE_SEND, dest, srcs, 4);
 
-         send->sfid = GFX12_SFID_UGM;
+         send->sfid = BRW_SFID_UGM;
          uint32_t desc = lsc_msg_desc(devinfo, LSC_OP_LOAD,
                                       LSC_ADDR_SURFTYPE_FLAT,
                                       pull_constants_a64 ?
@@ -935,6 +972,7 @@ brw_shader::invalidate_analysis(brw_analysis_dependency_class c)
    performance_analysis.invalidate(c);
    idom_analysis.invalidate(c);
    def_analysis.invalidate(c);
+   ip_ranges_analysis.invalidate(c);
 }
 
 void
@@ -942,7 +980,8 @@ brw_shader::debug_optimizer(const nir_shader *nir,
                             const char *pass_name,
                             int iteration, int pass_num) const
 {
-   if (!brw_should_print_shader(nir, DEBUG_OPTIMIZER))
+   /* source_hash is not readily accessible in this context */
+   if (!brw_should_print_shader(nir, DEBUG_OPTIMIZER, 0))
       return;
 
    char *filename;
@@ -987,12 +1026,11 @@ save_instruction_order(const struct cfg_t *cfg)
     * of brw_inst *.  This way, we can reset it between scheduling passes to
     * prevent dependencies between the different scheduling modes.
     */
-   int num_insts = cfg->last_block()->end_ip + 1;
+   int num_insts = cfg->total_instructions;
    brw_inst **inst_arr = new brw_inst * [num_insts];
 
    int ip = 0;
    foreach_block_and_inst(block, brw_inst, inst, cfg) {
-      assert(ip >= block->start_ip && ip <= block->end_ip);
       inst_arr[ip++] = inst;
    }
    assert(ip == num_insts);
@@ -1003,15 +1041,14 @@ save_instruction_order(const struct cfg_t *cfg)
 static void
 restore_instruction_order(struct cfg_t *cfg, brw_inst **inst_arr)
 {
-   ASSERTED int num_insts = cfg->last_block()->end_ip + 1;
+   ASSERTED int num_insts = cfg->total_instructions;
 
    int ip = 0;
    foreach_block (block, cfg) {
       block->instructions.make_empty();
 
-      assert(ip == block->start_ip);
-      for (; ip <= block->end_ip; ip++)
-         block->instructions.push_tail(inst_arr[ip]);
+      for (unsigned i = 0; i < block->num_instructions; i++)
+         block->instructions.push_tail(inst_arr[ip++]);
    }
    assert(ip == num_insts);
 }
@@ -1109,6 +1146,7 @@ brw_allocate_registers(brw_shader &s, bool allow_spilling)
 
       /* Reset back to the original order before trying the next mode */
       restore_instruction_order(s.cfg, orig_order);
+
       s.invalidate_analysis(BRW_DEPENDENCY_INSTRUCTIONS);
    }
 
@@ -1249,8 +1287,12 @@ brw_shader_phase_update(brw_shader &s, enum brw_shader_phase phase)
    brw_validate(s);
 }
 
-bool brw_should_print_shader(const nir_shader *shader, uint64_t debug_flag)
+bool brw_should_print_shader(const nir_shader *shader, uint64_t debug_flag, uint32_t source_hash)
 {
+   if (intel_shader_dump_filter && intel_shader_dump_filter != source_hash) {
+      return false;
+   }
+
    return INTEL_DEBUG(debug_flag) && (!shader->info.internal || NIR_DEBUG(PRINT_INTERNAL));
 }
 
@@ -1285,4 +1327,3 @@ brw_allocate_vgrf_units(brw_shader &s, unsigned units_of_REGSIZE)
 {
    return brw_vgrf(brw_allocate_vgrf_number(s, units_of_REGSIZE), BRW_TYPE_UD);
 }
-

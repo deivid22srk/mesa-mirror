@@ -67,11 +67,10 @@ is_shared_consts(struct ir3_compiler *compiler,
 }
 
 static void
-collect_reg_info(struct ir3_instruction *instr, struct ir3_register *reg,
+collect_reg_info(struct ir3_shader_variant *v,
+                 struct ir3_instruction *instr, struct ir3_register *reg,
                  struct ir3_info *info)
 {
-   struct ir3_shader_variant *v = info->data;
-
    if (reg->flags & IR3_REG_IMMED) {
       /* nothing to do */
       return;
@@ -248,7 +247,6 @@ ir3_collect_info(struct ir3_shader_variant *v)
    const struct ir3_compiler *compiler = v->compiler;
 
    memset(info, 0, sizeof(*info));
-   info->data = v;
    info->max_reg = -1;
    info->max_half_reg = -1;
    info->max_const = -1;
@@ -283,14 +281,31 @@ ir3_collect_info(struct ir3_shader_variant *v)
    /* Full and half aliases do not overlap so treat them as !mergedregs. */
    regmask_init(&aliases, false);
 
+   struct block_data {
+      unsigned sfu_delay;
+      unsigned mem_delay;
+   };
+
+   void *mem_ctx = ralloc_context(NULL);
+
    foreach_block (block, &shader->block_list) {
-      int sfu_delay = 0, mem_delay = 0;
+      block->data = rzalloc(mem_ctx, struct block_data);
+   }
+
+   foreach_block (block, &shader->block_list) {
+      struct block_data *bd = block->data;
+
+      for (unsigned i = 0; i < block->predecessors_count; i++) {
+         struct block_data *pbd = block->predecessors[i]->data;
+         bd->sfu_delay = MAX2(bd->sfu_delay, pbd->sfu_delay);
+         bd->mem_delay = MAX2(bd->mem_delay, pbd->mem_delay);
+      }
 
       foreach_instr (instr, &block->instr_list) {
 
          foreach_src (reg, instr) {
             if (!is_reg_gpr(reg) || !regmask_get(&aliases, reg)) {
-               collect_reg_info(instr, reg, info);
+               collect_reg_info(v, instr, reg, info);
             }
          }
 
@@ -299,7 +314,7 @@ ir3_collect_info(struct ir3_shader_variant *v)
                 instr->cat7.alias_scope == ALIAS_TEX) {
                regmask_set(&aliases, instr->dsts[0]);
             } else if (is_dest_gpr(reg)) {
-               collect_reg_info(instr, reg, info);
+               collect_reg_info(v, instr, reg, info);
             }
          }
 
@@ -369,28 +384,28 @@ ir3_collect_info(struct ir3_shader_variant *v)
 
             if (instr->flags & IR3_INSTR_SS) {
                info->ss++;
-               info->sstall += sfu_delay;
-               sfu_delay = 0;
+               info->sstall += bd->sfu_delay;
+               bd->sfu_delay = 0;
             }
 
             if (instr->flags & IR3_INSTR_SY) {
                info->sy++;
-               info->systall += mem_delay;
-               mem_delay = 0;
+               info->systall += bd->mem_delay;
+               bd->mem_delay = 0;
             }
 
             if (is_ss_producer(instr)) {
-               sfu_delay = soft_ss_delay(instr);
+               bd->sfu_delay = soft_ss_delay(instr);
             } else {
-               int n = MIN2(sfu_delay, 1 + instr->repeat + instr->nop);
-               sfu_delay -= n;
+               int n = MIN2(bd->sfu_delay, 1 + instr->repeat + instr->nop);
+               bd->sfu_delay -= n;
             }
 
             if (is_sy_producer(instr)) {
-               mem_delay = soft_sy_delay(instr, shader);
+               bd->mem_delay = soft_sy_delay(instr, shader);
             } else {
-               int n = MIN2(mem_delay, 1 + instr->repeat + instr->nop);
-               mem_delay -= n;
+               int n = MIN2(bd->mem_delay, 1 + instr->repeat + instr->nop);
+               bd->mem_delay -= n;
             }
          } else {
             unsigned instrs_count = 1 + instr->repeat + instr->nop;
@@ -473,6 +488,8 @@ ir3_collect_info(struct ir3_shader_variant *v)
       compiler, regs_count, info->double_threadsize);
    info->max_waves = MIN2(reg_independent_max_waves, reg_dependent_max_waves);
    assert(info->max_waves <= v->compiler->max_waves);
+
+   ralloc_free(mem_ctx);
 }
 
 static struct ir3_register *
@@ -606,7 +623,7 @@ ir3_find_shpe(struct ir3 *ir)
    }
 
    foreach_block (block, &ir->block_list) {
-      struct ir3_instruction *last = ir3_block_get_last_non_terminator(block);
+      struct ir3_instruction *last = ir3_block_get_terminator(block);
 
       if (last && last->opc == OPC_SHPE) {
          return last;
@@ -668,9 +685,6 @@ ir3_create_empty_preamble(struct ir3 *ir)
 
    b.cursor = ir3_after_block(body_block);
    struct ir3_instruction *shpe = ir3_SHPE(&b);
-   shpe->barrier_class = shpe->barrier_conflict = IR3_BARRIER_CONST_W;
-   array_insert(body_block, body_block->keeps, shpe);
-   ir3_JUMP(&b);
    body_block->successors[0] = main_start_block;
    ir3_block_add_predecessor(main_start_block, body_block);
    ir3_block_link_physical(body_block, main_start_block);
@@ -682,6 +696,17 @@ ir3_create_empty_preamble(struct ir3 *ir)
    ir3_block_link_physical(else_block, main_start_block);
 
    main_start_block->reconvergence_point = true;
+
+   /* Inputs are always expected to be in the first block so move them there. */
+   struct ir3_cursor inputs_cursor = ir3_before_terminator(shps_block);
+
+   foreach_instr_safe (instr, &main_start_block->instr_list) {
+      if (instr->opc == OPC_META_INPUT || instr->opc == OPC_META_TEX_PREFETCH) {
+         list_del(&instr->node);
+         insert_instr(inputs_cursor, instr);
+         instr->block = shps_block;
+      }
+   }
 
    return shpe;
 }
@@ -770,25 +795,10 @@ add_to_address_users(struct ir3_instruction *instr)
    }
 }
 
-static struct ir3_block *
-get_block(struct ir3_cursor cursor)
-{
-   switch (cursor.option) {
-   case IR3_CURSOR_BEFORE_BLOCK:
-   case IR3_CURSOR_AFTER_BLOCK:
-      return cursor.block;
-   case IR3_CURSOR_BEFORE_INSTR:
-   case IR3_CURSOR_AFTER_INSTR:
-      return cursor.instr->block;
-   }
-
-   unreachable("illegal cursor option");
-}
-
 struct ir3_instruction *
 ir3_instr_create_at(struct ir3_cursor cursor, opc_t opc, int ndst, int nsrc)
 {
-   struct ir3_block *block = get_block(cursor);
+   struct ir3_block *block = ir3_cursor_current_block(cursor);
    struct ir3_instruction *instr = instr_create(block, opc, ndst, nsrc);
    instr->block = block;
    instr->opc = opc;
@@ -842,6 +852,7 @@ ir3_instr_clone(struct ir3_instruction *instr)
    *new_instr = *instr;
    new_instr->dsts = dsts;
    new_instr->srcs = srcs;
+   new_instr->uses = NULL;
    list_inithead(&new_instr->rpt_node);
 
    insert_instr(ir3_before_terminator(instr->block), new_instr);
@@ -1010,6 +1021,220 @@ ir3_instr_set_address(struct ir3_instruction *instr,
    }
 }
 
+struct ir3_instruction *
+ir3_create_addr1(struct ir3_builder *build, unsigned const_val)
+{
+   struct ir3_instruction *immed =
+      create_immed_typed(build, const_val, TYPE_U16);
+   struct ir3_instruction *instr = ir3_MOV(build, immed, TYPE_U16);
+   instr->dsts[0]->num = regid(REG_A0, 1);
+   return instr;
+}
+
+static unsigned
+dest_flags(struct ir3_instruction *instr)
+{
+   return instr->dsts[0]->flags & (IR3_REG_HALF | IR3_REG_SHARED);
+}
+
+struct ir3_instruction *
+ir3_create_collect(struct ir3_builder *build,
+                   struct ir3_instruction *const *arr, unsigned arrsz)
+{
+   struct ir3_instruction *collect;
+
+   if (arrsz == 0)
+      return NULL;
+
+   if (arrsz == 1)
+      return arr[0];
+
+   int non_undef_src = -1;
+   for (unsigned i = 0; i < arrsz; i++) {
+      if (arr[i]) {
+         non_undef_src = i;
+         break;
+      }
+   }
+
+   /* There should be at least one non-undef source to determine the type of the
+    * destination.
+    */
+   assert(non_undef_src != -1);
+   unsigned flags = dest_flags(arr[non_undef_src]);
+
+   /* If any of the sources are themselves collects, flatten their sources into
+    * the new collect. This is mainly useful for collects used for 64b values,
+    * as we can treat them just like non-64b values when collecting them.
+    */
+   unsigned srcs_count = 0;
+
+   for (unsigned i = 0; i < arrsz; i++) {
+      if (arr[i] && arr[i]->opc == OPC_META_COLLECT) {
+         srcs_count += arr[i]->srcs_count;
+      } else {
+         srcs_count++;
+      }
+   }
+
+   struct ir3_instruction *srcs[srcs_count];
+
+   for (unsigned i = 0, s = 0; i < arrsz; i++) {
+      if (arr[i] && arr[i]->opc == OPC_META_COLLECT) {
+         foreach_src (collect_src, arr[i]) {
+            srcs[s++] = collect_src->def->instr;
+         }
+      } else {
+         srcs[s++] = arr[i];
+      }
+   }
+
+   collect = ir3_build_instr(build, OPC_META_COLLECT, 1, srcs_count);
+   __ssa_dst(collect)->flags |= flags;
+   for (unsigned i = 0; i < srcs_count; i++) {
+      struct ir3_instruction *elem = srcs[i];
+
+      /* Since arrays are pre-colored in RA, we can't assume that
+       * things will end up in the right place.  (Ie. if a collect
+       * joins elements from two different arrays.)  So insert an
+       * extra mov.
+       *
+       * We could possibly skip this if all the collected elements
+       * are contiguous elements in a single array.. not sure how
+       * likely that is to happen.
+       *
+       * Fixes a problem with glamor shaders, that in effect do
+       * something like:
+       *
+       *   if (foo)
+       *     texcoord = ..
+       *   else
+       *     texcoord = ..
+       *   color = texture2D(tex, texcoord);
+       *
+       * In this case, texcoord will end up as nir registers (which
+       * translate to ir3 array's of length 1.  And we can't assume
+       * the two (or more) arrays will get allocated in consecutive
+       * scalar registers.
+       *
+       */
+      if (elem && elem->dsts[0]->flags & IR3_REG_ARRAY) {
+         type_t type = (flags & IR3_REG_HALF) ? TYPE_U16 : TYPE_U32;
+         elem = ir3_MOV(build, elem, type);
+      }
+
+      if (elem) {
+         assert(dest_flags(elem) == flags);
+         __ssa_src(collect, elem, flags);
+      } else {
+         ir3_src_create(collect, INVALID_REG, flags | IR3_REG_SSA);
+      }
+   }
+
+   collect->dsts[0]->wrmask = MASK(srcs_count);
+
+   return collect;
+}
+
+/* helper for instructions that produce multiple consecutive scalar
+ * outputs which need to have a split meta instruction inserted
+ */
+void
+ir3_split_dest(struct ir3_builder *build, struct ir3_instruction **dst,
+               struct ir3_instruction *src, unsigned base, unsigned n)
+{
+   if ((n == 1) && (src->dsts[0]->wrmask == 0x1) &&
+       /* setup_input needs ir3_split_dest to generate a SPLIT instruction */
+       src->opc != OPC_META_INPUT) {
+      dst[0] = src;
+      return;
+   }
+
+   if (src->opc == OPC_META_COLLECT) {
+      assert((base + n) <= src->srcs_count);
+
+      for (int i = 0; i < n; i++) {
+         dst[i] = ssa(src->srcs[i + base]);
+      }
+
+      return;
+   }
+
+   unsigned flags = dest_flags(src);
+
+   for (int i = 0, j = 0; i < n; i++) {
+      struct ir3_instruction *split =
+         ir3_build_instr(build, OPC_META_SPLIT, 1, 1);
+      __ssa_dst(split)->flags |= flags;
+      __ssa_src(split, src, flags);
+      split->split.off = i + base;
+
+      if (src->dsts[0]->wrmask & (1 << (i + base)))
+         dst[j++] = split;
+   }
+}
+
+/* Split off the first 1 (bit_size < 64) or 2 (bit_size == 64) components from
+ * src and create a new 32b or 64b value.
+ */
+struct ir3_instruction *
+ir3_split_off_scalar(struct ir3_builder *build, struct ir3_instruction *src,
+                     unsigned bit_size)
+{
+   unsigned num_comps = bit_size == 64 ? 2 : 1;
+   assert((src->dsts[0]->wrmask & MASK(num_comps)) == MASK(num_comps));
+
+   if (num_comps == 1 && src->dsts[0]->wrmask == 0x1) {
+      return src;
+   }
+
+   struct ir3_instruction *comps[num_comps];
+   ir3_split_dest(build, comps, src, 0, num_comps);
+   return bit_size == 64 ? ir3_64b(build, comps[0], comps[1]) : comps[0];
+}
+
+struct ir3_instruction *
+ir3_store_const(struct ir3_shader_variant *so, struct ir3_builder *build,
+                struct ir3_instruction *src, unsigned dst)
+{
+   unsigned dst_lo = dst & 0xff;
+   unsigned dst_hi = dst >> 8;
+   unsigned components = util_last_bit(src->dsts[0]->wrmask);
+
+   struct ir3_instruction *a1 = NULL;
+   if (dst_hi) {
+      /* Encode only the high part of the destination in a1.x to increase the
+       * chance that we can reuse the a1.x value in subsequent stc
+       * instructions.
+       */
+      a1 = ir3_create_addr1(build, dst_hi << 8);
+   }
+
+   struct ir3_instruction *stc =
+      ir3_STC(build, create_immed(build, dst_lo), 0, src, 0);
+   stc->cat6.iim_val = components;
+   stc->cat6.type = TYPE_U32;
+   stc->barrier_conflict = IR3_BARRIER_CONST_W;
+
+   /* This isn't necessary for instruction encoding but is used by ir3_sched to
+    * set up dependencies between stc and const reads.
+    */
+   stc->cat6.dst_offset = dst;
+
+   if (a1) {
+      ir3_instr_set_address(stc, a1);
+      stc->flags |= IR3_INSTR_A1EN;
+   }
+
+   /* The assembler isn't aware of what value a1.x has, so make sure that
+    * constlen includes the stc here.
+    */
+   so->constlen = MAX2(so->constlen, DIV_ROUND_UP(dst + components, 4));
+   struct ir3_block *block = ir3_cursor_current_block(build->cursor);
+   array_insert(block, block->keeps, stc);
+   return stc;
+}
+
 /* Does this instruction use the scalar ALU?
  */
 bool
@@ -1021,6 +1246,7 @@ is_scalar_alu(struct ir3_instruction *instr,
    return instr->opc != OPC_MOVMSK &&
       instr->opc != OPC_SCAN_CLUSTERS_MACRO &&
       instr->opc != OPC_SCAN_MACRO &&
+      instr->opc != OPC_MOVS &&
       is_alu(instr) && (instr->dsts[0]->flags & IR3_REG_SHARED) &&
       /* scalar->scalar mov instructions (but NOT cov) were supported before the
        * scalar ALU was supported, but they still required (ss) whereas on GPUs
@@ -1352,6 +1578,13 @@ ir3_valid_flags(struct ir3_instruction *instr, unsigned n, unsigned flags)
          else
             return flags == 0;
          break;
+      case OPC_MOVS:
+         if (n == 0) {
+            valid_flags = IR3_REG_SHARED;
+         } else {
+            valid_flags = IR3_REG_IMMED;
+         }
+         break;
       default: {
          valid_flags =
             IR3_REG_IMMED | IR3_REG_CONST | IR3_REG_RELATIV | IR3_REG_SHARED;
@@ -1571,7 +1804,7 @@ ir3_valid_flags(struct ir3_instruction *instr, unsigned n, unsigned flags)
             return false;
 
          /* as with atomics, these cat6 instrs can only have an immediate
-          * for SSBO/IBO slot argument
+          * for SSBO/UAV slot argument
           */
          switch (instr->opc) {
          case OPC_LDIB:
@@ -1671,4 +1904,45 @@ ir3_supports_rpt(struct ir3_compiler *compiler, unsigned opc)
    default:
       return false;
    }
+}
+
+static bool
+is_unmodified_full_gpr(struct ir3_register *src)
+{
+   return !(src->flags & (IR3_REG_HALF | IR3_REG_CONST | IR3_REG_IMMED |
+                          IR3_REG_RELATIV | IR3_REG_FNEG | IR3_REG_FABS |
+                          IR3_REG_SNEG | IR3_REG_SABS | IR3_REG_BNOT));
+}
+
+/* Does `instr` move half of its full GPR src to its half dst? If this is the
+ * case, and RA assigns overlapping registers to src and dst, the instruction
+ * can be removed in mergedregs mode.
+ */
+enum ir3_subreg_move
+ir3_is_subreg_move(struct ir3_instruction *instr)
+{
+   if (instr->opc == OPC_MOV) {
+      /* `cov.u32u16 hdst, src`: moves lower half of src to hdst. */
+      struct ir3_register *src = instr->srcs[0];
+      struct ir3_register *dst = instr->dsts[0];
+
+      if (instr->cat1.src_type == TYPE_U32 &&
+          instr->cat1.dst_type == TYPE_U16 && is_unmodified_full_gpr(src) &&
+          (src->flags & IR3_REG_SHARED) == (dst->flags & IR3_REG_SHARED)) {
+         return IR3_SUBREG_MOVE_LOWER;
+      }
+   } else if (instr->opc == OPC_SHR_B || instr->opc == OPC_ASHR_B) {
+      /* `[a]shr.b hdst, src, 16`: moves upper half of src to hdst. */
+      struct ir3_register *src = instr->srcs[0];
+      struct ir3_register *shamt = instr->srcs[1];
+      struct ir3_register *dst = instr->dsts[0];
+
+      if ((dst->flags & IR3_REG_HALF) && is_unmodified_full_gpr(src) &&
+          ((src->flags & IR3_REG_SHARED) == (dst->flags & IR3_REG_SHARED)) &&
+          (shamt->flags & IR3_REG_IMMED) && shamt->uim_val == 16) {
+         return IR3_SUBREG_MOVE_UPPER;
+      }
+   }
+
+   return IR3_SUBREG_MOVE_NONE;
 }

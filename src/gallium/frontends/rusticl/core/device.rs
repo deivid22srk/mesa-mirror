@@ -17,6 +17,7 @@ use mesa_rust::pipe::transfer::PipeTransfer;
 use mesa_rust_gen::*;
 use mesa_rust_util::math::SetBitIndices;
 use mesa_rust_util::static_assert;
+use rusticl_llvm_gen::*;
 use rusticl_opencl_gen::*;
 
 use std::cmp::max;
@@ -25,14 +26,17 @@ use std::collections::HashMap;
 use std::convert::TryInto;
 use std::env;
 use std::ffi::CStr;
+use std::fmt::Debug;
 use std::mem::transmute;
+use std::num::NonZeroU64;
+use std::ops::Deref;
 use std::os::raw::*;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 
-pub struct Device {
-    pub base: CLObjectBase<CL_INVALID_DEVICE>,
+/// Contains basic stuff we need to partially initialize Device
+pub struct DeviceBase {
     pub screen: Arc<PipeScreen>,
     pub cl_version: CLVersion,
     pub clc_version: CLVersion,
@@ -41,19 +45,35 @@ pub struct Device {
     pub embedded: bool,
     pub extension_string: String,
     pub extensions: Vec<cl_name_version>,
+    pub spirv_caps: spirv_capabilities,
+    pub spirv_caps_vec: Vec<SpvCapability>,
     pub spirv_extensions: Vec<&'static CStr>,
     pub clc_features: Vec<cl_name_version>,
     pub formats: HashMap<cl_image_format, HashMap<cl_mem_object_type, cl_mem_flags>>,
-    pub lib_clc: NirShader,
     pub caps: DeviceCaps,
     helper_ctx: Mutex<PipeContext>,
     reusable_ctx: Mutex<Vec<PipeContext>>,
+}
+
+pub struct Device {
+    pub base: CLObjectBase<CL_INVALID_DEVICE>,
+    dev_base: DeviceBase,
+    pub lib_clc: NirShader,
+}
+
+impl Deref for Device {
+    type Target = DeviceBase;
+
+    fn deref(&self) -> &Self::Target {
+        &self.dev_base
+    }
 }
 
 #[derive(Default)]
 pub struct DeviceCaps {
     pub has_3d_image_writes: bool,
     pub has_depth_images: bool,
+    pub has_image_unorm_int_2_101010: bool,
     pub has_images: bool,
     pub has_rw_images: bool,
     pub has_timestamp: bool,
@@ -103,6 +123,13 @@ pub trait HelperContextWrapper {
     where
         F: Fn(&HelperContext);
 
+    fn buffer_map(
+        &self,
+        res: &PipeResource,
+        offset: i32,
+        size: i32,
+        rw: RWFlags,
+    ) -> Option<PipeTransfer>;
     fn create_compute_state(&self, nir: &NirShader, static_local_mem: u32) -> *mut c_void;
     fn delete_compute_state(&self, cso: *mut c_void);
     fn compute_state_info(&self, state: *mut c_void) -> pipe_compute_state_object_info;
@@ -164,6 +191,16 @@ impl HelperContextWrapper for HelperContext<'_> {
         self.lock.flush()
     }
 
+    fn buffer_map(
+        &self,
+        res: &PipeResource,
+        offset: i32,
+        size: i32,
+        rw: RWFlags,
+    ) -> Option<PipeTransfer> {
+        self.lock.buffer_map(res, offset, size, rw)
+    }
+
     fn create_compute_state(&self, nir: &NirShader, static_local_mem: u32) -> *mut c_void {
         self.lock.create_compute_state(nir, static_local_mem)
     }
@@ -216,62 +253,7 @@ impl HelperContextWrapper for HelperContext<'_> {
 
 impl_cl_type_trait_base!(cl_device_id, Device, [Device], CL_INVALID_DEVICE);
 
-impl Device {
-    fn new(screen: PipeScreen) -> Option<Device> {
-        if !Self::check_valid(&screen) {
-            return None;
-        }
-
-        let screen = Arc::new(screen);
-        // Create before loading libclc as llvmpipe only creates the shader cache with the first
-        // context being created.
-        let helper_ctx = screen.create_context()?;
-        let lib_clc = spirv::SPIRVBin::get_lib_clc(&screen);
-        if lib_clc.is_none() {
-            eprintln!("Libclc failed to load. Please make sure it is installed and provides spirv-mesa3d-.spv and/or spirv64-mesa3d-.spv");
-        }
-
-        let mut d = Self {
-            caps: DeviceCaps::new(&screen),
-            base: CLObjectBase::new(RusticlTypes::Device),
-            helper_ctx: Mutex::new(helper_ctx),
-            screen: screen,
-            cl_version: CLVersion::Cl3_0,
-            clc_version: CLVersion::Cl3_0,
-            clc_versions: Vec::new(),
-            device_type: 0,
-            embedded: false,
-            extension_string: String::from(""),
-            extensions: Vec::new(),
-            spirv_extensions: Vec::new(),
-            clc_features: Vec::new(),
-            formats: HashMap::new(),
-            lib_clc: lib_clc?,
-            reusable_ctx: Mutex::new(Vec::new()),
-        };
-
-        // check if we are embedded or full profile first
-        d.embedded = d.check_embedded_profile();
-
-        d.set_device_type();
-
-        d.fill_format_tables();
-
-        // query supported extensions
-        d.fill_extensions();
-
-        // now figure out what version we are
-        d.check_version();
-
-        Some(d)
-    }
-
-    /// Converts a temporary reference to a static if and only if this device lives inside static
-    /// memory.
-    pub fn to_static(&self) -> Option<&'static Self> {
-        devs().iter().find(|&dev| self == dev)
-    }
-
+impl DeviceBase {
     fn fill_format_tables(&mut self) {
         // no need to do this if we don't support images
         if !self.caps.has_images {
@@ -362,13 +344,26 @@ impl Device {
             .flatten()
             .any(|mask| *mask != 0);
 
+        // Got added to clang with 20.1
+        self.caps.has_image_unorm_int_2_101010 = self
+            .formats
+            .iter()
+            .filter_map(|(format, v)| {
+                (format.image_channel_data_type == CL_UNORM_INT_2_101010_EXT).then_some(v.values())
+            })
+            .flatten()
+            .any(|mask| *mask != 0);
+
         // if we can't advertize 3d image write ext, we have to disable them all
         if !self.caps.has_3d_image_writes {
-            for f in &mut self.formats.values_mut() {
-                *f.get_mut(&CL_MEM_OBJECT_IMAGE3D).unwrap() &= !cl_mem_flags::from(
-                    CL_MEM_WRITE_ONLY | CL_MEM_READ_WRITE | CL_MEM_KERNEL_READ_AND_WRITE,
-                );
-            }
+            self.formats
+                .values_mut()
+                .filter_map(|f| f.get_mut(&CL_MEM_OBJECT_IMAGE3D))
+                .for_each(|flags| {
+                    *flags &= !cl_mem_flags::from(
+                        CL_MEM_WRITE_ONLY | CL_MEM_READ_WRITE | CL_MEM_KERNEL_READ_AND_WRITE,
+                    )
+                });
         }
 
         // we require formatted loads
@@ -399,29 +394,6 @@ impl Device {
                 .flat_map(|f| f.values_mut())
                 .for_each(|f| *f &= !cl_mem_flags::from(CL_MEM_KERNEL_READ_AND_WRITE));
         }
-    }
-
-    fn check_valid(screen: &PipeScreen) -> bool {
-        if !screen.caps().compute
-            || screen
-                .shader_caps(pipe_shader_type::PIPE_SHADER_COMPUTE)
-                .supported_irs
-                & (1 << (pipe_shader_ir::PIPE_SHADER_IR_NIR as i32))
-                == 0
-        {
-            return false;
-        }
-
-        // CL_DEVICE_MAX_PARAMETER_SIZE
-        // For this minimum value, only a maximum of 128 arguments can be passed to a kernel
-        if screen
-            .shader_caps(pipe_shader_type::PIPE_SHADER_COMPUTE)
-            .max_const_buffer0_size
-            < 128
-        {
-            return false;
-        }
-        true
     }
 
     fn check_custom(&self) -> bool {
@@ -565,15 +537,21 @@ impl Device {
         }
 
         if !exts.contains(&"cl_khr_byte_addressable_store")
-         || !exts.contains(&"cl_khr_global_int32_base_atomics")
-         || !exts.contains(&"cl_khr_global_int32_extended_atomics")
-         || !exts.contains(&"cl_khr_local_int32_base_atomics")
-         || !exts.contains(&"cl_khr_local_int32_extended_atomics")
-         // The following modifications are made to the OpenCL 1.1 platform layer and runtime (sections 4 and 5):
-         // The minimum FULL_PROFILE value for CL_DEVICE_MAX_PARAMETER_SIZE increased from 256 to 1024 bytes
-         || self.param_max_size() < 1024
-         // The minimum FULL_PROFILE value for CL_DEVICE_LOCAL_MEM_SIZE increased from 16 KB to 32 KB.
-         || self.local_mem_size() < 32 * 1024
+            || !exts.contains(&"cl_khr_global_int32_base_atomics")
+            || !exts.contains(&"cl_khr_global_int32_extended_atomics")
+            || !exts.contains(&"cl_khr_local_int32_base_atomics")
+            || !exts.contains(&"cl_khr_local_int32_extended_atomics")
+        {
+            res = CLVersion::Cl1_0;
+        }
+
+        if !self.embedded &&
+            // Quoting OpenCL 1.1:
+            // The following modifications are made to the OpenCL platform layer and runtime (sections 4 and 5):
+            // The minimum FULL_PROFILE value for CL_DEVICE_MAX_PARAMETER_SIZE increased from 256 to 1024 bytes
+            (self.param_max_size() < 1024
+             // The minimum FULL_PROFILE value for CL_DEVICE_LOCAL_MEM_SIZE increased from 16 KB to 32 KB.
+             || self.local_mem_size() < 32 * 1024)
         {
             res = CLVersion::Cl1_0;
         }
@@ -608,8 +586,10 @@ impl Device {
 
     fn fill_extensions(&mut self) {
         let mut exts_str: Vec<String> = Vec::new();
-        let mut exts = PLATFORM_EXTENSIONS.to_vec();
+        let mut exts = Vec::new();
         let mut feats = Vec::new();
+        let mut spirv_caps = spirv_capabilities::default();
+        let mut spirv_caps_vec = Vec::new();
         let mut spirv_exts = Vec::new();
         let mut add_ext = |major, minor, patch, ext: &str| {
             exts.push(mk_cl_version_ext(major, minor, patch, ext));
@@ -621,25 +601,56 @@ impl Device {
         let mut add_spirv = |ext| {
             spirv_exts.push(ext);
         };
+        let mut add_cap = |cap: SpvCapability| {
+            unsafe {
+                spirv_capabilities_set(&mut spirv_caps, cap, true);
+            }
+            spirv_caps_vec.push(cap);
+        };
 
         // add extensions all drivers support for now
+        add_ext(1, 0, 0, "cl_khr_byte_addressable_store");
+        add_ext(1, 0, 0, "cl_khr_create_command_queue");
+        add_ext(1, 0, 0, "cl_khr_expect_assume");
+        add_ext(1, 0, 0, "cl_khr_extended_bit_ops");
+        add_ext(1, 0, 0, "cl_khr_extended_versioning");
         add_ext(1, 0, 0, "cl_khr_global_int32_base_atomics");
         add_ext(1, 0, 0, "cl_khr_global_int32_extended_atomics");
+        add_ext(1, 0, 0, "cl_khr_il_program");
+        add_ext(1, 0, 0, "cl_khr_local_int32_base_atomics");
+        add_ext(1, 0, 0, "cl_khr_local_int32_extended_atomics");
         add_ext(2, 0, 0, "cl_khr_integer_dot_product");
+        add_ext(1, 0, 0, "cl_khr_spirv_no_integer_wrap_decoration");
+        add_ext(1, 0, 0, "cl_khr_spirv_queries");
+        add_ext(1, 0, 0, "cl_khr_suggested_local_work_size");
+
+        add_feat(2, 0, 0, "__opencl_c_integer_dot_product_input_4x8bit");
         add_feat(
             2,
             0,
             0,
             "__opencl_c_integer_dot_product_input_4x8bit_packed",
         );
-        add_feat(2, 0, 0, "__opencl_c_integer_dot_product_input_4x8bit");
-        add_ext(1, 0, 0, "cl_khr_local_int32_base_atomics");
-        add_ext(1, 0, 0, "cl_khr_local_int32_extended_atomics");
 
+        add_spirv(c"SPV_KHR_bit_instructions");
         add_spirv(c"SPV_KHR_expect_assume");
         add_spirv(c"SPV_KHR_float_controls");
         add_spirv(c"SPV_KHR_integer_dot_product");
         add_spirv(c"SPV_KHR_no_integer_wrap_decoration");
+
+        add_cap(SpvCapability::SpvCapabilityAddresses);
+        add_cap(SpvCapability::SpvCapabilityBitInstructions);
+        add_cap(SpvCapability::SpvCapabilityDotProduct);
+        add_cap(SpvCapability::SpvCapabilityDotProductInput4x8Bit);
+        add_cap(SpvCapability::SpvCapabilityDotProductInput4x8BitPacked);
+        add_cap(SpvCapability::SpvCapabilityExpectAssumeKHR);
+        add_cap(SpvCapability::SpvCapabilityFloat16Buffer);
+        add_cap(SpvCapability::SpvCapabilityInt8);
+        add_cap(SpvCapability::SpvCapabilityInt16);
+        add_cap(SpvCapability::SpvCapabilityLinkage);
+        add_cap(SpvCapability::SpvCapabilityKernel);
+        add_cap(SpvCapability::SpvCapabilityUniformDecoration);
+        add_cap(SpvCapability::SpvCapabilityVector16);
 
         if self.linkonce_supported() {
             add_ext(1, 0, 0, "cl_khr_spirv_linkonce_odr");
@@ -647,10 +658,12 @@ impl Device {
         }
 
         if self.fp16_supported() {
+            add_cap(SpvCapability::SpvCapabilityFloat16);
             add_ext(1, 0, 0, "cl_khr_fp16");
         }
 
         if self.fp64_supported() {
+            add_cap(SpvCapability::SpvCapabilityFloat64);
             add_ext(1, 0, 0, "cl_khr_fp64");
             add_feat(1, 0, 0, "__opencl_c_fp64");
         }
@@ -664,10 +677,25 @@ impl Device {
                 add_ext(1, 0, 0, "cles_khr_int64");
             };
 
+            add_cap(SpvCapability::SpvCapabilityInt64);
             add_feat(1, 0, 0, "__opencl_c_int64");
         }
 
+        if self.kernel_clock_supported() {
+            add_cap(SpvCapability::SpvCapabilityShaderClockKHR);
+            add_ext(1, 0, 0, "cl_khr_kernel_clock");
+            add_feat(1, 0, 0, "__opencl_c_kernel_clock_scope_device");
+            add_feat(1, 0, 0, "__opencl_c_kernel_clock_scope_sub_group");
+            add_spirv(c"SPV_KHR_shader_clock");
+        }
+
         if self.caps.has_images {
+            add_cap(SpvCapability::SpvCapabilityImage1D);
+            add_cap(SpvCapability::SpvCapabilityImageBasic);
+            add_cap(SpvCapability::SpvCapabilityImageBuffer);
+            add_cap(SpvCapability::SpvCapabilityLiteralSampler);
+            add_cap(SpvCapability::SpvCapabilitySampled1D);
+            add_cap(SpvCapability::SpvCapabilitySampledBuffer);
             add_feat(1, 0, 0, "__opencl_c_images");
 
             if self.image2d_from_buffer_supported() {
@@ -675,6 +703,7 @@ impl Device {
             }
 
             if self.caps.has_rw_images {
+                add_cap(SpvCapability::SpvCapabilityImageReadWrite);
                 add_feat(1, 0, 0, "__opencl_c_read_write_images");
             }
 
@@ -686,10 +715,19 @@ impl Device {
             if self.caps.has_depth_images {
                 add_ext(1, 0, 0, "cl_khr_depth_images");
             }
+
+            if self.caps.has_image_unorm_int_2_101010 {
+                add_ext(1, 0, 0, "cl_ext_image_unorm_int_2_101010");
+                add_feat(1, 0, 0, "__opencl_c_ext_image_unorm_int_2_101010");
+            }
         }
 
         if self.pci_info().is_some() {
             add_ext(1, 0, 0, "cl_khr_pci_bus_info");
+        }
+
+        if self.context_priority_supported() != 0 {
+            add_ext(1, 0, 0, "cl_khr_priority_hints");
         }
 
         if self.screen().device_uuid().is_some() && self.screen().driver_uuid().is_some() {
@@ -700,6 +738,10 @@ impl Device {
         }
 
         if self.subgroups_supported() {
+            add_cap(SpvCapability::SpvCapabilityGroupNonUniformShuffle);
+            add_cap(SpvCapability::SpvCapabilityGroupNonUniformShuffleRelative);
+            add_cap(SpvCapability::SpvCapabilityGroups);
+            add_cap(SpvCapability::SpvCapabilitySubgroupDispatch);
             // requires CL_DEVICE_SUB_GROUP_INDEPENDENT_FORWARD_PROGRESS
             //add_ext(1, 0, 0, "cl_khr_subgroups");
             add_feat(1, 0, 0, "__opencl_c_subgroups");
@@ -707,57 +749,35 @@ impl Device {
             // we have lowering in `nir_lower_subgroups`, drivers can just use that
             add_ext(1, 0, 0, "cl_khr_subgroup_shuffle");
             add_ext(1, 0, 0, "cl_khr_subgroup_shuffle_relative");
+            if self.intel_subgroups_supported() {
+                // add_cap(SpvCapability::SpvCapabilitySubgroupBufferBlockIOINTEL);
+                // add_cap(SpvCapability::SpvCapabilitySubgroupImageBlockIOINTEL);
+                add_cap(SpvCapability::SpvCapabilitySubgroupShuffleINTEL);
+                add_ext(1, 0, 0, "cl_intel_required_subgroup_size");
+                add_ext(1, 0, 0, "cl_intel_subgroups");
+                add_spirv(c"SPV_INTEL_subgroups");
+            }
         }
 
         if self.svm_supported() {
             add_ext(1, 0, 0, "cl_arm_shared_virtual_memory");
         }
 
+        if self.bda_supported() {
+            add_ext(1, 0, 2, "cl_ext_buffer_device_address");
+        }
+
         self.extensions = exts;
         self.clc_features = feats;
-        self.extension_string = format!("{} {}", PLATFORM_EXTENSION_STR, exts_str.join(" "));
+        self.extension_string = exts_str.join(" ");
+        self.spirv_caps = spirv_caps;
+        self.spirv_caps_vec = spirv_caps_vec;
         self.spirv_extensions = spirv_exts;
     }
 
     fn shader_caps(&self) -> &pipe_shader_caps {
         self.screen
             .shader_caps(pipe_shader_type::PIPE_SHADER_COMPUTE)
-    }
-
-    pub fn all() -> Vec<Device> {
-        let mut devs: Vec<_> = load_screens().filter_map(Device::new).collect();
-
-        // Pick a default device. One must be the default one no matter what. And custom devices can
-        // only be that one if they are the only devices available.
-        //
-        // The entry with the highest value will be the default device.
-        let default = devs.iter_mut().max_by_key(|dev| {
-            let mut val = if dev.device_type == CL_DEVICE_TYPE_CUSTOM {
-                // needs to be small enough so it's always going to be the smallest value
-                -100
-            } else if dev.device_type == CL_DEVICE_TYPE_CPU {
-                0
-            } else if dev.unified_memory() {
-                // we give unified memory devices max priority, because we don't want to spin up the
-                // discrete GPU on laptops by default.
-                100
-            } else {
-                10
-            };
-
-            // we deprioritize zink for now.
-            if dev.screen.driver_name() == c"zink" {
-                val -= 1;
-            }
-
-            val
-        });
-
-        if let Some(default) = default {
-            default.device_type |= CL_DEVICE_TYPE_DEFAULT;
-        }
-
-        devs
     }
 
     pub fn address_bits(&self) -> cl_uint {
@@ -774,7 +794,7 @@ impl Device {
             1 << 26,
             min(
                 self.max_mem_alloc(),
-                self.screen.caps().max_shader_buffer_size as u64,
+                self.screen.caps().max_shader_buffer_size.into(),
             ),
         )
     }
@@ -836,10 +856,6 @@ impl Device {
     }
 
     pub fn fp16_supported(&self) -> bool {
-        if !Platform::features().fp16 {
-            return false;
-        }
-
         self.shader_caps().fp16
     }
 
@@ -849,6 +865,14 @@ impl Device {
         }
 
         self.screen.caps().doubles
+    }
+
+    pub fn bda_supported(&self) -> bool {
+        self.screen().is_fixed_address_supported()
+    }
+
+    pub fn intel_subgroups_supported(&self) -> bool {
+        Platform::features().intel && self.subgroups_supported()
     }
 
     pub fn is_gl_sharing_supported(&self) -> bool {
@@ -911,8 +935,27 @@ impl Device {
         self.screen.caps().int64
     }
 
+    pub fn context_priority_supported(&self) -> cl_queue_priority_khr {
+        let mut res = 0;
+        let prio_mask = self.screen().caps().context_priority_mask;
+
+        if prio_mask & PIPE_CONTEXT_PRIORITY_LOW != 0 {
+            res |= CL_QUEUE_PRIORITY_LOW_KHR;
+        }
+        if prio_mask & PIPE_CONTEXT_PRIORITY_MEDIUM != 0 {
+            res |= CL_QUEUE_PRIORITY_MED_KHR;
+        }
+        if prio_mask & PIPE_CONTEXT_PRIORITY_HIGH != 0 {
+            res |= CL_QUEUE_PRIORITY_HIGH_KHR;
+        }
+
+        debug_assert!(prio_mask == 0 || prio_mask & CL_QUEUE_PRIORITY_MED_KHR != 0);
+
+        res
+    }
+
     pub fn global_mem_size(&self) -> cl_ulong {
-        if let Some(memory_info) = self.screen().query_memory_info() {
+        if let Some(memory_info) = self.screen.query_memory_info() {
             let memory: cl_ulong = if memory_info.total_device_memory != 0 {
                 memory_info.total_device_memory.into()
             } else {
@@ -992,17 +1035,20 @@ impl Device {
         self.screen.compute_caps().max_local_size as cl_ulong
     }
 
-    pub fn max_block_sizes(&self) -> Vec<usize> {
-        let v: [u32; 3] = self.screen.compute_caps().max_block_size;
-        v.into_iter().map(|v| v as usize).collect()
+    pub fn max_block_sizes(&self) -> [usize; 3] {
+        self.screen
+            .compute_caps()
+            .max_block_size
+            .map(|value| value as usize)
     }
 
-    pub fn max_grid_size(&self) -> Vec<usize> {
-        let v: [u32; 3] = self.screen.compute_caps().max_grid_size;
-        v.into_iter()
-            .map(|a| min(a, Platform::dbg().max_grid_size))
-            .map(|v| v as usize)
-            .collect()
+    pub fn max_grid_size(&self) -> [usize; 3] {
+        self.screen
+            .compute_caps()
+            .max_grid_size
+            .map(|screen_max_grid_size| {
+                min(screen_max_grid_size, Platform::dbg().max_grid_size) as usize
+            })
     }
 
     pub fn max_clock_freq(&self) -> cl_uint {
@@ -1014,12 +1060,26 @@ impl Device {
     }
 
     pub fn max_grid_dimensions(&self) -> cl_uint {
-        self.screen.compute_caps().grid_dimension
+        // Much of the kernel code assumes three-dimensional grids, implicitly
+        // capping this value. The OpenCL spec requires a minimum value of 3 for
+        // devices not of type CL_DEVICE_TYPE_CUSTOM.
+        const MAX_GRID_DIM: cl_uint = 3;
+
+        MAX_GRID_DIM
     }
 
+    /// Returns the maximum size in bytes of a memory allocation for this
+    /// device.
     pub fn max_mem_alloc(&self) -> cl_ulong {
-        // TODO: at the moment gallium doesn't support bigger buffers
-        min(self.screen.compute_caps().max_mem_alloc_size, 0x80000000)
+        // The returned value must always be less than or equal to `isize::MAX`,
+        // as this method may be used for bounds checking on allocations.
+        // TODO: Add support for larger allocations. gallium doesn't support
+        // buffers larger than `i32::MAX` due to constraints in the buffer
+        // mapping API.
+        min(
+            self.screen.compute_caps().max_mem_alloc_size,
+            i32::MAX as cl_ulong,
+        )
     }
 
     pub fn max_samplers(&self) -> cl_uint {
@@ -1064,28 +1124,36 @@ impl Device {
         &self.screen
     }
 
-    pub fn create_context(&self) -> Option<PipeContext> {
-        self.reusable_ctx()
-            .pop()
-            .or_else(|| self.screen.create_context())
+    pub fn create_context(&self, prio: PipeContextPrio) -> Option<PipeContext> {
+        // We only cache for Med prio contexts for now.
+        let res = (prio == PipeContextPrio::Med)
+            .then(|| self.reusable_ctx().pop())
+            .flatten()
+            .or_else(|| self.screen.create_context(prio))?;
+
+        debug_assert_eq!(res.prio, prio);
+
+        Some(res)
     }
 
     pub fn recycle_context(&self, ctx: PipeContext) {
-        if Platform::dbg().reuse_context {
+        if Platform::dbg().reuse_context && ctx.prio == PipeContextPrio::Med {
             self.reusable_ctx().push(ctx);
         }
     }
 
-    pub fn subgroup_sizes(&self) -> Vec<usize> {
+    pub fn subgroup_sizes(&self) -> impl ExactSizeIterator<Item = usize> {
         let subgroup_size = self.screen.compute_caps().subgroup_sizes;
 
-        SetBitIndices::from_msb(subgroup_size)
-            .map(|bit| 1 << bit)
-            .collect()
+        SetBitIndices::from_msb(subgroup_size).map(|bit| 1 << bit)
     }
 
     pub fn max_subgroups(&self) -> u32 {
         self.screen.compute_caps().max_subgroups
+    }
+
+    pub fn kernel_clock_supported(&self) -> bool {
+        self.screen.caps().shader_clock && LLVM_VERSION_MAJOR >= 19
     }
 
     pub fn subgroups_supported(&self) -> bool {
@@ -1097,8 +1165,34 @@ impl Device {
             && (subgroup_sizes == 1 || (subgroup_sizes > 1 && self.shareable_shaders()))
     }
 
-    pub fn svm_supported(&self) -> bool {
+    pub fn system_svm_supported(&self) -> bool {
         self.screen.caps().system_svm
+    }
+
+    pub fn svm_supported(&self) -> bool {
+        if cfg!(any(
+            not(target_pointer_width = "64"),
+            not(any(target_os = "linux", target_os = "freebsd"))
+        )) {
+            return false;
+        }
+
+        self.system_svm_supported() || self.screen().is_vm_supported()
+    }
+
+    /// Checks if the device supports SVM _and_ that we were able to initialize SVM support on a
+    /// platform level.
+    pub fn api_svm_supported(&self) -> bool {
+        self.system_svm_supported()
+            || (self.screen().is_vm_supported() && Platform::get().vm.is_some())
+    }
+
+    // returns (start, end)
+    pub fn vm_alloc_range(&self) -> Option<(NonZeroU64, NonZeroU64)> {
+        let min = self.screen.caps().min_vma;
+        let max = self.screen.caps().max_vma;
+
+        Some((NonZeroU64::new(min)?, NonZeroU64::new(max)?))
     }
 
     pub fn unified_memory(&self) -> bool {
@@ -1138,14 +1232,18 @@ impl Device {
     pub fn cl_features(&self) -> clc_optional_features {
         let subgroups_supported = self.subgroups_supported();
         clc_optional_features {
+            extended_bit_ops: true,
             fp16: self.fp16_supported(),
             fp64: self.fp64_supported(),
             int64: self.int64_supported(),
             images: self.caps.has_images,
             images_depth: self.caps.has_depth_images,
+            images_unorm_int_2_101010: self.caps.has_image_unorm_int_2_101010,
             images_read_write: self.caps.has_rw_images,
             images_write_3d: self.caps.has_3d_image_writes,
             integer_dot_product: true,
+            intel_subgroups: self.intel_subgroups_supported(),
+            kernel_clock: self.kernel_clock_supported(),
             subgroups: subgroups_supported,
             subgroups_shuffle: subgroups_supported,
             subgroups_shuffle_relative: subgroups_supported,
@@ -1154,7 +1252,141 @@ impl Device {
     }
 }
 
-pub fn devs() -> &'static Vec<Device> {
+impl Device {
+    fn new(screen: PipeScreen) -> Option<Device> {
+        if !Self::check_valid(&screen) {
+            return None;
+        }
+
+        let screen = Arc::new(screen);
+        // Create before loading libclc as llvmpipe only creates the shader cache with the first
+        // context being created.
+        let helper_ctx = screen.create_context(PipeContextPrio::Med)?;
+        let mut dev_base = DeviceBase {
+            caps: DeviceCaps::new(&screen),
+            helper_ctx: Mutex::new(helper_ctx),
+            screen: screen,
+            cl_version: CLVersion::Cl3_0,
+            clc_version: CLVersion::Cl3_0,
+            clc_versions: Vec::new(),
+            device_type: 0,
+            embedded: false,
+            extension_string: String::from(""),
+            extensions: Vec::new(),
+            spirv_caps: spirv_capabilities::default(),
+            spirv_caps_vec: Vec::new(),
+            spirv_extensions: Vec::new(),
+            clc_features: Vec::new(),
+            formats: HashMap::new(),
+            reusable_ctx: Mutex::new(Vec::new()),
+        };
+
+        // check if we are embedded or full profile first
+        dev_base.embedded = dev_base.check_embedded_profile();
+
+        dev_base.set_device_type();
+
+        dev_base.fill_format_tables();
+
+        // query supported extensions
+        dev_base.fill_extensions();
+
+        // now figure out what version we are
+        dev_base.check_version();
+
+        // Libclc depends on a few caps which must always be enabled. At runtime we should never
+        // actually pass relevant functionality down to drivers, so this should be fine.
+        let mut spirv_caps = dev_base.spirv_caps;
+        spirv_caps.Float64 = true;
+        spirv_caps.Int64 = true;
+
+        let lib_clc = spirv::SPIRVBin::get_lib_clc(dev_base.screen(), &spirv_caps);
+        if lib_clc.is_none() {
+            eprintln!("Libclc failed to load. Please make sure it is installed and provides spirv-mesa3d-.spv and/or spirv64-mesa3d-.spv");
+        }
+
+        Some(Device {
+            base: CLObjectBase::new_no_dispatch(RusticlTypes::Device),
+            dev_base: dev_base,
+            lib_clc: lib_clc?,
+        })
+    }
+
+    pub fn all() -> Vec<Device> {
+        let mut devs: Vec<_> = load_screens().filter_map(Device::new).collect();
+
+        // Pick a default device. One must be the default one no matter what. And custom devices can
+        // only be that one if they are the only devices available.
+        //
+        // The entry with the highest value will be the default device.
+        let default = devs.iter_mut().max_by_key(|dev| {
+            let mut val = if dev.device_type == CL_DEVICE_TYPE_CUSTOM {
+                // needs to be small enough so it's always going to be the smallest value
+                -100
+            } else if dev.device_type == CL_DEVICE_TYPE_CPU {
+                0
+            } else if dev.unified_memory() {
+                // we give unified memory devices max priority, because we don't want to spin up the
+                // discrete GPU on laptops by default.
+                100
+            } else {
+                10
+            };
+
+            // we deprioritize zink for now.
+            if dev.screen.driver_name() == c"zink" {
+                val -= 1;
+            }
+
+            val
+        });
+
+        if let Some(default) = default {
+            default.dev_base.device_type |= CL_DEVICE_TYPE_DEFAULT;
+        }
+
+        devs
+    }
+
+    fn check_valid(screen: &PipeScreen) -> bool {
+        if !screen.caps().compute
+            || screen
+                .shader_caps(pipe_shader_type::PIPE_SHADER_COMPUTE)
+                .supported_irs
+                & (1 << (pipe_shader_ir::PIPE_SHADER_IR_NIR as i32))
+                == 0
+        {
+            return false;
+        }
+
+        // CL_DEVICE_MAX_PARAMETER_SIZE
+        // For this minimum value, only a maximum of 128 arguments can be passed to a kernel
+        if screen
+            .shader_caps(pipe_shader_type::PIPE_SHADER_COMPUTE)
+            .max_const_buffer0_size
+            < 128
+        {
+            return false;
+        }
+        true
+    }
+
+    /// Converts a temporary reference to a static if and only if this device lives inside static
+    /// memory.
+    pub fn to_static(&self) -> Option<&'static Self> {
+        devs().iter().find(|&dev| self == dev)
+    }
+}
+
+impl Debug for Device {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(&format!("Device@{:?}", self as *const _))
+            .field("name", &self.screen().name())
+            .finish()
+    }
+}
+
+pub fn devs() -> &'static [Device] {
     &Platform::get().devs
 }
 

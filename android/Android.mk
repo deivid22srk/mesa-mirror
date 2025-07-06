@@ -51,7 +51,7 @@ LOCAL_HEADER_LIBRARIES := libnativebase_headers hwvulkan_headers
 MESON_GEN_PKGCONFIGS := log cutils expat hardware libdrm:$(LIBDRM_VERSION) nativewindow sync zlib:1.2.11 libelf
 LOCAL_CFLAGS += $(BOARD_MESA3D_CFLAGS)
 
-ifneq ($(filter swrast,$(BOARD_MESA3D_GALLIUM_DRIVERS) $(BOARD_MESA3D_VULKAN_DRIVERS)),)
+ifneq ($(filter llvmpipe swrast,$(BOARD_MESA3D_GALLIUM_DRIVERS) $(BOARD_MESA3D_VULKAN_DRIVERS)),)
 ifeq ($(BOARD_MESA3D_FORCE_SOFTPIPE),)
 MESON_GEN_LLVM_STUB := true
 endif
@@ -104,6 +104,7 @@ LOCAL_SHARED_LIBRARIES += \
     libutils
 ifeq ($(shell test $(PLATFORM_SDK_VERSION) -ge 35; echo $$?), 0)
 LOCAL_SHARED_LIBRARIES += libui
+LOCAL_STATIC_LIBRARIES += libzstd
 MESON_GEN_PKGCONFIGS += ui
 endif
 MESON_GEN_PKGCONFIGS += android.hardware.graphics.mapper:4.0

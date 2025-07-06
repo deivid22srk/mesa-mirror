@@ -129,10 +129,10 @@ brw_alloc_reg_sets(struct brw_compiler *compiler)
 }
 
 static int
-count_to_loop_end(const bblock_t *block)
+count_to_loop_end(const bblock_t *block, const brw_ip_ranges &ips)
 {
    if (block->end()->opcode == BRW_OPCODE_WHILE)
-      return block->end_ip;
+      return ips.range(block).last();
 
    int depth = 1;
    /* Skip the first block, since we don't want to count the do the calling
@@ -146,7 +146,7 @@ count_to_loop_end(const bblock_t *block)
       if (block->end()->opcode == BRW_OPCODE_WHILE) {
          depth--;
          if (depth == 0)
-            return block->end_ip;
+            return ips.range(block).last();
       }
    }
    unreachable("not reached");
@@ -156,6 +156,8 @@ void brw_shader::calculate_payload_ranges(bool allow_spilling,
                                           unsigned payload_node_count,
                                           int *payload_last_use_ip) const
 {
+   const brw_ip_ranges &ips = this->ip_ranges_analysis.require();
+
    int loop_depth = 0;
    int loop_end_ip = 0;
 
@@ -174,7 +176,7 @@ void brw_shader::calculate_payload_ranges(bool allow_spilling,
           * the end now.
           */
          if (loop_depth == 1)
-            loop_end_ip = count_to_loop_end(block);
+            loop_end_ip = count_to_loop_end(block, ips);
          break;
       case BRW_OPCODE_WHILE:
          loop_depth--;
@@ -246,7 +248,7 @@ public:
       /* Stash the number of instructions so we can sanity check that our
        * counts still match liveness.
        */
-      live_instr_count = fs->cfg->last_block()->end_ip + 1;
+      live_instr_count = fs->cfg->total_instructions;
 
       spill_insts = _mesa_pointer_set_create(mem_ctx);
 
@@ -282,8 +284,7 @@ public:
    bool assign_regs(bool allow_spilling, bool spill_all);
 
 private:
-   void setup_live_interference(unsigned node,
-                                int node_start_ip, int node_end_ip);
+   void setup_live_interference(unsigned node, brw_range ip_range);
    void setup_inst_interference(const brw_inst *inst);
 
    void build_interference_graph(bool allow_spilling);
@@ -367,8 +368,7 @@ namespace {
 }
 
 void
-brw_reg_alloc::setup_live_interference(unsigned node,
-                                      int node_start_ip, int node_end_ip)
+brw_reg_alloc::setup_live_interference(unsigned node, brw_range ip_range)
 {
    /* Mark any virtual grf that is live between the start of the program and
     * the last use of a payload node interfering with that payload node.
@@ -381,9 +381,11 @@ brw_reg_alloc::setup_live_interference(unsigned node,
        * in order to not have to worry about the uniform issue described in
        * calculate_live_intervals().
        */
-      if (node_start_ip <= payload_last_use_ip[i])
+      if (ip_range.start <= payload_last_use_ip[i])
          ra_add_node_interference(g, node, first_payload_node + i);
    }
+
+   const brw_range clipped_ip_range = clip_end(ip_range, 1);
 
    /* Add interference with every vgrf whose live range intersects this
     * node's.  We only need to look at nodes below this one as the reflexivity
@@ -392,8 +394,12 @@ brw_reg_alloc::setup_live_interference(unsigned node,
    for (unsigned n2 = first_vgrf_node;
         n2 <= (unsigned)last_vgrf_node && n2 < node; n2++) {
       unsigned vgrf = n2 - first_vgrf_node;
-      if (!(node_end_ip <= live.vgrf_start[vgrf] ||
-            live.vgrf_end[vgrf] <= node_start_ip))
+
+      /* Clip the ranges so the end of a live range can overlap with
+       * the start of another live range.  See details in vgrfs_interfere().
+       */
+      if (overlaps(clip_end(live.vgrf_range[vgrf], 1),
+                   clipped_ip_range))
          ra_add_node_interference(g, node, n2);
    }
 }
@@ -660,11 +666,8 @@ brw_reg_alloc::build_interference_graph(bool allow_spilling)
    }
 
    /* Add interference based on the live range of the register */
-   for (unsigned i = 0; i < fs->alloc.count; i++) {
-      setup_live_interference(first_vgrf_node + i,
-                              live.vgrf_start[i],
-                              live.vgrf_end[i]);
-   }
+   for (unsigned i = 0; i < fs->alloc.count; i++)
+      setup_live_interference(first_vgrf_node + i, live.vgrf_range[i]);
 
    /* Add interference based on the instructions in which a register is used.
     */
@@ -691,27 +694,26 @@ brw_reg_alloc::build_ex_desc(const brw_builder &bld, unsigned reg_size, bool uns
     */
    brw_reg ex_desc = bld.vaddr(BRW_TYPE_UD,
                                BRW_ADDRESS_SUBREG_INDIRECT_SPILL_DESC);
-   brw_inst *inst = bld.exec_all().group(1, 0).AND(
-      ex_desc,
-      retype(brw_vec1_grf(0, 5), BRW_TYPE_UD),
-      brw_imm_ud(INTEL_MASK(31, 10)));
+
+   brw_builder ubld = bld.uniform();
+
+   brw_inst *inst = ubld.AND(ex_desc,
+                             retype(brw_vec1_grf(0, 5), BRW_TYPE_UD),
+                             brw_imm_ud(INTEL_MASK(31, 10)));
    _mesa_set_add(spill_insts, inst);
 
    const intel_device_info *devinfo = bld.shader->devinfo;
    if (devinfo->verx10 >= 200) {
-      inst = bld.exec_all().group(1, 0).SHR(
-         ex_desc, ex_desc, brw_imm_ud(4));
+      inst = ubld.SHR(ex_desc, ex_desc, brw_imm_ud(4));
       _mesa_set_add(spill_insts, inst);
    } else {
       if (unspill) {
-         inst = bld.exec_all().group(1, 0).OR(
-            ex_desc, ex_desc, brw_imm_ud(GFX12_SFID_UGM));
+         inst = ubld.OR(ex_desc, ex_desc, brw_imm_ud(BRW_SFID_UGM));
          _mesa_set_add(spill_insts, inst);
       } else {
-         inst = bld.exec_all().group(1, 0).OR(
-            ex_desc, ex_desc,
-            brw_imm_ud(brw_message_ex_desc(devinfo, reg_size) |
-                       GFX12_SFID_UGM));
+         inst = ubld.OR(ex_desc,
+                        ex_desc,
+                        brw_imm_ud(brw_message_ex_desc(devinfo, reg_size) | BRW_SFID_UGM));
          _mesa_set_add(spill_insts, inst);
       }
    }
@@ -734,21 +736,33 @@ brw_reg_alloc::build_lane_offsets(const brw_builder &bld, uint32_t spill_offset,
    inst = ubld.group(8, 0).MOV(retype(offset, BRW_TYPE_UW),
                                brw_imm_uv(0x76543210));
    _mesa_set_add(spill_insts, inst);
-   inst = ubld.group(8, 0).MOV(offset, retype(offset, BRW_TYPE_UW));
-   _mesa_set_add(spill_insts, inst);
+
+   if (spill_offset > 0 && spill_offset <= 0xffffu) {
+      inst = ubld.group(8, 0).MAD(offset,
+                                  brw_imm_uw(spill_offset),
+                                  retype(offset, BRW_TYPE_UW),
+                                  brw_imm_uw(4));
+      _mesa_set_add(spill_insts, inst);
+   } else {
+      /* Make the offset a dword */
+      inst = ubld.group(8, 0).SHL(offset, retype(offset, BRW_TYPE_UW), brw_imm_uw(2));
+      _mesa_set_add(spill_insts, inst);
+
+      /* Add the base offset */
+      if (spill_offset) {
+         inst = ubld.group(8, 0).ADD(offset, offset, brw_imm_ud(spill_offset));
+         _mesa_set_add(spill_insts, inst);
+      }
+   }
 
    /* Build offsets in the upper 8 lanes of SIMD16 */
    if (ubld.dispatch_width() > 8) {
       inst = ubld.group(8, 0).ADD(
          byte_offset(offset, REG_SIZE),
          byte_offset(offset, 0),
-         brw_imm_ud(8));
+         brw_imm_ud(8 << 2));
       _mesa_set_add(spill_insts, inst);
    }
-
-   /* Make the offset a dword */
-   inst = ubld.SHL(offset, offset, brw_imm_ud(2));
-   _mesa_set_add(spill_insts, inst);
 
    /* Build offsets in the upper 16 lanes of SIMD32 */
    if (ubld.dispatch_width() > 16) {
@@ -756,12 +770,6 @@ brw_reg_alloc::build_lane_offsets(const brw_builder &bld, uint32_t spill_offset,
          byte_offset(offset, 2 * REG_SIZE),
          byte_offset(offset, 0),
          brw_imm_ud(16 << 2));
-      _mesa_set_add(spill_insts, inst);
-   }
-
-   /* Add the base offset */
-   if (spill_offset) {
-      inst = ubld.ADD(offset, offset, brw_imm_ud(spill_offset));
       _mesa_set_add(spill_insts, inst);
    }
 
@@ -815,7 +823,7 @@ brw_reg_alloc::emit_unspill(const brw_builder &bld,
          const bool use_transpose =
             bld.dispatch_width() > 16 * reg_unit(devinfo) ||
             bld.has_writemask_all();
-         const brw_builder ubld = use_transpose ? bld.exec_all().group(1, 0) : bld;
+         const brw_builder ubld = use_transpose ? bld.uniform() : bld;
          brw_reg offset;
          if (use_transpose) {
             offset = build_single_offset(ubld, spill_offset, ip);
@@ -841,7 +849,7 @@ brw_reg_alloc::emit_unspill(const brw_builder &bld,
 
          unspill_inst = ubld.emit(SHADER_OPCODE_SEND, dst,
                                   srcs, ARRAY_SIZE(srcs));
-         unspill_inst->sfid = GFX12_SFID_UGM;
+         unspill_inst->sfid = BRW_SFID_UGM;
          unspill_inst->header_size = 0;
          unspill_inst->mlen = lsc_msg_addr_len(devinfo, LSC_ADDR_SIZE_A32,
                                                unspill_inst->exec_size);
@@ -874,7 +882,7 @@ brw_reg_alloc::emit_unspill(const brw_builder &bld,
          unspill_inst->size_written = reg_size * REG_SIZE;
          unspill_inst->send_has_side_effects = false;
          unspill_inst->send_is_volatile = true;
-         unspill_inst->sfid = GFX7_SFID_DATAPORT_DATA_CACHE;
+         unspill_inst->sfid = BRW_SFID_HDC0;
 
          unspill_inst->src[0] = brw_imm_ud(
             brw_dp_desc(devinfo, bti,
@@ -918,7 +926,7 @@ brw_reg_alloc::emit_spill(const brw_builder &bld,
          };
          spill_inst = bld.emit(SHADER_OPCODE_SEND, bld.null_reg_f(),
                                srcs, ARRAY_SIZE(srcs));
-         spill_inst->sfid = GFX12_SFID_UGM;
+         spill_inst->sfid = BRW_SFID_UGM;
          uint32_t desc = lsc_msg_desc(devinfo, LSC_OP_STORE,
                                       LSC_ADDR_SURFTYPE_SS,
                                       LSC_ADDR_SIZE_A32,
@@ -958,7 +966,7 @@ brw_reg_alloc::emit_spill(const brw_builder &bld,
          spill_inst->header_size = 1;
          spill_inst->send_has_side_effects = true;
          spill_inst->send_is_volatile = false;
-         spill_inst->sfid = GFX7_SFID_DATAPORT_DATA_CACHE;
+         spill_inst->sfid = BRW_SFID_HDC0;
 
          spill_inst->src[0] = brw_imm_ud(
             brw_dp_desc(devinfo, bti,
@@ -1041,7 +1049,7 @@ brw_reg_alloc::set_spill_costs()
       if (isinf(spill_costs[i]))
          continue;
 
-      int live_length = live.vgrf_end[i] - live.vgrf_start[i];
+      int live_length = live.vgrf_range[i].last() - live.vgrf_range[i].start;
       if (live_length <= 0)
          continue;
 
@@ -1084,7 +1092,8 @@ brw_reg_alloc::alloc_spill_reg(unsigned size, int ip)
    assert(n == first_vgrf_node + vgrf);
    assert(n == first_spill_node + spill_node_count);
 
-   setup_live_interference(n, ip - 1, ip + 1);
+   brw_range spill_reg_range{ ip - 1, ip + 2 };
+   setup_live_interference(n, spill_reg_range);
 
    /* Add interference between this spill node and any other spill nodes for
     * the same instruction.
@@ -1132,7 +1141,7 @@ brw_reg_alloc::spill_reg(unsigned spill_reg)
     */
    int ip = 0;
    foreach_block_and_inst (block, brw_inst, inst, fs->cfg) {
-      const brw_builder ibld = brw_builder(fs, block, inst);
+      const brw_builder ibld = brw_builder(inst);
       exec_node *before = inst->prev;
       exec_node *after = inst->next;
 
@@ -1228,7 +1237,7 @@ brw_reg_alloc::spill_reg(unsigned spill_reg)
           * write, there should be no need for the unspill since the
           * instruction will be overwriting the whole destination in any case.
 	  */
-         if (inst->is_partial_write() ||
+         if (inst->is_partial_write(reg_unit(devinfo) * REG_SIZE) ||
              (!inst->force_writemask_all && !per_channel))
             emit_unspill(ubld, &fs->shader_stats, spill_src,
                          subset_spill_offset, regs_written(inst), ip);

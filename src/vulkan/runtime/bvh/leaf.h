@@ -53,12 +53,11 @@ build_triangle(inout vk_aabb bounds, VOID_REF dst_ptr, vk_bvh_geometry_data geom
     * other vertex component is NaN, and the first is not, the behavior is undefined. If the vertex
     * format does not have a NaN representation, then all triangles are considered active.
     */
-   if (isnan(vertices.vertex[0].x) || isnan(vertices.vertex[1].x) || isnan(vertices.vertex[2].x))
-#if ALWAYS_ACTIVE
+   if (isnan(vertices.vertex[0].x) || isnan(vertices.vertex[1].x) || isnan(vertices.vertex[2].x)) {
       is_valid = false;
-#else
-      return false;
-#endif
+      if (!VK_BUILD_FLAG(VK_BUILD_FLAG_ALWAYS_ACTIVE))
+         return false;
+   }
 
    if (geom_data.transform != NULL) {
       mat4 transform = mat4(1.0);
@@ -110,12 +109,11 @@ build_aabb(inout vk_aabb bounds, VOID_REF src_ptr, VOID_REF dst_ptr, uint32_t ge
    /* An inactive AABB is one for which the minimum X coordinate is NaN. If any other component is
     * NaN, and the first is not, the behavior is undefined.
     */
-   if (isnan(bounds.min.x))
-#if ALWAYS_ACTIVE
+   if (isnan(bounds.min.x)) {
       is_valid = false;
-#else
-      return false;
-#endif
+      if (!VK_BUILD_FLAG(VK_BUILD_FLAG_ALWAYS_ACTIVE))
+         return false;
+   }
 
    DEREF(node).base.aabb = bounds;
    DEREF(node).primitive_id = global_id;
@@ -186,6 +184,18 @@ build_instance(inout vk_aabb bounds, VOID_REF src_ptr, VOID_REF dst_ptr, uint32_
    DEREF(node).sbt_offset_and_flags = instance.sbt_offset_and_flags;
    DEREF(node).instance_id = global_id;
 
+   if (!VK_BUILD_FLAG(VK_BUILD_FLAG_PROPAGATE_CULL_FLAGS))
+      return true;
+
+   uint32_t root_flags = 0;
+   if ((instance.sbt_offset_and_flags & (VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR << 24)) != 0)
+      root_flags = VK_BVH_BOX_FLAG_ONLY_OPAQUE;
+   else if ((instance.sbt_offset_and_flags & (VK_GEOMETRY_INSTANCE_FORCE_NO_OPAQUE_BIT_KHR << 24)) != 0)
+      root_flags = VK_BVH_BOX_FLAG_NO_OPAQUE;
+   else
+      root_flags = DEREF(REF(uint32_t)(instance.accelerationStructureReference + ROOT_FLAGS_OFFSET));
+   DEREF(node).root_flags = root_flags;
+
    return true;
 }
 
@@ -231,13 +241,12 @@ main(void)
       is_active = build_instance(bounds, src_ptr, dst_ptr, global_id);
    }
 
-#if ALWAYS_ACTIVE
-   if (!is_active && args.geom_data.geometry_type != VK_GEOMETRY_TYPE_INSTANCES_KHR) {
+   if (VK_BUILD_FLAG(VK_BUILD_FLAG_ALWAYS_ACTIVE) &&
+       !is_active && args.geom_data.geometry_type != VK_GEOMETRY_TYPE_INSTANCES_KHR) {
       bounds.min = vec3(0.0);
       bounds.max = vec3(0.0);
       is_active = true;
    }
-#endif
 
    DEREF(id_ptr).id = is_active ? pack_ir_node_id(dst_offset, node_type) : VK_BVH_INVALID_NODE;
 

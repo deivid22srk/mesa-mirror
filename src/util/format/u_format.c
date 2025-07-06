@@ -37,6 +37,7 @@
 #include "util/format/u_format.h"
 #include "util/format/u_format_s3tc.h"
 #include "util/u_math.h"
+#include "util/perf/cpu_trace.h"
 
 /**
  * Copy 2D rect from one place to another.
@@ -56,6 +57,8 @@ util_copy_rect(void * dst_in,
                unsigned src_x,
                unsigned src_y)
 {
+   MESA_TRACE_SCOPE("%s width=%u height=%u", __func__, width, height);
+
    uint8_t *dst = dst_in;
    const uint8_t *src = src_in;
    unsigned i;
@@ -360,6 +363,18 @@ util_format_is_subsampled_422(enum pipe_format format)
       desc->block.width == 2 &&
       desc->block.height == 1 &&
       desc->block.bits == 32;
+}
+
+bool
+util_format_is_float16(enum pipe_format format)
+{
+   const struct util_format_description *desc =
+      util_format_description(format);
+   const int c = util_format_get_first_non_void_channel(format);
+   if (c < 0)
+      return false;
+
+   return desc->channel[c].type == UTIL_FORMAT_TYPE_FLOAT && desc->channel[c].size == 16;
 }
 
 /**

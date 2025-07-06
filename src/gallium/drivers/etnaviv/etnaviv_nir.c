@@ -107,67 +107,10 @@ etna_lower_io(nir_shader *shader, struct etna_shader_variant *v)
                   break;
                }
             }
-
-            if (instr->type != nir_instr_type_tex)
-               continue;
-
-            nir_tex_instr *tex = nir_instr_as_tex(instr);
-            nir_src *coord = NULL;
-            nir_src *src1 = NULL;
-            unsigned src1_idx;
-
-            assert(tex->sampler_index == tex->texture_index);
-
-            for (unsigned i = 0; i < tex->num_srcs; i++) {
-               switch (tex->src[i].src_type) {
-               case nir_tex_src_coord:
-                  coord = &tex->src[i].src;
-                  break;
-               case nir_tex_src_bias:
-               case nir_tex_src_lod:
-                  assert(!src1);
-                  src1 = &tex->src[i].src;
-                  src1_idx = i;
-                  break;
-               case nir_tex_src_ddx:
-               case nir_tex_src_ddy:
-               case nir_tex_src_comparator:
-                  break;
-               default:
-                  assert(0);
-                  break;
-               }
-            }
-
-            /* pre HALTI5 needs texture sources in a single source */
-
-            if (!src1 || v->shader->info->halti >= 5)
-               continue;
-
-            assert(coord && src1 && tex->coord_components < 4);
-
-            nir_alu_instr *vec = nir_alu_instr_create(shader, nir_op_vec4);
-            for (unsigned i = 0; i < tex->coord_components; i++) {
-               vec->src[i].src = nir_src_for_ssa(coord->ssa);
-               vec->src[i].swizzle[0] = i;
-            }
-            for (unsigned i = tex->coord_components; i < 4; i++)
-               vec->src[i].src = nir_src_for_ssa(src1->ssa);
-
-            nir_def_init(&vec->instr, &vec->def, 4, 32);
-
-            nir_tex_instr_remove_src(tex, src1_idx);
-            nir_src_rewrite(coord, &vec->def);
-            tex->coord_components = 4;
-
-            nir_instr_insert_before(&tex->instr, &vec->instr);
-
-            func_progress = true;
          }
       }
 
-      if (func_progress)
-         nir_metadata_preserve(impl, nir_metadata_none);
+      nir_progress(func_progress, impl, nir_metadata_none);
 
       progress |= func_progress;
    }
@@ -235,10 +178,7 @@ etna_lower_alu_impl(nir_function_impl *impl, bool has_new_transcendentals)
       }
    }
 
-   if (progress)
-      nir_metadata_preserve(impl, nir_metadata_none);
-
-   return progress;
+   return nir_progress(progress, impl, nir_metadata_none);
 }
 
 bool

@@ -204,7 +204,7 @@ vl_deint_filter_cs_render(struct vl_deint_filter *filter,
    struct pipe_sampler_view **prev_sv;
    struct pipe_sampler_view **next_sv;
    struct pipe_sampler_view *sampler_views[4];
-   struct pipe_surface **dst_surfaces;
+   struct pipe_surface *dst_surfaces;
 
    /* Set up destination and source */
    dst_surfaces = filter->video_buffer->get_surfaces(filter->video_buffer);
@@ -217,7 +217,7 @@ vl_deint_filter_cs_render(struct vl_deint_filter *filter,
                                      0, 4, filter->sampler);
 
    for (unsigned i = 0; i < 2; i++) {
-      struct pipe_surface *dst = dst_surfaces[i];
+      struct pipe_surface *dst = &dst_surfaces[i];
 
       /* Update sampler view sources  */
       sampler_views[0] = prevprev_sv[i];
@@ -225,7 +225,7 @@ vl_deint_filter_cs_render(struct vl_deint_filter *filter,
       sampler_views[2] = cur_sv[i];
       sampler_views[3] = next_sv[i];
       filter->pipe->set_sampler_views(filter->pipe, PIPE_SHADER_COMPUTE,
-                                      0, 4, 0, false, sampler_views);
+                                      0, 4, 0, sampler_views);
 
       /* Bind the image */
       struct pipe_image_view image = {

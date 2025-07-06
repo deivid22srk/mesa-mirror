@@ -900,13 +900,7 @@ upcast_phi_impl(nir_function_impl *impl, unsigned min_bit_size)
       }
    }
 
-   if (progress) {
-      nir_metadata_preserve(impl, nir_metadata_control_flow);
-   } else {
-      nir_metadata_preserve(impl, nir_metadata_all);
-   }
-
-   return progress;
+   return nir_progress(progress, impl, nir_metadata_control_flow);
 }
 
 bool
@@ -936,9 +930,9 @@ struct dxil_nir_split_clip_cull_distance_params {
  * 
  * This pass can deal with splitting across two axes:
  * 1. Given { float clip[5]; float cull[3]; }, split clip into clip[4] and clip1[1]. This is
- *    what's produced by nir_lower_clip_cull_distance_arrays.
+ *    what's produced by nir_lower_clip_cull_distance_array_vars.
  * 2. Given { float clip[4]; float clipcull[4]; }, split clipcull into clip1[1] and cull[3].
- *    This is what's produced by the sequence of nir_lower_clip_cull_distance_arrays, then
+ *    This is what's produced by the sequence of nir_lower_clip_cull_distance_array_vars, then
  *    I/O lowering, vectorization, optimization, and I/O un-lowering.
  */
 static bool
@@ -963,7 +957,7 @@ dxil_nir_split_clip_cull_distance_instr(nir_builder *b,
    nir_variable *new_var = params->new_var[new_var_idx];
 
    /* The location should only be inside clip distance, because clip
-    * and cull should've been merged by nir_lower_clip_cull_distance_arrays()
+    * and cull should've been merged by nir_lower_clip_cull_distance_array_vars()
     */
    assert(var->data.location == VARYING_SLOT_CLIP_DIST0 ||
           var->data.location == VARYING_SLOT_CLIP_DIST1);

@@ -19,13 +19,6 @@ brw_optimize(brw_shader &s)
    /* Start by validating the shader we currently have. */
    brw_validate(s);
 
-   /* Track how much non-SSA at this point. */
-   {
-      const brw_def_analysis &defs = s.def_analysis.require();
-      s.shader_stats.non_ssa_registers_after_nir =
-         defs.count() - defs.ssa_count();
-   }
-
    bool progress = false;
    int iteration = 0;
    int pass_num = 0;
@@ -60,6 +53,21 @@ brw_optimize(brw_shader &s)
 
    OPT(brw_opt_eliminate_find_live_channel);
 
+   /* Add load_reg instructions before the main optimization loop to get more
+    * defs available in those passes. Do it after the preceeding few pre-loop
+    * passes so that it hopefully has less work to do. Having it here versus
+    * before the call to opt_dce made some difference, but it was mostly
+    * noise.
+    */
+   OPT(brw_insert_load_reg);
+
+   /* Track how much non-SSA at this point. */
+   {
+      const brw_def_analysis &defs = s.def_analysis.require();
+      s.shader_stats.non_ssa_registers_after_nir =
+         defs.count() - defs.ssa_count();
+   }
+
    do {
       progress = false;
       pass_num = 0;
@@ -67,8 +75,7 @@ brw_optimize(brw_shader &s)
 
       OPT(brw_opt_algebraic);
       OPT(brw_opt_cse_defs);
-      if (!OPT(brw_opt_copy_propagation_defs))
-         OPT(brw_opt_copy_propagation);
+      OPT(brw_opt_copy_propagation_defs);
       OPT(brw_opt_cmod_propagation);
       OPT(brw_opt_dead_code_eliminate);
       OPT(brw_opt_saturate_propagation);
@@ -84,6 +91,12 @@ brw_optimize(brw_shader &s)
 
    if (OPT(brw_opt_combine_convergent_txf))
       OPT(brw_opt_copy_propagation_defs);
+
+   if (OPT(brw_lower_load_reg)) {
+      OPT(brw_opt_copy_propagation);
+      OPT(brw_opt_register_coalesce);
+      OPT(brw_opt_dead_code_eliminate);
+   }
 
    if (OPT(brw_lower_pack)) {
       OPT(brw_opt_register_coalesce);
@@ -148,8 +161,6 @@ brw_optimize(brw_shader &s)
 
    brw_shader_phase_update(s, BRW_SHADER_PHASE_AFTER_MIDDLE_LOWERING);
 
-   OPT(brw_lower_alu_restrictions);
-
    OPT(brw_opt_combine_constants);
    if (OPT(brw_lower_integer_multiplication)) {
       /* If lower_integer_multiplication made progress, it may have produced
@@ -183,12 +194,15 @@ brw_optimize(brw_shader &s)
 
    OPT(brw_lower_uniform_pull_constant_loads);
 
+   /* Do this before brw_lower_send_descriptors. */
+   OPT(brw_workaround_memory_fence_before_eot);
+
    if (OPT(brw_lower_send_descriptors)) {
       /* No need for standard copy_propagation since
        * brw_opt_address_reg_load will only optimize defs.
        */
-      if (OPT(brw_opt_copy_propagation_defs))
-         OPT(brw_opt_algebraic);
+      OPT(brw_opt_copy_propagation_defs);
+      OPT(brw_opt_algebraic);
       OPT(brw_opt_address_reg_load);
       OPT(brw_opt_dead_code_eliminate);
    }
@@ -196,6 +210,8 @@ brw_optimize(brw_shader &s)
    OPT(brw_lower_sends_overlapping_payload);
 
    OPT(brw_lower_indirect_mov);
+
+   OPT(brw_lower_alu_restrictions);
 
    OPT(brw_lower_find_live_channel);
 
@@ -351,7 +367,7 @@ brw_opt_split_sends(brw_shader &s)
       if (end <= mid)
          continue;
 
-      const brw_builder ibld(&s, block, lp);
+      const brw_builder ibld(lp);
       brw_inst *lp1 = ibld.LOAD_PAYLOAD(lp->dst, &lp->src[0], mid, lp->header_size);
       brw_inst *lp2 = ibld.LOAD_PAYLOAD(lp->dst, &lp->src[mid], end - mid, 0);
 
@@ -394,14 +410,12 @@ brw_opt_remove_redundant_halts(brw_shader &s)
 
    unsigned halt_count = 0;
    brw_inst *halt_target = NULL;
-   bblock_t *halt_target_block = NULL;
    foreach_block_and_inst(block, brw_inst, inst, s.cfg) {
       if (inst->opcode == BRW_OPCODE_HALT)
          halt_count++;
 
       if (inst->opcode == SHADER_OPCODE_HALT_TARGET) {
          halt_target = inst;
-         halt_target_block = block;
          break;
       }
    }
@@ -415,13 +429,13 @@ brw_opt_remove_redundant_halts(brw_shader &s)
    for (brw_inst *prev = (brw_inst *) halt_target->prev;
         !prev->is_head_sentinel() && prev->opcode == BRW_OPCODE_HALT;
         prev = (brw_inst *) halt_target->prev) {
-      prev->remove(halt_target_block);
+      prev->remove();
       halt_count--;
       progress = true;
    }
 
    if (halt_count == 0) {
-      halt_target->remove(halt_target_block);
+      halt_target->remove();
       progress = true;
    }
 
@@ -517,7 +531,8 @@ brw_opt_eliminate_find_live_channel(brw_shader &s)
 
 out:
    if (progress)
-      s.invalidate_analysis(BRW_DEPENDENCY_INSTRUCTION_DETAIL);
+      s.invalidate_analysis(BRW_DEPENDENCY_INSTRUCTION_DATA_FLOW |
+                            BRW_DEPENDENCY_INSTRUCTION_DETAIL);
 
    return progress;
 }
@@ -556,7 +571,7 @@ brw_opt_remove_extra_rounding_modes(brw_shader &s)
             assert(inst->src[0].file == IMM);
             const brw_rnd_mode mode = (brw_rnd_mode) inst->src[0].d;
             if (mode == prev_mode) {
-               inst->remove(block);
+               inst->remove();
                progress = true;
             } else {
                prev_mode = mode;
@@ -723,9 +738,9 @@ brw_opt_send_gather_to_send(brw_shader &s)
        *
        * TODO: Pass LSC address length or infer it so valid splits can work.
        */
-      if (payload2_len && (inst->sfid == GFX12_SFID_UGM ||
-                           inst->sfid == GFX12_SFID_TGM ||
-                           inst->sfid == GFX12_SFID_SLM ||
+      if (payload2_len && (inst->sfid == BRW_SFID_UGM ||
+                           inst->sfid == BRW_SFID_TGM ||
+                           inst->sfid == BRW_SFID_SLM ||
                            inst->sfid == BRW_SFID_URB)) {
          enum lsc_opcode lsc_op = lsc_msg_desc_opcode(devinfo, inst->desc);
          if (lsc_op_num_data_values(lsc_op) > 0)

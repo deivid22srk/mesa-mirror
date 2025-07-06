@@ -47,8 +47,9 @@
 #include "util/u_surface.h"
 #include "util/u_upload_mgr.h"
 #include "util/u_vbuf.h"
+#include "util/perf/cpu_trace.h"
 
-#include "clc/panfrost_compile.h"
+#include "clc/pan_compile.h"
 #include "compiler/nir/nir_serialize.h"
 #include "util/pan_lower_framebuffer.h"
 #include "decode.h"
@@ -63,6 +64,8 @@ panfrost_clear(struct pipe_context *pipe, unsigned buffers,
                const union pipe_color_union *color, double depth,
                unsigned stencil)
 {
+   MESA_TRACE_FUNC();
+
    if (!panfrost_render_condition_check(pan_context(pipe)))
       return;
 
@@ -106,11 +109,13 @@ void
 panfrost_flush(struct pipe_context *pipe, struct pipe_fence_handle **fence,
                unsigned flags)
 {
+   MESA_TRACE_FUNC();
+
    struct panfrost_context *ctx = pan_context(pipe);
    struct panfrost_device *dev = pan_device(pipe->screen);
 
    /* Submit all pending jobs */
-   panfrost_flush_all_batches(ctx, NULL);
+   panfrost_flush_all_batches(ctx, "Gallium flush");
 
    if (fence) {
       struct pipe_fence_handle *f = panfrost_fence_create(ctx);
@@ -165,14 +170,13 @@ panfrost_set_blend_color(struct pipe_context *pipe,
 /* Create a final blend given the context */
 
 uint64_t
-panfrost_get_blend(struct panfrost_batch *batch, unsigned rti,
-                   struct panfrost_bo **bo, unsigned *shader_offset)
+panfrost_get_blend(struct panfrost_batch *batch, unsigned rti)
 {
    struct panfrost_context *ctx = batch->ctx;
    struct panfrost_device *dev = pan_device(ctx->base.screen);
    struct panfrost_blend_state *blend = ctx->blend;
    struct pan_blend_info info = blend->info[rti];
-   struct pipe_surface *surf = batch->key.cbufs[rti];
+   struct pipe_surface *surf = &batch->key.cbufs[rti];
    enum pipe_format fmt = surf->format;
 
    /* Use fixed-function if the equation permits, the format is blendable,
@@ -207,16 +211,6 @@ panfrost_get_blend(struct panfrost_batch *batch, unsigned rti,
    memcpy(pan_blend.constants, ctx->blend_color.color,
           sizeof(pan_blend.constants));
 
-   /* Upload the shader, sharing a BO */
-   if (!(*bo)) {
-      *bo = panfrost_batch_create_bo(batch, 4096, PAN_BO_EXECUTE,
-                                     PIPE_SHADER_FRAGMENT, "Blend shader");
-      if (!(*bo)) {
-         mesa_loge("failed to allocate blend-shader");
-         return 0;
-      }
-   }
-
    struct panfrost_compiled_shader *ss = ctx->prog[PIPE_SHADER_FRAGMENT];
 
    /* Default for Midgard */
@@ -230,19 +224,14 @@ panfrost_get_blend(struct panfrost_batch *batch, unsigned rti,
    }
 
    pthread_mutex_lock(&dev->blend_shaders.lock);
-   struct pan_blend_shader_variant *shader =
+   struct pan_blend_shader *shader =
       pan_screen(ctx->base.screen)
          ->vtbl.get_blend_shader(&dev->blend_shaders, &pan_blend, col0_type,
                                  col1_type, rti);
-
-   /* Size check and upload */
-   unsigned offset = *shader_offset;
-   assert((offset + shader->binary.size) < 4096);
-   memcpy((*bo)->ptr.cpu + offset, shader->binary.data, shader->binary.size);
-   *shader_offset += shader->binary.size;
+   uint64_t address = shader->address;
    pthread_mutex_unlock(&dev->blend_shaders.lock);
 
-   return ((*bo)->ptr.gpu + offset) | shader->first_tag;
+   return address;
 }
 
 static void
@@ -289,8 +278,7 @@ panfrost_set_shader_images(struct pipe_context *pctx,
 
       /* Images don't work with AFBC/AFRC, since they require pixel-level
        * granularity */
-      if (drm_is_afbc(rsrc->image.layout.modifier) ||
-          drm_is_afrc(rsrc->image.layout.modifier)) {
+      if (drm_is_afbc(rsrc->modifier) || drm_is_afrc(rsrc->modifier)) {
          pan_resource_modifier_convert(
             ctx, rsrc, DRM_FORMAT_MOD_ARM_16X16_BLOCK_U_INTERLEAVED, true,
             "Shader image");
@@ -391,7 +379,6 @@ panfrost_set_sampler_views(struct pipe_context *pctx,
                            enum pipe_shader_type shader, unsigned start_slot,
                            unsigned num_views,
                            unsigned unbind_num_trailing_slots,
-                           bool take_ownership,
                            struct pipe_sampler_view **views)
 {
    struct panfrost_context *ctx = pan_context(pctx);
@@ -407,14 +394,8 @@ panfrost_set_sampler_views(struct pipe_context *pctx,
       if (view)
          new_nr = p + 1;
 
-      if (take_ownership) {
-         pipe_sampler_view_reference(
-            (struct pipe_sampler_view **)&ctx->sampler_views[shader][p], NULL);
-         ctx->sampler_views[shader][i] = (struct panfrost_sampler_view *)view;
-      } else {
-         pipe_sampler_view_reference(
-            (struct pipe_sampler_view **)&ctx->sampler_views[shader][p], view);
-      }
+      pipe_sampler_view_reference(
+         (struct pipe_sampler_view **)&ctx->sampler_views[shader][p], view);
    }
 
    for (; i < num_views + unbind_num_trailing_slots; i++) {
@@ -469,7 +450,7 @@ panfrost_set_framebuffer_state(struct pipe_context *pctx,
    ctx->fb_rt_mask = 0;
 
    for (unsigned i = 0; i < ctx->pipe_framebuffer.nr_cbufs; ++i) {
-      if (ctx->pipe_framebuffer.cbufs[i])
+      if (ctx->pipe_framebuffer.cbufs[i].texture)
          ctx->fb_rt_mask |= BITFIELD_BIT(i);
    }
 }
@@ -496,13 +477,6 @@ panfrost_set_min_samples(struct pipe_context *pipe, unsigned min_samples)
    struct panfrost_context *ctx = pan_context(pipe);
    ctx->min_samples = min_samples;
    ctx->dirty |= PAN_DIRTY_MSAA;
-}
-
-static void
-panfrost_set_clip_state(struct pipe_context *pipe,
-                        const struct pipe_clip_state *clip)
-{
-   // struct panfrost_context *panfrost = pan_context(pipe);
 }
 
 static void
@@ -1064,7 +1038,6 @@ panfrost_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
    gallium->set_sample_mask = panfrost_set_sample_mask;
    gallium->set_min_samples = panfrost_set_min_samples;
 
-   gallium->set_clip_state = panfrost_set_clip_state;
    gallium->set_viewport_states = panfrost_set_viewport_states;
    gallium->set_scissor_states = panfrost_set_scissor_states;
    gallium->set_polygon_stipple = panfrost_set_polygon_stipple;

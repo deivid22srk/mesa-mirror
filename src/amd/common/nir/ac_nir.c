@@ -45,6 +45,8 @@ void ac_nir_set_options(struct radeon_info *info, bool use_llvm,
    options->lower_ineg = true;
    options->lower_bitfield_insert = true;
    options->lower_bitfield_extract = true;
+   options->lower_bitfield_extract16 = use_llvm;
+   options->lower_bitfield_extract8 = use_llvm;
    options->lower_pack_snorm_4x8 = true;
    options->lower_pack_unorm_4x8 = true;
    options->lower_pack_half_2x16 = true;
@@ -57,10 +59,12 @@ void ac_nir_set_options(struct radeon_info *info, bool use_llvm,
    options->lower_unpack_unorm_4x8 = true;
    options->lower_unpack_half_2x16 = true;
    options->lower_fpow = true;
+   options->lower_mul_high16 = true;
    options->lower_mul_2x32_64 = true;
    options->lower_iadd_sat = info->gfx_level <= GFX8;
    options->lower_hadd = true;
    options->lower_mul_32x16 = true;
+   options->lower_bfloat16_conversions = true,
    options->has_bfe = true;
    options->has_bfm = true;
    options->has_bitfield_select = true;
@@ -75,6 +79,7 @@ void ac_nir_set_options(struct radeon_info *info, bool use_llvm,
    options->has_sudot_4x8_sat = info->has_accelerated_dot_product && info->gfx_level >= GFX11;
    options->has_udot_4x8_sat = info->has_accelerated_dot_product;
    options->has_dot_2x16 = info->has_accelerated_dot_product && info->gfx_level < GFX11;
+   options->has_bfdot2_bfadd = info->gfx_level >= GFX12;
    options->has_find_msb_rev = true;
    options->has_pack_32_4x8 = true;
    options->has_pack_half_2x16_rtz = true;
@@ -82,8 +87,11 @@ void ac_nir_set_options(struct radeon_info *info, bool use_llvm,
    options->has_fmulz = true;
    options->has_msad = true;
    options->has_shfr32 = true;
+   options->has_mul24_relaxed = true;
+   options->has_f2e4m3fn_satfn = !use_llvm && info->gfx_level >= GFX12;
    options->lower_int64_options = nir_lower_imul64 | nir_lower_imul_high64 | nir_lower_imul_2x32_64 | nir_lower_divmod64 |
-                                  nir_lower_minmax64 | nir_lower_iabs64 | nir_lower_iadd_sat64 | nir_lower_conv64;
+                                  nir_lower_minmax64 | nir_lower_iabs64 | nir_lower_iadd_sat64 | nir_lower_conv64 |
+                                  nir_lower_bitfield_extract64;
    options->divergence_analysis_options = nir_divergence_view_index_uniform;
    options->optimize_quad_vote_to_reduce = !use_llvm;
    options->lower_fisnormal = true;
@@ -573,13 +581,14 @@ ac_nir_mem_vectorize_callback(unsigned align_mul, unsigned align_offset, unsigne
       if (config->uses_aco && uses_smem && aligned_new_size >= 128)
          overfetch_size = 32;
 
+      /* Allow overfetching from 8/16 bits to 32 bits. */
       int64_t aligned_unvectorized_size =
-         align_load_store_size(config->gfx_level, low->num_components * low->def.bit_size,
-                               uses_smem, is_shared) +
-         align_load_store_size(config->gfx_level, high->num_components * high->def.bit_size,
-                               uses_smem, is_shared);
+         ALIGN_POT(align_load_store_size(config->gfx_level, low->num_components * low->def.bit_size,
+                                         uses_smem, is_shared), 32) +
+         ALIGN_POT(align_load_store_size(config->gfx_level, high->num_components * high->def.bit_size,
+                                         uses_smem, is_shared), 32);
 
-      if (aligned_new_size > aligned_unvectorized_size + overfetch_size)
+      if (ALIGN_POT(aligned_new_size, 32) > aligned_unvectorized_size + overfetch_size)
          return false;
    }
 
@@ -600,32 +609,16 @@ ac_nir_mem_vectorize_callback(unsigned align_mul, unsigned align_offset, unsigne
 
    /* Validate the alignment and number of components. */
    if (!is_shared) {
-      unsigned max_components;
-      if (align % 4 == 0)
-         max_components = NIR_MAX_VEC_COMPONENTS;
-      else if (align % 2 == 0)
-         max_components = 16u / bit_size;
-      else
-         max_components = 8u / bit_size;
-      return (align % (bit_size / 8u)) == 0 && num_components <= max_components;
+      return (align % (bit_size / 8u)) == 0 && num_components <= NIR_MAX_VEC_COMPONENTS;
    } else {
-      if (bit_size * num_components == 96) { /* 96 bit loads require 128 bit alignment and are split otherwise */
-         return align % 16 == 0;
-      } else if (bit_size == 16 && (align % 4)) {
-         /* AMD hardware can't do 2-byte aligned f16vec2 loads, but they are useful for ALU
-          * vectorization, because our vectorizer requires the scalar IR to already contain vectors.
-          */
-         return (align % 2 == 0) && num_components <= 2;
-      } else {
-         if (num_components == 3) {
-            /* AMD hardware can't do 3-component loads except for 96-bit loads, handled above. */
-            return false;
-         }
-         unsigned req = bit_size * num_components;
-         if (req == 64 || req == 128) /* 64-bit and 128-bit loads can use ds_read2_b{32,64} */
-            req /= 2u;
-         return align % (req / 8u) == 0;
+      if (bit_size >= 32 && num_components == 3) {
+         /* AMD hardware can't do 3-component loads except for 96-bit loads. */
+         return bit_size == 32 && align % 16 == 0;
       }
+      unsigned req = bit_size >= 32 ? bit_size * num_components : bit_size;
+      if (req == 64 || req == 128) /* 64-bit and 128-bit loads can use ds_read2_b{32,64} */
+         req /= 2u;
+      return align % (req / 8u) == 0;
    }
    return false;
 }

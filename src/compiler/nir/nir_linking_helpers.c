@@ -1074,10 +1074,7 @@ replace_varying_input_by_constant_load(nir_shader *shader,
       }
    }
 
-   if (progress)
-      nir_metadata_preserve(impl, nir_metadata_control_flow);
-
-   return progress;
+   return nir_progress(progress, impl, nir_metadata_control_flow);
 }
 
 static bool
@@ -1123,10 +1120,7 @@ replace_duplicate_input(nir_shader *shader, nir_variable *input_var,
       }
    }
 
-   if (progress)
-      nir_metadata_preserve(impl, nir_metadata_control_flow);
-
-   return progress;
+   return nir_progress(progress, impl, nir_metadata_control_flow);
 }
 
 static bool
@@ -1177,7 +1171,10 @@ nir_clone_uniform_variable(nir_shader *nir, nir_variable *uniform, bool spirv)
    nir_foreach_variable_with_modes(v, nir, uniform->data.mode) {
       if ((spirv && uniform->data.mode & nir_var_mem_ubo &&
            v->data.binding == uniform->data.binding) ||
-          (!spirv && !strcmp(uniform->name, v->name))) {
+          (!spirv &&
+           (!strcmp(uniform->name, v->name) &&
+            uniform->data.explicit_binding == v->data.explicit_binding &&
+            uniform->data.binding == v->data.binding))) {
          new_var = v;
          break;
       }
@@ -1291,10 +1288,7 @@ replace_varying_input_by_uniform_load(nir_shader *shader,
       }
    }
 
-   if (progress)
-      nir_metadata_preserve(impl, nir_metadata_control_flow);
-
-   return progress;
+   return nir_progress(progress, impl, nir_metadata_control_flow);
 }
 
 /* The GLSL ES 3.20 spec says:

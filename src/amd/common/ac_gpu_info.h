@@ -104,6 +104,7 @@ struct radeon_info {
    bool has_image_load_dcc_bug;
    bool has_two_planes_iterate256_bug;
    bool has_vgt_flush_ngg_legacy_bug;
+   bool has_prim_restart_sync_bug;
    bool has_cs_regalloc_hang_bug;
    bool has_async_compute_threadgroup_bug;
    bool has_async_compute_align32_bug;
@@ -119,6 +120,7 @@ struct radeon_info {
    bool has_ngg_passthru_no_msg;
    bool has_export_conflict_bug;
    bool has_attr_ring_wait_bug;
+   bool has_cp_dma_with_null_prt_bug;
    bool has_vrs_ds_export_bug;
    bool has_taskmesh_indirect0_bug;
    bool sdma_supports_sparse;      /* Whether SDMA can safely access sparse resources. */
@@ -204,6 +206,7 @@ struct radeon_info {
    uint32_t vcn_dec_version;
    uint32_t vcn_enc_major_version;
    uint32_t vcn_enc_minor_version;
+   uint32_t vcn_fw_revision;
    struct video_caps_info {
       struct video_codec_cap {
          uint32_t valid;
@@ -217,6 +220,8 @@ struct radeon_info {
 
    enum vcn_version vcn_ip_version;
    enum sdma_version sdma_ip_version;
+   enum rt_version rt_ip_version;
+   enum vpe_version vpe_ip_version;
 
    /* Kernel & winsys capabilities. */
    uint32_t drm_major; /* version */
@@ -229,21 +234,21 @@ struct radeon_info {
    bool has_syncobj;
    bool has_timeline_syncobj;
    bool has_fence_to_handle;
-   bool has_local_buffers;
+   bool has_vm_always_valid;
    bool has_bo_metadata;
    bool has_eqaa_surface_allocator;
    bool has_sparse_vm_mappings;
-   bool has_scheduled_fence_dependency;
    bool has_gang_submit;
    bool has_gpuvm_fault_query;
    bool has_pcie_bandwidth_info;
    bool has_stable_pstate;
    /* Whether SR-IOV is enabled or amdgpu.mcbp=1 was set on the kernel command line. */
    bool register_shadowing_required;
+   bool has_default_zerovram_support;
    bool has_tmz_support;
    bool has_trap_handler_support;
    bool kernel_has_modifiers;
-   bool use_userq;
+   uint32_t userq_ip_mask; /* AMD_IP_* bits */
 
    /* If the kernel driver uses CU reservation for high priority compute on gfx10+, it programs
     * a global CU mask in the hw that is AND'ed with CU_EN register fields set by userspace.
@@ -278,6 +283,8 @@ struct radeon_info {
    uint32_t min_wave64_vgpr_alloc;
    uint32_t max_vgpr_alloc;
    uint32_t wave64_vgpr_alloc_granularity;
+   uint32_t scratch_wavesize_granularity_shift;
+   uint32_t scratch_wavesize_granularity;
    uint32_t max_scratch_waves;
    bool has_scratch_base_registers;
 
@@ -289,6 +296,13 @@ struct radeon_info {
    uint32_t prim_ring_offset;             /* GFX12+ */
    uint32_t total_attribute_pos_prim_ring_size; /* GFX11+ */
    bool has_attr_ring;
+
+   /* Tessellation rings. */
+   uint32_t hs_offchip_param;
+   uint32_t hs_offchip_workgroup_dw_size;
+   uint32_t tess_factor_ring_size;
+   uint32_t tess_offchip_ring_size;
+   uint32_t total_tess_ring_size;
 
    /* Render backends (color + depth blocks). */
    uint32_t r300_num_gb_pipes;
@@ -328,8 +342,14 @@ struct radeon_info {
    bool has_image_bvh_intersect_ray;
 };
 
-bool ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
-                       bool require_pci_bus_info);
+enum ac_query_gpu_info_result {
+   AC_QUERY_GPU_INFO_SUCCESS,
+   AC_QUERY_GPU_INFO_FAIL,
+   AC_QUERY_GPU_INFO_UNIMPLEMENTED_HW,
+};
+
+enum ac_query_gpu_info_result ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
+                                                bool require_pci_bus_info);
 
 void ac_compute_driver_uuid(char *uuid, size_t size);
 
@@ -343,18 +363,6 @@ void ac_get_harvested_configs(const struct radeon_info *info, unsigned raster_co
 unsigned ac_get_compute_resource_limits(const struct radeon_info *info,
                                         unsigned waves_per_threadgroup, unsigned max_waves_per_sh,
                                         unsigned threadgroups_per_cu);
-
-struct ac_hs_info {
-   uint32_t tess_offchip_block_dw_size;
-   uint32_t max_offchip_buffers;
-   uint32_t hs_offchip_param;
-   uint32_t tess_factor_ring_size;
-   uint32_t tess_offchip_ring_offset;
-   uint32_t tess_offchip_ring_size;
-};
-
-void ac_get_hs_info(const struct radeon_info *info,
-                    struct ac_hs_info *hs);
 
 /* Task rings BO layout information.
  * This BO is shared between GFX and ACE queues so that the ACE and GFX
@@ -382,12 +390,8 @@ struct ac_task_info {
    uint32_t payload_ring_offset;
    uint32_t bo_size_bytes;
    uint16_t num_entries;
+   uint32_t payload_entry_size;
 };
-
-/* Size of each payload entry in the task payload ring.
- * Spec requires minimum 16K bytes.
- */
-#define AC_TASK_PAYLOAD_ENTRY_BYTES 16384
 
 /* Size of each draw entry in the task draw ring.
  * 4 DWORDs per entry.

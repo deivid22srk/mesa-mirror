@@ -41,13 +41,22 @@ extern "C" {
 #endif
 
 struct ra_regs;
+struct nir_builder;
+struct nir_def;
 struct nir_shader;
 struct shader_info;
 
 struct nir_shader_compiler_options;
+typedef struct nir_builder nir_builder;
+typedef struct nir_def nir_def;
 typedef struct nir_shader nir_shader;
 
 #define REG_CLASS_COUNT 20
+
+struct brw_storage_format {
+   uint32_t num_formats;
+   uint32_t isl_formats[3];
+};
 
 struct brw_compiler {
    const struct intel_device_info *devinfo;
@@ -123,10 +132,14 @@ struct brw_compiler {
 
    struct nir_shader *clc_shader;
 
-   struct {
-      unsigned mue_header_packing;
-      bool mue_compaction;
-   } mesh;
+   /**
+    * A list of storage formats to lower from the matching return HW format.
+    *
+    * This list is used to build the lowering of read without format in
+    * brw_nir_lower_storage_image.c
+    */
+   uint32_t num_lowered_storage_formats;
+   uint32_t *lowered_storage_formats;
 };
 
 #define brw_shader_debug_log(compiler, data, fmt, ... ) do {    \
@@ -210,14 +223,16 @@ struct brw_base_prog_key {
 
    bool uses_inline_push_addr:1;
 
-   unsigned padding:21;
+   enum intel_vue_layout vue_layout:2;
 
    /**
     * Apply workarounds for SIN and COS input range problems.
     * This limits input range for SIN and COS to [-2p : 2p] to
     * avoid precision issues.
     */
-   bool limit_trig_input_range;
+   bool limit_trig_input_range:1;
+
+   unsigned padding:26;
 };
 
 /**
@@ -338,9 +353,6 @@ struct brw_task_prog_key
 struct brw_mesh_prog_key
 {
    struct brw_base_prog_key base;
-
-   bool compact_mue:1;
-   unsigned padding:31;
 };
 
 /** The program key for Fragment/Pixel Shaders. */
@@ -372,16 +384,31 @@ struct brw_wm_prog_key {
    /* Whether or not we are running on a multisampled framebuffer */
    enum intel_sometimes multisample_fbo:2;
 
-   /* Whether the preceding shader stage is mesh */
+   /* Whether the shader is dispatch with a preceeding mesh shader */
    enum intel_sometimes mesh_input:2;
+
+   /* Is provoking vertex last? */
+   enum intel_sometimes provoking_vertex_last:2;
 
    bool coherent_fb_fetch:1;
    bool ignore_sample_mask_out:1;
    bool coarse_pixel:1;
    bool null_push_constant_tbimr_workaround:1;
 
-   uint64_t padding:35;
+   uint64_t padding:33;
 };
+
+static inline bool
+brw_wm_prog_key_is_dynamic(const struct brw_wm_prog_key *key)
+{
+   return
+      key->mesh_input == INTEL_SOMETIMES ||
+      key->provoking_vertex_last == INTEL_SOMETIMES ||
+      key->alpha_to_coverage == INTEL_SOMETIMES ||
+      key->persample_interp == INTEL_SOMETIMES ||
+      key->multisample_fbo == INTEL_SOMETIMES ||
+      key->base.vue_layout == INTEL_VUE_LAYOUT_SEPARATE_MESH;
+}
 
 struct brw_cs_prog_key {
    struct brw_base_prog_key base;
@@ -506,6 +533,7 @@ enum brw_shader_reloc_id {
    BRW_SHADER_RELOC_RESUME_SBT_ADDR_HIGH,
    BRW_SHADER_RELOC_DESCRIPTORS_ADDR_HIGH,
    BRW_SHADER_RELOC_DESCRIPTORS_BUFFER_ADDR_HIGH,
+   BRW_SHADER_RELOC_INSTRUCTION_BASE_ADDR_HIGH,
    BRW_SHADER_RELOC_EMBEDDED_SAMPLER_HANDLE,
    BRW_SHADER_RELOC_LAST_EMBEDDED_SAMPLER_HANDLE =
    BRW_SHADER_RELOC_EMBEDDED_SAMPLER_HANDLE + BRW_MAX_EMBEDDED_SAMPLERS - 1,
@@ -602,6 +630,8 @@ struct brw_stage_prog_data {
 
    bool use_alt_mode; /**< Use ALT floating point mode?  Otherwise, IEEE. */
 
+   uint32_t source_hash;
+
    /* 32-bit identifiers for all push/pull parameters.  These can be anything
     * the driver wishes them to be; the core of the back-end compiler simply
     * re-arranges them.  The one restriction is that the bottom 2^16 values
@@ -661,7 +691,14 @@ enum brw_pixel_shader_computed_depth_mode {
 struct brw_wm_prog_data {
    struct brw_stage_prog_data base;
 
+   /**
+    * Number of slots (16B) chunks dedicated to per primitive payload.
+    */
    unsigned num_per_primitive_inputs;
+
+   /**
+    * Number of slots (16B) chunks dedicated to per vertex payload.
+    */
    unsigned num_varying_inputs;
 
    uint8_t dispatch_grf_start_reg_16;
@@ -708,6 +745,13 @@ struct brw_wm_prog_data {
    bool contains_flat_varying;
    bool contains_noperspective_varying;
 
+   /** Fragment shader barycentrics
+    *
+    * Request that the HW delta computation of attributes be turned off. This is needed
+    * when the FS has per-vertex inputs or reads BaryCoordKHR/BaryCoordNoPerspKHR.
+    */
+   bool vertex_attributes_bypass;
+
    /** True if the shader wants sample shading
     *
     * This corresponds to whether or not a gl_SampleId, gl_SamplePosition, or
@@ -737,7 +781,28 @@ struct brw_wm_prog_data {
     */
    enum intel_sometimes alpha_to_coverage;
 
+   /**
+    * Whether the shader is dispatch with a preceeding mesh shader.
+    */
+   enum intel_sometimes mesh_input;
+
+   /*
+    * Provoking vertex may be dynamically set to last and we need to know
+    * its value for fragment shader barycentrics and flat inputs.
+    */
+   enum intel_sometimes provoking_vertex_last;
+
+   /**
+    * Push constant location of intel_msaa_flags (dynamic configuration of the
+    * pixel shader).
+    */
    unsigned msaa_flags_param;
+
+   /**
+    * Push constant location of the remapping offset in the instruction heap
+    * for Wa_18019110168.
+    */
+   unsigned per_primitive_remap_param;
 
    /**
     * Mask of which interpolation modes are required by the fragment shader.
@@ -764,6 +829,13 @@ struct brw_wm_prog_data {
    uint64_t inputs;
 
    /**
+    * The FS per-primitive inputs (some bits can be in both inputs &
+    * per_primitive_inputs if the shader is compiled without being linked to
+    * the previous stage)
+    */
+   uint64_t per_primitive_inputs;
+
+   /**
     * Map from gl_varying_slot to the position within the FS setup data
     * payload where the varying's attribute vertex deltas should be delivered.
     * For varying slots that are not used by the FS, the value is -1.
@@ -779,6 +851,17 @@ struct brw_wm_prog_data {
    uint8_t urb_setup_attribs[VARYING_SLOT_MAX];
    uint8_t urb_setup_attribs_count;
 };
+
+static inline bool
+brw_wm_prog_data_is_dynamic(const struct brw_wm_prog_data *prog_data)
+{
+   return prog_data->mesh_input == INTEL_SOMETIMES ||
+      (prog_data->vertex_attributes_bypass &&
+       prog_data->provoking_vertex_last == INTEL_SOMETIMES) ||
+      prog_data->alpha_to_coverage == INTEL_SOMETIMES ||
+      prog_data->coarse_pixel_dispatch == INTEL_SOMETIMES ||
+      prog_data->persample_dispatch == INTEL_SOMETIMES;
+}
 
 #ifdef GFX_VERx10
 
@@ -1002,6 +1085,13 @@ typedef enum
    BRW_VARYING_SLOT_COUNT
 } brw_varying_slot;
 
+
+#define BRW_VUE_HEADER_VARYING_MASK \
+   (VARYING_BIT_VIEWPORT | \
+    VARYING_BIT_LAYER | \
+    VARYING_BIT_PRIMITIVE_SHADING_RATE | \
+    VARYING_BIT_PSIZ)
+
 /**
  * Bitmask indicating which fragment shader inputs represent varyings (and
  * hence have to be delivered to the fragment shader by the SF/SBE stage).
@@ -1031,10 +1121,20 @@ brw_varying_to_offset(const struct intel_vue_map *vue_map, unsigned varying)
    return brw_vue_slot_to_offset(vue_map->varying_to_slot[varying]);
 }
 
+void
+brw_compute_per_primitive_map(int *out_per_primitive_map,
+                              uint32_t *out_per_primitive_stride,
+                              uint32_t *out_first_offset,
+                              uint32_t base_offset,
+                              nir_shader *nir,
+                              uint32_t variables_mode,
+                              uint64_t slots_valid,
+                              bool separate_shader);
+
 void brw_compute_vue_map(const struct intel_device_info *devinfo,
                          struct intel_vue_map *vue_map,
                          uint64_t slots_valid,
-                         bool separate_shader,
+                         enum intel_vue_layout layout,
                          uint32_t pos_slots);
 
 void brw_compute_tess_vue_map(struct intel_vue_map *const vue_map,
@@ -1083,6 +1183,9 @@ struct brw_vs_prog_data {
 struct brw_tcs_prog_data
 {
    struct brw_vue_prog_data base;
+
+   /** Number of input vertices, 0 means dynamic */
+   unsigned input_vertices;
 
    /** Should the non-SINGLE_PATCH payload provide primitive ID? */
    bool include_primitive_id;
@@ -1149,25 +1252,42 @@ struct brw_tue_map {
 };
 
 struct brw_mue_map {
-   int32_t start_dw[VARYING_SLOT_MAX];
-   uint32_t len_dw[VARYING_SLOT_MAX];
-   uint32_t per_primitive_indices_dw;
-
-   uint32_t size_dw;
+   /* Total size in bytes of the MUE (32B aligned) */
+   uint32_t size;
 
    uint32_t max_primitives;
-   uint32_t per_primitive_start_dw;
-   uint32_t per_primitive_header_size_dw;
-   uint32_t per_primitive_data_size_dw;
-   uint32_t per_primitive_pitch_dw;
-   bool user_data_in_primitive_header;
-
    uint32_t max_vertices;
-   uint32_t per_vertex_start_dw;
-   uint32_t per_vertex_header_size_dw;
-   uint32_t per_vertex_data_size_dw;
-   uint32_t per_vertex_pitch_dw;
-   bool user_data_in_vertex_header;
+
+   /* Stride in bytes between sets of primitive indices */
+   uint32_t per_primitive_indices_stride;
+
+   /* Per primitive offset from the start of the MUE (32B aligned) */
+   uint32_t per_primitive_offset;
+
+   /* Per primitive stride in bytes (32B aligned) */
+   uint32_t per_primitive_stride;
+
+   /* Whether the per primitive block includes a header */
+   bool has_per_primitive_header;
+
+   /* Per vertex offset in bytes from the start of the MUE (32B aligned) */
+   uint32_t per_vertex_offset;
+
+   /* Size of the per vertex header (32B aligned) */
+   uint32_t per_vertex_header_size;
+
+   /* Per vertex stride in bytes (32B aligned) */
+   uint32_t per_vertex_stride;
+
+   /* VUE map for the per vertex attributes */
+   struct intel_vue_map vue_map;
+
+   bool wa_18019110168_active;
+
+   /* Offset in bytes of each per primitive relative to
+    * per_primitive_offset (-1 if unused)
+    */
+   int per_primitive_offsets[VARYING_SLOT_MAX];
 };
 
 struct brw_task_prog_data {
@@ -1193,6 +1313,15 @@ struct brw_mesh_prog_data {
 
    bool uses_drawid;
    bool autostrip_enable;
+
+   /**
+    * Offset in the program where the remapping table for Wa_18019110168 is
+    * located.
+    *
+    * The remapping table has the same format as
+    * intel_vue_map::varying_to_slot[]
+    */
+   uint32_t wa_18019110168_mapping_offset;
 };
 
 /* brw_any_prog_data is prog_data for any stage that maps to an API stage */
@@ -1413,6 +1542,13 @@ struct brw_compile_mesh_params {
    const struct brw_mesh_prog_key *key;
    struct brw_mesh_prog_data *prog_data;
    const struct brw_tue_map *tue_map;
+
+   /** Load provoking vertex
+    *
+    * The callback returns a 32bit integer representing the provoking vertex.
+    */
+   void *load_provoking_vertex_data;
+   nir_def *(*load_provoking_vertex)(nir_builder *b, void *data);
 };
 
 const unsigned *
@@ -1581,31 +1717,35 @@ brw_stage_has_packed_dispatch(ASSERTED const struct intel_device_info *devinfo,
  * that is used in the next stage. We do this by testing the varying slots in
  * the previous stage's vue map against the inputs read in the next stage.
  *
- * Note that:
- *
- * - Each URB offset contains two varying slots and we can only skip a
- *   full offset if both slots are unused, so the value we return here is always
- *   rounded down to the closest multiple of two.
- *
- * - gl_Layer and gl_ViewportIndex don't have their own varying slots, they are
- *   part of the vue header, so if these are read we can't skip anything.
+ * Note that each URB offset contains two varying slots and we can only skip a
+ * full offset if both slots are unused, so the value we return here is always
+ * rounded down to the closest multiple of two.
  */
-static inline int
-brw_compute_first_urb_slot_required(uint64_t inputs_read,
-                                    const struct intel_vue_map *prev_stage_vue_map)
-{
-   if ((inputs_read & (VARYING_BIT_LAYER | VARYING_BIT_VIEWPORT | VARYING_BIT_PRIMITIVE_SHADING_RATE)) == 0) {
-      for (int i = 0; i < prev_stage_vue_map->num_slots; i++) {
-         int varying = prev_stage_vue_map->slot_to_varying[i];
-         if (varying != BRW_VARYING_SLOT_PAD && varying > 0 &&
-             (inputs_read & BITFIELD64_BIT(varying)) != 0) {
-            return ROUND_DOWN_TO(i, 2);
-         }
-      }
-   }
+int
+brw_compute_first_fs_urb_slot_required(uint64_t inputs_read,
+                                       const struct intel_vue_map *prev_stage_vue_map,
+                                       bool mesh);
 
-   return 0;
-}
+void
+brw_compute_sbe_per_vertex_urb_read(const struct intel_vue_map *prev_stage_vue_map,
+                                    bool mesh, bool per_primitive_remapping,
+                                    const struct brw_wm_prog_data *wm_prog_data,
+                                    uint32_t *out_first_slot,
+                                    uint32_t *num_slots,
+                                    uint32_t *out_num_varyings,
+                                    uint32_t *out_primitive_id_offset,
+                                    uint32_t *out_flat_inputs);
+
+/**
+ * Computes the URB offset at which SBE should read the per primitive date
+ * written by the mesh shader.
+ */
+void
+brw_compute_sbe_per_primitive_urb_read(uint64_t inputs_read,
+                                       uint32_t num_varyings,
+                                       const struct brw_mue_map *mue_map,
+                                       uint32_t *out_read_offset,
+                                       uint32_t *out_read_length);
 
 /* From InlineData in 3DSTATE_TASK_SHADER_DATA and 3DSTATE_MESH_SHADER_DATA. */
 #define BRW_TASK_MESH_INLINE_DATA_SIZE_DW 8

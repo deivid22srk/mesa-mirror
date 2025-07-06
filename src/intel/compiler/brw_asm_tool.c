@@ -54,7 +54,7 @@ print_help(const char *progname, FILE *file)
            "    -g, --gen=platform     assemble instructions for given \n"
            "                           platform (3 letter platform name)\n"
            "Example:\n"
-           "    i965_asm -g kbl input.asm -t hex -o output\n",
+           "    brw_asm -g kbl input.asm -t hex -o output\n",
            progname);
 }
 
@@ -132,15 +132,14 @@ int main(int argc, char **argv)
    void *mem_ctx = ralloc_context(NULL);
    FILE *input_file = NULL;
    char *output_file = NULL;
-   char c;
+   int c;
    FILE *output = stdout;
    bool help = false, compact = false;
    uint64_t pci_id = 0;
-   int offset = 0;
    struct intel_device_info *devinfo = NULL;
    int result = EXIT_FAILURE;
 
-   const struct option i965_asm_opts[] = {
+   const struct option brw_asm_opts[] = {
       { "help",          no_argument,       (int *) &help,      true },
       { "type",          required_argument, NULL,               't' },
       { "gen",           required_argument, NULL,               'g' },
@@ -149,7 +148,7 @@ int main(int argc, char **argv)
       { NULL,            0,                 NULL,               0 }
    };
 
-   while ((c = getopt_long(argc, argv, ":t:g:o:h", i965_asm_opts, NULL)) != -1) {
+   while ((c = getopt_long(argc, argv, ":t:g:o:h", brw_asm_opts, NULL)) != -1) {
       switch (c) {
       case 'g': {
          const int id = intel_device_name_to_pci_device_id(optarg);
@@ -201,7 +200,7 @@ int main(int argc, char **argv)
       goto end;
    }
 
-   if (!argv[optind]) {
+   if (optind == argc) {
       fprintf(stderr, "Please specify input file\n");
       goto end;
    }
@@ -237,7 +236,7 @@ int main(int argc, char **argv)
    if (output_type == OPT_OUTPUT_C_LITERAL)
       fprintf(output, "{\n");
 
-   for (int i = 0; i < r.inst_count; i++) {
+   for (int offset = 0; offset < r.bin_size;) {
       const brw_eu_inst *insn = r.bin + offset;
       bool compacted = false;
 

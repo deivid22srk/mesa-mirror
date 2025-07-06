@@ -83,14 +83,13 @@ struct hk_device {
 
    struct {
       struct agx_bo *bo;
-      struct agx_usc_uniform_packed image_heap;
-      uint64_t null_sink, zero_sink;
-      uint64_t geometry_state;
+      uint64_t image_heap_ptr;
+      uint64_t heap;
    } rodata;
 
    struct hk_internal_shaders prolog_epilog;
    struct hk_internal_shaders kernels;
-   struct hk_api_shader *write_shader;
+   struct hk_api_shader *null_fs;
 
    /* Indirected for common secondary emulation */
    struct vk_device_dispatch_table cmd_dispatch;

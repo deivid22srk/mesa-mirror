@@ -78,7 +78,8 @@ amdgpu_userq_deinit(struct amdgpu_winsys *aws, struct amdgpu_userq *userq)
 }
 
 bool
-amdgpu_userq_init(struct amdgpu_winsys *aws, struct amdgpu_userq *userq, enum amd_ip_type ip_type)
+amdgpu_userq_init(struct amdgpu_winsys *aws, struct amdgpu_userq *userq, enum amd_ip_type ip_type,
+                  unsigned queue_index)
 {
    int r = -1;
    uint32_t hw_ip_type;
@@ -164,7 +165,7 @@ amdgpu_userq_init(struct amdgpu_winsys *aws, struct amdgpu_userq *userq, enum am
    /* The VA page table for ring buffer should be ready before job submission so that the packets
     * submitted can be read by gpu. The same applies to rptr, wptr buffers also.
     */
-   r = ac_drm_cs_syncobj_timeline_wait(aws->fd, &aws->vm_timeline_syncobj,
+   r = ac_drm_cs_syncobj_timeline_wait(aws->dev, &aws->vm_timeline_syncobj,
                                        &get_real_bo(amdgpu_winsys_bo(userq->doorbell_bo))
                                           ->vm_timeline_point,
                                        1, INT64_MAX, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL |
@@ -175,11 +176,24 @@ amdgpu_userq_init(struct amdgpu_winsys *aws, struct amdgpu_userq *userq, enum am
    }
 
    uint64_t ring_va = amdgpu_bo_get_va(userq->gtt_bo);
-   r = ac_drm_create_userqueue(aws->dev, hw_ip_type,
-                               get_real_bo(amdgpu_winsys_bo(userq->doorbell_bo))->kms_handle,
-                               AMDGPU_USERQ_DOORBELL_INDEX, ring_va, AMDGPU_USERQ_RING_SIZE,
-                               amdgpu_bo_get_va(userq->wptr_bo), amdgpu_bo_get_va(userq->rptr_bo),
-                               mqd, &userq->userq_handle);
+   unsigned priority = queue_index == AMDGPU_QUEUE_GFX_HIGH_PRIO ?
+                          AMDGPU_USERQ_CREATE_FLAGS_QUEUE_PRIORITY_HIGH :
+                          AMDGPU_USERQ_CREATE_FLAGS_QUEUE_PRIORITY_NORMAL_LOW;
+
+   while (1) {
+      r = ac_drm_create_userqueue(aws->dev, hw_ip_type,
+                                  get_real_bo(amdgpu_winsys_bo(userq->doorbell_bo))->kms_handle,
+                                  AMDGPU_USERQ_DOORBELL_INDEX, ring_va, AMDGPU_USERQ_RING_SIZE,
+                                  amdgpu_bo_get_va(userq->wptr_bo), amdgpu_bo_get_va(userq->rptr_bo),
+                                  mqd, priority, &userq->userq_handle);
+      if (r == -EACCES && priority == AMDGPU_USERQ_CREATE_FLAGS_QUEUE_PRIORITY_HIGH) {
+         /* Try again with a lower priority. */
+         priority = AMDGPU_USERQ_CREATE_FLAGS_QUEUE_PRIORITY_NORMAL_HIGH;
+         continue;
+      }
+      break;
+   }
+
    if (r) {
       fprintf(stderr, "amdgpu: failed to create userq\n");
       goto fail;

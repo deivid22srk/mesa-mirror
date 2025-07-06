@@ -6,6 +6,7 @@
 #pragma once
 
 #include "compiler/nir/nir.h"
+#include "util/shader_stats.h"
 #include "util/u_dynarray.h"
 #include "util/u_tristate.h"
 #include "shader_enums.h"
@@ -154,6 +155,8 @@ struct agx_shader_info {
     * registers as specified hre.
     */
    struct agx_rodata rodata;
+
+   struct agx2_stats stats;
 };
 
 struct agx_precompiled_kernel_info {
@@ -194,6 +197,15 @@ struct agx_shader_part {
    struct agx_shader_info info;
    void *binary;
 };
+
+static inline bool
+agx_is_shader_empty(struct agx_shader_part *s)
+{
+   /* Last instruction is a stop, so if there's one instruction, there is
+    * nothing but a stop. The shader is thus empty.
+    */
+   return (s->info.stats.instrs == 1);
+}
 
 #define AGX_MAX_RTS (8)
 
@@ -305,7 +317,6 @@ bool agx_mem_vectorize_cb(unsigned align_mul, unsigned align_offset,
                           nir_intrinsic_instr *high, void *data);
 
 void agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
-                            struct util_debug_callback *debug,
                             struct agx_shader_part *out);
 
 struct agx_occupancy {
@@ -324,6 +335,8 @@ static const nir_shader_compiler_options agx_nir_options = {
    .lower_flrp32 = true,
    .lower_fpow = true,
    .lower_fmod = true,
+   .lower_bitfield_extract8 = true,
+   .lower_bitfield_extract16 = true,
    .lower_bitfield_insert = true,
    .lower_ifind_msb = true,
    .lower_find_lsb = true,
@@ -357,6 +370,7 @@ static const nir_shader_compiler_options agx_nir_options = {
    .lower_hadd = true,
    .has_amul = true,
    .has_isub = true,
+   .has_load_global_bounded = true,
    .support_16bit_alu = true,
    .max_unroll_iterations = 32,
    .lower_uniforms_to_ubo = true,

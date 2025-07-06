@@ -61,12 +61,14 @@ void ac_llvm_context_init(struct ac_llvm_context *ctx, struct ac_llvm_compiler *
    ctx->i64 = LLVMIntTypeInContext(ctx->context, 64);
    ctx->i128 = LLVMIntTypeInContext(ctx->context, 128);
    ctx->intptr = ctx->i32;
+   ctx->bf16 = LLVMBFloatTypeInContext(ctx->context);
    ctx->f16 = LLVMHalfTypeInContext(ctx->context);
    ctx->f32 = LLVMFloatTypeInContext(ctx->context);
    ctx->f64 = LLVMDoubleTypeInContext(ctx->context);
    ctx->v4i8 = LLVMVectorType(ctx->i8, 4);
    ctx->v2i16 = LLVMVectorType(ctx->i16, 2);
    ctx->v4i16 = LLVMVectorType(ctx->i16, 4);
+   ctx->v2bf16 = LLVMVectorType(ctx->bf16, 2);
    ctx->v2f16 = LLVMVectorType(ctx->f16, 2);
    ctx->v4f16 = LLVMVectorType(ctx->f16, 4);
    ctx->v2i32 = LLVMVectorType(ctx->i32, 2);
@@ -154,7 +156,7 @@ int ac_get_elem_bits(struct ac_llvm_context *ctx, LLVMTypeRef type)
          return 32;
    }
 
-   if (type == ctx->f16)
+   if (type == ctx->f16 || type == ctx->bf16)
       return 16;
    if (type == ctx->f32)
       return 32;
@@ -172,6 +174,7 @@ unsigned ac_get_type_size(LLVMTypeRef type)
    case LLVMIntegerTypeKind:
       return LLVMGetIntTypeWidth(type) / 8;
    case LLVMHalfTypeKind:
+   case LLVMBFloatTypeKind:
       return 2;
    case LLVMFloatTypeKind:
       return 4;
@@ -197,7 +200,7 @@ static LLVMTypeRef to_integer_type_scalar(struct ac_llvm_context *ctx, LLVMTypeR
       return ctx->i1;
    else if (t == ctx->i8)
       return ctx->i8;
-   else if (t == ctx->f16 || t == ctx->i16)
+   else if (t == ctx->f16 || t == ctx->bf16 || t == ctx->i16)
       return ctx->i16;
    else if (t == ctx->f32 || t == ctx->i32)
       return ctx->i32;
@@ -355,6 +358,9 @@ void ac_build_type_name_for_intr(LLVMTypeRef type, char *buf, unsigned bufsize)
       break;
    case LLVMIntegerTypeKind:
       snprintf(buf, bufsize, "i%d", LLVMGetIntTypeWidth(elem_type));
+      break;
+   case LLVMBFloatTypeKind:
+      snprintf(buf, bufsize, "bf16");
       break;
    case LLVMHalfTypeKind:
       snprintf(buf, bufsize, "f16");
@@ -1585,7 +1591,7 @@ static const char *get_atomic_name(enum ac_atomic_op op)
 
 LLVMValueRef ac_build_image_opcode(struct ac_llvm_context *ctx, struct ac_image_args *a)
 {
-   const char *overload[3] = {"", "", ""};
+   const char *overload[5] = {"", "", "", "", ""};
    unsigned num_overloads = 0;
    LLVMValueRef args[18];
    unsigned num_args = 0;
@@ -1703,9 +1709,15 @@ LLVMValueRef ac_build_image_opcode(struct ac_llvm_context *ctx, struct ac_image_
    overload[num_overloads++] = sample ? (a->a16 ? ".f16" : ".f32") : (a->a16 ? ".i16" : ".i32");
 
    args[num_args++] = a->resource;
+   #if LLVM_VERSION_MAJOR >= 20
+   overload[num_overloads++] = ".v8i32";
+   #endif
    if (sample) {
       args[num_args++] = a->sampler;
       args[num_args++] = LLVMConstInt(ctx->i1, a->unorm, false);
+      #if LLVM_VERSION_MAJOR >= 20
+      overload[num_overloads++] = ".v4i32";
+      #endif
    }
 
    args[num_args++] = a->tfe ? ctx->i32_1 : ctx->i32_0; /* texfailctrl */
@@ -1792,11 +1804,11 @@ LLVMValueRef ac_build_image_opcode(struct ac_llvm_context *ctx, struct ac_image_
    snprintf(intr_name, sizeof(intr_name),
             "llvm.amdgcn.image.%s%s" /* base name */
             "%s%s%s%s"               /* sample/gather modifiers */
-            ".%s.%s%s%s%s",          /* dimension and type overloads */
+            ".%s.%s%s%s%s%s%s",      /* dimension and type overloads */
             name, atomic_subop, a->compare ? ".c" : "",
             a->bias ? ".b" : lod_suffix ? ".l" : a->derivs[0] ? ".d" : a->level_zero ? ".lz" : "",
             a->min_lod ? ".cl" : "", a->offset ? ".o" : "", dimname,
-            data_type_str, overload[0], overload[1], overload[2]);
+            data_type_str, overload[0], overload[1], overload[2], overload[3], overload[4]);
 
    LLVMTypeRef retty;
    if (a->opcode == ac_image_store || a->opcode == ac_image_store_mip)
@@ -2191,18 +2203,15 @@ LLVMValueRef ac_build_bitfield_reverse(struct ac_llvm_context *ctx, LLVMValueRef
    switch (bitsize) {
    case 64:
       result = ac_build_intrinsic(ctx, "llvm.bitreverse.i64", ctx->i64, (LLVMValueRef[]){src0}, 1, 0);
-      result = LLVMBuildTrunc(ctx->builder, result, ctx->i32, "");
       break;
    case 32:
       result = ac_build_intrinsic(ctx, "llvm.bitreverse.i32", ctx->i32, (LLVMValueRef[]){src0}, 1, 0);
       break;
    case 16:
       result = ac_build_intrinsic(ctx, "llvm.bitreverse.i16", ctx->i16, (LLVMValueRef[]){src0}, 1, 0);
-      result = LLVMBuildZExt(ctx->builder, result, ctx->i32, "");
       break;
    case 8:
       result = ac_build_intrinsic(ctx, "llvm.bitreverse.i8", ctx->i8, (LLVMValueRef[]){src0}, 1, 0);
-      result = LLVMBuildZExt(ctx->builder, result, ctx->i32, "");
       break;
    default:
       unreachable("invalid bitsize");
@@ -2554,8 +2563,13 @@ static LLVMValueRef _ac_build_readlane(struct ac_llvm_context *ctx, LLVMValueRef
    if (lane)
       lane = LLVMBuildZExt(ctx->builder, lane, ctx->i32, "");
 
+   #if LLVM_VERSION_MAJOR >= 19
+   const char *intr_name = lane == NULL ? "llvm.amdgcn.readfirstlane.i32" : "llvm.amdgcn.readlane.i32";
+   #else
+   const char *intr_name = lane == NULL ? "llvm.amdgcn.readfirstlane" : "llvm.amdgcn.readlane";
+   #endif
    result =
-      ac_build_intrinsic(ctx, lane == NULL ? "llvm.amdgcn.readfirstlane" : "llvm.amdgcn.readlane",
+      ac_build_intrinsic(ctx, intr_name,
                          ctx->i32, (LLVMValueRef[]){src, lane}, lane == NULL ? 1 : 2, 0);
 
    return LLVMBuildTrunc(ctx->builder, result, type, "");
@@ -2593,6 +2607,12 @@ static LLVMValueRef ac_build_readlane_common(struct ac_llvm_context *ctx, LLVMVa
    return LLVMBuildBitCast(ctx->builder, ret, src_type, "");
 }
 
+LLVMValueRef ac_build_readlane_no_opt_barrier(struct ac_llvm_context *ctx, LLVMValueRef src,
+                                              LLVMValueRef lane)
+{
+   return ac_build_readlane_common(ctx, src, lane, false);
+}
+
 LLVMValueRef ac_build_readlane(struct ac_llvm_context *ctx, LLVMValueRef src, LLVMValueRef lane)
 {
    return ac_build_readlane_common(ctx, src, lane, true);
@@ -2601,7 +2621,8 @@ LLVMValueRef ac_build_readlane(struct ac_llvm_context *ctx, LLVMValueRef src, LL
 LLVMValueRef ac_build_writelane(struct ac_llvm_context *ctx, LLVMValueRef src, LLVMValueRef value,
                                 LLVMValueRef lane)
 {
-   return ac_build_intrinsic(ctx, "llvm.amdgcn.writelane", ctx->i32,
+   const char *intr_name = LLVM_VERSION_MAJOR >= 19 ? "llvm.amdgcn.writelane.i32" : "llvm.amdgcn.writelane";
+   return ac_build_intrinsic(ctx, intr_name, ctx->i32,
                              (LLVMValueRef[]){value, lane, src}, 3, 0);
 }
 
@@ -2742,8 +2763,13 @@ static LLVMValueRef _ac_build_permlane16(struct ac_llvm_context *ctx, LLVMValueR
       bound_ctrl ? ctx->i1true : ctx->i1false,
    };
 
+   #if LLVM_VERSION_MAJOR >= 19
+   const char *intr_name = exchange_rows ? "llvm.amdgcn.permlanex16.i32" : "llvm.amdgcn.permlane16.i32";
+   #else
+   const char *intr_name = exchange_rows ? "llvm.amdgcn.permlanex16" : "llvm.amdgcn.permlane16";
+   #endif
    result =
-      ac_build_intrinsic(ctx, exchange_rows ? "llvm.amdgcn.permlanex16" : "llvm.amdgcn.permlane16",
+      ac_build_intrinsic(ctx, intr_name,
                          ctx->i32, args, 6, 0);
 
    return LLVMBuildTrunc(ctx->builder, result, type, "");

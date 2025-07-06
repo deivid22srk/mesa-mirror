@@ -17,7 +17,7 @@
 #include "common/freedreno_lrz.h"
 #include "common/freedreno_ubwc.h"
 
-#include "a6xx.xml.h"
+#include "fd6_hw.h"
 
 /* A subset of the valid tiled formats can be compressed.  We do
  * already require tiled in order to be compressed, but just because
@@ -27,6 +27,12 @@ static bool
 ok_ubwc_format(struct pipe_screen *pscreen, enum pipe_format pfmt, unsigned nr_samples)
 {
    const struct fd_dev_info *info = fd_screen(pscreen)->info;
+
+   /*
+    * TODO: no UBWC on a702?
+    */
+   if (info->a6xx.is_a702)
+      return false;
 
    switch (pfmt) {
    case PIPE_FORMAT_Z24X8_UNORM:
@@ -256,7 +262,7 @@ fd6_setup_slices(struct fd_resource *rsc)
 
    fdl6_layout(&rsc->layout, screen->info, prsc->format, fd_resource_nr_samples(prsc),
                prsc->width0, prsc->height0, prsc->depth0, prsc->last_level + 1,
-               prsc->array_size, prsc->target == PIPE_TEXTURE_3D, false, NULL);
+               prsc->array_size, prsc->target == PIPE_TEXTURE_3D, false, false, NULL);
 
    if (!FD_DBG(NOLRZ) && has_depth(prsc->format) && !is_z32(prsc->format))
       setup_lrz<CHIP>(rsc);
@@ -282,7 +288,7 @@ fill_ubwc_buffer_sizes(struct fd_resource *rsc)
 
    if (!fdl6_layout(&rsc->layout, screen->info, prsc->format, fd_resource_nr_samples(prsc),
                     prsc->width0, prsc->height0, prsc->depth0,
-                    prsc->last_level + 1, prsc->array_size, false, false, &l))
+                    prsc->last_level + 1, prsc->array_size, false, false, true, &l))
       return -1;
 
    if (rsc->layout.size > fd_bo_size(rsc->bo))

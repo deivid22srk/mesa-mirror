@@ -51,7 +51,11 @@ name_for_chip(uint32_t dev_id,
 static uint8_t
 sm_for_chipset(uint16_t chipset)
 {
-   if (chipset >= 0x190)
+   if (chipset >= 0x1b0)
+      return 120;
+   else if (chipset >= 0x1a0)
+      return 100;
+   else if (chipset >= 0x190)
       return 89;
    // GH100 is older than AD10X, but is SM90
    else if (chipset >= 0x180)
@@ -111,6 +115,9 @@ sm_for_chipset(uint16_t chipset)
 static uint8_t
 max_warps_per_mp_for_sm(uint8_t sm)
 {
+   /* These are documented in each architecture's tuning guide. Eg. see:
+    * https://docs.nvidia.com/cuda/blackwell-tuning-guide/index.html#occupancy
+    */
    switch (sm) {
    case 10:
    case 11:
@@ -124,6 +131,7 @@ max_warps_per_mp_for_sm(uint8_t sm)
    case 86:
    case 87:
    case 89:
+   case 120:
       return 48;
    case 30:
    case 32:
@@ -139,6 +147,8 @@ max_warps_per_mp_for_sm(uint8_t sm)
    case 72:
    case 80:
    case 90:
+   case 100:
+   case 104:
       return 64;
    default:
       assert(!"unkown SM version");

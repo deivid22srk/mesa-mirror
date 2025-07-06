@@ -43,6 +43,8 @@
 #include "kopper_interface.h"
 #include "loader_dri_helper.h"
 #include "dri_util.h"
+#include "mapi/glapi/glapi.h"
+#include "dispatch.h"
 
 static int xshm_error = 0;
 static int xshm_opcode = -1;
@@ -410,7 +412,6 @@ static const __DRIextension *loader_extensions_noshm[] = {
 static const __DRIextension *kopper_extensions_noshm[] = {
    &swrastLoaderExtension.base,
    &kopperLoaderExtension.base,
-   &dri2UseInvalidate.base,
    &driBackgroundCallable.base,
    NULL
 };
@@ -423,7 +424,7 @@ static const __DRIextension *kopper_extensions_noshm[] = {
 static void
 drisw_wait_gl(struct glx_context *context)
 {
-   glFinish();
+   CALL_Finish(GET_DISPATCH(), ());
 }
 
 static void
@@ -541,7 +542,7 @@ driswSwapBuffers(__GLXDRIdrawable * pdraw,
    (void) remainder;
 
    if (flush) {
-      glFlush();
+      CALL_Flush(GET_DISPATCH(), ());
    }
 
    if (psc->kopper)
@@ -557,7 +558,7 @@ drisw_copy_sub_buffer(__GLXDRIdrawable * pdraw,
                       int x, int y, int width, int height, Bool flush)
 {
    if (flush) {
-      glFlush();
+      CALL_Flush(GET_DISPATCH(), ());
    }
 
    driswCopySubBuffer(pdraw->dri_drawable, x, y, width, height);
@@ -655,17 +656,11 @@ driswCreateScreen(int screen, struct glx_display *priv, enum glx_driver glx_driv
    if (psc == NULL)
       return NULL;
    psc->kopper = !strcmp(driver, "zink");
-
-   if (!glx_screen_init(&psc->base, screen, priv)) {
-      free(psc);
-      return NULL;
-   }
-
    psc->base.driverName = strdup(driver);
 
    if (glx_driver)
       loader_extensions_local = kopper_extensions_noshm;
-   else if (!check_xshm(psc->base.dpy))
+   else if (!check_xshm(priv->dpy))
       loader_extensions_local = loader_extensions_noshm;
    else
       loader_extensions_local = loader_extensions_shm;

@@ -15,11 +15,11 @@
 
 #include "common/freedreno_common.h"
 
-#include "adreno_pm4.xml.h"
-#include "adreno_common.xml.h"
-#include "a6xx.xml.h"
+#include "fd6_hw.h"
 
 BEGINC;
+
+struct fd_dev_info;
 
 static inline enum a6xx_tex_swiz
 fdl6_swiz(unsigned char swiz)
@@ -40,6 +40,9 @@ enum a3xx_color_swap fd6_vertex_swap(enum pipe_format format) ATTRIBUTE_CONST;
 enum a6xx_format fd6_texture_format(enum pipe_format format,
                                     enum a6xx_tile_mode tile_mode,
                                     bool is_mutable) ATTRIBUTE_CONST;
+bool fd6_texture_format_supported(const struct fd_dev_info *info, enum pipe_format format,
+                                  enum a6xx_tile_mode tile_mode, bool is_mutable)
+                                  ATTRIBUTE_CONST;
 enum a3xx_color_swap fd6_texture_swap(enum pipe_format format,
                                       enum a6xx_tile_mode tile_mode,
                                       bool is_mutable) ATTRIBUTE_CONST;

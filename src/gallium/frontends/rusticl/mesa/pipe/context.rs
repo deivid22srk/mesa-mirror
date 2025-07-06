@@ -8,20 +8,33 @@ use mesa_rust_gen::pipe_fd_type::*;
 use mesa_rust_gen::*;
 use mesa_rust_util::has_required_feature;
 
-use std::mem;
 use std::mem::size_of;
 use std::os::raw::*;
 use std::ptr;
 use std::ptr::*;
 use std::sync::Arc;
 
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PipeContextPrio {
+    Low = PIPE_CONTEXT_LOW_PRIORITY,
+    Med = 0,
+    High = PIPE_CONTEXT_HIGH_PRIORITY,
+}
+
+impl From<PipeContextPrio> for u32 {
+    fn from(value: PipeContextPrio) -> Self {
+        value as _
+    }
+}
+
 pub struct PipeContext {
     pipe: NonNull<pipe_context>,
     screen: Arc<PipeScreen>,
+    pub prio: PipeContextPrio,
 }
 
 unsafe impl Send for PipeContext {}
-unsafe impl Sync for PipeContext {}
 
 #[derive(Clone, Copy)]
 #[repr(u32)]
@@ -38,10 +51,15 @@ impl From<RWFlags> for pipe_map_flags {
 }
 
 impl PipeContext {
-    pub(super) fn new(context: *mut pipe_context, screen: &Arc<PipeScreen>) -> Option<Self> {
+    pub(super) fn new(
+        context: *mut pipe_context,
+        prio: PipeContextPrio,
+        screen: &Arc<PipeScreen>,
+    ) -> Option<Self> {
         let s = Self {
             pipe: NonNull::new(context)?,
             screen: Arc::clone(screen),
+            prio: prio,
         };
 
         if !has_required_cbs(unsafe { s.pipe.as_ref() }) {
@@ -117,7 +135,7 @@ impl PipeContext {
         &self,
         res: &PipeResource,
         pattern: &[u32],
-        origin: &[usize; 3],
+        offset_bytes: u32,
         region: &[usize; 3],
         strides: (usize, usize),
         pixel_size: usize,
@@ -126,16 +144,14 @@ impl PipeContext {
         for z in 0..region[2] {
             for y in 0..region[1] {
                 let pitch = [pixel_size, row_pitch, slice_pitch];
-                // Convoluted way of doing (origin + [0, y, z]) * pitch
-                let offset = (0..3)
-                    .map(|i| ((origin[i] + [0, y, z][i]) * pitch[i]) as u32)
-                    .sum();
+                // Convoluted way of doing [0, y, z] * pitch
+                let offset: u32 = (0..3).map(|i| ([0, y, z][i] * pitch[i]) as u32).sum();
 
                 unsafe {
                     self.pipe.as_ref().clear_buffer.unwrap()(
                         self.pipe.as_ptr(),
                         res.pipe(),
-                        offset,
+                        offset + offset_bytes,
                         (region[0] * pixel_size) as u32,
                         pattern.as_ptr().cast(),
                         pixel_size as i32,
@@ -217,6 +233,35 @@ impl PipeContext {
         debug_assert!(!dst.is_buffer());
 
         self.resource_copy_region(src, dst, dst_offset, bx)
+    }
+
+    pub fn has_buffer_texture_copies(&self) -> bool {
+        unsafe { self.pipe.as_ref() }.image_copy_buffer.is_some()
+    }
+
+    /// Copies between a buffer and a texture if supported by the context
+    /// ([Self::has_buffer_texture_copies]).
+    pub fn resource_copy_buffer_texture(
+        &self,
+        src: &PipeResource,
+        dst: &PipeResource,
+        buffer_offset: u32,
+        bx: &pipe_box,
+    ) {
+        debug_assert_ne!(src.is_buffer(), dst.is_buffer());
+
+        unsafe {
+            self.pipe.as_ref().image_copy_buffer.unwrap()(
+                self.pipe.as_ptr(),
+                dst.pipe(),
+                src.pipe(),
+                buffer_offset,
+                0,
+                0,
+                0,
+                bx,
+            );
+        }
     }
 
     fn resource_map(
@@ -303,13 +348,15 @@ impl PipeContext {
         let state = pipe_compute_state {
             ir_type: pipe_shader_ir::PIPE_SHADER_IR_NIR,
             prog: nir.dup_for_driver().cast(),
-            req_input_mem: 0,
             static_shared_mem: static_local_mem,
         };
         unsafe { self.pipe.as_ref().create_compute_state.unwrap()(self.pipe.as_ptr(), &state) }
     }
 
-    pub fn bind_compute_state(&self, state: *mut c_void) {
+    /// # Safety
+    ///
+    /// The state pointer needs to point to valid memory until a new one is set.
+    pub unsafe fn bind_compute_state(&self, state: *mut c_void) {
         unsafe { self.pipe.as_ref().bind_compute_state.unwrap()(self.pipe.as_ptr(), state) }
     }
 
@@ -454,12 +501,16 @@ impl PipeContext {
         block: [u32; 3],
         grid: [u32; 3],
         variable_local_mem: u32,
+        globals: &[&PipeResource],
     ) {
+        let mut globals: Vec<*mut pipe_resource> = globals.iter().map(|res| res.pipe()).collect();
         let info = pipe_grid_info {
             variable_shared_mem: variable_local_mem,
             work_dim: work_dim,
             block: block,
             grid: grid,
+            globals: globals.as_mut_ptr(),
+            num_globals: globals.len() as u32,
             ..Default::default()
         };
         unsafe { self.pipe.as_ref().launch_grid.unwrap()(self.pipe.as_ptr(), &info) }
@@ -498,14 +549,9 @@ impl PipeContext {
                 0,
                 views.len() as u32,
                 0,
-                true,
                 PipeSamplerView::as_pipe(views.as_mut_slice()),
-            )
+            );
         }
-
-        // the take_ownership parameter of set_sampler_views is set to true, so we need to forget
-        // about them on our side as ownership has been transferred to the driver.
-        views.into_iter().for_each(mem::forget);
     }
 
     pub fn clear_sampler_views(&self, count: u32) {
@@ -517,7 +563,6 @@ impl PipeContext {
                 0,
                 count,
                 0,
-                true,
                 samplers.as_mut_ptr(),
             )
         }
@@ -672,6 +717,7 @@ fn has_required_cbs(context: &pipe_context) -> bool {
         & has_required_feature!(context, set_constant_buffer)
         & has_required_feature!(context, set_global_binding)
         & has_required_feature!(context, set_sampler_views)
+        & has_required_feature!(context, sampler_view_release)
         & has_required_feature!(context, set_shader_images)
         & has_required_feature!(context, texture_map)
         & has_required_feature!(context, texture_subdata)

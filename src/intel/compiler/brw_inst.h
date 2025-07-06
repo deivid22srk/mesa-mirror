@@ -66,7 +66,7 @@ public:
 
    bool is_send_from_grf() const;
    bool is_payload(unsigned arg) const;
-   bool is_partial_write() const;
+   bool is_partial_write(unsigned grf_size = REG_SIZE) const;
    unsigned components_read(unsigned i) const;
    unsigned size_read(const struct intel_device_info *devinfo, int arg) const;
    bool can_do_source_mods(const struct intel_device_info *devinfo) const;
@@ -91,8 +91,7 @@ public:
     */
    bool uses_indirect_addressing() const;
 
-   void remove(bblock_t *block, bool defer_later_block_ip_updates = false);
-   void insert_after(bblock_t *block, brw_inst *inst);
+   void remove();
    void insert_before(bblock_t *block, brw_inst *inst);
 
    /**
@@ -191,7 +190,7 @@ public:
           */
          unsigned rcount:4;
 
-         unsigned pad:5;
+         unsigned pad:4;
 
          bool predicate_inverse:1;
          bool writes_accumulator:1; /**< instruction implicitly writes accumulator */
@@ -206,6 +205,12 @@ public:
                               *   bindless surface offset (26bits instead of
                               *   20bits)
                               */
+         /**
+          * Only for SHADER_OPCODE_SEND, @offset field contains an immediate
+          * part of the extended descriptor that must be encoded in the
+          * instruction.
+          */
+         bool send_ex_desc_imm:1;
          /**
           * The predication mask applied to this instruction is guaranteed to
           * be uniform and a superset of the execution mask of the present block.
@@ -235,6 +240,8 @@ public:
    const char *annotation;
    /** @} */
 #endif
+
+   bblock_t *block;
 };
 
 /**
@@ -342,6 +349,20 @@ is_unordered(const intel_device_info *devinfo, const brw_inst *inst)
           (devinfo->has_64bit_float_via_math_pipe &&
            (get_exec_type(inst) == BRW_TYPE_DF ||
             inst->dst.type == BRW_TYPE_DF));
+}
+
+static inline bool
+has_bfloat_operands(const brw_inst *inst)
+{
+   if (brw_type_is_bfloat(inst->dst.type))
+      return true;
+
+   for (int i = 0; i < inst->sources; i++) {
+      if (brw_type_is_bfloat(inst->src[i].type))
+         return true;
+   }
+
+   return false;
 }
 
 bool has_dst_aligned_region_restriction(const intel_device_info *devinfo,

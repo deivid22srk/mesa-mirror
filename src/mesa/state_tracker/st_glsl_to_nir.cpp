@@ -298,9 +298,7 @@ st_glsl_to_nir_post_opts(struct st_context *st, struct gl_program *prog,
          gl_nir_opts(nir);
    }
 
-   nir_variable_mode mask =
-      nir_var_shader_in | nir_var_shader_out | nir_var_function_temp;
-   nir_remove_dead_variables(nir, mask, NULL);
+   nir_remove_dead_variables(nir, nir_var_function_temp, NULL);
 
    if (!st->has_hw_atomics && !screen->caps.nir_atomics_as_deref) {
       unsigned align_offset_state = 0;
@@ -478,8 +476,8 @@ st_link_glsl_to_nir(struct gl_context *ctx,
       /* Since IO is lowered, we won't need the IO variables from now on.
        * nir_build_program_resource_list was the last pass that needed them.
        */
-      NIR_PASS_V(nir, nir_remove_dead_variables,
-                 nir_var_shader_in | nir_var_shader_out, NULL);
+      NIR_PASS(_, nir, nir_remove_dead_variables,
+               nir_var_shader_in | nir_var_shader_out, NULL);
 
       /* If there are forms of indirect addressing that the driver
        * cannot handle, perform the lowering pass.

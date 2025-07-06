@@ -11,9 +11,7 @@
 
 #include "freedreno_layout.h"
 
-#include "adreno_pm4.xml.h"
-#include "adreno_common.xml.h"
-#include "a6xx.xml.h"
+#include "fd6_hw.h"
 
 static bool
 is_r8g8(const struct fdl_layout *layout)
@@ -118,6 +116,7 @@ fdl6_layout(struct fdl_layout *layout, const struct fd_dev_info *info,
             enum pipe_format format, uint32_t nr_samples, uint32_t width0,
             uint32_t height0, uint32_t depth0, uint32_t mip_levels,
             uint32_t array_size, bool is_3d, bool is_mutable,
+            bool force_ubwc,
             struct fdl_explicit_layout *explicit_layout)
 {
    uint32_t offset = 0, heightalign;
@@ -149,7 +148,9 @@ fdl6_layout(struct fdl_layout *layout, const struct fd_dev_info *info,
    if (ubwc_blockwidth == 0)
       layout->ubwc = false;
 
-   if (width0 < FDL_MIN_UBWC_WIDTH) {
+   assert(!force_ubwc || layout->ubwc);
+
+   if (!force_ubwc && width0 < FDL_MIN_UBWC_WIDTH) {
       layout->ubwc = false;
       /* Linear D/S is not supported by HW. */
       if (!util_format_is_depth_or_stencil(format))

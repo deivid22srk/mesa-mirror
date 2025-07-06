@@ -36,6 +36,7 @@
 #include "compiler/nir/nir_builder.h"
 #include "util/half_float.h"
 #include "util/list.h"
+#include "util/shader_stats.h"
 #include "util/u_debug.h"
 #include "util/u_dynarray.h"
 #include "util/u_math.h"
@@ -49,6 +50,7 @@
 #include "midgard_quirks.h"
 
 #include "disassemble.h"
+#include "shader_enums.h"
 
 static const struct debug_named_value midgard_debug_options[] = {
    {"shaders", MIDGARD_DBG_SHADERS, "Dump shaders in NIR and MIR"},
@@ -68,10 +70,10 @@ create_empty_block(compiler_context *ctx)
 {
    midgard_block *blk = rzalloc(ctx, midgard_block);
 
-   blk->base.predecessors =
+   blk->predecessors =
       _mesa_set_create(blk, _mesa_hash_pointer, _mesa_key_pointer_equal);
 
-   blk->base.name = ctx->block_source_count++;
+   blk->name = ctx->block_source_count++;
 
    return blk;
 }
@@ -82,9 +84,9 @@ schedule_barrier(compiler_context *ctx)
    midgard_block *temp = ctx->after_block;
    ctx->after_block = create_empty_block(ctx);
    ctx->block_count++;
-   list_addtail(&ctx->after_block->base.link, &ctx->blocks);
-   list_inithead(&ctx->after_block->base.instructions);
-   pan_block_add_successor(&ctx->current_block->base, &ctx->after_block->base);
+   list_addtail(&ctx->after_block->link, &ctx->blocks);
+   list_inithead(&ctx->after_block->instructions);
+   mir_block_add_successor(ctx->current_block, ctx->after_block);
    ctx->current_block = ctx->after_block;
    ctx->after_block = temp;
 }
@@ -272,9 +274,9 @@ midgard_nir_lower_global_load_instr(nir_builder *b, nir_intrinsic_instr *intr,
 static bool
 midgard_nir_lower_global_load(nir_shader *shader)
 {
-   return nir_shader_intrinsics_pass(
-      shader, midgard_nir_lower_global_load_instr,
-      nir_metadata_control_flow, NULL);
+   return nir_shader_intrinsics_pass(shader,
+                                     midgard_nir_lower_global_load_instr,
+                                     nir_metadata_control_flow, NULL);
 }
 
 static bool
@@ -365,22 +367,7 @@ mem_access_size_align_cb(nir_intrinsic_op intrin, uint8_t bytes,
 static uint8_t
 lower_vec816_alu(const nir_instr *instr, const void *cb_data)
 {
-  return 4;
-}
-
-static bool
-lower_halt_to_return(nir_builder *b, nir_instr *instr, UNUSED void *_data)
-{
-   if (instr->type != nir_instr_type_jump)
-      return false;
-
-   nir_jump_instr *jump = nir_instr_as_jump(instr);
-   if (jump->type != nir_jump_halt)
-      return false;
-
-   assert(b->impl == nir_shader_get_entrypoint(b->shader));
-   jump->type = nir_jump_return;
-   return true;
+   return 4;
 }
 
 void
@@ -389,8 +376,7 @@ midgard_preprocess_nir(nir_shader *nir, unsigned gpu_id)
    unsigned quirks = midgard_get_quirks(gpu_id);
 
    /* Ensure that halt are translated to returns and get ride of them */
-   NIR_PASS(_, nir, nir_shader_instructions_pass, lower_halt_to_return,
-            nir_metadata_all, NULL);
+   NIR_PASS(_, nir, nir_lower_halt_to_return);
    NIR_PASS(_, nir, nir_lower_returns);
 
    /* Lower gl_Position pre-optimisation, but after lowering vars to ssa
@@ -476,11 +462,13 @@ midgard_preprocess_nir(nir_shader *nir, unsigned gpu_id)
    /* Midgard image ops coordinates are 16-bit instead of 32-bit */
    NIR_PASS(_, nir, midgard_nir_lower_image_bitsize);
 
-   if (nir->info.stage == MESA_SHADER_FRAGMENT)
+   if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       NIR_PASS(_, nir, nir_lower_helper_writes, true);
+      NIR_PASS(_, nir, nir_lower_is_helper_invocation);
+      NIR_PASS(_, nir, pan_lower_helper_invocation);
+      NIR_PASS(_, nir, pan_lower_sample_pos);
+   }
 
-   NIR_PASS(_, nir, pan_lower_helper_invocation);
-   NIR_PASS(_, nir, pan_lower_sample_pos);
    NIR_PASS(_, nir, midgard_nir_lower_algebraic_early);
    NIR_PASS(_, nir, nir_lower_alu_to_scalar, mdg_should_scalarize, NULL);
    NIR_PASS(_, nir, nir_lower_flrp, 16 | 32 | 64, false /* always_precise */);
@@ -2469,7 +2457,7 @@ inline_alu_constants(compiler_context *ctx, midgard_block *block)
              * possible.
              */
             midgard_instruction *first = list_first_entry(
-               &block->base.instructions, midgard_instruction, link);
+               &block->instructions, midgard_instruction, link);
 
             if (alu == first) {
                mir_insert_instruction_before(ctx, alu, &ins);
@@ -2734,13 +2722,13 @@ emit_block_init(compiler_context *ctx)
    if (!this_block)
       this_block = create_empty_block(ctx);
 
-   list_addtail(&this_block->base.link, &ctx->blocks);
+   list_addtail(&this_block->link, &ctx->blocks);
 
    this_block->scheduled = false;
    ++ctx->block_count;
 
    /* Set up current block */
-   list_inithead(&this_block->base.instructions);
+   list_inithead(&this_block->instructions);
    ctx->current_block = this_block;
 
    return this_block;
@@ -2807,11 +2795,11 @@ emit_if(struct compiler_context *ctx, nir_if *nif)
 
    ctx->after_block = create_empty_block(ctx);
 
-   pan_block_add_successor(&before_block->base, &then_block->base);
-   pan_block_add_successor(&before_block->base, &else_block->base);
+   mir_block_add_successor(before_block, then_block);
+   mir_block_add_successor(before_block, else_block);
 
-   pan_block_add_successor(&end_then_block->base, &ctx->after_block->base);
-   pan_block_add_successor(&end_else_block->base, &ctx->after_block->base);
+   mir_block_add_successor(end_then_block, ctx->after_block);
+   mir_block_add_successor(end_else_block, ctx->after_block);
 }
 
 static void
@@ -2837,8 +2825,8 @@ emit_loop(struct compiler_context *ctx, nir_loop *nloop)
    emit_mir_instruction(ctx, &br_back);
 
    /* Mark down that branch in the graph. */
-   pan_block_add_successor(&start_block->base, &loop_block->base);
-   pan_block_add_successor(&ctx->current_block->base, &loop_block->base);
+   mir_block_add_successor(start_block, loop_block);
+   mir_block_add_successor(ctx->current_block, loop_block);
 
    /* Find the index of the block about to follow us (note: we don't add
     * one; blocks are 0-indexed so we get a fencepost problem) */
@@ -2870,7 +2858,7 @@ emit_loop(struct compiler_context *ctx, nir_loop *nloop)
          ins->branch.target_type = TARGET_GOTO;
          ins->branch.target_block = break_block_idx;
 
-         pan_block_add_successor(_block, &ctx->after_block->base);
+         mir_block_add_successor((midgard_block *)_block, ctx->after_block);
       }
    }
 
@@ -2887,7 +2875,8 @@ emit_cf_list(struct compiler_context *ctx, struct exec_list *list)
 {
    midgard_block *start_block = NULL;
 
-   foreach_list_typed(nir_cf_node, node, node, list) {
+   foreach_list_typed(nir_cf_node, node, node, list)
+   {
       switch (node->type) {
       case nir_cf_node_block: {
          midgard_block *block = emit_block(ctx, nir_cf_node_as_block(node));
@@ -2953,8 +2942,8 @@ mir_add_writeout_loops(compiler_context *ctx)
             continue;
 
          unsigned popped = br->branch.target_block;
-         pan_block_add_successor(&(mir_get_block(ctx, popped - 1)->base),
-                                 &ctx->current_block->base);
+         mir_block_add_successor(mir_get_block(ctx, popped - 1),
+                                 ctx->current_block);
          br->branch.target_block = emit_fragment_epilogue(ctx, rt, s);
          br->branch.target_type = TARGET_GOTO;
 
@@ -2973,8 +2962,8 @@ mir_add_writeout_loops(compiler_context *ctx)
             uncond.branch.target_block = popped;
             uncond.branch.target_type = TARGET_GOTO;
             emit_mir_instruction(ctx, &uncond);
-            pan_block_add_successor(&ctx->current_block->base,
-                                    &(mir_get_block(ctx, popped)->base));
+            mir_block_add_successor(ctx->current_block,
+                                    mir_get_block(ctx, popped));
             schedule_barrier(ctx);
          } else {
             /* We're last, so we can terminate here */
@@ -2986,7 +2975,7 @@ mir_add_writeout_loops(compiler_context *ctx)
 
 void
 midgard_compile_shader_nir(nir_shader *nir,
-                           const struct panfrost_compile_inputs *inputs,
+                           const struct pan_compile_inputs *inputs,
                            struct util_dynarray *binary,
                            struct pan_shader_info *info)
 {
@@ -3109,7 +3098,8 @@ midgard_compile_shader_nir(nir_shader *nir,
    int bundle_idx = 0;
    mir_foreach_block(ctx, _block) {
       midgard_block *block = (midgard_block *)_block;
-      util_dynarray_foreach(&block->bundles, midgard_bundle, bundle) {
+      util_dynarray_foreach(&block->bundles, midgard_bundle, bundle)
+      {
          source_order_bundles[bundle_idx++] = bundle;
       }
    }
@@ -3155,51 +3145,34 @@ midgard_compile_shader_nir(nir_shader *nir,
    if (binary->size)
       memset(util_dynarray_grow(binary, uint8_t, 16), 0, 16);
 
-   if ((midgard_debug & MIDGARD_DBG_SHADERDB || inputs->debug) &&
-       !nir->info.internal) {
-      unsigned nr_bundles = 0, nr_ins = 0;
+   struct midgard_stats stats = {
+      .quadwords = ctx->quadword_count,
+      .registers = info->work_reg_count,
+      .loops = ctx->loop_count,
+      .spills = ctx->spills,
+      .fills = ctx->fills,
+   };
 
-      /* Count instructions and bundles */
+   /* Count instructions and bundles */
+   mir_foreach_block(ctx, _block) {
+      midgard_block *block = (midgard_block *)_block;
+      stats.bundles +=
+         util_dynarray_num_elements(&block->bundles, midgard_bundle);
 
-      mir_foreach_block(ctx, _block) {
-         midgard_block *block = (midgard_block *)_block;
-         nr_bundles +=
-            util_dynarray_num_elements(&block->bundles, midgard_bundle);
+      mir_foreach_bundle_in_block(block, bun)
+         stats.inst += bun->instruction_count;
+   }
 
-         mir_foreach_bundle_in_block(block, bun)
-            nr_ins += bun->instruction_count;
-      }
+   /* Calculate thread count. There are certain cutoffs by
+    * register count for thread count */
+   stats.threads = (stats.registers <= 4) ? 4 : (stats.registers <= 8) ? 2 : 1;
 
-      /* Calculate thread count. There are certain cutoffs by
-       * register count for thread count */
+   info->stats.isa = PAN_STAT_MIDGARD;
+   info->stats.midgard = stats;
 
-      unsigned nr_registers = info->work_reg_count;
-
-      unsigned nr_threads = (nr_registers <= 4)   ? 4
-                            : (nr_registers <= 8) ? 2
-                                                  : 1;
-
-      char *shaderdb = NULL;
-
-      /* Dump stats */
-
-      asprintf(&shaderdb,
-               "%s shader: "
-               "%u inst, %u bundles, %u quadwords, "
-               "%u registers, %u threads, %u loops, "
-               "%u:%u spills:fills",
-               ctx->inputs->is_blend ? "PAN_SHADER_BLEND"
-                                     : gl_shader_stage_name(ctx->stage),
-               nr_ins, nr_bundles, ctx->quadword_count, nr_registers,
-               nr_threads, ctx->loop_count, ctx->spills, ctx->fills);
-
-      if (midgard_debug & MIDGARD_DBG_SHADERDB)
-         fprintf(stderr, "SHADER-DB: %s\n", shaderdb);
-
-      if (inputs->debug)
-         util_debug_message(inputs->debug, SHADER_INFO, "%s", shaderdb);
-
-      free(shaderdb);
+   if ((midgard_debug & MIDGARD_DBG_SHADERDB) && !nir->info.internal) {
+      const char *prefix = _mesa_shader_stage_to_abbrev(ctx->stage);
+      midgard_stats_fprintf(stderr, prefix, &stats);
    }
 
    _mesa_hash_table_u64_destroy(ctx->ssa_constants);

@@ -11,15 +11,16 @@
 #include "vk_shader_module.h"
 
 #include "nir/radv_nir.h"
+#include "ac_nir.h"
 #include "radv_debug.h"
 #include "radv_descriptor_set.h"
 #include "radv_entrypoints.h"
 #include "radv_pipeline_binary.h"
 #include "radv_pipeline_cache.h"
+#include "radv_pipeline_layout.h"
 #include "radv_pipeline_rt.h"
 #include "radv_rmv.h"
 #include "radv_shader.h"
-#include "ac_nir.h"
 
 struct rt_handle_hash_entry {
    uint32_t key;
@@ -332,9 +333,10 @@ should_move_rt_instruction(nir_intrinsic_instr *instr)
    }
 }
 
-static void
+static bool
 move_rt_instructions(nir_shader *shader)
 {
+   bool progress = false;
    nir_cursor target = nir_before_impl(nir_shader_get_entrypoint(shader));
 
    nir_foreach_block (block, nir_shader_get_entrypoint(shader)) {
@@ -347,11 +349,12 @@ move_rt_instructions(nir_shader *shader)
          if (!should_move_rt_instruction(intrinsic))
             continue;
 
+         progress = true;
          nir_instr_move(target, instr);
       }
    }
 
-   nir_metadata_preserve(nir_shader_get_entrypoint(shader), nir_metadata_control_flow);
+   return nir_progress(progress, nir_shader_get_entrypoint(shader), nir_metadata_control_flow);
 }
 
 static VkResult
@@ -387,7 +390,7 @@ radv_rt_nir_to_asm(struct radv_device *device, struct vk_pipeline_cache *cache,
    /* Move ray tracing system values to the top that are set by rt_trace_ray
     * to prevent them from being overwritten by other rt_trace_ray calls.
     */
-   NIR_PASS_V(stage->nir, move_rt_instructions);
+   NIR_PASS(_, stage->nir, move_rt_instructions);
 
    uint32_t num_resume_shaders = 0;
    nir_shader **resume_shaders = NULL;
@@ -437,8 +440,9 @@ radv_rt_nir_to_asm(struct radv_device *device, struct vk_pipeline_cache *cache,
 
    bool dump_shader = radv_can_dump_shader(device, shaders[0]);
    bool dump_nir = dump_shader && (instance->debug_flags & RADV_DEBUG_DUMP_NIR);
-   bool replayable =
-      pipeline->base.base.create_flags & VK_PIPELINE_CREATE_2_RAY_TRACING_SHADER_GROUP_HANDLE_CAPTURE_REPLAY_BIT_KHR;
+   bool replayable = (pipeline->base.base.create_flags &
+                      VK_PIPELINE_CREATE_2_RAY_TRACING_SHADER_GROUP_HANDLE_CAPTURE_REPLAY_BIT_KHR) &&
+                     stage->stage != MESA_SHADER_INTERSECTION;
 
    if (dump_shader) {
       simple_mtx_lock(&instance->shader_dump_mtx);
@@ -449,13 +453,15 @@ radv_rt_nir_to_asm(struct radv_device *device, struct vk_pipeline_cache *cache,
       }
    }
 
+   /* Compile NIR shader to AMD assembly. */
+   binary =
+      radv_shader_nir_to_asm(device, stage, shaders, num_shaders, NULL, keep_executable_info, keep_statistic_info);
+
+   /* Dump NIR after nir_to_asm, because ACO modifies it. */
    char *nir_string = NULL;
    if (keep_executable_info || dump_shader)
       nir_string = radv_dump_nir_shaders(instance, shaders, num_shaders);
 
-   /* Compile NIR shader to AMD assembly. */
-   binary =
-      radv_shader_nir_to_asm(device, stage, shaders, num_shaders, NULL, keep_executable_info, keep_statistic_info);
    struct radv_shader *shader;
    if (replay_block || replayable) {
       VkResult result = radv_shader_create_uncached(device, binary, replayable, replay_block, &shader);
@@ -599,7 +605,11 @@ radv_rt_compile_shaders(struct radv_device *device, struct vk_pipeline_cache *ca
 
    bool library = pipeline->base.base.create_flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR;
 
-   bool monolithic = !library;
+   /* Beyond 50 shader stages, inlining everything bloats the shader a ton, increasing compile times and
+    * potentially even reducing runtime performance because of instruction cache coherency issues in the
+    * traversal loop.
+    */
+   bool monolithic = !library && pipeline->stage_count < 50;
    for (uint32_t i = 0; i < pCreateInfo->stageCount; i++) {
       if (rt_stages[i].shader || rt_stages[i].nir)
          continue;
@@ -1149,6 +1159,8 @@ radv_rt_pipeline_create(VkDevice _device, VkPipelineCache _cache, const VkRayTra
             pipeline->groups[i].handle.recursive_shader_ptr = shader->va | radv_get_rt_priority(shader->info.stage);
       }
    }
+
+   radv_pipeline_report_pso_history(device, &pipeline->base.base);
 
    *pPipeline = radv_pipeline_to_handle(&pipeline->base.base);
    radv_rmv_log_rt_pipeline_create(device, pipeline);

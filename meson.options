@@ -79,10 +79,10 @@ option(
   type : 'array',
   value : ['auto'],
   choices : [
-    'auto', 'radeonsi', 'r300', 'r600', 'nouveau', 'freedreno',
-    'swrast', 'v3d', 'vc4', 'etnaviv', 'tegra', 'i915', 'svga', 'virgl',
-    'panfrost', 'iris', 'lima', 'zink', 'd3d12', 'asahi', 'crocus', 'all',
-    'softpipe', 'llvmpipe',
+    'all', 'auto',
+    'asahi', 'crocus', 'd3d12', 'etnaviv', 'freedreno', 'i915', 'iris',
+    'lima', 'llvmpipe', 'nouveau', 'panfrost', 'r300', 'r600', 'radeonsi',
+    'softpipe', 'svga', 'tegra', 'v3d', 'vc4', 'virgl', 'zink',
   ],
   description : 'List of gallium drivers to build. If this is set to auto ' +
                 'all drivers applicable to the target OS/architecture ' +
@@ -118,6 +118,20 @@ option(
 )
 
 option(
+  'gallium-mediafoundation',
+  type : 'feature',
+  deprecated: {'true': 'enabled', 'false': 'disabled'},
+  description : 'enable gallium mediafoundation frontend.',
+)
+
+option(
+  'gallium-mediafoundation-test',
+  type : 'boolean',
+  value : false,
+  description : 'enable gallium mediafoundation frontend tests.',
+)
+
+option(
   'va-libs-path',
   type : 'string',
   value : '',
@@ -125,32 +139,10 @@ option(
 )
 
 option(
-  'gallium-xa',
-  type : 'feature',
-  deprecated: {'true': 'enabled', 'false': 'disabled'},
-  description : 'enable gallium xa frontend.',
-)
-
-option(
-  'gallium-nine',
-  type : 'boolean',
-  value : false,
-  description : 'build gallium "nine" Direct3D 9.x frontend.',
-)
-
-option(
   'gallium-d3d10umd',
   type : 'boolean',
   value : false,
   description : 'build gallium D3D10 WDDM UMD frontend.',
-)
-
-option(
-  'gallium-opencl',
-  type : 'combo',
-  choices : ['icd', 'standalone', 'disabled'],
-  value : 'disabled',
-  description : 'build gallium "clover" OpenCL frontend.',
 )
 
 option(
@@ -163,7 +155,7 @@ option(
 option(
   'gallium-rusticl-enable-drivers',
   type : 'array',
-  value : ['auto', 'asahi'],
+  value : ['auto', 'asahi', 'freedreno', 'radeonsi'],
   description : 'List of gallium drivers for which rusticl will be enabled ' +
                 'by default',
 )
@@ -182,6 +174,25 @@ option(
   value : 'libgallium_d3d10',
   description : 'name of gallium d3d10 target DLL built for Windows. ' +
                 'defaults to libgallium_d3d10.dll to match DRI',
+)
+
+option(
+  'mediafoundation-store-dll',
+  type : 'boolean',
+  value : false,
+  description : 'Selects whether the gallium mediafoundation DLL is built for the store. ',
+)
+
+option(
+  'mediafoundation-codecs',
+  type : 'array',
+  value : ['all'],
+  choices: [
+    'all', 'h264enc', 'h265enc', 'av1enc'
+  ],
+  description : 'List of codecs to build mediafoundation frontend DLLs for. ' +
+                'These will generate different MFT DLLs per codec and link' +
+                'against the gallium drivers which uses the video-codecs option'
 )
 
 option(
@@ -288,7 +299,7 @@ option(
   type : 'array',
   value : [],
   choices : [
-    'device-select', 'intel-nullhw', 'overlay', 'screenshot', 
+    'device-select', 'intel-nullhw', 'overlay', 'screenshot',
     'vram-report-limit',
   ],
   description : 'List of vulkan layers to build'
@@ -297,9 +308,8 @@ option(
 option(
   'shared-glapi',
   type : 'feature',
-  deprecated: {'true': 'enabled', 'false': 'disabled'},
-  description : 'Whether to build a shared or static glapi. Defaults to ' +
-                'disabled on Windows, enabled elsewhere'
+  deprecated: true,
+  description : 'Does nothing, left here for a while to avoid build breakages.',
 )
 
 option(
@@ -328,6 +338,13 @@ option(
   type : 'feature',
   deprecated: {'true': 'enabled', 'false': 'disabled'},
   description : 'Build support for gbm platform'
+)
+
+option(
+  'libgbm-external',
+  type: 'boolean',
+  value: false,
+  description: 'Whether to use external libgbm (default: use in-tree copy)'
 )
 
 option(
@@ -466,6 +483,13 @@ option(
 )
 
 option(
+  'build-radv-tests',
+  type : 'boolean',
+  value : false,
+  description : 'Build RADV tests. These do not require an AMD GPU.'
+)
+
+option(
   'build-aco-tests',
   type : 'boolean',
   value : false,
@@ -510,13 +534,6 @@ option(
 )
 
 option(
-  'osmesa',
-  type : 'boolean',
-  value : false,
-  description : 'Build OSmesa.'
-)
-
-option(
   'tools',
   type : 'array',
   value : [],
@@ -529,8 +546,8 @@ option(
 option(
   'power8',
   type : 'feature',
-  deprecated: {'true': 'enabled', 'false': 'disabled'},
-  description : 'Enable power8 optimizations.',
+  description : 'Does nothing, left here for a while to avoid build breakages.',
+  deprecated: true,
 )
 
 option(
@@ -565,8 +582,8 @@ option(
   type : 'integer',
   min : 25,
   max : 10000,
-  value : 25,
-  description : 'Android Platform SDK version. Default: Nougat version.'
+  value : 34,
+  description : 'Android Platform SDK version. Default: Android14 version.'
 )
 
 option(
@@ -631,6 +648,13 @@ option(
 )
 
 option(
+  'sysprof',
+  type : 'boolean',
+  value : false,
+  description : 'Enable tracing markers for sysprof. Default: false'
+)
+
+option(
   'custom-shader-replacement',
   type : 'string',
   value : '',
@@ -664,13 +688,6 @@ option(
     'enabled', 'system', 'auto'
   ],
   description : 'Build the intel-clc compiler or use a system version.'
-)
-
-option(
-  'intel-bvh-grl',
-  type : 'boolean',
-  value : false,
-  description : 'Build the BVH structure using GRL.'
 )
 
 option(
@@ -734,6 +751,14 @@ option(
 )
 
 option(
+  'radeonsi-build-id',
+  type : 'string',
+  value : '',
+  description : 'Override build id for shader cache keys (hex string). ' +
+                'Can be extracted with readelf -x .note.gnu.build-id'
+)
+
+option(
   'min-windows-version',
   type : 'integer',
   min : 7,
@@ -755,10 +780,10 @@ option(
 option(
   'legacy-x11',
   type : 'array',
-  value : ['none'],
+  value : [],
   description : 'Build legacy X11 support features.',
   choices : [
-    'none', 'dri2'
+    'dri2'
   ],
 )
 
@@ -780,6 +805,16 @@ option(
 )
 
 option(
+  'mesa-clc-bundle-headers',
+  type : 'combo',
+  value : 'auto',
+  choices : [
+    'enabled', 'auto'
+  ],
+  description : 'Bundle the OpenCL headers into the mesa-clc binary (default to bundle if static LLVM is used). Note, it might require rebuilding mesa-clc if opencl-c.h or opencl-c-base.h are changed (e.g. on Clang upgrades).'
+)
+
+option(
   'precomp-compiler',
   type : 'combo',
   value : 'auto',
@@ -794,4 +829,21 @@ option(
   type : 'boolean',
   value : false,
   description : 'Install the drivers internal shader compilers (if needed for cross builds).'
+)
+
+option(
+  'allow-fallback-for',
+  type : 'array',
+  value : [],
+  choices : [
+    'libdrm',
+  ],
+  description : 'Allows the fallback mechanism if the dependency is not available on the system, or too old.'
+)
+
+option(
+  'virtgpu_kumquat',
+  type : 'boolean',
+  value : false,
+  description : 'Build virtgpu_kumquat (only useful with gfxstream currently)'
 )

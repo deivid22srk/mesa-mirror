@@ -76,7 +76,28 @@ nir_intrinsics_c = custom_target(
   depend_files : files('nir_intrinsics.py'),
 )
 
-files_libnir = files(
+with_nir_headers_only = (
+  gallium_drivers == ['d3d12'] and
+  get_option('gallium-d3d12-graphics').disabled() and
+  not [
+    with_gallium_vdpau,
+    with_gallium_va,
+    with_any_vk,
+    with_gallium_st_d3d10umd,
+    with_gallium_rusticl,
+    with_microsoft_clc,
+    with_spirv_to_dxil,
+    with_clc,
+    with_drivers_clc,
+    get_option('intel-elk'),
+    with_tools.length() != 0,
+  ].contains(true))
+
+files_libnir = []
+if with_nir_headers_only
+  files_libnir += files('nir_stub.c')
+else
+  files_libnir += files(
   'nir.c',
   'nir.h',
   'nir_builder.c',
@@ -99,6 +120,7 @@ files_libnir = files(
   'nir_from_ssa.c',
   'nir_functions.c',
   'nir_gather_info.c',
+  'nir_gather_output_deps.c',
   'nir_gather_tcs_info.c',
   'nir_gather_types.c',
   'nir_gather_xfb_info.c',
@@ -107,6 +129,8 @@ files_libnir = files(
   'nir_inline_uniforms.c',
   'nir_instr_set.c',
   'nir_instr_set.h',
+  'nir_io_add_const_offset_to_base.c',
+  'nir_io_add_xfb_info.c',
   'nir_legacy.c',
   'nir_legacy.h',
   'nir_linking_helpers.c',
@@ -115,6 +139,7 @@ files_libnir = files(
   'nir_loop_analyze.h',
   'nir_lower_alu.c',
   'nir_lower_alu_width.c',
+  'nir_lower_alpha.c',
   'nir_lower_alpha_test.c',
   'nir_lower_amul.c',
   'nir_lower_array_deref_of_vec.c',
@@ -128,7 +153,7 @@ files_libnir = files(
   'nir_lower_cl_images.c',
   'nir_lower_clamp_color_outputs.c',
   'nir_lower_clip.c',
-  'nir_lower_clip_cull_distance_arrays.c',
+  'nir_lower_clip_cull_distance_array_vars.c',
   'nir_lower_clip_disable.c',
   'nir_lower_clip_halfz.c',
   'nir_lower_const_arrays_to_uniforms.c',
@@ -138,6 +163,7 @@ files_libnir = files(
   'nir_lower_discard_if.c',
   'nir_lower_double_ops.c',
   'nir_lower_drawpixels.c',
+  'nir_lower_explicit_io.c',
   'nir_lower_fb_read.c',
   'nir_lower_flatshade.c',
   'nir_lower_flrp.c',
@@ -149,6 +175,7 @@ files_libnir = files(
   'nir_lower_global_vars_to_local.c',
   'nir_lower_goto_ifs.c',
   'nir_lower_gs_intrinsics.c',
+  'nir_lower_halt_to_return.c',
   'nir_lower_helper_writes.c',
   'nir_lower_load_const_to_scalar.c',
   'nir_lower_locals_to_regs.c',
@@ -161,10 +188,10 @@ files_libnir = files(
   'nir_lower_interpolation.c',
   'nir_lower_int_to_float.c',
   'nir_lower_io.c',
-  'nir_lower_io_arrays_to_elements.c',
-  'nir_lower_io_to_temporaries.c',
+  'nir_lower_io_array_vars_to_elements.c',
+  'nir_lower_io_vars_to_temporaries.c',
   'nir_lower_io_to_scalar.c',
-  'nir_lower_io_to_vector.c',
+  'nir_lower_io_vars_to_scalar.c',
   'nir_lower_is_helper_invocation.c',
   'nir_lower_multiview.c',
   'nir_lower_mediump.c',
@@ -255,6 +282,7 @@ files_libnir = files(
   'nir_opt_offsets.c',
   'nir_opt_peephole_select.c',
   'nir_opt_phi_precision.c',
+  'nir_opt_phi_to_bool.c',
   'nir_opt_preamble.c',
   'nir_opt_ray_queries.c',
   'nir_opt_reassociate_bfi.c',
@@ -263,12 +291,14 @@ files_libnir = files(
   'nir_opt_shrink_stores.c',
   'nir_opt_shrink_vectors.c',
   'nir_opt_sink.c',
+  'nir_opt_tex_skip_helpers.c',
   'nir_opt_undef.c',
   'nir_opt_uniform_atomics.c',
   'nir_opt_uniform_subgroup.c',
   'nir_opt_varyings.c',
   'nir_opt_vectorize.c',
   'nir_opt_vectorize_io.c',
+  'nir_opt_vectorize_io_vars.c',
   'nir_passthrough_gs.c',
   'nir_passthrough_tcs.c',
   'nir_phi_builder.c',
@@ -277,6 +307,7 @@ files_libnir = files(
   'nir_propagate_invariant.c',
   'nir_range_analysis.c',
   'nir_range_analysis.h',
+  'nir_recompute_io_bases.c',
   'nir_remove_dead_variables.c',
   'nir_remove_tex_shadow.c',
   'nir_repair_ssa.c',
@@ -290,6 +321,7 @@ files_libnir = files(
   'nir_serialize.h',
   'nir_shader_compiler_options.h',
   'nir_split_64bit_vec3_and_vec4.c',
+  'nir_split_conversions.c',
   'nir_split_per_member_structs.c',
   'nir_split_var_copies.c',
   'nir_split_vars.c',
@@ -304,7 +336,8 @@ files_libnir = files(
   'nir_worklist.h',
   'nir_xfb_info.h',
   'nir_lower_atomics.c'
-)
+  )
+endif
 
 # When a file is too large, -Wmisleading-indentation will give a note about
 # not being able to process it, however that is not suppressable by a #pragma
@@ -316,11 +349,17 @@ if cc.get_id() == 'gcc'
   no_misleading_indentation += cc.get_supported_arguments('-Wno-misleading-indentation')
 endif
 
+custom_targets_libnir = []
+if not with_nir_headers_only
+  custom_targets_libnir += [nir_opt_algebraic_c, nir_opcodes_c,
+    nir_opcodes_h, nir_constant_expressions_c, nir_builder_opcodes_h,
+    nir_intrinsics_c, nir_intrinsics_h, nir_intrinsics_indices_h
+]
+endif
+
 _libnir = static_library(
   'nir',
-  [files_libnir, nir_opt_algebraic_c, nir_opcodes_c,
-   nir_opcodes_h, nir_constant_expressions_c, nir_builder_opcodes_h,
-   nir_intrinsics_c, nir_intrinsics_h, nir_intrinsics_indices_h],
+  [files_libnir, custom_targets_libnir],
   include_directories : [inc_include, inc_src],
   c_args : [c_msvc_compat_args, no_override_init_args, no_misleading_indentation],
   gnu_symbol_visibility : 'hidden',
@@ -371,6 +410,8 @@ if with_tests
         'tests/loop_analyze_tests.cpp',
         'tests/loop_unroll_tests.cpp',
         'tests/lower_alu_width_tests.cpp',
+        'tests/lower_discard_if_tests.cpp',
+        'tests/minimize_call_live_states_test.cpp',
         'tests/mod_analysis_tests.cpp',
         'tests/negative_equal_tests.cpp',
         'tests/opt_if_tests.cpp',

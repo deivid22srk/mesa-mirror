@@ -37,6 +37,7 @@ tu_bo_init_new_explicit_iova(struct tu_device *dev,
                              VkMemoryPropertyFlags mem_property,
                              enum tu_bo_alloc_flags flags, const char *name)
 {
+   MESA_TRACE_FUNC();
    struct tu_instance *instance = dev->physical_device->instance;
 
    VkResult result =
@@ -88,6 +89,7 @@ tu_bo_export_dmabuf(struct tu_device *dev, struct tu_bo *bo)
 void
 tu_bo_finish(struct tu_device *dev, struct tu_bo *bo)
 {
+   MESA_TRACE_FUNC();
    struct tu_instance *instance = dev->physical_device->instance;
 
    vk_address_binding_report(&instance->vk, bo->base ? bo->base : &dev->vk.base,
@@ -397,6 +399,13 @@ tu_physical_device_try_create(struct vk_instance *vk_instance,
    struct tu_physical_device *device = NULL;
 
    VkResult result = VK_ERROR_INCOMPATIBLE_DRIVER;
+
+#ifdef TU_HAS_VIRTIO
+   if (debug_get_bool_option("FD_FORCE_VTEST", false)) {
+      result = tu_knl_drm_virtio_load(instance, -1, version, &device);
+      path = "";
+   } else
+#endif
    if (strcmp(version->name, "msm") == 0) {
 #ifdef TU_HAS_MSM
       result = tu_knl_drm_msm_load(instance, fd, version, &device);
@@ -438,7 +447,12 @@ tu_physical_device_try_create(struct vk_instance *vk_instance,
       device->master_minor = 0;
    }
 
-   if (stat(path, &st) == 0) {
+   if (strlen(path) == 0) {
+      /* if vtest, then fake it: */
+      device->has_local = true;
+      device->local_major = 226;
+      device->local_minor = 128;
+   } else if (stat(path, &st) == 0) {
       device->has_local = true;
       device->local_major = major(st.st_rdev);
       device->local_minor = minor(st.st_rdev);

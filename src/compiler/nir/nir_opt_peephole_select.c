@@ -159,6 +159,9 @@ block_check_for_allowed_instrs(nir_block *block, unsigned *count,
          case nir_intrinsic_load_view_index:
          case nir_intrinsic_load_layer_id:
          case nir_intrinsic_load_frag_coord:
+         case nir_intrinsic_load_pixel_coord:
+         case nir_intrinsic_load_frag_coord_z:
+         case nir_intrinsic_load_frag_coord_w:
          case nir_intrinsic_load_sample_pos:
          case nir_intrinsic_load_sample_pos_or_center:
          case nir_intrinsic_load_sample_id:
@@ -566,13 +569,7 @@ nir_opt_peephole_select_impl(nir_function_impl *impl,
       progress |= nir_opt_peephole_select_block(block, shader, options);
    }
 
-   if (progress) {
-      nir_metadata_preserve(impl, nir_metadata_none);
-   } else {
-      nir_metadata_preserve(impl, nir_metadata_all);
-   }
-
-   return progress;
+   return nir_progress(progress, impl, nir_metadata_none);
 }
 
 bool

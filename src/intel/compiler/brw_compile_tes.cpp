@@ -49,7 +49,6 @@ run_tes(brw_shader &s)
    brw_assign_tes_urb_setup(s);
 
    brw_lower_3src_null_dest(s);
-   brw_workaround_memory_fence_before_eot(s);
    brw_workaround_emit_dummy_mov_instruction(s);
 
    brw_allocate_registers(s, true /* allow_spilling */);
@@ -70,10 +69,9 @@ brw_compile_tes(const struct brw_compiler *compiler,
    struct brw_tes_prog_data *prog_data = params->prog_data;
    const unsigned dispatch_width = brw_geometry_stage_dispatch_width(compiler->devinfo);
 
-   const bool debug_enabled = brw_should_print_shader(nir, DEBUG_TES);
+   const bool debug_enabled = brw_should_print_shader(nir, DEBUG_TES, params->base.source_hash);
 
-   prog_data->base.base.stage = MESA_SHADER_TESS_EVAL;
-   prog_data->base.base.ray_queries = nir->info.ray_queries;
+   brw_prog_data_init(&prog_data->base.base, &params->base);
 
    nir->info.inputs_read = key->inputs_read;
    nir->info.patch_inputs_read = key->patch_inputs_read;
@@ -86,7 +84,7 @@ brw_compile_tes(const struct brw_compiler *compiler,
 
    brw_compute_vue_map(devinfo, &prog_data->base.vue_map,
                        nir->info.outputs_written,
-                       nir->info.separate_shader, 1);
+                       key->base.vue_layout, 1);
 
    unsigned output_size_bytes = prog_data->base.vue_map.num_slots * 4 * 4;
 
@@ -184,4 +182,3 @@ brw_compile_tes(const struct brw_compiler *compiler,
 
    return g.get_assembly();
 }
-

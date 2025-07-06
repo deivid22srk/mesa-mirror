@@ -1,10 +1,12 @@
 /*
  * Copyright © 2021 Collabora Ltd.
+ * Copyright © 2025 Arm Ltd.
  * SPDX-License-Identifier: MIT
  */
 
 #include "panvk_cmd_meta.h"
 #include "panvk_entrypoints.h"
+#include "panvk_tracepoints.h"
 
 static bool
 copy_to_image_use_gfx_pipeline(struct panvk_device *dev,
@@ -44,6 +46,10 @@ panvk_per_arch(cmd_meta_compute_start)(
    save_ctx->push_constants = cmdbuf->state.push_constants;
    save_ctx->cs.shader = cmdbuf->state.compute.shader;
    save_ctx->cs.desc = cmdbuf->state.compute.cs.desc;
+
+#if PAN_ARCH >= 10
+   trace_begin_meta(&cmdbuf->utrace.uts[PANVK_SUBQUEUE_COMPUTE], cmdbuf);
+#endif
 }
 
 void
@@ -53,6 +59,10 @@ panvk_per_arch(cmd_meta_compute_end)(
 {
    struct panvk_descriptor_set *push_set0 =
       cmdbuf->state.compute.desc_state.push_sets[0];
+
+#if PAN_ARCH >= 10
+   trace_end_meta(&cmdbuf->utrace.uts[PANVK_SUBQUEUE_COMPUTE], cmdbuf);
+#endif
 
    cmdbuf->state.compute.desc_state.sets[0] = save_ctx->set0;
    if (save_ctx->push_set0.desc_count) {
@@ -105,6 +115,13 @@ panvk_per_arch(cmd_meta_gfx_start)(
    cmdbuf->state.gfx.occlusion_query.ptr = 0;
    cmdbuf->state.gfx.occlusion_query.mode = MALI_OCCLUSION_MODE_DISABLED;
    gfx_state_set_dirty(cmdbuf, OQ);
+
+   cmdbuf->state.gfx.vk_meta = true;
+
+#if PAN_ARCH >= 10
+   trace_begin_meta(&cmdbuf->utrace.uts[PANVK_SUBQUEUE_VERTEX_TILER], cmdbuf);
+   trace_begin_meta(&cmdbuf->utrace.uts[PANVK_SUBQUEUE_FRAGMENT], cmdbuf);
+#endif
 }
 
 void
@@ -114,6 +131,11 @@ panvk_per_arch(cmd_meta_gfx_end)(
 {
    struct panvk_descriptor_set *push_set0 =
       cmdbuf->state.gfx.desc_state.push_sets[0];
+
+#if PAN_ARCH >= 10
+   trace_end_meta(&cmdbuf->utrace.uts[PANVK_SUBQUEUE_VERTEX_TILER], cmdbuf);
+   trace_end_meta(&cmdbuf->utrace.uts[PANVK_SUBQUEUE_FRAGMENT], cmdbuf);
+#endif
 
    cmdbuf->state.gfx.desc_state.sets[0] = save_ctx->set0;
    if (save_ctx->push_set0.desc_count) {
@@ -133,7 +155,7 @@ panvk_per_arch(cmd_meta_gfx_end)(
    cmdbuf->state.gfx.vs.desc = save_ctx->vs.desc;
    cmdbuf->state.gfx.vb.bufs[0] = save_ctx->vb0;
 
-#if PAN_ARCH <= 7
+#if PAN_ARCH < 9
    cmdbuf->state.gfx.vs.attribs = 0;
    cmdbuf->state.gfx.vs.attrib_bufs = 0;
    cmdbuf->state.gfx.fs.rsd = 0;
@@ -155,6 +177,8 @@ panvk_per_arch(cmd_meta_gfx_end)(
    gfx_state_set_dirty(cmdbuf, OQ);
    gfx_state_set_dirty(cmdbuf, DESC_STATE);
    gfx_state_set_dirty(cmdbuf, RENDER_STATE);
+
+   cmdbuf->state.gfx.vk_meta = false;
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -191,19 +215,15 @@ panvk_per_arch(CmdClearAttachments)(VkCommandBuffer commandBuffer,
                                     const VkClearRect *pRects)
 {
    VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
-   const struct pan_fb_info *fbinfo = &cmdbuf->state.gfx.render.fb.info;
    struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
    struct panvk_cmd_meta_graphics_save_ctx save = {0};
    struct vk_meta_rendering_info render = {
       .view_mask = cmdbuf->state.gfx.render.view_mask,
-      .samples = fbinfo->nr_samples,
-      .color_attachment_count = fbinfo->rt_count,
+      .samples = cmdbuf->state.gfx.render.fb.nr_samples,
+      .color_attachment_count = cmdbuf->state.gfx.render.fb.info.rt_count,
       .depth_attachment_format = cmdbuf->state.gfx.render.z_attachment.fmt,
       .stencil_attachment_format = cmdbuf->state.gfx.render.s_attachment.fmt,
    };
-   /* Multiview is not supported pre-v10 */
-   assert(cmdbuf->state.gfx.render.view_mask == 0 || PAN_ARCH >= 10);
-
    for (uint32_t i = 0; i < render.color_attachment_count; i++) {
        render.color_attachment_formats[i] =
           cmdbuf->state.gfx.render.color_attachments.fmts[i];
@@ -267,6 +287,80 @@ panvk_per_arch(CmdCopyBuffer2)(VkCommandBuffer commandBuffer,
    panvk_per_arch(cmd_meta_compute_end)(cmdbuf, &save);
 }
 
+static bool
+lower_copy_buffer_to_image(
+   VkCommandBuffer commandBuffer,
+   const VkCopyBufferToImageInfo2 *pCopyBufferToImageInfo)
+{
+   VK_FROM_HANDLE(panvk_image, dst_img, pCopyBufferToImageInfo->dstImage);
+
+   const VkImageAspectFlags zs_mask =
+      (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
+   /* Only required for interleaved depth stencil that are not multi-planar */
+   if (vk_format_aspects(dst_img->vk.format) != zs_mask ||
+       dst_img->plane_count > 1)
+      return false;
+
+   uint32_t num_depth_regions = 0, num_stencil_regions = 0;
+   for (uint32_t i = 0; i < pCopyBufferToImageInfo->regionCount; i++) {
+      const VkImageAspectFlags aspect_mask =
+         pCopyBufferToImageInfo->pRegions[i].imageSubresource.aspectMask;
+      assert((aspect_mask & ~zs_mask) == 0);
+      if (aspect_mask & VK_IMAGE_ASPECT_DEPTH_BIT)
+         num_depth_regions++;
+      else
+         num_stencil_regions++;
+   }
+
+   /* If we have both depth and stencil writes to an interleaved depth stencil
+    * image, we must split the writes per aspect with a barrier between them to
+    * avoid a write-after-write race. */
+   const bool lowering_needed = (num_depth_regions && num_stencil_regions);
+   if (!lowering_needed)
+      return false;
+
+   VkCopyBufferToImageInfo2 adjusted_info = *pCopyBufferToImageInfo;
+   STACK_ARRAY(VkBufferImageCopy2, depth_regions, num_depth_regions);
+   STACK_ARRAY(VkBufferImageCopy2, stencil_regions, num_stencil_regions);
+
+   uint32_t depth_idx = 0, stencil_idx = 0;
+   for (uint32_t i = 0; i < pCopyBufferToImageInfo->regionCount; i++) {
+      const VkImageAspectFlags aspect_mask =
+         pCopyBufferToImageInfo->pRegions[i].imageSubresource.aspectMask;
+
+      if (aspect_mask & VK_IMAGE_ASPECT_DEPTH_BIT)
+         depth_regions[depth_idx++] = pCopyBufferToImageInfo->pRegions[i];
+      else
+         stencil_regions[stencil_idx++] = pCopyBufferToImageInfo->pRegions[i];
+   }
+
+   adjusted_info.regionCount = num_depth_regions;
+   adjusted_info.pRegions = depth_regions;
+   panvk_per_arch(CmdCopyBufferToImage2)(commandBuffer, &adjusted_info);
+
+   const VkMemoryBarrier2 mem_barrier = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+      .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+      .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+      .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+      .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT};
+   const VkDependencyInfo dep_info = {
+      .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+      .memoryBarrierCount = 1,
+      .pMemoryBarriers = &mem_barrier,
+   };
+   panvk_per_arch(CmdPipelineBarrier2)(commandBuffer, &dep_info);
+
+   adjusted_info.regionCount = num_stencil_regions;
+   adjusted_info.pRegions = stencil_regions;
+   panvk_per_arch(CmdCopyBufferToImage2)(commandBuffer, &adjusted_info);
+
+   STACK_ARRAY_FINISH(depth_regions);
+   STACK_ARRAY_FINISH(stencil_regions);
+
+   return true;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 panvk_per_arch(CmdCopyBufferToImage2)(
    VkCommandBuffer commandBuffer,
@@ -277,8 +371,12 @@ panvk_per_arch(CmdCopyBufferToImage2)(
    VK_FROM_HANDLE(panvk_image, img, pCopyBufferToImageInfo->dstImage);
    struct vk_meta_copy_image_properties img_props =
       panvk_meta_copy_get_image_properties(img);
-   bool use_gfx_pipeline = copy_to_image_use_gfx_pipeline(dev, img);
 
+   /* Early out if this operation was lowered. */
+   if (lower_copy_buffer_to_image(commandBuffer, pCopyBufferToImageInfo))
+      return;
+
+   bool use_gfx_pipeline = copy_to_image_use_gfx_pipeline(dev, img);
    if (use_gfx_pipeline) {
       struct panvk_cmd_meta_graphics_save_ctx save = {0};
 
@@ -346,6 +444,79 @@ panvk_per_arch(CmdUpdateBuffer)(VkCommandBuffer commandBuffer,
    panvk_per_arch(cmd_meta_compute_end)(cmdbuf, &save);
 }
 
+static bool
+lower_copy_image(VkCommandBuffer commandBuffer,
+                 const VkCopyImageInfo2 *pCopyImageInfo)
+{
+   VK_FROM_HANDLE(panvk_image, dst_img, pCopyImageInfo->dstImage);
+
+   const VkImageAspectFlags zs_mask =
+      (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
+   /* Only required for interleaved depth stencil that are not multi-planar */
+   if (vk_format_aspects(dst_img->vk.format) != zs_mask ||
+       dst_img->plane_count > 1)
+      return false;
+
+   uint32_t num_depth_regions = 0, num_stencil_regions = 0;
+   for (uint32_t i = 0; i < pCopyImageInfo->regionCount; i++) {
+      const VkImageAspectFlags aspect_mask =
+         pCopyImageInfo->pRegions[i].dstSubresource.aspectMask;
+      assert((aspect_mask & ~zs_mask) == 0);
+      if (aspect_mask & VK_IMAGE_ASPECT_DEPTH_BIT)
+         num_depth_regions++;
+      else
+         num_stencil_regions++;
+   }
+
+   /* If we have both depth and stencil writes to an interleaved depth stencil
+    * image, we must split the writes per aspect with a barrier between them to
+    * avoid a write-after-write race. */
+   const bool lowering_needed = (num_depth_regions && num_stencil_regions);
+   if (!lowering_needed)
+      return false;
+
+   VkCopyImageInfo2 adjusted_info = *pCopyImageInfo;
+   STACK_ARRAY(VkImageCopy2, depth_regions, num_depth_regions);
+   STACK_ARRAY(VkImageCopy2, stencil_regions, num_stencil_regions);
+
+   uint32_t depth_idx = 0, stencil_idx = 0;
+   for (uint32_t i = 0; i < pCopyImageInfo->regionCount; i++) {
+      const VkImageAspectFlags aspect_mask =
+         pCopyImageInfo->pRegions[i].dstSubresource.aspectMask;
+
+      if (aspect_mask & VK_IMAGE_ASPECT_DEPTH_BIT)
+         depth_regions[depth_idx++] = pCopyImageInfo->pRegions[i];
+      else
+         stencil_regions[stencil_idx++] = pCopyImageInfo->pRegions[i];
+   }
+
+   adjusted_info.regionCount = num_depth_regions;
+   adjusted_info.pRegions = depth_regions;
+   panvk_per_arch(CmdCopyImage2)(commandBuffer, &adjusted_info);
+
+   const VkMemoryBarrier2 mem_barrier = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+      .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+      .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+      .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+      .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT};
+   const VkDependencyInfo dep_info = {
+      .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+      .memoryBarrierCount = 1,
+      .pMemoryBarriers = &mem_barrier,
+   };
+   panvk_per_arch(CmdPipelineBarrier2)(commandBuffer, &dep_info);
+
+   adjusted_info.regionCount = num_stencil_regions;
+   adjusted_info.pRegions = stencil_regions;
+   panvk_per_arch(CmdCopyImage2)(commandBuffer, &adjusted_info);
+
+   STACK_ARRAY_FINISH(depth_regions);
+   STACK_ARRAY_FINISH(stencil_regions);
+
+   return true;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 panvk_per_arch(CmdCopyImage2)(VkCommandBuffer commandBuffer,
                               const VkCopyImageInfo2 *pCopyImageInfo)
@@ -358,8 +529,12 @@ panvk_per_arch(CmdCopyImage2)(VkCommandBuffer commandBuffer,
       panvk_meta_copy_get_image_properties(src_img);
    struct vk_meta_copy_image_properties dst_img_props =
       panvk_meta_copy_get_image_properties(dst_img);
-   bool use_gfx_pipeline = copy_to_image_use_gfx_pipeline(dev, dst_img);
 
+   /* Early out if this operation was lowered. */
+   if (lower_copy_image(commandBuffer, pCopyImageInfo))
+      return;
+
+   bool use_gfx_pipeline = copy_to_image_use_gfx_pipeline(dev, dst_img);
    if (use_gfx_pipeline) {
       struct panvk_cmd_meta_graphics_save_ctx save = {0};
 

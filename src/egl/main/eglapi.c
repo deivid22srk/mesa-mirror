@@ -81,12 +81,6 @@
  *
  */
 
-#if USE_LIBGLVND
-#define EGLAPI
-#undef PUBLIC
-#define PUBLIC
-#endif
-
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -707,9 +701,7 @@ eglInitialize(EGLDisplay dpy, EGLint *major, EGLint *minor)
             bool success = false;
             if (!disp->Options.Zink && !getenv("GALLIUM_DRIVER")) {
                disp->Options.Zink = EGL_TRUE;
-               disp->Options.FallbackZink = EGL_TRUE;
                success = _eglDriver.Initialize(disp);
-               disp->Options.FallbackZink = EGL_FALSE;
             }
             if (!success) {
                disp->Options.Zink = EGL_FALSE;
@@ -2720,6 +2712,22 @@ eglQueryDeviceAttribEXT(EGLDeviceEXT device, EGLint attribute, EGLAttrib *value)
 
    ret = _eglQueryDeviceAttribEXT(dev, attribute, value);
    RETURN_EGL_EVAL(NULL, ret);
+}
+
+static EGLBoolean EGLAPIENTRY
+eglQueryDeviceBinaryEXT(EGLDeviceEXT device,
+                        EGLint name,
+                        EGLint max_size,
+                        void *value,
+                        EGLint *size)
+{
+   _EGLDevice *dev = _eglLookupDevice(device);
+
+   _EGL_FUNC_START(NULL, EGL_NONE, NULL);
+   if (!dev)
+      RETURN_EGL_ERROR(NULL, EGL_BAD_DEVICE_EXT, EGL_FALSE);
+
+   RETURN_EGL_EVAL(NULL, _eglQueryDeviceBinaryEXT(dev, name, max_size, value, size));
 }
 
 static const char *EGLAPIENTRY

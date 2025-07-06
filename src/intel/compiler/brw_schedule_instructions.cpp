@@ -357,12 +357,12 @@ schedule_node::set_latency(const struct brw_isa_info *isa)
          break;
       }
 
-      case GFX6_SFID_DATAPORT_CONSTANT_CACHE:
+      case BRW_SFID_HDC_READ_ONLY:
          /* See FS_OPCODE_UNIFORM_PULL_CONSTANT_LOAD */
          latency = 200;
          break;
 
-      case GFX6_SFID_DATAPORT_RENDER_CACHE:
+      case BRW_SFID_RENDER_CACHE:
          switch (brw_fb_desc_msg_type(isa->devinfo, inst->desc)) {
          case GFX7_DATAPORT_RC_TYPED_SURFACE_WRITE:
          case GFX7_DATAPORT_RC_TYPED_SURFACE_READ:
@@ -386,7 +386,7 @@ schedule_node::set_latency(const struct brw_isa_info *isa)
          }
          break;
 
-      case GFX7_SFID_DATAPORT_DATA_CACHE:
+      case BRW_SFID_HDC0:
          switch ((inst->desc >> 14) & 0x1f) {
          case BRW_DATAPORT_READ_MESSAGE_OWORD_BLOCK_READ:
          case GFX7_DATAPORT_DC_UNALIGNED_OWORD_BLOCK_READ:
@@ -458,7 +458,7 @@ schedule_node::set_latency(const struct brw_isa_info *isa)
          }
          break;
 
-      case HSW_SFID_DATAPORT_DATA_CACHE_1:
+      case BRW_SFID_HDC1:
          switch (brw_dp_desc_msg_type(isa->devinfo, inst->desc)) {
          case HSW_DATAPORT_DC_PORT1_UNTYPED_SURFACE_READ:
          case HSW_DATAPORT_DC_PORT1_UNTYPED_SURFACE_WRITE:
@@ -492,18 +492,20 @@ schedule_node::set_latency(const struct brw_isa_info *isa)
          }
          break;
 
-      case GFX7_SFID_PIXEL_INTERPOLATOR:
+      case BRW_SFID_PIXEL_INTERPOLATOR:
          latency = 50; /* TODO */
          break;
 
-      case GFX12_SFID_UGM:
-      case GFX12_SFID_TGM:
-      case GFX12_SFID_SLM:
+      case BRW_SFID_UGM:
+      case BRW_SFID_TGM:
+      case BRW_SFID_SLM:
          switch (lsc_msg_desc_opcode(isa->devinfo, inst->desc)) {
          case LSC_OP_LOAD:
          case LSC_OP_STORE:
          case LSC_OP_LOAD_CMASK:
          case LSC_OP_STORE_CMASK:
+         case LSC_OP_LOAD_CMASK_MSRT:
+         case LSC_OP_STORE_CMASK_MSRT:
             latency = 300;
             break;
          case LSC_OP_FENCE:
@@ -534,8 +536,8 @@ schedule_node::set_latency(const struct brw_isa_info *isa)
          break;
 
       case BRW_SFID_MESSAGE_GATEWAY:
-      case GEN_RT_SFID_BINDLESS_THREAD_DISPATCH: /* or THREAD_SPAWNER */
-      case GEN_RT_SFID_RAY_TRACE_ACCELERATOR:
+      case BRW_SFID_BINDLESS_THREAD_DISPATCH: /* or THREAD_SPAWNER */
+      case BRW_SFID_RAY_TRACE_ACCELERATOR:
          /* TODO.
           *
           * We'll assume for the moment that this is pretty quick as it
@@ -592,7 +594,7 @@ public:
    void add_dep(schedule_node *before, schedule_node *after);
    void add_address_dep(schedule_node *before, schedule_node *after);
 
-   void set_current_block(bblock_t *block);
+   void set_current_block(bblock_t *block, const brw_ip_ranges &ips);
    void compute_delays();
    void compute_exits();
 
@@ -646,6 +648,7 @@ public:
 
    bool post_reg_alloc;
    int grf_count;
+   unsigned max_vgrf_size;
    const brw_shader *s;
 
    /**
@@ -711,10 +714,7 @@ brw_instruction_scheduler::brw_instruction_scheduler(void *mem_ctx, const brw_sh
    this->grf_count = grf_count;
    this->post_reg_alloc = post_reg_alloc;
 
-   const unsigned grf_write_scale = MAX_VGRF_SIZE(s->devinfo);
-   this->last_grf_write = linear_zalloc_array(lin_ctx, schedule_node *, grf_count * grf_write_scale);
-
-   this->nodes_len = s->cfg->last_block()->end_ip + 1;
+   this->nodes_len = s->cfg->total_instructions;
    this->nodes = linear_zalloc_array(lin_ctx, schedule_node, this->nodes_len);
 
    const struct brw_isa_info *isa = &s->compiler->isa;
@@ -777,10 +777,15 @@ brw_instruction_scheduler::brw_instruction_scheduler(void *mem_ctx, const brw_sh
       this->written = NULL;
       this->reads_remaining = NULL;
       this->hw_reads_remaining = NULL;
+      this->max_vgrf_size = MAX_VGRF_SIZE(s->devinfo);
    }
 
+   this->last_grf_write = linear_zalloc_array(lin_ctx, schedule_node *, grf_count * this->max_vgrf_size);
+
+   const brw_ip_ranges &ips = s->ip_ranges_analysis.require();
+
    foreach_block(block, s->cfg) {
-      set_current_block(block);
+      set_current_block(block, ips);
 
       for (schedule_node *n = current.start; n < current.end; n++)
          n->issue_time = calculate_issue_time(n->inst);
@@ -826,6 +831,7 @@ void
 brw_instruction_scheduler::setup_liveness(cfg_t *cfg)
 {
    const brw_live_variables &live = s->live_analysis.require();
+   const brw_ip_ranges &ips = s->ip_ranges_analysis.require();
 
    /* First, compute liveness on a per-GRF level using the in/out sets from
     * liveness calculation.
@@ -851,8 +857,11 @@ brw_instruction_scheduler::setup_liveness(cfg_t *cfg)
     */
    for (int block = 0; block < cfg->num_blocks - 1; block++) {
       for (int i = 0; i < grf_count; i++) {
-         if (live.vgrf_start[i] <= cfg->blocks[block]->end_ip &&
-             live.vgrf_end[i] >= cfg->blocks[block + 1]->start_ip) {
+         const int block_end = ips.range(cfg->blocks[block]).last();
+         const brw_range vgrf_range = live.vgrf_range[i];
+
+         if (vgrf_range.contains(block_end) &&
+             vgrf_range.contains(block_end + 1)) {
             if (!BITSET_TEST(livein[block + 1], i)) {
                 reg_pressure_in[block + 1] += s->alloc.sizes[i];
                 BITSET_SET(livein[block + 1], i);
@@ -871,13 +880,17 @@ brw_instruction_scheduler::setup_liveness(cfg_t *cfg)
          continue;
 
       for (int block = 0; block < cfg->num_blocks; block++) {
-         if (cfg->blocks[block]->start_ip <= payload_last_use_ip[i])
+         brw_range range = ips.range(cfg->blocks[block]);
+
+         if (range.start <= payload_last_use_ip[i])
             reg_pressure_in[block]++;
 
-         if (cfg->blocks[block]->end_ip <= payload_last_use_ip[i])
+         if (range.last() <= payload_last_use_ip[i])
             BITSET_SET(hw_liveout[block], i);
       }
    }
+
+   this->max_vgrf_size = live.max_vgrf_size;
 
    ralloc_free(payload_last_use_ip);
 }
@@ -942,11 +955,11 @@ brw_instruction_scheduler::get_register_pressure_benefit(const brw_inst *inst)
 }
 
 void
-brw_instruction_scheduler::set_current_block(bblock_t *block)
+brw_instruction_scheduler::set_current_block(bblock_t *block, const brw_ip_ranges &ips)
 {
    current.block = block;
-   current.start = nodes + block->start_ip;
-   current.len = block->end_ip - block->start_ip + 1;
+   current.start = nodes + ips.range(block).start;
+   current.len = block->num_instructions;
    current.end = current.start + current.len;
    current.time = 0;
    current.scheduled = 0;
@@ -1087,7 +1100,7 @@ static bool
 is_scheduling_barrier(const brw_inst *inst)
 {
    return inst->opcode == SHADER_OPCODE_HALT_TARGET ||
-          inst->is_control_flow() ||
+          (inst->is_control_flow() && inst->opcode != BRW_OPCODE_HALT) ||
           inst->has_side_effects();
 }
 
@@ -1215,13 +1228,13 @@ brw_instruction_scheduler::clear_last_grf_write()
 
          if (inst->dst.file == VGRF) {
             /* Don't bother being careful with regs_written(), quicker to just clear 2 cachelines. */
-            memset(&last_grf_write[inst->dst.nr * MAX_VGRF_SIZE(s->devinfo)], 0,
-                   sizeof(*last_grf_write) * MAX_VGRF_SIZE(s->devinfo));
+            memset(&last_grf_write[inst->dst.nr * max_vgrf_size], 0,
+                   sizeof(*last_grf_write) * max_vgrf_size);
          }
       }
    } else {
       memset(last_grf_write, 0,
-             sizeof(*last_grf_write) * grf_count * MAX_VGRF_SIZE(s->devinfo));
+             sizeof(*last_grf_write) * grf_count * max_vgrf_size);
    }
 }
 
@@ -1230,7 +1243,7 @@ brw_instruction_scheduler::grf_index(const brw_reg &reg)
 {
    if (post_reg_alloc)
       return reg.nr;
-   return reg.nr * MAX_VGRF_SIZE(s->devinfo) + reg.offset / REG_SIZE;
+   return reg.nr * max_vgrf_size + reg.offset / REG_SIZE;
 }
 
 void
@@ -1805,8 +1818,10 @@ brw_instruction_scheduler::run(brw_instruction_scheduler_mode mode)
       memset(written, 0, grf_count * sizeof(*written));
    }
 
+   const brw_ip_ranges &ips = s->ip_ranges_analysis.require();
+
    foreach_block(block, s->cfg) {
-      set_current_block(block);
+      set_current_block(block, ips);
 
       if (!post_reg_alloc) {
          for (schedule_node *n = current.start; n < current.end; n++)

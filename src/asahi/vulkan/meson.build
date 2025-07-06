@@ -50,7 +50,6 @@ hk_files = files(
 )
 
 hk_entrypoints = custom_target(
-  'hk_entrypoints',
   input : [vk_entrypoints_gen, vk_api_xml],
   output : ['hk_entrypoints.h', 'hk_entrypoints.c'],
   command : [
@@ -111,12 +110,12 @@ if with_platform_windows
 endif
 
 asahi_icd = custom_target(
-  'asahi_icd',
   input : [vk_icd_gen, vk_api_xml],
   output : 'asahi_icd.@0@.json'.format(host_machine.cpu()),
   command : [
     prog_python, '@INPUT0@',
     '--api-version', '1.4', '--xml', '@INPUT1@',
+    '--sizeof-pointer', sizeof_pointer,
     '--lib-path', join_paths(icd_lib_path, icd_file_name),
     '--out', '@OUTPUT@',
   ],
@@ -128,12 +127,12 @@ asahi_icd = custom_target(
 
 _dev_icdname = 'asahi_devenv_icd.@0@.json'.format(host_machine.cpu())
 custom_target(
-  'asahi_devenv_icd',
   input : [vk_icd_gen, vk_api_xml],
   output : _dev_icdname,
   command : [
     prog_python, '@INPUT0@',
     '--api-version', '1.4', '--xml', '@INPUT1@',
+    '--sizeof-pointer', sizeof_pointer,
     '--lib-path', meson.current_build_dir() / icd_file_name,
     '--out', '@OUTPUT@',
   ],

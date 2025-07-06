@@ -946,6 +946,9 @@ typedef void (*vtn_decoration_foreach_cb)(struct vtn_builder *,
 void vtn_foreach_decoration(struct vtn_builder *b, struct vtn_value *value,
                             vtn_decoration_foreach_cb cb, void *data);
 
+bool vtn_has_decoration(struct vtn_builder *b, struct vtn_value *value,
+                        SpvDecoration decoration);
+
 typedef void (*vtn_execution_mode_foreach_cb)(struct vtn_builder *,
                                               struct vtn_value *,
                                               const struct vtn_decoration *,
@@ -954,9 +957,13 @@ typedef void (*vtn_execution_mode_foreach_cb)(struct vtn_builder *,
 void vtn_foreach_execution_mode(struct vtn_builder *b, struct vtn_value *value,
                                 vtn_execution_mode_foreach_cb cb, void *data);
 
+nir_alu_type vtn_convert_op_src_type(SpvOp opcode);
+nir_alu_type vtn_convert_op_dst_type(SpvOp opcode);
+
 nir_op vtn_nir_alu_op_for_spirv_opcode(struct vtn_builder *b,
                                        SpvOp opcode, bool *swap, bool *exact,
-                                       unsigned src_bit_size, unsigned dst_bit_size);
+                                       const glsl_type *src_type,
+                                       const glsl_type *dst_type);
 
 void vtn_handle_alu(struct vtn_builder *b, SpvOp opcode,
                     const uint32_t *w, unsigned count);

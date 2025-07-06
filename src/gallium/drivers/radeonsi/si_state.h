@@ -62,6 +62,7 @@ struct si_state_rasterizer {
    unsigned pa_su_line_cntl;
    unsigned pa_sc_mode_cntl_0;
    unsigned pa_su_sc_mode_cntl;
+   unsigned pa_su_cull_bits;
    unsigned pa_cl_ngg_cntl;
    unsigned pa_sc_edgerule;
    unsigned pa_su_poly_offset_db_fmt_cntl[3];
@@ -172,6 +173,7 @@ struct si_vertex_elements {
    uint16_t vb_alignment_check_mask;
 
    uint8_t count;
+   uint8_t num_vertex_buffers;
 
    /* Vertex buffer descriptor list size aligned for optimal prefetch. */
    uint16_t vb_desc_list_alloc_size;
@@ -499,7 +501,7 @@ enum
 #define SI_NUM_DESCS           (SI_DESCS_FIRST_SHADER + SI_NUM_SHADERS * SI_NUM_SHADER_DESCS)
 
 #define SI_DESCS_SHADER_MASK(name)                                                                 \
-   u_bit_consecutive(SI_DESCS_FIRST_SHADER + PIPE_SHADER_##name * SI_NUM_SHADER_DESCS,             \
+   BITFIELD_RANGE(SI_DESCS_FIRST_SHADER + PIPE_SHADER_##name * SI_NUM_SHADER_DESCS,             \
                      SI_NUM_SHADER_DESCS)
 
 static inline unsigned si_const_and_shader_buffer_descriptors_idx(unsigned shader)
@@ -598,7 +600,7 @@ void si_set_ring_buffer(struct si_context *sctx, uint slot, struct pipe_resource
 void si_init_all_descriptors(struct si_context *sctx);
 void si_release_all_descriptors(struct si_context *sctx);
 void si_compute_resources_add_all_to_bo_list(struct si_context *sctx);
-bool si_gfx_resources_check_encrypted(struct si_context *sctx);
+int si_gfx_resources_check_encrypted(struct si_context *sctx);
 bool si_compute_resources_check_encrypted(struct si_context *sctx);
 void si_shader_pointers_mark_dirty(struct si_context *sctx);
 void si_add_all_descriptors_to_bo_list(struct si_context *sctx);

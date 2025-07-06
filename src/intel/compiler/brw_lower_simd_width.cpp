@@ -110,6 +110,9 @@ get_fpu_lowered_simd_width(const brw_shader *shader,
    if (inst->is_3src(compiler) && !devinfo->supports_simd16_3src)
       max_width = MIN2(max_width, inst->exec_size / reg_count);
 
+   if (has_bfloat_operands(inst))
+      max_width = MIN2(max_width, devinfo->ver < 20 ? 8 : 16);
+
    if (inst->opcode != BRW_OPCODE_MOV) {
       /* From the SKL PRM, Special Restrictions for Handling Mixed Mode
        * Float Operations:
@@ -420,7 +423,8 @@ brw_get_lowered_simd_width(const brw_shader *shader, const brw_inst *inst)
               swiz == BRW_SWIZZLE_XYXY || swiz == BRW_SWIZZLE_ZWZW ? 4 :
               get_fpu_lowered_simd_width(shader, inst));
    }
-   case SHADER_OPCODE_MOV_INDIRECT: {
+   case SHADER_OPCODE_MOV_INDIRECT:
+   case FS_OPCODE_READ_ATTRIBUTE_PAYLOAD: {
       /* From IVB and HSW PRMs:
        *
        * "2.When the destination requires two registers and the sources are
@@ -630,7 +634,7 @@ emit_zip(const brw_builder &lbld_before, const brw_builder &lbld_after,
        * have to build a single 32bit value for the SIMD32 message out of 2
        * SIMD16 16 bit values.
        */
-      const brw_builder rbld = lbld_after.exec_all().group(1, 0);
+      const brw_builder rbld = lbld_after.uniform();
       brw_reg local_res_reg = component(
          retype(offset(tmp, lbld_before, dst_size), BRW_TYPE_UW), 0);
       brw_reg final_res_reg =
@@ -658,7 +662,7 @@ brw_lower_simd_width(brw_shader &s)
       assert(lower_width < inst->exec_size);
 
       /* Builder matching the original instruction. */
-      const brw_builder bld = brw_builder(&s).at_end();
+      const brw_builder bld = brw_builder(&s);
       const brw_builder ibld =
          bld.at(block, inst).exec_all(inst->force_writemask_all)
             .group(inst->exec_size, inst->group / inst->exec_size);
@@ -749,7 +753,7 @@ brw_lower_simd_width(brw_shader &s)
          lbld.at(block, inst->next).emit(split_inst);
       }
 
-      inst->remove(block);
+      inst->remove();
       progress = true;
    }
 

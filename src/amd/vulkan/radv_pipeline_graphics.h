@@ -15,6 +15,7 @@
 
 #include "radv_descriptor_set.h"
 #include "radv_pipeline.h"
+#include "radv_pipeline_layout.h"
 #include "radv_shader.h"
 
 #include "vk_graphics_state.h"
@@ -260,10 +261,9 @@ radv_translate_prim(unsigned topology)
 }
 
 static inline bool
-radv_prim_is_points_or_lines(unsigned topology)
+radv_prim_is_lines(unsigned topology)
 {
    switch (topology) {
-   case V_008958_DI_PT_POINTLIST:
    case V_008958_DI_PT_LINELIST:
    case V_008958_DI_PT_LINESTRIP:
    case V_008958_DI_PT_LINELIST_ADJ:
@@ -272,6 +272,12 @@ radv_prim_is_points_or_lines(unsigned topology)
    default:
       return false;
    }
+}
+
+static inline bool
+radv_prim_is_points_or_lines(unsigned topology)
+{
+   return topology == V_008958_DI_PT_POINTLIST || radv_prim_is_lines(topology);
 }
 
 static inline bool

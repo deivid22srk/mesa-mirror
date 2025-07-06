@@ -82,7 +82,7 @@ radv_set_mutable_tex_desc_fields(struct radv_device *device, struct radv_image *
          },
       .is_stencil = is_stencil,
       .dcc_enabled = !disable_compression && dcc_enabled,
-      .tc_compat_htile_enabled = !disable_compression && radv_image_is_tc_compat_htile(image),
+      .tc_compat_htile_enabled = !disable_compression && radv_tc_compat_htile_enabled(image, first_level),
    };
 
    ac_set_mutable_tex_desc_fields(&pdev->info, &ac_state, state);
@@ -188,7 +188,7 @@ gfx10_make_texture_descriptor(struct radv_device *device, struct radv_image *ima
             .nbc_view = nbc_view,
          },
       .dcc_enabled = radv_dcc_enabled(image, first_level),
-      .tc_compat_htile_enabled = radv_image_is_tc_compat_htile(image),
+      .tc_compat_htile_enabled = radv_tc_compat_htile_enabled(image, first_level),
    };
 
    ac_build_texture_descriptor(&pdev->info, &tex_state, &state[0]);
@@ -291,7 +291,7 @@ gfx6_make_texture_descriptor(struct radv_device *device, struct radv_image *imag
       .last_layer = last_layer,
       .min_lod = min_lod,
       .dcc_enabled = radv_dcc_enabled(image, first_level),
-      .tc_compat_htile_enabled = radv_image_is_tc_compat_htile(image),
+      .tc_compat_htile_enabled = radv_tc_compat_htile_enabled(image, first_level),
       .aniso_single_level = !instance->drirc.disable_aniso_single_level,
    };
 
@@ -506,6 +506,8 @@ radv_image_view_init(struct radv_image_view *iview, struct radv_device *device,
    bool from_client = extra_create_info && extra_create_info->from_client;
    vk_image_view_init(&device->vk, &iview->vk, !from_client, pCreateInfo);
 
+   memset(&iview->descriptor, 0, sizeof(iview->descriptor));
+
    iview->image = image;
    iview->plane_id = radv_plane_from_aspect(pCreateInfo->subresourceRange.aspectMask);
    iview->nbc_view.valid = false;
@@ -633,6 +635,7 @@ radv_image_view_init(struct radv_image_view *iview, struct radv_device *device,
 
    iview->support_fast_clear = radv_image_view_can_fast_clear(device, iview);
    iview->disable_dcc_mrt = extra_create_info ? extra_create_info->disable_dcc_mrt : false;
+   iview->disable_tc_compat_cmask_mrt = extra_create_info ? extra_create_info->disable_tc_compat_cmask_mrt : false;
 
    bool disable_compression = extra_create_info ? extra_create_info->disable_compression : false;
    bool enable_compression = extra_create_info ? extra_create_info->enable_compression : false;

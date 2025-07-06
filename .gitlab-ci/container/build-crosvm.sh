@@ -4,24 +4,25 @@
 # When changing this file, you need to bump the following
 # .gitlab-ci/image-tags.yml tags:
 # DEBIAN_BASE_TAG
-# DEBIAN_TEST_GL_TAG
-# DEBIAN_TEST_VK_TAG
-# KERNEL_ROOTFS_TAG
+
+# Do a very early check to make sure the tag is correct without the need of
+# setting up the environment variables locally
+ci_tag_build_time_check "CROSVM_TAG"
 
 set -uex
 
-uncollapsed_section_start crosvm "Building crosvm"
+section_start crosvm "Building crosvm"
 
 git config --global user.email "mesa@example.com"
 git config --global user.name "Mesa CI"
 
-CROSVM_VERSION=10d2f33440475cb1a96eba1dc27c59c8b57b68bd
+CROSVM_VERSION=4a6b4316155742fbfa1be7087c2ee578cfee884d
 git clone --single-branch -b main --no-checkout https://chromium.googlesource.com/crosvm/crosvm /platform/crosvm
 pushd /platform/crosvm
 git checkout "$CROSVM_VERSION"
 git submodule update --init
 
-VIRGLRENDERER_VERSION=5b116c35ae08897b4d5171d8ed4cb0e73fb18069
+VIRGLRENDERER_VERSION=06d43ce974b664f9dc521b706a0ad7f91dbf2866
 rm -rf third_party/virglrenderer
 git clone --single-branch -b main --no-checkout https://gitlab.freedesktop.org/virgl/virglrenderer.git third_party/virglrenderer
 pushd third_party/virglrenderer
@@ -30,14 +31,14 @@ meson setup build/ -D libdir=lib -D render-server-worker=process -D venus=true $
 meson install -C build
 popd
 
-cargo update -p pkg-config@0.3.26 --precise 0.3.27
+rm rust-toolchain
 
 RUSTFLAGS='-L native=/usr/local/lib' cargo install \
   bindgen-cli \
   --locked \
   -j ${FDO_CI_CONCURRENT:-4} \
   --root /usr/local \
-  --version 0.65.1 \
+  --version 0.71.1 \
   ${EXTRA_CARGO_ARGS:-}
 
 CROSVM_USE_SYSTEM_MINIGBM=1 CROSVM_USE_SYSTEM_VIRGLRENDERER=1 RUSTFLAGS='-L native=/usr/local/lib' cargo install \

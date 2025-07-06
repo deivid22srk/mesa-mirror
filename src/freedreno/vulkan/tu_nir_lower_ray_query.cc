@@ -262,7 +262,7 @@ load_tlas(nir_builder *b, nir_def *tlas,
                               .align_offset = offset);
    } else {
       return nir_load_global_ir3(b, components, 32,
-                                 tlas,
+                                 nir_pack_64_2x32(b, tlas),
                                  nir_iadd_imm(b, nir_imul_imm(b, index, AS_RECORD_SIZE / 4),
                                               offset / 4),
                                  /* The required alignment of the
@@ -1031,7 +1031,7 @@ tu_nir_lower_ray_queries(nir_shader *shader)
          }
       }
 
-      nir_metadata_preserve(function->impl, nir_metadata_none);
+      nir_progress(true, function->impl, nir_metadata_none);
    }
 
    ralloc_free(query_ht);

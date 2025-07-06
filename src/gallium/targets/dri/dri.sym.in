@@ -1,8 +1,6 @@
 {
 	global:
                 # shared-glapi exported from libgallium:
-                _mesa_glapi_get_context;
-                _mesa_glapi_get_dispatch;
                 _mesa_glapi_get_dispatch_table_size;
                 _mesa_glapi_get_proc_address;
                 _mesa_glapi_get_proc_offset;
@@ -72,6 +70,7 @@
 		dri_server_wait_sync;
 		dri_set_blob_cache_funcs;
 		dri_get_pipe_screen;
+		dri_get_drm_device_info;
 		dri3*;
 		loader_dri3*;
 		dri_create_drawable;

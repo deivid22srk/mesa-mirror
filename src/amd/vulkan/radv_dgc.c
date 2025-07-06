@@ -7,6 +7,7 @@
 #include "radv_dgc.h"
 #include "meta/radv_meta.h"
 #include "nir/radv_meta_nir.h"
+#include "radv_debug.h"
 #include "radv_entrypoints.h"
 #include "radv_pipeline_rt.h"
 
@@ -14,7 +15,6 @@
 
 #include "nir_builder.h"
 
-#include "vk_common_entrypoints.h"
 #include "vk_device_generated_commands.h"
 #include "vk_shader_module.h"
 
@@ -284,6 +284,11 @@ radv_get_sequence_size_graphics(const struct radv_indirect_command_layout *layou
             *cmd_size += (5 + 2 + 3) * 4;
          }
       }
+   }
+
+   if (pdev->info.gfx_level == GFX12 && pdev->use_hiz) {
+      /* HiZ/HiS hw workaround */
+      *cmd_size += 8 * 4;
    }
 
    if (device->sqtt.bo) {
@@ -1130,6 +1135,42 @@ build_dgc_buffer_preamble_ace(nir_builder *b, nir_def *sequence_count, const str
  * Draw
  */
 static void
+dgc_gfx12_emit_hiz_his_wa(struct dgc_cmdbuf *cs)
+{
+   const struct radv_device *device = cs->dev;
+   const struct radv_physical_device *pdev = radv_device_physical(device);
+
+   if (pdev->info.gfx_level == GFX12 && pdev->use_hiz) {
+      dgc_cs_begin(cs);
+      dgc_cs_emit_imm(PKT3(PKT3_RELEASE_MEM, 6, 0));
+      dgc_cs_emit_imm(S_490_EVENT_TYPE(V_028A90_BOTTOM_OF_PIPE_TS) | S_490_EVENT_INDEX(5));
+      dgc_cs_emit_imm(0); /* DST_SEL, INT_SEL = no write confirm, DATA_SEL = no data */
+      dgc_cs_emit_imm(0); /* ADDRESS_LO */
+      dgc_cs_emit_imm(0); /* ADDRESS_HI */
+      dgc_cs_emit_imm(0); /* DATA_LO */
+      dgc_cs_emit_imm(0); /* DATA_HI */
+      dgc_cs_emit_imm(0); /* INT_CTXID */
+      dgc_cs_end();
+   }
+}
+
+static void
+dgc_emit_before_draw(struct dgc_cmdbuf *cs, nir_def *sequence_id, enum rgp_sqtt_marker_general_api_type api_type,
+                     enum rgp_sqtt_marker_event_type event)
+{
+   dgc_emit_sqtt_begin_api_marker(cs, api_type);
+   dgc_emit_sqtt_marker_event(cs, sequence_id, event);
+}
+
+static void
+dgc_emit_after_draw(struct dgc_cmdbuf *cs, enum rgp_sqtt_marker_general_api_type api_type)
+{
+   dgc_gfx12_emit_hiz_his_wa(cs);
+   dgc_emit_sqtt_thread_trace_marker(cs);
+   dgc_emit_sqtt_end_api_marker(cs, api_type);
+}
+
+static void
 dgc_emit_userdata_vertex(struct dgc_cmdbuf *cs, nir_def *first_vertex, nir_def *first_instance, nir_def *drawid)
 {
    nir_builder *b = cs->b;
@@ -1265,14 +1306,13 @@ dgc_emit_draw_indirect(struct dgc_cmdbuf *cs, nir_def *stream_addr, nir_def *seq
 
    nir_def *va = nir_iadd_imm(b, stream_addr, layout->vk.draw_src_offset_B);
 
-   dgc_emit_sqtt_begin_api_marker(cs, indexed ? ApiCmdDrawIndexedIndirect : ApiCmdDrawIndirect);
-   dgc_emit_sqtt_marker_event(cs, sequence_id, indexed ? EventCmdDrawIndexedIndirect : EventCmdDrawIndirect);
+   dgc_emit_before_draw(cs, sequence_id, indexed ? ApiCmdDrawIndexedIndirect : ApiCmdDrawIndirect,
+                        indexed ? EventCmdDrawIndexedIndirect : EventCmdDrawIndirect);
 
    dgc_emit_pkt3_set_base(cs, va);
    dgc_emit_pkt3_draw_indirect(cs, indexed);
 
-   dgc_emit_sqtt_thread_trace_marker(cs);
-   dgc_emit_sqtt_end_api_marker(cs, indexed ? ApiCmdDrawIndexedIndirect : ApiCmdDrawIndirect);
+   dgc_emit_after_draw(cs, indexed ? ApiCmdDrawIndexedIndirect : ApiCmdDrawIndirect);
 }
 
 static void
@@ -1290,15 +1330,13 @@ dgc_emit_draw(struct dgc_cmdbuf *cs, nir_def *stream_addr, nir_def *sequence_id)
 
    nir_push_if(b, nir_iand(b, nir_ine_imm(b, vertex_count, 0), nir_ine_imm(b, instance_count, 0)));
    {
-      dgc_emit_sqtt_begin_api_marker(cs, ApiCmdDraw);
-      dgc_emit_sqtt_marker_event(cs, sequence_id, EventCmdDraw);
+      dgc_emit_before_draw(cs, sequence_id, ApiCmdDraw, EventCmdDraw);
 
       dgc_emit_userdata_vertex(cs, vertex_offset, first_instance, nir_imm_int(b, 0));
       dgc_emit_instance_count(cs, instance_count);
       dgc_emit_draw_index_auto(cs, vertex_count);
 
-      dgc_emit_sqtt_thread_trace_marker(cs);
-      dgc_emit_sqtt_end_api_marker(cs, ApiCmdDraw);
+      dgc_emit_after_draw(cs, ApiCmdDraw);
    }
    nir_pop_if(b, 0);
 }
@@ -1322,15 +1360,13 @@ dgc_emit_draw_indexed(struct dgc_cmdbuf *cs, nir_def *stream_addr, nir_def *sequ
 
    nir_push_if(b, nir_iand(b, nir_ine_imm(b, index_count, 0), nir_ine_imm(b, instance_count, 0)));
    {
-      dgc_emit_sqtt_begin_api_marker(cs, ApiCmdDrawIndexed);
-      dgc_emit_sqtt_marker_event(cs, sequence_id, EventCmdDrawIndexed);
+      dgc_emit_before_draw(cs, sequence_id, ApiCmdDrawIndexed, EventCmdDrawIndexed);
 
       dgc_emit_userdata_vertex(cs, vertex_offset, first_instance, nir_imm_int(b, 0));
       dgc_emit_instance_count(cs, instance_count);
       dgc_emit_draw_index_offset_2(cs, first_index, index_count, max_index_count);
 
-      dgc_emit_sqtt_thread_trace_marker(cs);
-      dgc_emit_sqtt_end_api_marker(cs, ApiCmdDrawIndexed);
+      dgc_emit_after_draw(cs, ApiCmdDrawIndexed);
    }
    nir_pop_if(b, 0);
 }
@@ -1363,8 +1399,8 @@ dgc_emit_draw_with_count(struct dgc_cmdbuf *cs, nir_def *stream_addr, nir_def *s
 
    nir_def *di_src_sel = nir_imm_int(b, indexed ? V_0287F0_DI_SRC_SEL_DMA : V_0287F0_DI_SRC_SEL_AUTO_INDEX);
 
-   dgc_emit_sqtt_begin_api_marker(cs, indexed ? ApiCmdDrawIndexedIndirectCount : ApiCmdDrawIndirectCount);
-   dgc_emit_sqtt_marker_event(cs, sequence_id, indexed ? EventCmdDrawIndexedIndirectCount : EventCmdDrawIndirectCount);
+   dgc_emit_before_draw(cs, sequence_id, indexed ? ApiCmdDrawIndexedIndirectCount : ApiCmdDrawIndirectCount,
+                        indexed ? EventCmdDrawIndexedIndirectCount : EventCmdDrawIndirectCount);
 
    dgc_cs_begin(cs);
    dgc_cs_emit_imm(PKT3(indexed ? PKT3_DRAW_INDEX_INDIRECT_MULTI : PKT3_DRAW_INDIRECT_MULTI, 8, false));
@@ -1379,8 +1415,7 @@ dgc_emit_draw_with_count(struct dgc_cmdbuf *cs, nir_def *stream_addr, nir_def *s
    dgc_cs_emit(di_src_sel);
    dgc_cs_end();
 
-   dgc_emit_sqtt_thread_trace_marker(cs);
-   dgc_emit_sqtt_end_api_marker(cs, indexed ? ApiCmdDrawIndexedIndirectCount : ApiCmdDrawIndirectCount);
+   dgc_emit_after_draw(cs, indexed ? ApiCmdDrawIndexedIndirectCount : ApiCmdDrawIndirectCount);
 }
 
 /**
@@ -1653,8 +1688,7 @@ dgc_emit_push_constant(struct dgc_cmdbuf *cs, nir_def *stream_addr, nir_def *seq
    nir_builder *b = cs->b;
 
    nir_def *push_constant_stages = dgc_get_push_constant_stages(cs);
-   radv_foreach_stage(s, stages)
-   {
+   radv_foreach_stage (s, stages) {
       nir_push_if(b, nir_test_mask(b, push_constant_stages, mesa_to_vk_shader_stage(s)));
       {
          dgc_emit_push_constant_for_stage(cs, stream_addr, sequence_id, &params, s);
@@ -2065,8 +2099,7 @@ dgc_emit_dispatch_taskmesh_gfx(struct dgc_cmdbuf *cs, nir_def *sequence_id)
       nir_bcsel(b, has_linear_dispatch_en, nir_imm_int(b, S_4D1_LINEAR_DISPATCH_ENABLE(1)), nir_imm_int(b, 0));
    nir_def *sqtt_enable = nir_imm_int(b, device->sqtt.bo ? S_4D1_THREAD_TRACE_MARKER_ENABLE(1) : 0);
 
-   dgc_emit_sqtt_begin_api_marker(cs, ApiCmdDrawMeshTasksEXT);
-   dgc_emit_sqtt_marker_event(cs, sequence_id, EventCmdDrawMeshTasksEXT);
+   dgc_emit_before_draw(cs, sequence_id, ApiCmdDrawMeshTasksEXT, EventCmdDrawMeshTasksEXT);
 
    dgc_cs_begin(cs);
    dgc_cs_emit_imm(PKT3(PKT3_DISPATCH_TASKMESH_GFX, 2, 0) | PKT3_RESET_FILTER_CAM_S(1));
@@ -2080,8 +2113,7 @@ dgc_emit_dispatch_taskmesh_gfx(struct dgc_cmdbuf *cs, nir_def *sequence_id)
    dgc_cs_emit_imm(V_0287F0_DI_SRC_SEL_AUTO_INDEX);
    dgc_cs_end();
 
-   dgc_emit_sqtt_thread_trace_marker(cs);
-   dgc_emit_sqtt_end_api_marker(cs, ApiCmdDrawMeshTasksEXT);
+   dgc_emit_after_draw(cs, ApiCmdDrawMeshTasksEXT);
 }
 
 static void
@@ -2106,8 +2138,7 @@ dgc_emit_draw_mesh_tasks_gfx(struct dgc_cmdbuf *cs, nir_def *stream_addr, nir_de
       }
       nir_push_else(b, NULL);
       {
-         dgc_emit_sqtt_begin_api_marker(cs, ApiCmdDrawMeshTasksEXT);
-         dgc_emit_sqtt_marker_event(cs, sequence_id, EventCmdDrawMeshTasksEXT);
+         dgc_emit_before_draw(cs, sequence_id, ApiCmdDrawMeshTasksEXT, EventCmdDrawMeshTasksEXT);
 
          dgc_emit_userdata_mesh(cs, x, y, z, sequence_id);
          dgc_emit_instance_count(cs, nir_imm_int(b, 1));
@@ -2119,8 +2150,7 @@ dgc_emit_draw_mesh_tasks_gfx(struct dgc_cmdbuf *cs, nir_def *stream_addr, nir_de
             dgc_emit_draw_index_auto(cs, vertex_count);
          }
 
-         dgc_emit_sqtt_thread_trace_marker(cs);
-         dgc_emit_sqtt_end_api_marker(cs, ApiCmdDrawMeshTasksEXT);
+         dgc_emit_after_draw(cs, ApiCmdDrawMeshTasksEXT);
       }
       nir_pop_if(b, NULL);
    }
@@ -2169,8 +2199,7 @@ dgc_emit_draw_mesh_tasks_with_count_gfx(struct dgc_cmdbuf *cs, nir_def *stream_a
          nir_bcsel(b, has_drawid, nir_imm_int(b, S_4C2_DRAW_INDEX_ENABLE(1)), nir_imm_int(b, 0));
       nir_def *xyz_dim_enable = nir_bcsel(b, has_grid_size, nir_imm_int(b, S_4C2_XYZ_DIM_ENABLE(1)), nir_imm_int(b, 0));
 
-      dgc_emit_sqtt_begin_api_marker(cs, ApiCmdDrawMeshTasksIndirectCountEXT);
-      dgc_emit_sqtt_marker_event(cs, sequence_id, EventCmdDrawMeshTasksIndirectCountEXT);
+      dgc_emit_before_draw(cs, sequence_id, ApiCmdDrawMeshTasksIndirectCountEXT, EventCmdDrawMeshTasksIndirectCountEXT);
 
       dgc_cs_begin(cs);
       dgc_cs_emit(nir_imm_int(b, PKT3(PKT3_DISPATCH_MESH_INDIRECT_MULTI, 7, false) | PKT3_RESET_FILTER_CAM_S(1)));
@@ -2191,8 +2220,7 @@ dgc_emit_draw_mesh_tasks_with_count_gfx(struct dgc_cmdbuf *cs, nir_def *stream_a
       dgc_cs_emit_imm(V_0287F0_DI_SRC_SEL_AUTO_INDEX);
       dgc_cs_end();
 
-      dgc_emit_sqtt_thread_trace_marker(cs);
-      dgc_emit_sqtt_end_api_marker(cs, ApiCmdDrawMeshTasksIndirectCountEXT);
+      dgc_emit_after_draw(cs, ApiCmdDrawMeshTasksIndirectCountEXT);
    }
    nir_pop_if(b, NULL);
 }
@@ -2760,6 +2788,7 @@ radv_CmdPreprocessGeneratedCommandsEXT(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(radv_cmd_buffer, state_cmd_buffer, stateCommandBuffer);
    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
    VK_FROM_HANDLE(radv_indirect_command_layout, layout, pGeneratedCommandsInfo->indirectCommandsLayout);
+   const bool execution_is_predicating = state_cmd_buffer->state.predicating;
 
    assert(layout->vk.usage & VK_INDIRECT_COMMANDS_LAYOUT_USAGE_EXPLICIT_PREPROCESS_BIT_EXT);
 
@@ -2769,7 +2798,7 @@ radv_CmdPreprocessGeneratedCommandsEXT(VkCommandBuffer commandBuffer,
    const bool old_predicating = cmd_buffer->state.predicating;
    cmd_buffer->state.predicating = false;
 
-   radv_prepare_dgc(cmd_buffer, pGeneratedCommandsInfo, state_cmd_buffer, old_predicating);
+   radv_prepare_dgc(cmd_buffer, pGeneratedCommandsInfo, state_cmd_buffer, execution_is_predicating);
 
    /* Restore conditional rendering. */
    cmd_buffer->state.predicating = old_predicating;
@@ -2794,8 +2823,8 @@ radv_prepare_dgc_compute(struct radv_cmd_buffer *cmd_buffer, const VkGeneratedCo
 
    if (cond_render_enabled) {
       params->predicating = true;
-      params->predication_va = cmd_buffer->state.predication_va;
-      params->predication_type = cmd_buffer->state.predication_type;
+      params->predication_va = state_cmd_buffer->state.user_predication_va;
+      params->predication_type = state_cmd_buffer->state.predication_type;
    }
 
    if (ies) {
@@ -2916,14 +2945,12 @@ radv_prepare_dgc_graphics(struct radv_cmd_buffer *cmd_buffer, const VkGeneratedC
       uint8_t *ptr = (uint8_t *)((char *)*upload_data);
 
       for (uint32_t i = 0; i < MAX_VBS; i++) {
-         struct radv_vbo_info vbo_info;
-         radv_get_vbo_info(state_cmd_buffer, i, &vbo_info);
+         struct radv_vbo_info *vbo_info = (void *)ptr;
 
-         const uint32_t vbo_offset = get_dgc_vertex_binding_offset(layout, vbo_info.binding);
-
-         memcpy(ptr, &vbo_info, sizeof(vbo_info));
+         radv_get_vbo_info(state_cmd_buffer, i, vbo_info);
          ptr += sizeof(struct radv_vbo_info);
 
+         const uint32_t vbo_offset = get_dgc_vertex_binding_offset(layout, vbo_info->binding);
          memcpy(ptr, &vbo_offset, sizeof(uint32_t));
          ptr += sizeof(uint32_t);
       }
@@ -3075,11 +3102,19 @@ radv_prepare_dgc(struct radv_cmd_buffer *cmd_buffer, const VkGeneratedCommandsIn
 
    radv_CmdBindPipeline(radv_cmd_buffer_to_handle(cmd_buffer), VK_PIPELINE_BIND_POINT_COMPUTE, layout->pipeline);
 
-   vk_common_CmdPushConstants(radv_cmd_buffer_to_handle(cmd_buffer), layout->pipeline_layout,
-                              VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(params), &params);
+   const VkPushConstantsInfoKHR pc_info = {
+      .sType = VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO_KHR,
+      .layout = layout->pipeline_layout,
+      .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+      .offset = 0,
+      .size = sizeof(params),
+      .pValues = &params,
+   };
+
+   radv_CmdPushConstants2(radv_cmd_buffer_to_handle(cmd_buffer), &pc_info);
 
    unsigned block_count = MAX2(1, DIV_ROUND_UP(pGeneratedCommandsInfo->maxSequenceCount, 64));
-   vk_common_CmdDispatch(radv_cmd_buffer_to_handle(cmd_buffer), block_count, 1, 1);
+   radv_CmdDispatchBase(radv_cmd_buffer_to_handle(cmd_buffer), 0, 0, 0, block_count, 1, 1);
 
    radv_meta_restore(&saved_state, cmd_buffer);
 }

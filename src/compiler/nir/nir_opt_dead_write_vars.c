@@ -115,6 +115,10 @@ ends_program(nir_block *block)
    if (block->cf_node.parent->type == nir_cf_node_loop)
       return false;
 
+   /* Avoid called functions */
+   if (!nir_cf_node_get_function(&block->cf_node)->function->is_entrypoint)
+      return false;
+
    if (block->successors[0] == NULL) {
       /* This is the end block */
       assert(block->successors[1] == NULL);
@@ -267,13 +271,7 @@ remove_dead_write_vars_impl(void *mem_ctx, nir_shader *shader, nir_function_impl
    nir_foreach_block(block, impl)
       progress |= remove_dead_write_vars_local(mem_ctx, shader, block);
 
-   if (progress) {
-      nir_metadata_preserve(impl, nir_metadata_control_flow);
-   } else {
-      nir_metadata_preserve(impl, nir_metadata_all);
-   }
-
-   return progress;
+   return nir_progress(progress, impl, nir_metadata_control_flow);
 }
 
 bool

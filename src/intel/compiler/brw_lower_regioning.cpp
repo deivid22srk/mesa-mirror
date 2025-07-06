@@ -52,7 +52,10 @@ namespace {
    required_src_byte_stride(const intel_device_info *devinfo, const brw_inst *inst,
                             unsigned i)
    {
-      if (has_dst_aligned_region_restriction(devinfo, inst)) {
+      if (devinfo->has_bfloat16 && has_bfloat_operands(inst)) {
+         return brw_type_size_bytes(inst->src[i].type);
+
+      } else if (has_dst_aligned_region_restriction(devinfo, inst)) {
          return MAX2(brw_type_size_bytes(inst->dst.type),
                      byte_stride(inst->dst));
 
@@ -143,7 +146,7 @@ namespace {
     * that requires it to have some particular alignment.
     */
    unsigned
-   required_dst_byte_stride(const brw_inst *inst)
+   required_dst_byte_stride(const intel_device_info *devinfo, const brw_inst *inst)
    {
       if (inst->dst.is_accumulator()) {
          /* If the destination is an accumulator, insist that we leave the
@@ -159,6 +162,11 @@ namespace {
           * and fix the sources of the multiply instead of the destination.
           */
          return inst->dst.hstride * brw_type_size_bytes(inst->dst.type);
+
+      } else if (devinfo->has_bfloat16 && has_bfloat_operands(inst)) {
+         /* Prefer packed since it can be used as a source. */
+         return brw_type_size_bytes(inst->dst.type);
+
       } else if (brw_type_size_bytes(inst->dst.type) < get_exec_type_size(inst) &&
           !is_byte_raw_mov(inst)) {
          return get_exec_type_size(inst);
@@ -201,6 +209,8 @@ namespace {
    unsigned
    required_dst_byte_offset(const intel_device_info *devinfo, const brw_inst *inst)
    {
+      assert(!brw_type_is_bfloat(inst->dst.type));
+
       for (unsigned i = 0; i < inst->sources; i++) {
          if (!is_uniform(inst->src[i]) && !inst->is_control_source(i))
             if (reg_offset(inst->src[i]) % (reg_unit(devinfo) * REG_SIZE) !=
@@ -314,6 +324,25 @@ namespace {
       const unsigned dst_byte_offset = reg_offset(inst->dst) % (reg_unit(devinfo) * REG_SIZE);
       const unsigned src_byte_offset = reg_offset(inst->src[i]) % (reg_unit(devinfo) * REG_SIZE);
 
+      if (devinfo->has_bfloat16 && has_bfloat_operands(inst)) {
+         if (brw_type_is_bfloat(inst->src[i].type)) {
+            const unsigned half_register = REG_SIZE * reg_unit(devinfo) / 2;
+            const unsigned offset = reg_offset(inst->src[i]);
+
+            /* Region restrictions described by PRM
+             *
+             *   Bfloat16 source must be packed.
+             *
+             *   Bfloat16 source must have register offset 0 or half of GRF register.
+             */
+            return !(byte_stride(inst->src[i]) == 2 && (offset == 0 || offset == half_register));
+         } else {
+            assert(inst->src[i].type == BRW_TYPE_F);
+            /* Restrict Floats sources mixed with BFloats to also be aligned and packed. */
+            return !is_uniform(inst->src[i]) && src_byte_offset != 0 && byte_stride(inst->src[i]) != 4;
+         }
+      }
+
       return (has_dst_aligned_region_restriction(devinfo, inst) &&
               !is_uniform(inst->src[i]) &&
               (byte_stride(inst->src[i]) != required_src_byte_stride(devinfo, inst, i) ||
@@ -333,6 +362,29 @@ namespace {
    {
       if (is_send(inst)) {
          return false;
+
+      } else if (devinfo->has_bfloat16 && has_bfloat_operands(inst)) {
+         const unsigned stride = byte_stride(inst->dst);
+         const unsigned offset = reg_offset(inst->dst);
+         const unsigned half_register = REG_SIZE * reg_unit(devinfo) / 2;
+
+         /* Region restrictions described by PRM
+          *
+          *   Packed bfloat16 destination must have register offset of 0 or half of GRF register.
+          *
+          *   Unpacked bfloat16 destination must have stride 2 and register offset 0 or 1.
+          *
+          * Note numbers above are in terms of elements (2 bytes).
+          */
+         if (inst->dst.type == BRW_TYPE_BF) {
+            return !(stride == 2 && (offset == 0 || offset == half_register)) &&
+                   !(stride == 4 && (offset == 0 || offset == 2));
+         } else {
+            assert(inst->dst.type == BRW_TYPE_F);
+            /* Restrict Floats sources mixed with BFloats to also be aligned and packed. */
+            return !(stride == 4 && offset == 0);
+         }
+
       } else {
          const brw_reg_type exec_type = get_exec_type(inst);
          const unsigned dst_byte_offset = reg_offset(inst->dst) % (reg_unit(devinfo) * REG_SIZE);
@@ -340,10 +392,10 @@ namespace {
             brw_type_size_bytes(inst->dst.type) < brw_type_size_bytes(exec_type);
 
          return (has_dst_aligned_region_restriction(devinfo, inst) &&
-                 (required_dst_byte_stride(inst) != byte_stride(inst->dst) ||
+                 (required_dst_byte_stride(devinfo, inst) != byte_stride(inst->dst) ||
                   required_dst_byte_offset(devinfo, inst) != dst_byte_offset)) ||
                 (is_narrowing_conversion &&
-                 required_dst_byte_stride(inst) != byte_stride(inst->dst));
+                 required_dst_byte_stride(devinfo, inst) != byte_stride(inst->dst));
       }
    }
 
@@ -456,7 +508,7 @@ namespace {
    }
 
    bool
-   lower_instruction(brw_shader *v, bblock_t *block, brw_inst *inst);
+   lower_instruction(brw_shader *v, brw_inst *inst);
 }
 
 /**
@@ -466,7 +518,7 @@ namespace {
  * MOV instruction prior to the original instruction.
  */
 bool
-brw_lower_src_modifiers(brw_shader &s, bblock_t *block, brw_inst *inst, unsigned i)
+brw_lower_src_modifiers(brw_shader &s, brw_inst *inst, unsigned i)
 {
    assert(inst->components_read(i) == 1);
    assert(s.devinfo->has_integer_dword_mul ||
@@ -475,10 +527,10 @@ brw_lower_src_modifiers(brw_shader &s, bblock_t *block, brw_inst *inst, unsigned
           MIN2(brw_type_size_bytes(inst->src[0].type), brw_type_size_bytes(inst->src[1].type)) >= 4 ||
           brw_type_size_bytes(inst->src[i].type) == get_exec_type_size(inst));
 
-   const brw_builder ibld(&s, block, inst);
+   const brw_builder ibld(inst);
    const brw_reg tmp = ibld.vgrf(get_exec_type(inst));
 
-   lower_instruction(&s, block, ibld.MOV(tmp, inst->src[i]));
+   lower_instruction(&s, ibld.MOV(tmp, inst->src[i]));
    inst->src[i] = tmp;
 
    return true;
@@ -493,9 +545,9 @@ namespace {
     * instruction.
     */
    bool
-   lower_dst_modifiers(brw_shader *v, bblock_t *block, brw_inst *inst)
+   lower_dst_modifiers(brw_shader *v, brw_inst *inst)
    {
-      const brw_builder ibld(v, block, inst);
+      const brw_builder ibld(inst);
       const brw_reg_type type = get_exec_type(inst);
       /* Not strictly necessary, but if possible use a temporary with the same
        * channel alignment as the current destination in order to avoid
@@ -511,7 +563,7 @@ namespace {
       tmp = horiz_stride(tmp, stride);
 
       /* Emit a MOV taking care of all the destination modifiers. */
-      brw_inst *mov = ibld.at(block, inst->next).MOV(inst->dst, tmp);
+      brw_inst *mov = ibld.at(inst->block, inst->next).MOV(inst->dst, tmp);
       mov->saturate = inst->saturate;
       if (!has_inconsistent_cmod(inst))
          mov->conditional_mod = inst->conditional_mod;
@@ -520,7 +572,7 @@ namespace {
          mov->predicate_inverse = inst->predicate_inverse;
       }
       mov->flag_subreg = inst->flag_subreg;
-      lower_instruction(v, block, mov);
+      lower_instruction(v, mov);
 
       /* Point the original instruction at the temporary, and clean up any
        * destination modifiers.
@@ -542,11 +594,11 @@ namespace {
     * copies into a temporary with the same channel layout as the destination.
     */
    bool
-   lower_src_region(brw_shader *v, bblock_t *block, brw_inst *inst, unsigned i)
+   lower_src_region(brw_shader *v, brw_inst *inst, unsigned i)
    {
       assert(inst->components_read(i) == 1);
       const intel_device_info *devinfo = v->devinfo;
-      const brw_builder ibld(v, block, inst);
+      const brw_builder ibld(inst);
       const unsigned stride = required_src_byte_stride(devinfo, inst, i) /
                               brw_type_size_bytes(inst->src[i].type);
       assert(stride > 0);
@@ -582,7 +634,7 @@ namespace {
            /* The copy isn't guaranteed to comply with all subdword integer
             * regioning restrictions in some cases.  Lower it recursively.
             */
-	   lower_instruction(v, block, jnst);
+	   lower_instruction(v, jnst);
         }
       }
 
@@ -604,7 +656,7 @@ namespace {
     * sources.
     */
    bool
-   lower_dst_region(brw_shader *v, bblock_t *block, brw_inst *inst)
+   lower_dst_region(brw_shader *v, brw_inst *inst)
    {
       /* We cannot replace the result of an integer multiply which writes the
        * accumulator because MUL+MACH pairs act on the accumulator as a 66-bit
@@ -614,8 +666,8 @@ namespace {
       assert(inst->opcode != BRW_OPCODE_MUL || !inst->dst.is_accumulator() ||
              brw_type_is_float(inst->dst.type));
 
-      const brw_builder ibld(v, block, inst);
-      const unsigned stride = required_dst_byte_stride(inst) /
+      const brw_builder ibld(inst);
+      const unsigned stride = required_dst_byte_stride(v->devinfo, inst) /
                               brw_type_size_bytes(inst->dst.type);
       assert(stride > 0);
       brw_reg tmp = ibld.vgrf(inst->dst.type, stride);
@@ -645,13 +697,13 @@ namespace {
          }
 
          for (unsigned j = 0; j < n; j++) {
-            brw_inst *jnst = ibld.at(block, inst->next).MOV(subscript(inst->dst, raw_type, j),
+            brw_inst *jnst = ibld.at(inst->block, inst->next).MOV(subscript(inst->dst, raw_type, j),
                                                            subscript(tmp, raw_type, j));
             if (has_subdword_integer_region_restriction(v->devinfo, jnst)) {
                /* The copy isn't guaranteed to comply with all subdword integer
                 * regioning restrictions in some cases.  Lower it recursively.
                 */
-               lower_instruction(v, block, jnst);
+               lower_instruction(v, jnst);
             }
          }
 
@@ -679,13 +731,13 @@ namespace {
     * where the execution type of an instruction is unsupported.
     */
    bool
-   lower_exec_type(brw_shader *v, bblock_t *block, brw_inst *inst)
+   lower_exec_type(brw_shader *v, brw_inst *inst)
    {
       assert(inst->dst.type == get_exec_type(inst));
       const unsigned mask = has_invalid_exec_type(v->devinfo, inst);
       const brw_reg_type raw_type = required_exec_type(v->devinfo, inst);
       const unsigned n = get_exec_type_size(inst) / brw_type_size_bytes(raw_type);
-      const brw_builder ibld(v, block, inst);
+      const brw_builder ibld(inst);
 
       brw_reg tmp = ibld.vgrf(inst->dst.type, inst->dst.stride);
       ibld.UNDEF(tmp);
@@ -713,10 +765,10 @@ namespace {
             mov->predicate = inst->predicate;
             mov->predicate_inverse = inst->predicate_inverse;
          }
-         lower_instruction(v, block, mov);
+         lower_instruction(v, mov);
       }
 
-      inst->remove(block);
+      inst->remove();
 
       return true;
    }
@@ -729,10 +781,10 @@ namespace {
     * the general lowering in lower_src_modifiers or lower_src_region.
     */
    void
-   lower_src_conversion(brw_shader *v, bblock_t *block, brw_inst *inst)
+   lower_src_conversion(brw_shader *v, brw_inst *inst)
    {
       const intel_device_info *devinfo = v->devinfo;
-      const brw_builder ibld = brw_builder(v, block, inst).scalar_group();
+      const brw_builder ibld = brw_builder(inst).scalar_group();
 
       /* We only handle scalar conversions from small types for now. */
       assert(is_uniform(inst->src[0]));
@@ -758,7 +810,7 @@ namespace {
     * instruction.
     */
    bool
-   lower_instruction(brw_shader *v, bblock_t *block, brw_inst *inst)
+   lower_instruction(brw_shader *v, brw_inst *inst)
    {
       const intel_device_info *devinfo = v->devinfo;
       bool progress = false;
@@ -773,26 +825,26 @@ namespace {
          return false;
 
       if (has_invalid_dst_modifiers(devinfo, inst))
-         progress |= lower_dst_modifiers(v, block, inst);
+         progress |= lower_dst_modifiers(v, inst);
 
       if (has_invalid_dst_region(devinfo, inst))
-         progress |= lower_dst_region(v, block, inst);
+         progress |= lower_dst_region(v, inst);
 
       if (has_invalid_src_conversion(devinfo, inst)) {
-         lower_src_conversion(v, block, inst);
+         lower_src_conversion(v, inst);
          progress = true;
       }
 
       for (unsigned i = 0; i < inst->sources; i++) {
          if (has_invalid_src_modifiers(devinfo, inst, i))
-            progress |= brw_lower_src_modifiers(*v, block, inst, i);
+            progress |= brw_lower_src_modifiers(*v, inst, i);
 
          if (has_invalid_src_region(devinfo, inst, i))
-            progress |= lower_src_region(v, block, inst, i);
+            progress |= lower_src_region(v, inst, i);
       }
 
       if (has_invalid_exec_type(devinfo, inst))
-         progress |= lower_exec_type(v, block, inst);
+         progress |= lower_exec_type(v, inst);
 
       return progress;
    }
@@ -804,7 +856,7 @@ brw_lower_regioning(brw_shader &s)
    bool progress = false;
 
    foreach_block_and_inst_safe(block, brw_inst, inst, s.cfg)
-      progress |= lower_instruction(&s, block, inst);
+      progress |= lower_instruction(&s, inst);
 
    if (progress)
       s.invalidate_analysis(BRW_DEPENDENCY_INSTRUCTIONS |

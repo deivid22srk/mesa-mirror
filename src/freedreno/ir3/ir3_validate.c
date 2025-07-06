@@ -75,7 +75,8 @@ validate_src(struct ir3_validate_ctx *ctx, struct ir3_instruction *instr,
    if (reg->flags & IR3_REG_ALIAS) {
       unsigned valid_flags = IR3_REG_ALIAS | IR3_REG_FIRST_ALIAS |
                              IR3_REG_HALF | IR3_REG_CONST | IR3_REG_IMMED |
-                             IR3_REG_SSA | IR3_REG_KILL | IR3_REG_FIRST_KILL;
+                             IR3_REG_SSA | IR3_REG_KILL | IR3_REG_FIRST_KILL |
+                             IR3_REG_LAST_USE;
       validate_assert(ctx, !(reg->flags & ~valid_flags));
    }
 
@@ -353,6 +354,10 @@ validate_instr(struct ir3_validate_ctx *ctx, struct ir3_instruction *instr)
          validate_assert(ctx,
                          reg_class_flags(instr->dsts[instr->dsts_count - 1]) ==
                             reg_class_flags(instr->srcs[1]));
+      } else if (instr->opc == OPC_MOVS) {
+         validate_assert(ctx, instr->dsts[0]->flags & IR3_REG_SHARED);
+         validate_reg_size(ctx, instr->dsts[0], instr->cat1.dst_type);
+         validate_reg_size(ctx, instr->srcs[0], instr->cat1.src_type);
       } else {
          foreach_dst (dst, instr)
             validate_reg_size(ctx, dst, instr->cat1.dst_type);
@@ -379,7 +384,7 @@ validate_instr(struct ir3_validate_ctx *ctx, struct ir3_instruction *instr)
          }
       }
 
-      if (instr->opc != OPC_MOV)
+      if (instr->opc != OPC_MOV && instr->opc != OPC_MOVS)
          validate_assert(ctx, !instr->address);
 
       break;

@@ -347,6 +347,12 @@ glsl_get_base_glsl_type(const glsl_type *t)
       return &glsl_type_builtin_float16_t;
    case GLSL_TYPE_DOUBLE:
       return &glsl_type_builtin_double;
+   case GLSL_TYPE_BFLOAT16:
+      return &glsl_type_builtin_bfloat16_t;
+   case GLSL_TYPE_FLOAT_E4M3FN:
+      return &glsl_type_builtin_e4m3fn_t;
+   case GLSL_TYPE_FLOAT_E5M2:
+      return &glsl_type_builtin_e5m2_t;
    case GLSL_TYPE_BOOL:
       return &glsl_type_builtin_bool;
    case GLSL_TYPE_UINT64:
@@ -384,6 +390,9 @@ glsl_get_bare_type(const glsl_type *t)
    case GLSL_TYPE_UINT16:
    case GLSL_TYPE_INT16:
    case GLSL_TYPE_FLOAT16:
+   case GLSL_TYPE_BFLOAT16:
+   case GLSL_TYPE_FLOAT_E4M3FN:
+   case GLSL_TYPE_FLOAT_E5M2:
    case GLSL_TYPE_UINT:
    case GLSL_TYPE_INT:
    case GLSL_TYPE_FLOAT:
@@ -593,6 +602,9 @@ glsl_ ## vname ## _type (unsigned components)    \
 
 VECN(components, float, vec)
 VECN(components, float16_t, f16vec)
+VECN(components, bfloat16_t, bf16vec)
+VECN(components, e4m3fn_t, e4m3fnvec)
+VECN(components, e5m2_t, e5m2vec)
 VECN(components, double, dvec)
 VECN(components, int, ivec)
 VECN(components, uint, uvec)
@@ -641,6 +653,12 @@ glsl_simple_explicit_type(unsigned base_type, unsigned rows, unsigned columns,
          return glsl_vec_type(rows);
       case GLSL_TYPE_FLOAT16:
          return glsl_f16vec_type(rows);
+      case GLSL_TYPE_BFLOAT16:
+         return glsl_bf16vec_type(rows);
+      case GLSL_TYPE_FLOAT_E4M3FN:
+         return glsl_e4m3fnvec_type(rows);
+      case GLSL_TYPE_FLOAT_E5M2:
+         return glsl_e5m2vec_type(rows);
       case GLSL_TYPE_DOUBLE:
          return glsl_dvec_type(rows);
       case GLSL_TYPE_BOOL:
@@ -1742,6 +1760,9 @@ glsl_get_component_slots(const glsl_type *t)
    case GLSL_TYPE_INT16:
    case GLSL_TYPE_FLOAT:
    case GLSL_TYPE_FLOAT16:
+   case GLSL_TYPE_BFLOAT16:
+   case GLSL_TYPE_FLOAT_E4M3FN:
+   case GLSL_TYPE_FLOAT_E5M2:
    case GLSL_TYPE_BOOL:
       return glsl_get_components(t);
 
@@ -1794,6 +1815,9 @@ glsl_get_component_slots_aligned(const glsl_type *t, unsigned offset)
    case GLSL_TYPE_INT16:
    case GLSL_TYPE_FLOAT:
    case GLSL_TYPE_FLOAT16:
+   case GLSL_TYPE_BFLOAT16:
+   case GLSL_TYPE_FLOAT_E4M3FN:
+   case GLSL_TYPE_FLOAT_E5M2:
    case GLSL_TYPE_BOOL:
       return glsl_get_components(t);
 
@@ -2880,6 +2904,9 @@ glsl_count_vec4_slots(const glsl_type *t, bool is_gl_vertex_input, bool is_bindl
    case GLSL_TYPE_INT16:
    case GLSL_TYPE_FLOAT:
    case GLSL_TYPE_FLOAT16:
+   case GLSL_TYPE_BFLOAT16:
+   case GLSL_TYPE_FLOAT_E4M3FN:
+   case GLSL_TYPE_FLOAT_E5M2:
    case GLSL_TYPE_BOOL:
       return t->matrix_columns;
    case GLSL_TYPE_DOUBLE:
@@ -3084,6 +3111,9 @@ encode_type_to_blob(struct blob *blob, const glsl_type *type)
    case GLSL_TYPE_INT:
    case GLSL_TYPE_FLOAT:
    case GLSL_TYPE_FLOAT16:
+   case GLSL_TYPE_BFLOAT16:
+   case GLSL_TYPE_FLOAT_E4M3FN:
+   case GLSL_TYPE_FLOAT_E5M2:
    case GLSL_TYPE_DOUBLE:
    case GLSL_TYPE_UINT8:
    case GLSL_TYPE_INT8:
@@ -3732,6 +3762,9 @@ glsl_get_natural_size_align_bytes(const glsl_type *type,
    case GLSL_TYPE_UINT16:
    case GLSL_TYPE_INT16:
    case GLSL_TYPE_FLOAT16:
+   case GLSL_TYPE_BFLOAT16:
+   case GLSL_TYPE_FLOAT_E4M3FN:
+   case GLSL_TYPE_FLOAT_E5M2:
    case GLSL_TYPE_UINT:
    case GLSL_TYPE_INT:
    case GLSL_TYPE_FLOAT:
@@ -3791,6 +3824,9 @@ glsl_get_word_size_align_bytes(const glsl_type *type,
    case GLSL_TYPE_UINT16:
    case GLSL_TYPE_INT16:
    case GLSL_TYPE_FLOAT16:
+   case GLSL_TYPE_BFLOAT16:
+   case GLSL_TYPE_FLOAT_E4M3FN:
+   case GLSL_TYPE_FLOAT_E5M2:
    case GLSL_TYPE_UINT:
    case GLSL_TYPE_INT:
    case GLSL_TYPE_FLOAT:
@@ -3850,6 +3886,9 @@ glsl_get_vec4_size_align_bytes(const glsl_type *type,
    case GLSL_TYPE_UINT16:
    case GLSL_TYPE_INT16:
    case GLSL_TYPE_FLOAT16:
+   case GLSL_TYPE_BFLOAT16:
+   case GLSL_TYPE_FLOAT_E4M3FN:
+   case GLSL_TYPE_FLOAT_E5M2:
    case GLSL_TYPE_UINT:
    case GLSL_TYPE_INT:
    case GLSL_TYPE_FLOAT:
@@ -3922,4 +3961,25 @@ unsigned
 glsl_type_get_image_count(const glsl_type *type)
 {
    return glsl_type_count(type, GLSL_TYPE_IMAGE);
+}
+
+enum glsl_base_type
+glsl_apply_signedness_to_base_type(enum glsl_base_type type, bool signedness)
+{
+   switch (type) {
+   case GLSL_TYPE_UINT:
+   case GLSL_TYPE_INT:
+      return signedness ? GLSL_TYPE_INT : GLSL_TYPE_UINT;
+   case GLSL_TYPE_UINT8:
+   case GLSL_TYPE_INT8:
+      return signedness ? GLSL_TYPE_INT8 : GLSL_TYPE_UINT8;
+   case GLSL_TYPE_UINT16:
+   case GLSL_TYPE_INT16:
+      return signedness ? GLSL_TYPE_INT16 : GLSL_TYPE_UINT16;
+   case GLSL_TYPE_UINT64:
+   case GLSL_TYPE_INT64:
+      return signedness ? GLSL_TYPE_INT64 : GLSL_TYPE_UINT64;
+   default:
+      return type;
+   }
 }

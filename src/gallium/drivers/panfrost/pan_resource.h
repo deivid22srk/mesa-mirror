@@ -29,7 +29,6 @@
 #include "util/u_range.h"
 #include "pan_minmax_cache.h"
 #include "pan_screen.h"
-#include "pan_texture.h"
 
 #define LAYOUT_CONVERT_THRESHOLD 8
 #define PAN_MAX_BATCHES          32
@@ -61,6 +60,11 @@ struct panfrost_resource {
 
    /* Description of the resource layout */
    struct pan_image image;
+   struct pan_image_plane plane;
+
+   /* In case of emulated modifiers, the image.props.modifier won't match this
+    * modifier. */
+   uint64_t modifier;
 
    struct panfrost_bo *bo;
 
@@ -86,13 +90,28 @@ struct panfrost_resource {
    uint8_t stencil_value;
 
    /* Cached min/max values for index buffers */
-   struct panfrost_minmax_cache *index_cache;
+   struct pan_minmax_cache *index_cache;
+
+   /* Whether the resource owns the backing BO's label */
+   bool owns_label;
 };
 
 static inline struct panfrost_resource *
 pan_resource(struct pipe_resource *p)
 {
    return (struct panfrost_resource *)p;
+}
+
+static inline unsigned
+pan_resource_plane_index(const struct panfrost_resource *rsc)
+{
+   for (unsigned i = 0; i < ARRAY_SIZE(rsc->image.planes); i++) {
+      if (rsc->image.planes[i] == &rsc->plane)
+         return i;
+   }
+
+   assert(!"Invalid image props");
+   return 0;
 }
 
 struct panfrost_transfer {
@@ -138,6 +157,9 @@ enum {
    PAN_RENDER_CLEAR = PAN_SAVE_FRAGMENT_STATE | PAN_SAVE_FRAGMENT_CONSTANT,
 };
 
+/* Callers should ensure that all AFBC/AFRC resources that will be used in the
+ * blit operation are legalized before calling blitter operations, otherwise
+ * we may trigger a recursive blit */
 void panfrost_blitter_save(struct panfrost_context *ctx,
                            const enum panfrost_blitter_op blitter_op);
 
@@ -178,10 +200,14 @@ panfrost_translate_texture_dimension(enum pipe_texture_target t)
    }
 }
 
-struct pipe_resource *
-panfrost_resource_create_with_modifier(struct pipe_screen *screen,
-                                       const struct pipe_resource *template,
-                                       uint64_t modifier);
+void
+panfrost_resource_change_format(struct panfrost_resource *rsrc,
+                                enum pipe_format new_format,
+                                struct panfrost_resource *save);
+
+void
+panfrost_resource_restore_format(struct panfrost_resource *rsrc,
+                                 const struct panfrost_resource *saved);
 
 bool panfrost_should_pack_afbc(struct panfrost_device *dev,
                                const struct panfrost_resource *rsrc);

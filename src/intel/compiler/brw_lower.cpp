@@ -60,7 +60,7 @@ brw_lower_load_payload(brw_shader &s)
       assert(inst->saturate == false);
       brw_reg dst = inst->dst;
 
-      const brw_builder ibld(&s, block, inst);
+      const brw_builder ibld(inst);
       const brw_builder ubld = ibld.exec_all();
 
       for (uint8_t i = 0; i < inst->header_size;) {
@@ -68,8 +68,10 @@ brw_lower_load_payload(brw_shader &s)
           * instruction.
           */
          const unsigned n =
-            (i + 1 < inst->header_size && inst->src[i].stride == 1 &&
-             inst->src[i + 1].equals(byte_offset(inst->src[i], REG_SIZE))) ?
+            (i + 1 < inst->header_size &&
+             (inst->src[i].file == IMM ||
+              (inst->src[i].is_contiguous() &&
+               inst->src[i + 1].equals(byte_offset(inst->src[i], REG_SIZE))))) ?
             2 : 1;
 
          if (inst->src[i].file != BAD_FILE)
@@ -88,7 +90,7 @@ brw_lower_load_payload(brw_shader &s)
          dst = offset(dst, ibld, 1);
       }
 
-      inst->remove(block);
+      inst->remove();
       progress = true;
    }
 
@@ -153,7 +155,7 @@ brw_lower_csel(brw_shader &s)
       }
 
       if (!supported) {
-         const brw_builder ibld(&s, block, inst);
+         const brw_builder ibld(inst);
 
          /* CSEL: dst = src2 <op> 0 ? src0 : src1 */
          brw_reg zero = brw_imm_reg(orig_type);
@@ -185,7 +187,7 @@ brw_lower_sub_sat(brw_shader &s)
    bool progress = false;
 
    foreach_block_and_inst_safe(block, brw_inst, inst, s.cfg) {
-      const brw_builder ibld(&s, block, inst);
+      const brw_builder ibld(inst);
 
       if (inst->opcode == SHADER_OPCODE_USUB_SAT ||
           inst->opcode == SHADER_OPCODE_ISUB_SAT) {
@@ -252,7 +254,7 @@ brw_lower_sub_sat(brw_shader &s)
                ->predicate = BRW_PREDICATE_NORMAL;
          }
 
-         inst->remove(block);
+         inst->remove();
          progress = true;
       }
    }
@@ -294,7 +296,7 @@ brw_lower_barycentrics(brw_shader &s)
       if (inst->exec_size < 16)
          continue;
 
-      const brw_builder ibld(&s, block, inst);
+      const brw_builder ibld(inst);
       const brw_builder ubld = ibld.exec_all().group(8, 0);
 
       switch (inst->opcode) {
@@ -352,10 +354,10 @@ brw_lower_barycentrics(brw_shader &s)
  * swizzles of the source, specified as \p swz0 and \p swz1.
  */
 static bool
-lower_derivative(brw_shader &s, bblock_t *block, brw_inst *inst,
+lower_derivative(brw_shader &s, brw_inst *inst,
                  unsigned swz0, unsigned swz1)
 {
-   const brw_builder ubld = brw_builder(&s, block, inst).exec_all();
+   const brw_builder ubld = brw_builder(inst).exec_all();
    const brw_reg tmp0 = ubld.vgrf(inst->src[0].type);
    const brw_reg tmp1 = ubld.vgrf(inst->src[0].type);
 
@@ -384,19 +386,19 @@ brw_lower_derivatives(brw_shader &s)
 
    foreach_block_and_inst(block, brw_inst, inst, s.cfg) {
       if (inst->opcode == FS_OPCODE_DDX_COARSE)
-         progress |= lower_derivative(s, block, inst,
+         progress |= lower_derivative(s, inst,
                                       BRW_SWIZZLE_XXXX, BRW_SWIZZLE_YYYY);
 
       else if (inst->opcode == FS_OPCODE_DDX_FINE)
-         progress |= lower_derivative(s, block, inst,
+         progress |= lower_derivative(s, inst,
                                       BRW_SWIZZLE_XXZZ, BRW_SWIZZLE_YYWW);
 
       else if (inst->opcode == FS_OPCODE_DDY_COARSE)
-         progress |= lower_derivative(s, block, inst,
+         progress |= lower_derivative(s, inst,
                                       BRW_SWIZZLE_XXXX, BRW_SWIZZLE_ZZZZ);
 
       else if (inst->opcode == FS_OPCODE_DDY_FINE)
-         progress |= lower_derivative(s, block, inst,
+         progress |= lower_derivative(s, inst,
                                       BRW_SWIZZLE_XYXY, BRW_SWIZZLE_ZWZW);
    }
 
@@ -434,11 +436,11 @@ brw_lower_find_live_channel(brw_shader &s)
        * useless there.
        */
 
-      const brw_builder ibld(&s, block, inst);
+      const brw_builder ibld(inst);
       if (!inst->is_partial_write())
          ibld.emit_undef_for_dst(inst);
 
-      const brw_builder ubld = brw_builder(&s, block, inst).exec_all().group(1, 0);
+      const brw_builder ubld = brw_builder(inst).uniform();
 
       brw_reg exec_mask = ubld.vgrf(BRW_TYPE_UD);
       ubld.UNDEF(exec_mask);
@@ -492,7 +494,7 @@ brw_lower_find_live_channel(brw_shader &s)
          unreachable("Impossible.");
       }
 
-      inst->remove(block);
+      inst->remove();
       progress = true;
    }
 
@@ -530,7 +532,7 @@ brw_lower_sends_overlapping_payload(brw_shader &s)
          /* Sadly, we've lost all notion of channels and bit sizes at this
           * point.  Just WE_all it.
           */
-         const brw_builder ibld = brw_builder(&s, block, inst).exec_all().group(16, 0);
+         const brw_builder ibld = brw_builder(inst).exec_all().group(16, 0);
          brw_reg copy_src = retype(inst->src[arg], BRW_TYPE_UD);
          brw_reg copy_dst = tmp;
          for (unsigned i = 0; i < len; i += 2) {
@@ -573,7 +575,8 @@ brw_lower_3src_null_dest(brw_shader &s)
    }
 
    if (progress)
-      s.invalidate_analysis(BRW_DEPENDENCY_INSTRUCTION_DETAIL |
+      s.invalidate_analysis(BRW_DEPENDENCY_INSTRUCTION_DATA_FLOW |
+                            BRW_DEPENDENCY_INSTRUCTION_DETAIL |
                             BRW_DEPENDENCY_VARIABLES);
 
    return progress;
@@ -586,6 +589,46 @@ unsupported_64bit_type(const intel_device_info *devinfo,
    return (!devinfo->has_64bit_float && type == BRW_TYPE_DF) ||
           (!devinfo->has_64bit_int && (type == BRW_TYPE_UQ ||
                                        type == BRW_TYPE_Q));
+}
+
+bool
+brw_lower_bfloat_conversion(brw_shader &s, brw_inst *inst)
+{
+   assert(s.devinfo->has_bfloat16);
+   assert(inst->dst.type == BRW_TYPE_BF || inst->src[0].type == BRW_TYPE_BF);
+
+   if (inst->dst.type == inst->src[0].type) {
+      /* Except for DPAS, instructions with only bfloat operands are
+       * not supported, so just move the bits using UW.
+       */
+      inst->dst    = retype(inst->dst, BRW_TYPE_UW);
+      inst->src[0] = retype(inst->src[0], BRW_TYPE_UW);
+      return true;
+
+   } else if (inst->dst.type == BRW_TYPE_BF &&
+              byte_stride(inst->dst) == 2) {
+      /* Converting to packed BF is not supported natively.  Using
+       * ADD with -0.0f preserves NaN correctly.  Note +0.0f would
+       * not work since it doesn't preserve -0.0f!
+       */
+      assert(inst->src[0].type == BRW_TYPE_F);
+      inst->resize_sources(2);
+      inst->opcode = BRW_OPCODE_ADD;
+      inst->src[1] = brw_imm_f(-0.0f);
+      return true;
+
+   } else if (inst->dst.type == BRW_TYPE_F &&
+              byte_stride(inst->src[0]) != 2) {
+      /* Converting from a unpacked BF is not supported natively. */
+      const brw_builder ibld(inst);
+      ibld.SHL(retype(inst->dst, BRW_TYPE_UD),
+               retype(inst->src[0], BRW_TYPE_UW),
+               brw_imm_uw(16));
+      inst->remove();
+      return true;
+   }
+
+   return false;
 }
 
 /**
@@ -608,7 +651,7 @@ brw_lower_alu_restrictions(brw_shader &s)
             assert(!inst->saturate);
             assert(!inst->src[0].abs);
             assert(!inst->src[0].negate);
-            const brw_builder ibld(&s, block, inst);
+            const brw_builder ibld(inst);
 
             enum brw_reg_type type = brw_type_with_size(inst->dst.type, 32);
 
@@ -620,10 +663,41 @@ brw_lower_alu_restrictions(brw_shader &s)
             ibld.MOV(subscript(inst->dst, type, 0),
                      subscript(inst->src[0], type, 0));
 
-            inst->remove(block);
+            inst->remove();
+            progress = true;
+         }
+
+         if (inst->dst.type == BRW_TYPE_BF || inst->src[0].type == BRW_TYPE_BF)
+            progress |= brw_lower_bfloat_conversion(s, inst);
+
+         break;
+
+      case BRW_OPCODE_MUL:
+      case BRW_OPCODE_MAD: {
+         /* BFloat16 restrictions:
+          *
+          *   "Bfloat16 not in Src1 of 2-source instructions involving
+          *    multiplier."
+          *
+          * and
+          *
+          *   "Bfloat16 not allowed in Src2 of 3-source instructions
+          *   involving multiplier."
+          */
+         brw_reg &last_src = inst->src[inst->sources - 1];
+         if (last_src.type == BRW_TYPE_BF) {
+            assert(devinfo->has_bfloat16);
+            const brw_builder ibld = brw_builder(inst);
+
+            brw_reg src2_as_f = ibld.vgrf(BRW_TYPE_F);
+            brw_inst *conv = ibld.MOV(src2_as_f, last_src);
+            brw_lower_bfloat_conversion(s, conv);
+            last_src = src2_as_f;
+
             progress = true;
          }
          break;
+      }
 
       case BRW_OPCODE_SEL:
          if (unsupported_64bit_type(devinfo, inst->dst.type)) {
@@ -632,7 +706,7 @@ brw_lower_alu_restrictions(brw_shader &s)
             assert(!inst->src[0].abs && !inst->src[0].negate);
             assert(!inst->src[1].abs && !inst->src[1].negate);
             assert(inst->conditional_mod == BRW_CONDITIONAL_NONE);
-            const brw_builder ibld(&s, block, inst);
+            const brw_builder ibld(inst);
 
             enum brw_reg_type type = brw_type_with_size(inst->dst.type, 32);
 
@@ -648,9 +722,25 @@ brw_lower_alu_restrictions(brw_shader &s)
                                    subscript(inst->src[0], type, 1),
                                    subscript(inst->src[1], type, 1)));
 
-            inst->remove(block);
+            inst->remove();
             progress = true;
          }
+         break;
+
+      case SHADER_OPCODE_SHUFFLE:
+      case SHADER_OPCODE_MOV_INDIRECT:
+      case SHADER_OPCODE_BROADCAST:
+         /* Gen12.5 adds the following region restriction:
+          *
+          *   "Vx1 and VxH indirect addressing for Float, Half-Float,
+          *    Double-Float and Quad-Word data must not be used."
+          *
+          * We require the source and destination types to match so stomp to
+          * an unsigned integer type.
+          */
+         assert(inst->src[0].type == inst->dst.type);
+         inst->src[0].type = inst->dst.type = brw_type_with_size(BRW_TYPE_UD,
+            brw_type_size_bits(inst->src[0].type));
          break;
 
       default:
@@ -659,8 +749,8 @@ brw_lower_alu_restrictions(brw_shader &s)
    }
 
    if (progress) {
-      s.invalidate_analysis(BRW_DEPENDENCY_INSTRUCTION_DATA_FLOW |
-                            BRW_DEPENDENCY_INSTRUCTION_DETAIL);
+      s.invalidate_analysis(BRW_DEPENDENCY_INSTRUCTIONS |
+                            BRW_DEPENDENCY_VARIABLES);
    }
 
    return progress;
@@ -756,6 +846,7 @@ brw_lower_vgrfs_to_fixed_grfs(brw_shader &s)
    }
 
    s.invalidate_analysis(BRW_DEPENDENCY_INSTRUCTION_DATA_FLOW |
+                         BRW_DEPENDENCY_INSTRUCTION_DETAIL |
                          BRW_DEPENDENCY_VARIABLES);
 }
 
@@ -776,7 +867,7 @@ brw_s0(enum brw_reg_type type, unsigned subnr)
 }
 
 static bool
-brw_lower_send_gather_inst(brw_shader &s, bblock_t *block, brw_inst *inst)
+brw_lower_send_gather_inst(brw_shader &s, brw_inst *inst)
 {
    const intel_device_info *devinfo = s.devinfo;
    assert(devinfo->ver >= 30);
@@ -809,7 +900,7 @@ brw_lower_send_gather_inst(brw_shader &s, bblock_t *block, brw_inst *inst)
    /* Fill out ARF scalar register with the physical register numbers
     * and use SEND_GATHER.
     */
-   brw_builder ubld = brw_builder(&s, block, inst).group(1, 0).exec_all();
+   brw_builder ubld = brw_builder(inst).uniform();
    for (unsigned q = 0; q < DIV_ROUND_UP(count, 8); q++) {
       uint64_t v = 0;
       for (unsigned i = 0; i < 8; i++) {
@@ -835,11 +926,11 @@ brw_lower_send_gather(brw_shader &s)
 
    foreach_block_and_inst(block, brw_inst, inst, s.cfg) {
       if (inst->opcode == SHADER_OPCODE_SEND_GATHER)
-         progress |= brw_lower_send_gather_inst(s, block, inst);
+         progress |= brw_lower_send_gather_inst(s, inst);
    }
 
    if (progress)
-      s.invalidate_analysis(BRW_DEPENDENCY_INSTRUCTION_DATA_FLOW |
+      s.invalidate_analysis(BRW_DEPENDENCY_INSTRUCTIONS |
                             BRW_DEPENDENCY_VARIABLES);
 
    return progress;
@@ -855,7 +946,7 @@ brw_lower_load_subgroup_invocation(brw_shader &s)
          continue;
 
       const brw_builder abld =
-         brw_builder(&s, block, inst).annotate("SubgroupInvocation");
+         brw_builder(inst).annotate("SubgroupInvocation");
       const brw_builder ubld8 = abld.group(8, 0).exec_all();
       ubld8.UNDEF(inst->dst);
 
@@ -874,7 +965,7 @@ brw_lower_load_subgroup_invocation(brw_shader &s)
          }
       }
 
-      inst->remove(block);
+      inst->remove();
       progress = true;
    }
 
@@ -903,7 +994,7 @@ brw_lower_indirect_mov(brw_shader &s)
          assert(brw_type_size_bytes(inst->src[0].type) ==
                 brw_type_size_bytes(inst->dst.type));
 
-         const brw_builder ibld(&s, block, inst);
+         const brw_builder ibld(inst);
 
          /* Extract unaligned part */
          uint16_t extra_offset = inst->src[0].offset & 0x1;
@@ -943,7 +1034,7 @@ brw_lower_indirect_mov(brw_shader &s)
          /* Extra MOV needed here to convert back to the corresponding B type */
          ibld.MOV(inst->dst, result);
 
-         inst->remove(block);
+         inst->remove();
          progress = true;
       }
    }
@@ -954,3 +1045,4 @@ brw_lower_indirect_mov(brw_shader &s)
 
    return progress;
 }
+

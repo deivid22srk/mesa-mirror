@@ -205,8 +205,6 @@ crocus_init_compute_caps(struct crocus_screen *screen)
 
    caps->address_bits = 32;
 
-   snprintf(caps->ir_target, sizeof(caps->ir_target), "gen");
-
    caps->grid_dimension = 3;
 
    caps->max_grid_size[0] =
@@ -223,8 +221,6 @@ crocus_init_compute_caps(struct crocus_screen *screen)
 
    /* MaxComputeSharedMemorySize */
    caps->max_local_size = 64 * 1024;
-
-   caps->images_supported = true;
 
    caps->subgroup_sizes = ELK_SUBGROUP_SIZE;
 

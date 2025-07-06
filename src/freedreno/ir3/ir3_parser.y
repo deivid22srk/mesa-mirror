@@ -57,6 +57,8 @@ struct ir3 * ir3_parse(struct ir3_shader_variant *v,
 #define IR3_REG_ABS     IR3_REG_FABS
 #define IR3_REG_NEGATE  IR3_REG_FNEG
 
+static pthread_mutex_t ir3_parse_mtx = PTHREAD_MUTEX_INITIALIZER;
+
 static struct ir3_kernel_info    *info;
 static struct ir3_shader_variant *variant;
 /* NOTE the assembler doesn't really use the ir3_block construction
@@ -243,23 +245,23 @@ static void fixup_cat5_s2en(void)
 
 static void add_const(unsigned reg, unsigned c0, unsigned c1, unsigned c2, unsigned c3)
 {
-	struct ir3_const_state *const_state = ir3_const_state_mut(variant);
+	struct ir3_imm_const_state *imm_state = &variant->imm_state;
 	assert((reg & 0x7) == 0);
 	int idx = reg >> (1 + 2); /* low bit is half vs full, next two bits are swiz */
-	if (idx * 4 + 4 > const_state->immediates_size) {
-		const_state->immediates = rerzalloc(const_state,
-				const_state->immediates,
-				__typeof__(const_state->immediates[0]),
-				const_state->immediates_size,
+	if (idx * 4 + 4 > imm_state->size) {
+		imm_state->values = rerzalloc(variant,
+				imm_state->values,
+				__typeof__(imm_state->values[0]),
+				imm_state->size,
 				idx * 4 + 4);
-		for (unsigned i = const_state->immediates_size; i < idx * 4; i++)
-			const_state->immediates[i] = 0xd0d0d0d0;
-		const_state->immediates_size = const_state->immediates_count = idx * 4 + 4;
+		for (unsigned i = imm_state->size; i < idx * 4; i++)
+			imm_state->values[i] = 0xd0d0d0d0;
+		imm_state->size = imm_state->count = idx * 4 + 4;
 	}
-	const_state->immediates[idx * 4 + 0] = c0;
-	const_state->immediates[idx * 4 + 1] = c1;
-	const_state->immediates[idx * 4 + 2] = c2;
-	const_state->immediates[idx * 4 + 3] = c3;
+	imm_state->values[idx * 4 + 0] = c0;
+	imm_state->values[idx * 4 + 1] = c1;
+	imm_state->values[idx * 4 + 2] = c2;
+	imm_state->values[idx * 4 + 3] = c3;
 }
 
 static void add_buf_init_val(uint32_t val)
@@ -337,6 +339,8 @@ static void yyerror(const char *error)
 struct ir3 * ir3_parse(struct ir3_shader_variant *v,
 		struct ir3_kernel_info *k, FILE *f)
 {
+	pthread_mutex_lock(&ir3_parse_mtx);
+
 	ir3_yyset_lineno(1);
 	ir3_yyset_input(f);
 #ifdef YYDEBUG
@@ -354,7 +358,10 @@ struct ir3 * ir3_parse(struct ir3_shader_variant *v,
 	}
 	ralloc_free(labels);
 	ralloc_free(ir3_parser_dead_ctx);
-	return variant->ir;
+
+	struct ir3 *ir = variant->ir;
+	pthread_mutex_unlock(&ir3_parse_mtx);
+	return ir;
 }
 %}
 
@@ -495,6 +502,7 @@ static void print_token(FILE *file, int type, YYSTYPE value)
 %token <tok> T_OP_SWZ
 %token <tok> T_OP_GAT
 %token <tok> T_OP_SCT
+%token <tok> T_OP_MOVS
 
 /* category 2: */
 %token <tok> T_OP_ADD_F
@@ -777,7 +785,7 @@ static void print_token(FILE *file, int type, YYSTYPE value)
 %token <tok> T_MOD_RUP
 %token <tok> T_MOD_RDOWN
 
-%type <num> integer offset uoffset
+%type <num> integer uinteger offset uoffset
 %type <num> flut_immed
 %type <flt> float
 %type <reg> dst const src_gpr src_a0 src_a1 src_p0 cat0_src1 cat0_src2
@@ -893,12 +901,16 @@ in_header:         T_A_IN '(' T_REGISTER ')' T_IDENTIFIER '(' T_IDENTIFIER '=' i
 
 out_header:        T_A_OUT '(' T_REGISTER ')' T_IDENTIFIER '(' T_IDENTIFIER '=' integer ')' { }
 
+/* The only used OPC for texture prefetches seems to be SAM */
+tex_header_opc:    T_OP_SAM
+
 tex_header:        T_A_TEX '(' T_REGISTER ')'
                        T_IDENTIFIER '=' integer ',' /* src */
+                       T_IDENTIFIER '=' integer ',' /* bindless */
                        T_IDENTIFIER '=' integer ',' /* samp */
-                       T_IDENTIFIER '=' integer ',' /* tex */
+                       T_MOD_TEX '=' integer ',' /* tex */
                        T_IDENTIFIER '=' integer ',' /* wrmask */
-                       T_IDENTIFIER '=' integer     /* cmd */ { }
+                       T_IDENTIFIER '=' tex_header_opc /* cmd */ { }
 
 fullnop_start_section: T_A_FULLNOPSTART { is_in_fullnop_section = true; }
 fullnop_end_section: T_A_FULLNOPEND { is_in_fullnop_section = false; }
@@ -1029,6 +1041,11 @@ cat1_gat:          T_OP_GAT '.' T_CAT1_TYPE_TYPE { parse_type_type(new_instr(OPC
 
 cat1_sct:          T_OP_SCT '.' T_CAT1_TYPE_TYPE { parse_type_type(new_instr(OPC_SCT), $3); } dst_reg ',' dst_reg ',' dst_reg ',' dst_reg ',' src_reg
 
+movs_invocation: uinteger { new_src(0, IR3_REG_IMMED)->uim_val = $1; }
+|                src_a0
+
+cat1_movs: T_OP_MOVS '.' T_CAT1_TYPE_TYPE { parse_type_type(new_instr(OPC_MOVS), $3); } dst_reg ',' src_reg ',' movs_invocation
+
                    /* NOTE: cat1 can also *write* to relative gpr */
 cat1_instr:        cat1_movmsk
 |                  cat1_mova1
@@ -1038,6 +1055,7 @@ cat1_instr:        cat1_movmsk
 |                  cat1_sct
 |                  cat1_opc dst_reg ',' cat1_src
 |                  cat1_opc relative_gpr_dst ',' cat1_src
+|                  cat1_movs
 
 cat2_opc_1src:     T_OP_ABSNEG_F  { new_instr(OPC_ABSNEG_F); }
 |                  T_OP_ABSNEG_S  { new_instr(OPC_ABSNEG_S); }
@@ -1698,10 +1716,11 @@ flut_immed:        T_FLUT_0_0
 |                  T_FLUT_LOG2_10
 |                  T_FLUT_4_0
 
-integer:           T_INT       { $$ = $1; }
-|                  '-' T_INT   { $$ = -$2; }
+uinteger:          T_INT       { $$ = $1; }
 |                  T_HEX       { $$ = $1; }
-|                  '-' T_HEX   { $$ = -$2; }
+
+integer:           uinteger     { $$ = $1; }
+|                  '-' uinteger { $$ = -$2; }
 
 float:             T_FLOAT     { $$ = $1; }
 |                  '-' T_FLOAT { $$ = -$2; }

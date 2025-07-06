@@ -91,6 +91,11 @@ void si_init_resource_fields(struct si_screen *sscreen, struct si_resource *res,
    if (res->b.b.bind & PIPE_BIND_CUSTOM)
       res->flags |= RADEON_FLAG_NO_SUBALLOC;
 
+   /* The frontend assigns addresses so we can't sub allocate at all.
+    */
+   if (res->b.b.flags & PIPE_RESOURCE_FLAG_FRONTEND_VM)
+      res->flags |= RADEON_FLAG_NO_SUBALLOC | RADEON_FLAG_NO_VMA;
+
    if (res->b.b.bind & PIPE_BIND_PROTECTED ||
        /* Force scanout/depth/stencil buffer allocation to be encrypted */
        (sscreen->debug_flags & DBG(TMZ) &&
@@ -256,10 +261,13 @@ static bool si_invalidate_buffer(struct si_context *sctx, struct si_resource *bu
    if (buf->b.is_user_ptr)
       return false;
 
+   /* Can't reallocate when this resource can't change its address.
+    */
+   if (buf->b.b.flags & PIPE_RESOURCE_FLAG_FIXED_ADDRESS || buf->flags & RADEON_FLAG_NO_VMA)
+      return false;
+
    /* Check if mapping this buffer would cause waiting for the GPU. */
-   if (si_cs_is_buffer_referenced(sctx, buf->buf, RADEON_USAGE_READWRITE) ||
-       !sctx->ws->buffer_wait(sctx->ws, buf->buf, 0,
-                              RADEON_USAGE_READWRITE | RADEON_USAGE_DISALLOW_SLOW_REPLY)) {
+   if (!si_is_buffer_idle(sctx, buf, RADEON_USAGE_READWRITE)) {
       /* Reallocate the buffer in the same pipe_resource. */
       si_alloc_resource(sctx->screen, buf);
       si_rebind_buffer(sctx, &buf->b.b);
@@ -281,7 +289,9 @@ void si_replace_buffer_storage(struct pipe_context *ctx, struct pipe_resource *d
 
    radeon_bo_reference(sctx->screen->ws, &sdst->buf, ssrc->buf);
    sdst->gpu_address = ssrc->gpu_address;
+   sdst->b.b.usage = ssrc->b.b.usage;
    sdst->b.b.bind = ssrc->b.b.bind;
+   sdst->domains = ssrc->domains;
    sdst->flags = ssrc->flags;
 
    assert(sdst->bo_size == ssrc->bo_size);
@@ -291,6 +301,28 @@ void si_replace_buffer_storage(struct pipe_context *ctx, struct pipe_resource *d
    si_rebind_buffer(sctx, dst);
 
    util_idalloc_mt_free(&sctx->screen->buffer_ids, delete_buffer_id);
+}
+
+bool si_reallocate_buffer_change_flags(struct si_context *sctx, struct pipe_resource *buf,
+                                       unsigned usage, unsigned bind)
+{
+   struct pipe_resource templ = *buf;
+   templ.usage = usage;
+   templ.bind = bind;
+
+   struct pipe_resource *new_buf = sctx->b.screen->resource_create(sctx->b.screen, &templ);
+   if (!new_buf)
+      return false;
+
+   /* Copy the old buffer contents to the new one. */
+   struct pipe_box box;
+   u_box_1d(0, new_buf->width0, &box);
+   sctx->b.resource_copy_region(&sctx->b, new_buf, 0, 0, 0, 0, buf, 0, &box);
+
+   /* Move the new buffer storage to the old pipe_resource. */
+   si_replace_buffer_storage(&sctx->b, buf, new_buf, 0, 0, 0);
+   pipe_resource_reference(&new_buf, NULL);
+   return true;
 }
 
 static void si_invalidate_resource(struct pipe_context *ctx, struct pipe_resource *resource)
@@ -401,9 +433,7 @@ static void *si_buffer_transfer_map(struct pipe_context *ctx, struct pipe_resour
        */
       if (buf->flags & (RADEON_FLAG_SPARSE | RADEON_FLAG_NO_CPU_ACCESS) ||
           force_discard_range ||
-          si_cs_is_buffer_referenced(sctx, buf->buf, RADEON_USAGE_READWRITE) ||
-          !sctx->ws->buffer_wait(sctx->ws, buf->buf, 0,
-                                 RADEON_USAGE_READWRITE | RADEON_USAGE_DISALLOW_SLOW_REPLY)) {
+          !si_is_buffer_idle(sctx, buf, RADEON_USAGE_READWRITE)) {
          /* Do a wait-free write-only transfer using a temporary buffer. */
          struct u_upload_mgr *uploader;
          struct si_resource *staging = NULL;
@@ -756,11 +786,52 @@ static bool si_resource_commit(struct pipe_context *pctx, struct pipe_resource *
       return si_texture_commit(ctx, res, level, box, commit);
 }
 
+static uint64_t si_resource_get_address(struct pipe_screen *screen,
+                                        struct pipe_resource *resource)
+{
+   struct si_resource *res = si_resource(resource);
+   return res->gpu_address;
+}
+
+static struct pipe_vm_allocation *si_alloc_vm(struct pipe_screen *screen,
+                                              uint64_t start, uint64_t size)
+{
+   struct si_screen *sscreen = si_screen(screen);
+   return sscreen->ws->alloc_vm(sscreen->ws, start, size);
+}
+
+static void si_free_vm(struct pipe_screen *screen,
+                       struct pipe_vm_allocation *alloc)
+{
+   struct si_screen *sscreen = si_screen(screen);
+   sscreen->ws->free_vm(sscreen->ws, alloc);
+}
+
+static bool si_resource_assign_vma(struct pipe_screen *screen,
+                                   struct pipe_resource *resource,
+                                   uint64_t address)
+{
+   struct si_screen *sscreen = si_screen(screen);
+   struct si_resource *res = si_resource(resource);
+
+   int ret = sscreen->ws->buffer_assign_vma(sscreen->ws, res->buf, address);
+   if (ret)
+      res->gpu_address = address;
+
+   return ret;
+}
+
 void si_init_screen_buffer_functions(struct si_screen *sscreen)
 {
    sscreen->b.resource_create = si_resource_create;
    sscreen->b.resource_destroy = si_resource_destroy;
    sscreen->b.resource_from_user_memory = si_buffer_from_user_memory;
+   sscreen->b.resource_get_address = si_resource_get_address;
+   if (sscreen->ws->alloc_vm) {
+      sscreen->b.alloc_vm = si_alloc_vm;
+      sscreen->b.free_vm = si_free_vm;
+      sscreen->b.resource_assign_vma = si_resource_assign_vma;
+   }
 }
 
 void si_init_buffer_functions(struct si_context *sctx)

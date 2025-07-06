@@ -18,6 +18,9 @@
 #include "nir_intrinsics_indices.h"
 #include "shader_enums.h"
 
+/* Residency flags are inverted from NIR */
+#define AGX_RESIDENT (0)
+
 static bool
 fence_image(struct nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
@@ -156,7 +159,18 @@ lower_buffer_texture(nir_builder *b, nir_tex_instr *tex)
 
    nir_def *rgb32 = nir_trim_vector(
       b, libagx_texture_load_rgb32(b, desc, coord, nir_imm_bool(b, is_float)),
-      nir_tex_instr_dest_size(tex));
+      nir_tex_instr_result_size(tex));
+
+   /* Raw loads do not return residency information, but residency queries are
+    * supported on buffer textures. Fortunately, we do not need to support
+    * sparse RGB32 buffers, so we simply claim all RGB32 loads were resident.
+    * Nothing should hit this in practice, but if we don't do *something* here
+    * we'll get vector size mismatches which blow up in vkd3d-proton.
+    */
+   if (tex->is_sparse) {
+      rgb32 = nir_pad_vector_imm_int(b, rgb32, AGX_RESIDENT,
+                                     rgb32->num_components + 1);
+   }
 
    nir_push_else(b, nif);
 
@@ -312,8 +326,11 @@ lower_regular_texture(nir_builder *b, nir_instr *instr, UNUSED void *data)
          nir_def *nibble = nir_iand_imm(b, nir_channel(b, offset, c), 0xF);
          nir_def *shifted = nir_ishl_imm(b, nibble, 4 * c);
 
+         /* We pack with iadd instead of ior to let us fuse in the shift with an
+          * iadd-lsl instruction.
+          */
          if (packed != NULL)
-            packed = nir_ior(b, packed, shifted);
+            packed = nir_iadd(b, packed, shifted);
          else
             packed = shifted;
       }
@@ -347,84 +364,6 @@ lower_regular_texture(nir_builder *b, nir_instr *instr, UNUSED void *data)
    return true;
 }
 
-static nir_def *
-bias_for_tex(nir_builder *b, nir_tex_instr *tex)
-{
-   return nir_build_texture_query(b, tex, nir_texop_lod_bias_agx, 1,
-                                  nir_type_float16, false, false);
-}
-
-static bool
-lower_sampler_bias(nir_builder *b, nir_instr *instr, UNUSED void *data)
-{
-   if (instr->type != nir_instr_type_tex)
-      return false;
-
-   nir_tex_instr *tex = nir_instr_as_tex(instr);
-   b->cursor = nir_before_instr(instr);
-
-   switch (tex->op) {
-   case nir_texop_tex: {
-      tex->op = nir_texop_txb;
-      nir_tex_instr_add_src(tex, nir_tex_src_bias, bias_for_tex(b, tex));
-      return true;
-   }
-
-   case nir_texop_txb:
-   case nir_texop_txl: {
-      nir_tex_src_type src =
-         tex->op == nir_texop_txl ? nir_tex_src_lod : nir_tex_src_bias;
-
-      nir_def *orig = nir_steal_tex_src(tex, src);
-      assert(orig != NULL && "invalid NIR");
-
-      if (orig->bit_size != 16)
-         orig = nir_f2f16(b, orig);
-
-      nir_tex_instr_add_src(tex, src, nir_fadd(b, orig, bias_for_tex(b, tex)));
-      return true;
-   }
-
-   case nir_texop_txd: {
-      /* For txd, the computed level-of-detail is log2(rho)
-       * where rho should scale proportionally to all
-       * derivatives. So scale derivatives by exp2(bias) to
-       * get level-of-detail log2(exp2(bias) * rho) = bias + log2(rho).
-       */
-      nir_def *scale = nir_fexp2(b, nir_f2f32(b, bias_for_tex(b, tex)));
-      nir_tex_src_type src[] = {nir_tex_src_ddx, nir_tex_src_ddy};
-
-      for (unsigned s = 0; s < ARRAY_SIZE(src); ++s) {
-         nir_def *orig = nir_steal_tex_src(tex, src[s]);
-         assert(orig != NULL && "invalid");
-
-         nir_def *scaled = nir_fmul(b, nir_f2f32(b, orig), scale);
-         nir_tex_instr_add_src(tex, src[s], scaled);
-      }
-
-      return true;
-   }
-
-   case nir_texop_lod: {
-      nir_tex_instr_add_src(tex, nir_tex_src_bias, bias_for_tex(b, tex));
-      return true;
-   }
-
-   case nir_texop_txf:
-   case nir_texop_txf_ms:
-   case nir_texop_txs:
-   case nir_texop_tg4:
-   case nir_texop_texture_samples:
-   case nir_texop_samples_identical:
-   case nir_texop_query_levels:
-      /* These operations do not use a sampler */
-      return false;
-
-   default:
-      unreachable("Unhandled texture operation");
-   }
-}
-
 static bool
 legalize_image_lod(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
 {
@@ -438,6 +377,7 @@ legalize_image_lod(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
 
    switch (intr->intrinsic) {
       CASE(image_load, 3)
+      CASE(image_sparse_load, 3)
       CASE(image_store, 4)
       CASE(image_size, 1)
    default:
@@ -528,7 +468,9 @@ lower_buffer_image(nir_builder *b, nir_intrinsic_instr *intr)
    nir_def *coord = nir_channel(b, coord_vector, 0);
 
    /* If we're not bindless, assume we don't need an offset (GL driver) */
-   if (intr->intrinsic == nir_intrinsic_bindless_image_load) {
+   if (intr->intrinsic == nir_intrinsic_bindless_image_load ||
+       intr->intrinsic == nir_intrinsic_bindless_image_sparse_load) {
+
       nir_def *desc = nir_load_from_texture_handle_agx(b, intr->src[0].ssa);
       coord = libagx_buffer_texture_offset(b, desc, coord);
    } else if (intr->intrinsic == nir_intrinsic_bindless_image_store) {
@@ -612,12 +554,14 @@ lower_images(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
    case nir_intrinsic_image_load:
    case nir_intrinsic_image_store:
    case nir_intrinsic_bindless_image_load:
+   case nir_intrinsic_bindless_image_sparse_load:
    case nir_intrinsic_bindless_image_store: {
       /* Legalize MSAA index */
       nir_src_rewrite(&intr->src[2], nir_u2u16(b, intr->src[2].ssa));
 
       if (intr->intrinsic == nir_intrinsic_image_load ||
-          intr->intrinsic == nir_intrinsic_bindless_image_load) {
+          intr->intrinsic == nir_intrinsic_bindless_image_load ||
+          intr->intrinsic == nir_intrinsic_bindless_image_sparse_load) {
          lower_image_load_robustness(b, intr);
       }
 
@@ -648,6 +592,21 @@ lower_images(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
       nir_def_rewrite_uses(&intr->def, image_texel_address(b, intr, false));
       return true;
 
+   case nir_intrinsic_is_sparse_texels_resident:
+      /* Residency information is in bit 0, so we need to mask. Unclear what's
+       * in the upper bits. For now, let's match the blob.
+       */
+      nir_def_replace(
+         &intr->def,
+         nir_ieq_imm(b, nir_iand_imm(b, intr->src[0].ssa, 1), AGX_RESIDENT));
+      return true;
+
+   case nir_intrinsic_sparse_residency_code_and:
+      /* ior because residency codes are inverted from NIR */
+      nir_def_replace(&intr->def,
+                      nir_ior(b, intr->src[0].ssa, intr->src[1].ssa));
+      return true;
+
    case nir_intrinsic_image_size:
    case nir_intrinsic_image_texel_address:
       unreachable("should've been lowered");
@@ -669,6 +628,7 @@ lower_robustness(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
 
    switch (intr->intrinsic) {
    case nir_intrinsic_image_deref_load:
+   case nir_intrinsic_image_deref_sparse_load:
    case nir_intrinsic_image_deref_store:
       break;
    default:
@@ -738,6 +698,7 @@ agx_nir_lower_texture_early(nir_shader *s, bool support_lod_bias)
       .lower_invalid_implicit_lod = true,
       .lower_tg4_offsets = true,
       .lower_index_to_offset = true,
+      .lower_sampler_lod_bias = support_lod_bias,
 
       /* Unclear if/how mipmapped 1D textures work in the hardware. */
       .lower_1d = true,
@@ -749,15 +710,6 @@ agx_nir_lower_texture_early(nir_shader *s, bool support_lod_bias)
    };
 
    NIR_PASS(progress, s, nir_lower_tex, &lower_tex_options);
-
-   /* Lower bias after nir_lower_tex (to get rid of txd) but before
-    * lower_regular_texture (which will shuffle around the sources)
-    */
-   if (support_lod_bias) {
-      NIR_PASS(progress, s, nir_shader_instructions_pass, lower_sampler_bias,
-               nir_metadata_control_flow, NULL);
-   }
-
    return progress;
 }
 

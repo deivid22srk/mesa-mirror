@@ -42,8 +42,8 @@
 #define PAN_DBG_NO_CRC  0x0080
 #define PAN_DBG_GL3     0x0100
 #define PAN_DBG_NO_AFBC 0x0200
-#define PAN_DBG_MSAA16  0x0400
-/* 0x800 unused */
+/* 0x400 unused */
+#define PAN_DBG_STRICT_IMPORT 0x0800
 #define PAN_DBG_LINEAR   0x1000
 #define PAN_DBG_NO_CACHE 0x2000
 #define PAN_DBG_DUMP     0x4000
@@ -58,9 +58,9 @@
 
 struct pan_blendable_format;
 
-unsigned panfrost_translate_swizzle_4(const unsigned char swizzle[4]);
+unsigned pan_translate_swizzle_4(const unsigned char swizzle[4]);
 
-void panfrost_invert_swizzle(const unsigned char *in, unsigned char *out);
+void pan_invert_swizzle(const unsigned char *in, unsigned char *out);
 
 void pan_pack_color(const struct pan_blendable_format *blendable_formats,
                     uint32_t *packed, const union pipe_color_union *color,
@@ -69,7 +69,7 @@ void pan_pack_color(const struct pan_blendable_format *blendable_formats,
 /* Get the last blend shader, for an erratum workaround on v5 */
 
 static inline uint64_t
-panfrost_last_nonnull(uint64_t *ptrs, unsigned count)
+pan_last_nonnull(uint64_t *ptrs, unsigned count)
 {
    for (signed i = ((signed)count - 1); i >= 0; --i) {
       if (ptrs[i])
@@ -77,27 +77,6 @@ panfrost_last_nonnull(uint64_t *ptrs, unsigned count)
    }
 
    return 0;
-}
-
-static inline uint32_t
-pan_select_tiler_hierarchy_mask(unsigned width, unsigned height,
-                                unsigned max_levels)
-{
-   uint32_t max_fb_wh = MAX2(width, height);
-   uint32_t last_hierarchy_bit = util_last_bit(DIV_ROUND_UP(max_fb_wh, 16));
-   uint32_t hierarchy_mask = BITFIELD_MASK(max_levels);
-
-   /* Always enable the level covering the whole FB, and disable the finest
-    * levels if we don't have enough to cover everything.
-    * This is suboptimal for small primitives, since it might force
-    * primitives to be walked multiple times even if they don't cover the
-    * the tile being processed. On the other hand, it's hard to guess
-    * the draw pattern, so it's probably good enough for now.
-    */
-   if (last_hierarchy_bit > max_levels)
-      hierarchy_mask <<= last_hierarchy_bit - max_levels;
-
-   return hierarchy_mask;
 }
 
 #endif /* PAN_UTIL_H */

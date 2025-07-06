@@ -75,6 +75,8 @@ struct amdgpu_userq {
    uint32_t userq_handle;
    enum amd_ip_type ip_type;
    simple_mtx_t lock;
+   /* flags used for queue priority level */
+   uint32_t flags;
 
    union {
       struct amdgpu_userq_gfx_data gfx_data;
@@ -84,7 +86,8 @@ struct amdgpu_userq {
 };
 
 bool
-amdgpu_userq_init(struct amdgpu_winsys *aws, struct amdgpu_userq *userq, enum amd_ip_type ip_type);
+amdgpu_userq_init(struct amdgpu_winsys *aws, struct amdgpu_userq *userq, enum amd_ip_type ip_type,
+                  unsigned queue_index);
 void
 amdgpu_userq_deinit(struct amdgpu_winsys *aws, struct amdgpu_userq *userq);
 

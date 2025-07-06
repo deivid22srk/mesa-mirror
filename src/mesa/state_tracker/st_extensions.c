@@ -366,6 +366,8 @@ void st_init_limits(struct pipe_screen *screen,
          screen->shader_caps[sh].glsl_16bit_consts;
       options->LowerPrecisionFloat16Uniforms =
          screen->shader_caps[sh].fp16_const_buffers;
+      options->LowerPrecision16BitLoadDst =
+         screen->shader_caps[sh].glsl_16bit_load_dst;
    }
 
    c->MaxUserAssignableUniformLocations =
@@ -702,17 +704,19 @@ get_max_samples_for_formats(struct pipe_screen *screen,
                             unsigned max_samples,
                             unsigned bind)
 {
-   unsigned i, f;
+   unsigned i, f, supported_samples = 0;
 
-   for (i = max_samples; i > 0; --i) {
-      for (f = 0; f < num_formats; f++) {
+   for (f = 0; f < num_formats; f++) {
+      for (i = max_samples; i > 0; --i) {
          if (screen->is_format_supported(screen, formats[f],
                                          PIPE_TEXTURE_2D, i, i, bind)) {
-            return i;
+            /* update both return value and loop-boundary */
+            max_samples = supported_samples = i;
+            break;
          }
       }
    }
-   return 0;
+   return supported_samples;
 }
 
 static unsigned
@@ -889,6 +893,22 @@ void st_init_extensions(struct pipe_screen *screen,
           PIPE_FORMAT_ASTC_12x10_SRGB,
           PIPE_FORMAT_ASTC_12x12_SRGB } },
 
+      { { o(KHR_texture_compression_astc_hdr) },
+          { PIPE_FORMAT_ASTC_4x4_FLOAT,
+            PIPE_FORMAT_ASTC_5x4_FLOAT,
+            PIPE_FORMAT_ASTC_5x5_FLOAT,
+            PIPE_FORMAT_ASTC_6x5_FLOAT,
+            PIPE_FORMAT_ASTC_6x6_FLOAT,
+            PIPE_FORMAT_ASTC_8x5_FLOAT,
+            PIPE_FORMAT_ASTC_8x6_FLOAT,
+            PIPE_FORMAT_ASTC_8x8_FLOAT,
+            PIPE_FORMAT_ASTC_10x5_FLOAT,
+            PIPE_FORMAT_ASTC_10x6_FLOAT,
+            PIPE_FORMAT_ASTC_10x8_FLOAT,
+            PIPE_FORMAT_ASTC_10x10_FLOAT,
+            PIPE_FORMAT_ASTC_12x10_FLOAT,
+            PIPE_FORMAT_ASTC_12x12_FLOAT } },
+
       { { o(EXT_texture_shared_exponent) },
         { PIPE_FORMAT_R9G9B9E5_FLOAT } },
 
@@ -1033,7 +1053,6 @@ void st_init_extensions(struct pipe_screen *screen,
    EXT_CAP(ARB_sample_locations,             programmable_sample_locations);
    EXT_CAP(ARB_seamless_cube_map,            seamless_cube_map);
    EXT_CAP(ARB_shader_ballot,                shader_ballot);
-   EXT_CAP(ARB_shader_clock,                 shader_clock);
    EXT_CAP(ARB_shader_draw_parameters,       draw_parameters);
    EXT_CAP(ARB_shader_group_vote,            shader_group_vote);
    EXT_CAP(EXT_shader_image_load_formatted,  image_load_formatted);
@@ -1080,6 +1099,7 @@ void st_init_extensions(struct pipe_screen *screen,
 #else
    EXT_CAP(EXT_semaphore_win32,              fence_signal);
 #endif
+   EXT_CAP(EXT_shader_realtime_clock,        shader_realtime_clock);
    EXT_CAP(EXT_shader_samples_identical,     shader_samples_identical);
    EXT_CAP(EXT_texture_array,                max_texture_array_layers);
    EXT_CAP(EXT_texture_compression_astc_decode_mode, astc_decode_mode);
@@ -1195,6 +1215,8 @@ void st_init_extensions(struct pipe_screen *screen,
    consts->GLSLIgnoreWriteToReadonlyVar = options->glsl_ignore_write_to_readonly_var;
 
    consts->ForceMapBufferSynchronized = options->force_gl_map_buffer_synchronized;
+
+   consts->ForceDepthComponentTypeInt = options->force_gl_depth_component_type_int;
 
    consts->PrimitiveRestartFixedIndex =
       screen->caps.primitive_restart_fixed_index;
@@ -1331,6 +1353,10 @@ void st_init_extensions(struct pipe_screen *screen,
    /* Maximum sample count. */
    {
       static const enum pipe_format color_formats[] = {
+         PIPE_FORMAT_R32G32B32A32_FLOAT,
+         PIPE_FORMAT_R32G32B32A32_UNORM,
+         PIPE_FORMAT_R16G16B16A16_FLOAT,
+         PIPE_FORMAT_R16G16B16A16_UNORM,
          PIPE_FORMAT_R8G8B8A8_UNORM,
          PIPE_FORMAT_B8G8R8A8_UNORM,
          PIPE_FORMAT_A8R8G8B8_UNORM,
@@ -1344,6 +1370,8 @@ void st_init_extensions(struct pipe_screen *screen,
          PIPE_FORMAT_Z32_FLOAT
       };
       static const enum pipe_format int_formats[] = {
+         PIPE_FORMAT_R32G32B32A32_SINT,
+         PIPE_FORMAT_R16G16B16A16_SINT,
          PIPE_FORMAT_R8G8B8A8_SINT
       };
       static const enum pipe_format void_formats[] = {
@@ -1352,12 +1380,12 @@ void st_init_extensions(struct pipe_screen *screen,
 
       consts->MaxSamples =
          get_max_samples_for_formats(screen, ARRAY_SIZE(color_formats),
-                                     color_formats, 16,
+                                     color_formats, MAX_SAMPLES,
                                      PIPE_BIND_RENDER_TARGET);
 
       consts->MaxImageSamples =
          get_max_samples_for_formats(screen, ARRAY_SIZE(color_formats),
-                                     color_formats, 16,
+                                     color_formats, MAX_SAMPLES,
                                      PIPE_BIND_SHADER_IMAGE);
 
       consts->MaxColorTextureSamples =
@@ -1387,7 +1415,7 @@ void st_init_extensions(struct pipe_screen *screen,
          consts->MaxColorFramebufferSamples =
             get_max_samples_for_formats_advanced(screen,
                                                 ARRAY_SIZE(color_formats),
-                                                color_formats, 16,
+                                                color_formats, MAX_SAMPLES,
                                                 consts->MaxSamples,
                                                 PIPE_BIND_RENDER_TARGET);
 

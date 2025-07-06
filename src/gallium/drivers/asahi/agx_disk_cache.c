@@ -37,15 +37,10 @@ agx_disk_cache_compute_key(struct disk_cache *cache,
    if (uncompiled->type == PIPE_SHADER_VERTEX ||
        uncompiled->type == PIPE_SHADER_TESS_EVAL)
       key_size = sizeof(shader_key->vs);
-   else if (uncompiled->type == PIPE_SHADER_GEOMETRY)
-      key_size = sizeof(shader_key->gs);
    else if (uncompiled->type == PIPE_SHADER_FRAGMENT)
       key_size = sizeof(shader_key->fs);
-   else if (uncompiled->type == PIPE_SHADER_COMPUTE ||
-            uncompiled->type == PIPE_SHADER_TESS_CTRL)
-      key_size = 0;
    else
-      unreachable("Unsupported shader stage");
+      key_size = 0;
 
    memcpy(data, uncompiled->nir_sha1, hash_size);
 
@@ -74,8 +69,7 @@ write_shader(struct blob *blob, const struct agx_compiled_shader *binary,
                     sizeof(binary->push[0]) * binary->push_range_count);
 
    if (is_root_gs) {
-      blob_write_uint32(blob, binary->gs_count_words);
-      blob_write_uint32(blob, binary->gs_output_mode);
+      blob_write_bytes(blob, &binary->gs, sizeof(binary->gs));
       write_shader(blob, binary->pre_gs, false);
 
       blob_write_uint8(blob, binary->gs_copy != NULL);
@@ -126,8 +120,7 @@ read_shader(struct agx_screen *screen, struct blob_reader *blob,
                    sizeof(binary->push[0]) * binary->push_range_count);
 
    if (is_root && uncompiled->type == PIPE_SHADER_GEOMETRY) {
-      binary->gs_count_words = blob_read_uint32(blob);
-      binary->gs_output_mode = blob_read_uint32(blob);
+      blob_copy_bytes(blob, &binary->gs, sizeof(binary->gs));
       binary->pre_gs = read_shader(screen, blob, uncompiled, false);
 
       if (blob_read_uint8(blob))

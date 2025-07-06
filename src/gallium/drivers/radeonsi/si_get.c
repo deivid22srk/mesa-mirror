@@ -14,9 +14,9 @@
 #include "util/u_cpu_detect.h"
 #include "util/u_screen.h"
 #include "util/u_video.h"
-#include "vl/vl_decoder.h"
 #include "vl/vl_video_buffer.h"
 #include <sys/utsname.h>
+#include "drm-uapi/drm.h"
 
 /* The capabilities reported by the kernel has priority
    over the existing logic in si_get_video_param */
@@ -84,33 +84,6 @@ static const char *si_get_name(struct pipe_screen *pscreen)
    return sscreen->renderer_string;
 }
 
-static int si_get_video_param_no_video_hw(struct pipe_screen *screen, enum pipe_video_profile profile,
-                                          enum pipe_video_entrypoint entrypoint,
-                                          enum pipe_video_cap param)
-{
-   switch (param) {
-   case PIPE_VIDEO_CAP_SUPPORTED:
-      return vl_profile_supported(screen, profile, entrypoint);
-   case PIPE_VIDEO_CAP_NPOT_TEXTURES:
-      return 1;
-   case PIPE_VIDEO_CAP_MAX_WIDTH:
-   case PIPE_VIDEO_CAP_MAX_HEIGHT:
-      return vl_video_buffer_max_size(screen);
-   case PIPE_VIDEO_CAP_PREFERRED_FORMAT:
-      return PIPE_FORMAT_NV12;
-   case PIPE_VIDEO_CAP_PREFERS_INTERLACED:
-      return false;
-   case PIPE_VIDEO_CAP_SUPPORTS_INTERLACED:
-      return false;
-   case PIPE_VIDEO_CAP_SUPPORTS_PROGRESSIVE:
-      return true;
-   case PIPE_VIDEO_CAP_MAX_LEVEL:
-      return vl_level_supported(screen, profile);
-   default:
-      return 0;
-   }
-}
-
 static int si_get_video_param(struct pipe_screen *screen, enum pipe_video_profile profile,
                               enum pipe_video_entrypoint entrypoint, enum pipe_video_cap param)
 {
@@ -155,7 +128,7 @@ static int si_get_video_param(struct pipe_screen *screen, enum pipe_video_profil
          /* VPE 1st generation does not support orientation
           * Have to determine the version and features of VPE in future.
           */
-         return PIPE_VIDEO_VPP_ORIENTATION_DEFAULT;
+         return PIPE_VIDEO_VPP_FLIP_HORIZONTAL;
       case PIPE_VIDEO_CAP_VPP_BLEND_MODES:
          /* VPE 1st generation does not support blending.
           * Have to determine the version and features of VPE in future.
@@ -173,6 +146,10 @@ static int si_get_video_param(struct pipe_screen *screen, enum pipe_video_profil
          return false;
       case PIPE_VIDEO_CAP_SUPPORTS_INTERLACED:
          /* for VPE we prefer non-interlaced buffer */
+         return false;
+      case PIPE_VIDEO_CAP_VPP_SUPPORT_HDR_INPUT:
+         if (debug_get_bool_option("AMDGPU_SIVPE_SUPPORT_HDR_INPUT", false))
+            return true;
          return false;
       default:
          return 0;
@@ -319,8 +296,9 @@ static int si_get_video_param(struct pipe_screen *screen, enum pipe_video_profil
             attrib.bits.support_superres = PIPE_ENC_FEATURE_NOT_SUPPORTED;
             attrib.bits.support_restoration = PIPE_ENC_FEATURE_NOT_SUPPORTED;
             attrib.bits.support_allow_intrabc = PIPE_ENC_FEATURE_NOT_SUPPORTED;
-            attrib.bits.support_cdef_channel_strength = PIPE_ENC_FEATURE_SUPPORTED;
-
+            attrib.bits.support_cdef_channel_strength = PIPE_ENC_FEATURE_NOT_SUPPORTED;
+            if (sscreen->info.vcn_ip_version >= VCN_5_0_0)
+               attrib.bits.support_cdef_channel_strength = PIPE_ENC_FEATURE_SUPPORTED;
             return attrib.value;
          } else
             return 0;
@@ -872,9 +850,6 @@ void si_init_screen_get_functions(struct si_screen *sscreen)
       sscreen->b.get_video_param = si_get_video_param;
       sscreen->b.is_video_format_supported = si_vid_is_format_supported;
       sscreen->b.is_video_target_buffer_supported = si_vid_is_target_buffer_supported;
-   } else {
-      sscreen->b.get_video_param = si_get_video_param_no_video_hw;
-      sscreen->b.is_video_format_supported = vl_video_buffer_is_format_supported;
    }
 
    si_init_renderer_string(sscreen);
@@ -903,7 +878,7 @@ void si_init_screen_get_functions(struct si_screen *sscreen)
       (sscreen->info.family >= CHIP_GFX940 && !sscreen->info.has_graphics) ||
       /* fma32 is too slow for gpu < gfx9, so apply the option only for gpu >= gfx9 */
       (sscreen->info.gfx_level >= GFX9 && sscreen->options.force_use_fma32);
-   bool has_mediump = sscreen->info.gfx_level >= GFX8 && sscreen->options.fp16;
+   bool has_mediump = sscreen->info.gfx_level >= GFX9 && sscreen->options.mediump;
 
    nir_shader_compiler_options *options = sscreen->nir_options;
    ac_nir_set_options(&sscreen->info, !sscreen->use_aco, options);
@@ -926,9 +901,13 @@ void si_init_screen_get_functions(struct si_screen *sscreen)
     *
     * For OpenCL, rounding mode is explicit. This will only lower f2f16 to f2f16_rtz
     * when execution mode is rtz instead of rtne.
+    *
+    * GFX8 has precision issues with this option.
     */
-   options->force_f2f16_rtz = true;
-   options->io_options |= (!has_mediump ? nir_io_mediump_is_32bit : 0) | nir_io_has_intrinsics;
+   options->force_f2f16_rtz = sscreen->info.gfx_level >= GFX9;
+   options->io_options |= (!has_mediump ? nir_io_mediump_is_32bit : 0) | nir_io_has_intrinsics |
+                          (sscreen->use_ngg_culling ?
+                              nir_io_compaction_groups_tes_inputs_into_pos_and_var_groups : 0);
    options->lower_mediump_io = has_mediump ? si_lower_mediump_io : NULL;
    /* HW supports indirect indexing for: | Enabled in driver
     * -------------------------------------------------------
@@ -969,8 +948,6 @@ void si_init_shader_caps(struct si_screen *sscreen)
       caps->max_shader_images = SI_NUM_IMAGES;
 
       caps->supported_irs = (1 << PIPE_SHADER_IR_TGSI) | (1 << PIPE_SHADER_IR_NIR);
-      if (i == PIPE_SHADER_COMPUTE)
-         caps->supported_irs |= 1 << PIPE_SHADER_IR_NATIVE;
 
       /* Supported boolean features. */
       caps->cont_supported = true;
@@ -981,14 +958,17 @@ void si_init_shader_caps(struct si_screen *sscreen)
       caps->int64_atomics = true;
       caps->tgsi_any_inout_decl_range = true;
 
-      /* We need f16c for fast FP16 conversions in glUniform. */
-      caps->fp16_const_buffers =
-         util_get_cpu_caps()->has_f16c && sscreen->nir_options->lower_mediump_io;
+      /* We need F16C for fast FP16 conversions in glUniform.
+       * It's supported since Intel Ivy Bridge and AMD Bulldozer.
+       */
+      bool has_16bit_alu = sscreen->info.gfx_level >= GFX8 && util_get_cpu_caps()->has_f16c;
 
-      caps->fp16 =
-      caps->fp16_derivatives =
-      caps->glsl_16bit_consts =
-      caps->int16 = sscreen->nir_options->lower_mediump_io != NULL;
+      caps->fp16 = has_16bit_alu;
+      caps->fp16_derivatives = has_16bit_alu;
+      caps->fp16_const_buffers = has_16bit_alu;
+      caps->int16 = has_16bit_alu;
+      caps->glsl_16bit_consts = has_16bit_alu;
+      caps->glsl_16bit_load_dst = sscreen->info.gfx_level >= GFX9;
    }
 }
 
@@ -996,9 +976,6 @@ void si_init_compute_caps(struct si_screen *sscreen)
 {
    struct pipe_compute_caps *caps =
       (struct pipe_compute_caps *)&sscreen->b.compute_caps;
-
-   snprintf(caps->ir_target, sizeof(caps->ir_target), "%s-amdgcn-mesa-mesa3d",
-            ac_get_llvm_processor_name(sscreen->info.family));
 
    caps->grid_dimension = 3;
 
@@ -1011,12 +988,7 @@ void si_init_compute_caps(struct si_screen *sscreen)
    caps->max_block_size[1] =
    caps->max_block_size[2] = 1024;
 
-   caps->max_block_size_clover[0] =
-   caps->max_block_size_clover[1] =
-   caps->max_block_size_clover[2] = 256;
-
    caps->max_threads_per_block = 1024;
-   caps->max_threads_per_block_clover = 256;
    caps->address_bits = 64;
 
    /* Return 1/4 of the heap size as the maximum because the max size is not practically
@@ -1035,7 +1007,6 @@ void si_init_compute_caps(struct si_screen *sscreen)
 
    /* Value reported by the closed source driver. */
    caps->max_local_size = sscreen->info.gfx_level == GFX6 ? 32 * 1024 : 64 * 1024;
-   caps->max_input_size = 1024;
 
    caps->max_clock_frequency = sscreen->info.max_gpu_freq_mhz;
    caps->max_compute_units = sscreen->info.num_cu;
@@ -1125,12 +1096,12 @@ void si_init_screen_caps(struct si_screen *sscreen)
    caps->fs_face_is_integer_sysval = true;
    caps->invalidate_buffer = true;
    caps->surface_reinterpret_blocks = true;
+   caps->compressed_surface_reinterpret_blocks_layered = true;
    caps->query_buffer_object = true;
    caps->query_memory_info = true;
    caps->shader_pack_half_float = true;
    caps->framebuffer_no_attachment = true;
    caps->robust_buffer_access_behavior = true;
-   caps->polygon_offset_units_unscaled = true;
    caps->string_marker = true;
    caps->cull_distance = true;
    caps->shader_array_components = true;
@@ -1155,7 +1126,6 @@ void si_init_screen_caps(struct si_screen *sscreen)
    caps->compute_grid_info_last_block = true;
    caps->image_load_formatted = true;
    caps->prefer_compute_for_multimedia = true;
-   caps->tgsi_div = true;
    caps->packed_uniforms = true;
    caps->gl_spirv = true;
    caps->alpha_to_coverage_dither_control = true;
@@ -1178,6 +1148,11 @@ void si_init_screen_caps(struct si_screen *sscreen)
    caps->has_const_bw = true;
    caps->cl_gl_sharing = true;
    caps->call_finalize_nir_in_linker = true;
+
+   /* Fixup dmabuf caps for the virtio + vpipe case (when fd=-1, u_init_pipe_screen_caps
+    * fails to set this capability). */
+   if (sscreen->info.is_virtio)
+         caps->dmabuf |= DRM_PRIME_CAP_EXPORT | DRM_PRIME_CAP_IMPORT;
 
    caps->fbfetch = 1;
 
@@ -1376,4 +1351,7 @@ void si_init_screen_caps(struct si_screen *sscreen)
     *    KHR-GL46.texture_lod_bias.texture_lod_bias_all
     */
    caps->max_texture_lod_bias = 16;
+
+   if (sscreen->ws->va_range)
+      sscreen->ws->va_range(sscreen->ws, &caps->min_vma, &caps->max_vma);
 }

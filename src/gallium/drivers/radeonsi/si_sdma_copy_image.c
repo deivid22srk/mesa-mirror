@@ -168,26 +168,29 @@ static bool si_sdma_v4_v5_copy_texture(struct si_context *sctx, struct si_textur
       if (dcc) {
          unsigned data_format = ac_get_cb_format(sctx->gfx_level, tiled->buffer.b.b.format);
          unsigned number_type = ac_get_cb_number_type(tiled->buffer.b.b.format);
-         uint64_t md_address = tiled_address + tiled->surface.meta_offset;
 
          if (is_v7) {
-            radeon_emit(SDMA_DCC_DATA_FORMAT(data_format) |
-                        SDMA_DCC_NUM_TYPE(number_type) |
-                        SDMA_DCC_READ_CM(2) |
-                        SDMA_DCC_WRITE_CM(1) |
-                        SDMA_DCC_MAX_COM(tiled->surface.u.gfx9.color.dcc.max_compressed_block_size) |
-                        SDMA_DCC_MAX_UCOM(1));
+            radeon_emit(SDMA7_DCC_DATA_FORMAT(data_format) |
+                        SDMA7_DCC_NUM_TYPE(number_type) |
+                        SDMA7_DCC_READ_CM(2) |
+                        SDMA7_DCC_WRITE_CM(1) |
+                        SDMA7_DCC_MAX_COM(tiled->surface.u.gfx9.color.dcc.max_compressed_block_size) |
+                        SDMA7_DCC_MAX_UCOM(1));
          } else {
             /* Add metadata */
+            uint64_t md_address = tiled_address + tiled->surface.meta_offset;
+
             radeon_emit((uint32_t)md_address);
             radeon_emit((uint32_t)(md_address >> 32));
-            radeon_emit(data_format |
-                        ac_alpha_is_on_msb(&sctx->screen->info, tiled->buffer.b.b.format) << 8 |
-                        number_type << 9 |
-                        tiled->surface.u.gfx9.color.dcc.max_compressed_block_size << 24 |
-                        V_028C78_MAX_BLOCK_SIZE_256B << 26 |
-                        tmz << 29 |
-                        tiled->surface.u.gfx9.color.dcc.pipe_aligned << 31);
+            radeon_emit(SDMA5_DCC_DATA_FORMAT(data_format) |
+                        SDMA5_DCC_ALPHA_IS_ON_MSB(ac_alpha_is_on_msb(&sctx->screen->info, tiled->buffer.b.b.format)) |
+                        SDMA5_DCC_NUM_TYPE(number_type) |
+                        SDMA5_DCC_SURF_TYPE(0) |
+                        SDMA5_DCC_MAX_COM(tiled->surface.u.gfx9.color.dcc.max_compressed_block_size) |
+                        SDMA5_DCC_MAX_UCOM(V_028C78_MAX_BLOCK_SIZE_256B) |
+                        SDMA5_DCC_WRITE_COMPRESS(tiled == sdst) |
+                        SDMA5_DCC_TMZ(tmz) |
+                        SDMA5_DCC_PIPE_ALIGNED(tiled->surface.u.gfx9.color.dcc.pipe_aligned));
          }
       }
       radeon_end();
@@ -402,8 +405,10 @@ bool si_sdma_copy_image(struct si_context *sctx, struct si_texture *dst, struct 
          return false;
 
       sctx->sdma_cs = CALLOC_STRUCT(radeon_cmdbuf);
-      if (ws->cs_create(sctx->sdma_cs, sctx->ctx, AMD_IP_SDMA, NULL, NULL))
+      if (!ws->cs_create(sctx->sdma_cs, sctx->ctx, AMD_IP_SDMA, NULL, NULL)) {
+         sctx->screen->debug_flags |= DBG(NO_DMA);
          return false;
+      }
    }
 
    if (!si_prepare_for_sdma_copy(sctx, dst, src))

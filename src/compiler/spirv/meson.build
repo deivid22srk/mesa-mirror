@@ -62,6 +62,7 @@ libvtn = static_library(
 idep_vtn = declare_dependency(
   dependencies : [dep_spirv_tools, idep_nir, idep_mesautil],
   link_with : libvtn,
+  sources : [spirv_info_h],
 )
 
 spirv2nir = executable(
@@ -102,7 +103,10 @@ if with_tests
         'tests/helpers.h',
         'tests/avail_vis.cpp',
         'tests/volatile.cpp',
+        'tests/cmat.cpp',
         'tests/control_flow_tests.cpp',
+        'tests/non_semantic.cpp',
+        'tests/workarounds.cpp',
       ),
       c_args : [c_msvc_compat_args, no_override_init_args],
       gnu_symbol_visibility : 'hidden',

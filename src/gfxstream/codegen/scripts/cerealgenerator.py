@@ -43,6 +43,7 @@ SUPPORTED_FEATURES = [
     "VK_KHR_dedicated_allocation",
     "VK_KHR_get_memory_requirements2",
     "VK_KHR_sampler_ycbcr_conversion",
+    "VK_KHR_global_priority",
     "VK_KHR_shader_float16_int8",
     "VK_AMD_gpu_shader_half_float",
     "VK_NV_shader_subgroup_partitioned",
@@ -68,11 +69,13 @@ SUPPORTED_FEATURES = [
     "VK_KHR_external_fence",
     "VK_KHR_external_fence_fd",
     "VK_EXT_device_memory_report",
+    "VK_EXT_memory_budget",
     "VK_KHR_create_renderpass2",
     "VK_KHR_imageless_framebuffer",
     "VK_KHR_descriptor_update_template",
     "VK_EXT_depth_clip_enable",
     "VK_EXT_robustness2",
+    "VK_KHR_multiview",
     # see aosp/2736079 + b/268351352
     "VK_EXT_swapchain_maintenance1",
     "VK_KHR_maintenance5",
@@ -166,7 +169,7 @@ SUPPORTED_MODULES = {
     "VK_EXT_swapchain_maintenance1" : HOST_MODULES,
     "VK_KHR_swapchain" : HOST_MODULES,
     "VK_NV_device_diagnostic_checkpoints": ["goldfish_vk_dispatch"],
-    "VK_KHR_ray_tracing_pipeline": HOST_MODULES,
+    "VK_KHR_ray_tracing_pipeline": ["goldfish_vk_dispatch"],
     "VK_KHR_pipeline_library": HOST_MODULES,
 }
 
@@ -200,6 +203,22 @@ copyrightHeader = """// Copyright (C) 2018 The Android Open Source Project
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+"""
+
+coprightHeaderPy = """# Copyright (C) 2025 The Android Open Source Project
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 
 # We put the long generated commands in a separate paragraph, so that the formatter won't mess up
@@ -278,9 +297,6 @@ class CerealGenerator(OutputGenerator):
         self.codegen = cereal.CodeGen()
         self.featureSupported = False
         self.supportedModules = None
-
-        self.baseLibDirPrefix = "aemu/base"
-        self.utilsHeaderDirPrefix = "utils"
 
         # The cereal variant should be an environmental variable of one of
         # the following:
@@ -379,6 +395,11 @@ class IOStream;
 #undef VK_ANDROID_external_memory_android_hardware_buffer
 """ % VULKAN_STREAM_TYPE_GUEST
 
+        reservedMarshalingHostIncludes = """
+#include "VulkanBoxedHandles.h"
+
+"""
+
         reservedmarshalImplIncludeGuest = """
 #include "Resources.h"
 """
@@ -388,15 +409,15 @@ class IOStream;
 #include "goldfish_vk_private_defs.h"
 
 #include "%s.h"
-#include "{self.baseLibDirPrefix}/files/StreamSerializing.h"
+#include "gfxstream/host/stream_utils.h"
 """ % VULKAN_STREAM_TYPE
 
         poolInclude = f"""
 {self.hostCommonExtraVulkanHeaders}
 #include "goldfish_vk_private_defs.h"
-#include "{self.baseLibDirPrefix}/BumpPool.h"
-using android::base::Allocator;
-using android::base::BumpPool;
+#include "gfxstream/BumpPool.h"
+using gfxstream::base::Allocator;
+using gfxstream::base::BumpPool;
 """
         transformIncludeGuest = """
 #include "goldfish_vk_private_defs.h"
@@ -415,6 +436,11 @@ using android::base::BumpPool;
         deepcopyInclude = """
 #include "vk_util.h"
 """
+
+        deepcopyHostInclude = """
+#include "VkUtils.h"
+"""
+
         poolIncludeGuest = f"""
 #include "goldfish_vk_private_defs.h"
 #include "BumpPool.h"
@@ -443,8 +469,8 @@ using DlSymFunc = void* (void*, const char*);
 
         extensionStructsInclude = f"""
 {self.hostCommonExtraVulkanHeaders}
+#include "gfxstream/common/logging.h"
 #include "goldfish_vk_private_defs.h"
-#include "host-common/GfxstreamFatalError.h"
 #include "vulkan/vk_enum_string_helper.h"
 """
 
@@ -486,31 +512,32 @@ using DlSymFunc = void* (void*, const char*);
         decoderSnapshotHeaderIncludes = f"""
 #include <memory>
 
-#include "VkSnapshotApiCall.h"
-#include "{self.utilsHeaderDirPrefix}/GfxApiLogger.h"
-#include "{self.baseLibDirPrefix}/HealthMonitor.h"
+#include "VkSnapshotHandles.h"
+#include "gfxstream/HealthMonitor.h"
+#include "gfxstream/host/GfxApiLogger.h"
 #include "goldfish_vk_private_defs.h"
 """
         decoderSnapshotImplIncludes = f"""
 #include <mutex>
 
+#include "VulkanBoxedHandles.h"
 #include "VulkanHandleMapping.h"
 #include "VkDecoderGlobalState.h"
 #include "VkReconstruction.h"
-#include "{self.baseLibDirPrefix}/ThreadAnnotations.h"
+#include "gfxstream/ThreadAnnotations.h"
 """
 
         decoderHeaderIncludes = f"""
 #include "VkDecoderContext.h"
-#include "ProcessResources.h"
+#include "gfxstream/host/ProcessResources.h"
 
 #include <memory>
 
-namespace android {{
+namespace gfxstream {{
 namespace base {{
 class BumpPool;
-}} // namespace android
 }} // namespace base
+}} // namespace gfxstream
 
 """
 
@@ -520,22 +547,21 @@ class BumpPool;
 #include "goldfish_vk_private_defs.h"
 #include "common/goldfish_vk_transform.h"
 
-#include "{self.baseLibDirPrefix}/BumpPool.h"
-#include "{self.baseLibDirPrefix}/system/System.h"
-#include "{self.baseLibDirPrefix}/Metrics.h"
-#include "render-utils/IOStream.h"
+#include "gfxstream/BumpPool.h"
+#include "gfxstream/system/System.h"
+#include "gfxstream/Metrics.h"
 #include "FrameBuffer.h"
 #include "gfxstream/host/Tracing.h"
-#include "host-common/feature_control.h"
-#include "host-common/GfxstreamFatalError.h"
-#include "host-common/logging.h"
-
+#include "gfxstream/host/iostream.h"
+#include "gfxstream/common/logging.h"
 #include "VkDecoderGlobalState.h"
 #include "VkDecoderSnapshot.h"
 
+#include "VulkanBoxedHandles.h"
 #include "VulkanDispatch.h"
 #include "%s.h"
 
+#include <cstring>
 #include <functional>
 #include <optional>
 #include <unordered_map>
@@ -620,10 +646,10 @@ class BumpPool;
                            extraImpl=commonCerealImplIncludes)
             self.addCppModule("common", "goldfish_vk_reserved_marshaling",
                            extraHeader=vulkanStreamIncludeHost,
-                           extraImpl=commonCerealImplIncludes)
+                           extraImpl=commonCerealImplIncludes + reservedMarshalingHostIncludes)
             self.addCppModule("common", "goldfish_vk_deepcopy",
                            extraHeader=poolInclude,
-                           extraImpl=commonCerealImplIncludes + deepcopyInclude)
+                           extraImpl=commonCerealImplIncludes + deepcopyHostInclude)
             self.addCppModule("common", "goldfish_vk_dispatch",
                            extraHeader=dispatchHeaderDefs,
                            extraImpl=dispatchImplIncludes)
@@ -645,7 +671,8 @@ class BumpPool;
                                implOnly=True)
 
             self.addModule(cereal.PyScript(self.host_tag, "vulkan_printer", customAbsDir=Path(
-                self.host_script_destination) / "print_gfx_logs"), moduleName="ApiLogDecoder")
+                self.host_script_destination) / "print_gfx_logs"), moduleName="ApiLogDecoder",
+                extraHeader=coprightHeaderPy)
             self.addHostModule(
                 "vulkan_gfxstream_structure_type", headerOnly=True, suppressFeatureGuards=True,
                 moduleName="vulkan_gfxstream_structure_type_host", useNamespace=False,
@@ -699,10 +726,12 @@ class BumpPool;
             suppressFeatureGuards=suppressFeatureGuards, moduleName=moduleName,
             suppressVulkanHeaders=suppressVulkanHeaders)
 
-    def addModule(self, module, moduleName=None):
+    def addModule(self, module, moduleName=None, extraHeader=None):
         if moduleName is None:
             moduleName = module.basename
         self.moduleList.append(moduleName)
+        if extraHeader:
+            module.preamble = extraHeader
         self.modules[moduleName] = module
 
     def addCppModule(

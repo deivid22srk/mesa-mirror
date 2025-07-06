@@ -35,7 +35,6 @@
 
 struct remap_entry {
    brw_inst *inst;
-   bblock_t *block;
    enum brw_reg_type type;
    unsigned nr;
    bool negate;
@@ -419,6 +418,24 @@ brw_opt_cse_defs(brw_shader &s)
             last_flag_write = last;
          last = inst;
 
+         /* Discard jumps aren't represented in the CFG unfortunately, so we need
+          * to make sure that they behave as a CSE barrier, since we lack global
+          * dataflow information.  This is particularly likely to cause problems
+          * with instructions dependent on the current execution mask like
+          * SHADER_OPCODE_FIND_LIVE_CHANNEL.
+          */
+         if (inst->opcode == BRW_OPCODE_HALT ||
+             inst->opcode == SHADER_OPCODE_HALT_TARGET) {
+            /* Treat each side of the HALT separately for local_only
+             * expressions as it's altering the channel enables.
+             */
+            set_foreach(set, e) {
+               brw_inst *match = (brw_inst *) e->key;
+               if (match->block == block && local_only(match))
+                  _mesa_set_remove(set, e);
+            }
+         }
+
          if (inst->dst.is_null()) {
             bool ignored;
             if (last_flag_write && !inst->writes_accumulator &&
@@ -427,7 +444,7 @@ brw_opt_cse_defs(brw_shader &s)
                 * which is redundant with the previous flag write in our
                 * basic block.  So we can simply remove it.
                 */
-               inst->remove(block, true);
+               inst->remove();
                last = NULL;
                progress = true;
             }
@@ -450,7 +467,7 @@ brw_opt_cse_defs(brw_shader &s)
             if (match == inst)
                continue;
 
-            bblock_t *def_block = defs.get_block(match->dst);
+            bblock_t *def_block = match->block;
             if (block != def_block && (local_only(inst) ||
                 !idom.dominates(def_block, block))) {
                /* If `match` doesn't dominate `inst` then remove it from
@@ -484,7 +501,6 @@ brw_opt_cse_defs(brw_shader &s)
 
             need_remaps = true;
             remap_table[inst->dst.nr].inst = inst;
-            remap_table[inst->dst.nr].block = block;
             remap_table[inst->dst.nr].type = match->dst.type;
             remap_table[inst->dst.nr].nr = match->dst.nr;
             remap_table[inst->dst.nr].negate = negate;
@@ -499,7 +515,7 @@ brw_opt_cse_defs(brw_shader &s)
          continue;
 
       if (!remap_table[i].still_used) {
-         remap_table[i].inst->remove(remap_table[i].block, true);
+         remap_table[i].inst->remove();
          progress = true;
       }
    }
@@ -509,9 +525,7 @@ out:
    _mesa_set_destroy(set, NULL);
 
    if (progress) {
-      s.cfg->adjust_block_ips();
-      s.invalidate_analysis(BRW_DEPENDENCY_INSTRUCTION_DATA_FLOW |
-                            BRW_DEPENDENCY_INSTRUCTION_DETAIL);
+      s.invalidate_analysis(BRW_DEPENDENCY_INSTRUCTIONS);
    }
 
    return progress;

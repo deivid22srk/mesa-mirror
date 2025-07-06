@@ -1011,6 +1011,14 @@ vn_sizeof_VkSubpassDescription2_pnext(const void *val)
             size += vn_sizeof_VkSubpassDescription2_pnext(pnext->pNext);
             size += vn_sizeof_VkFragmentShadingRateAttachmentInfoKHR_self((const VkFragmentShadingRateAttachmentInfoKHR *)pnext);
             return size;
+        case VK_STRUCTURE_TYPE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_INFO_EXT:
+            if (!vn_cs_renderer_protocol_has_extension(377 /* VK_EXT_multisampled_render_to_single_sampled */))
+                break;
+            size += vn_sizeof_simple_pointer(pnext);
+            size += vn_sizeof_VkStructureType(&pnext->sType);
+            size += vn_sizeof_VkSubpassDescription2_pnext(pnext->pNext);
+            size += vn_sizeof_VkMultisampledRenderToSingleSampledInfoEXT_self((const VkMultisampledRenderToSingleSampledInfoEXT *)pnext);
+            return size;
         default:
             /* ignore unknown/unsupported struct */
             break;
@@ -1097,6 +1105,14 @@ vn_encode_VkSubpassDescription2_pnext(struct vn_cs_encoder *enc, const void *val
             vn_encode_VkStructureType(enc, &pnext->sType);
             vn_encode_VkSubpassDescription2_pnext(enc, pnext->pNext);
             vn_encode_VkFragmentShadingRateAttachmentInfoKHR_self(enc, (const VkFragmentShadingRateAttachmentInfoKHR *)pnext);
+            return;
+        case VK_STRUCTURE_TYPE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_INFO_EXT:
+            if (!vn_cs_renderer_protocol_has_extension(377 /* VK_EXT_multisampled_render_to_single_sampled */))
+                break;
+            vn_encode_simple_pointer(enc, pnext);
+            vn_encode_VkStructureType(enc, &pnext->sType);
+            vn_encode_VkSubpassDescription2_pnext(enc, pnext->pNext);
+            vn_encode_VkMultisampledRenderToSingleSampledInfoEXT_self(enc, (const VkMultisampledRenderToSingleSampledInfoEXT *)pnext);
             return;
         default:
             /* ignore unknown/unsupported struct */
@@ -1816,19 +1832,6 @@ static inline void vn_async_vkCreateRenderPass(struct vn_ring *vn_ring, VkDevice
 {
     struct vn_ring_submit_command submit;
     vn_submit_vkCreateRenderPass(vn_ring, 0, device, pCreateInfo, pAllocator, pRenderPass, &submit);
-}
-
-static inline void vn_call_vkDestroyRenderPass(struct vn_ring *vn_ring, VkDevice device, VkRenderPass renderPass, const VkAllocationCallbacks* pAllocator)
-{
-    VN_TRACE_FUNC();
-
-    struct vn_ring_submit_command submit;
-    vn_submit_vkDestroyRenderPass(vn_ring, VK_COMMAND_GENERATE_REPLY_BIT_EXT, device, renderPass, pAllocator, &submit);
-    struct vn_cs_decoder *dec = vn_ring_get_command_reply(vn_ring, &submit);
-    if (dec) {
-        vn_decode_vkDestroyRenderPass_reply(dec, device, renderPass, pAllocator);
-        vn_ring_free_command_reply(vn_ring, &submit);
-    }
 }
 
 static inline void vn_async_vkDestroyRenderPass(struct vn_ring *vn_ring, VkDevice device, VkRenderPass renderPass, const VkAllocationCallbacks* pAllocator)

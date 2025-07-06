@@ -48,7 +48,7 @@ radv_is_vertex_buffer_format_supported(VkFormat format)
    if (first_non_void < 0)
       return false;
 
-   const struct util_format_description *desc = vk_format_description(format);
+   const struct util_format_description *desc = radv_format_description(format);
    return ac_translate_buffer_dataformat(desc, first_non_void) != V_008F0C_BUF_DATA_FORMAT_INVALID;
 }
 
@@ -81,7 +81,7 @@ radv_translate_tex_numformat(const struct util_format_description *desc, int fir
 static bool
 radv_is_sampler_format_supported(const struct radv_physical_device *pdev, VkFormat format, bool *linear_sampling)
 {
-   const struct util_format_description *desc = vk_format_description(format);
+   const struct util_format_description *desc = radv_format_description(format);
    uint32_t num_format;
    if (format == VK_FORMAT_UNDEFINED || format == VK_FORMAT_R64_UINT || format == VK_FORMAT_R64_SINT)
       return false;
@@ -95,7 +95,8 @@ radv_is_sampler_format_supported(const struct radv_physical_device *pdev, VkForm
       *linear_sampling = true;
    else
       *linear_sampling = false;
-   return radv_translate_tex_dataformat(pdev, vk_format_description(format),
+
+   return radv_translate_tex_dataformat(pdev, radv_format_description(format),
                                         vk_format_get_first_non_void_channel(format)) != ~0U;
 }
 
@@ -110,7 +111,7 @@ bool
 radv_is_storage_image_format_supported(const struct radv_physical_device *pdev, VkFormat format)
 {
    const struct radv_instance *instance = radv_physical_device_instance(pdev);
-   const struct util_format_description *desc = vk_format_description(format);
+   const struct util_format_description *desc = radv_format_description(format);
    unsigned data_format, num_format;
    if (format == VK_FORMAT_UNDEFINED)
       return false;
@@ -200,7 +201,7 @@ radv_is_buffer_dataformat_supported(const struct util_format_description *desc, 
 bool
 radv_is_buffer_format_supported(VkFormat format, bool *scaled)
 {
-   const struct util_format_description *desc = vk_format_description(format);
+   const struct util_format_description *desc = radv_format_description(format);
    unsigned num_format;
 
    if (format == VK_FORMAT_UNDEFINED)
@@ -223,7 +224,7 @@ radv_is_buffer_format_supported(VkFormat format, bool *scaled)
 static bool
 radv_is_colorbuffer_format_blendable(const struct radv_physical_device *pdev, VkFormat format)
 {
-   const struct util_format_description *desc = vk_format_description(format);
+   const struct util_format_description *desc = radv_format_description(format);
    const uint32_t color_format = ac_get_cb_format(pdev->info.gfx_level, desc->format);
    const uint32_t color_num_format = ac_get_cb_number_type(desc->format);
 
@@ -239,7 +240,7 @@ radv_is_colorbuffer_format_blendable(const struct radv_physical_device *pdev, Vk
 bool
 radv_is_colorbuffer_format_supported(const struct radv_physical_device *pdev, VkFormat format)
 {
-   const struct util_format_description *desc = vk_format_description(format);
+   const struct util_format_description *desc = radv_format_description(format);
    return ac_is_colorbuffer_format_supported(pdev->info.gfx_level, desc->format);
 }
 
@@ -275,7 +276,7 @@ radv_physical_device_get_format_properties(struct radv_physical_device *pdev, Vk
                                            VkFormatProperties3 *out_properties)
 {
    VkFormatFeatureFlags2 linear = 0, tiled = 0, buffer = 0;
-   const struct util_format_description *desc = vk_format_description(format);
+   const struct util_format_description *desc = radv_format_description(format);
    bool scaled = false;
    /* TODO: implement some software emulation of SUBSAMPLED formats. */
    if (desc->format == PIPE_FORMAT_NONE || desc->layout == UTIL_FORMAT_LAYOUT_SUBSAMPLED) {
@@ -398,9 +399,8 @@ radv_physical_device_get_format_properties(struct radv_physical_device *pdev, Vk
             tiled |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
          }
 
-         /* Don't support blitting/minmax for R32G32B32 formats. */
-         if (format == VK_FORMAT_R32G32B32_SFLOAT || format == VK_FORMAT_R32G32B32_UINT ||
-             format == VK_FORMAT_R32G32B32_SINT) {
+         /* Don't support blitting/minmax for 96-bit formats. */
+         if (vk_format_is_96bit(format)) {
             linear &= ~VK_FORMAT_FEATURE_2_BLIT_SRC_BIT;
             linear &= ~VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_MINMAX_BIT;
          }
@@ -502,7 +502,7 @@ radv_physical_device_get_format_properties(struct radv_physical_device *pdev, Vk
 bool
 radv_format_pack_clear_color(VkFormat format, uint32_t clear_vals[2], VkClearColorValue *value)
 {
-   const struct util_format_description *desc = vk_format_description(format);
+   const struct util_format_description *desc = radv_format_description(format);
 
    if (format == VK_FORMAT_B10G11R11_UFLOAT_PACK32) {
       clear_vals[0] = float3_to_r11g11b10f(value->float32);
@@ -631,7 +631,8 @@ radv_get_modifier_flags(struct radv_physical_device *pdev, VkFormat format, uint
        * do not support DCC image stores or when explicitly disabled.
        */
       if (!ac_modifier_supports_dcc_image_stores(pdev->info.gfx_level, modifier) ||
-          radv_is_atomic_format_supported(format) || instance->drirc.disable_dcc_stores)
+          radv_is_atomic_format_supported(format) ||
+          (instance->drirc.disable_dcc_stores && pdev->info.gfx_level < GFX12))
          features &= ~VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT;
 
       if (instance->debug_flags & (RADV_DEBUG_NO_DCC | RADV_DEBUG_NO_DISPLAY_DCC))
@@ -865,7 +866,7 @@ radv_get_image_format_properties(struct radv_physical_device *pdev, const VkPhys
    uint32_t maxMipLevels;
    uint32_t maxArraySize;
    VkSampleCountFlags sampleCounts = VK_SAMPLE_COUNT_1_BIT;
-   const struct util_format_description *desc = vk_format_description(format);
+   const struct util_format_description *desc = radv_format_description(format);
    enum amd_gfx_level gfx_level = pdev->info.gfx_level;
    VkImageTiling tiling = info->tiling;
    const VkPhysicalDeviceImageDrmFormatModifierInfoEXT *mod_info =
@@ -937,8 +938,7 @@ radv_get_image_format_properties(struct radv_physical_device *pdev, const VkPhys
       sampleCounts |= VK_SAMPLE_COUNT_2_BIT | VK_SAMPLE_COUNT_4_BIT | VK_SAMPLE_COUNT_8_BIT;
    }
 
-   if (tiling == VK_IMAGE_TILING_LINEAR && (format == VK_FORMAT_R32G32B32_SFLOAT ||
-                                            format == VK_FORMAT_R32G32B32_SINT || format == VK_FORMAT_R32G32B32_UINT)) {
+   if (tiling == VK_IMAGE_TILING_LINEAR && vk_format_is_96bit(format)) {
       /* R32G32B32 is a weird format and the driver currently only
        * supports the barely minimum.
        * TODO: Implement more if we really need to.
@@ -1234,7 +1234,7 @@ radv_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physicalDevice,
    }
 
    if (ycbcr_props) {
-      ycbcr_props->combinedImageSamplerDescriptorCount = 1;
+      ycbcr_props->combinedImageSamplerDescriptorCount = vk_format_get_plane_count(format);
    }
 
    if (texture_lod_props) {
@@ -1249,9 +1249,8 @@ radv_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physicalDevice,
       image_compression_props->imageCompressionFixedRateFlags = VK_IMAGE_COMPRESSION_FIXED_RATE_NONE_EXT;
 
       if (vk_format_is_depth_or_stencil(format)) {
-         image_compression_props->imageCompressionFlags = (instance->debug_flags & RADV_DEBUG_NO_HIZ)
-                                                             ? VK_IMAGE_COMPRESSION_DISABLED_EXT
-                                                             : VK_IMAGE_COMPRESSION_DEFAULT_EXT;
+         image_compression_props->imageCompressionFlags =
+            pdev->use_hiz ? VK_IMAGE_COMPRESSION_DEFAULT_EXT : VK_IMAGE_COMPRESSION_DISABLED_EXT;
       } else {
          image_compression_props->imageCompressionFlags =
             ((instance->debug_flags & RADV_DEBUG_NO_DCC) || pdev->info.gfx_level < GFX8)
@@ -1407,9 +1406,8 @@ radv_GetDeviceImageSparseMemoryRequirements(VkDevice device, const VkDeviceImage
    UNUSED VkResult result;
    VkImage image;
 
-   /* Determining the image size/alignment require to create a surface, which is complicated without
-    * creating an image.
-    * TODO: Avoid creating an image.
+   /* Determining the image size/alignment require to create a surface, which isn't really possible
+    * without creating an image.
     */
    result =
       radv_image_create(device, &(struct radv_image_create_info){.vk_info = pInfo->pCreateInfo}, NULL, &image, true);
@@ -1508,8 +1506,8 @@ radv_dcc_formats_compatible(enum amd_gfx_level gfx_level, VkFormat format1, VkFo
    if (format1 == format2)
       return true;
 
-   desc1 = vk_format_description(format1);
-   desc2 = vk_format_description(format2);
+   desc1 = radv_format_description(format1);
+   desc2 = radv_format_description(format2);
 
    if (desc1->nr_channels != desc2->nr_channels)
       return false;

@@ -11,6 +11,7 @@
 #include "util/ralloc.h"
 #include "util/u_dump.h"
 #include "util/u_inlines.h"
+#include "agx_abi.h"
 #include "agx_bo.h"
 #include "agx_device.h"
 #include "agx_state.h"
@@ -408,12 +409,12 @@ agx_get_query_result(struct pipe_context *pctx, struct pipe_query *pquery,
       return true;
 
    case QUERY_COPY_TIMESTAMP:
-      vresult->u64 = agx_gpu_time_to_ns(dev, value);
+      vresult->u64 = agx_gpu_timestamp_to_ns(dev, value);
       return true;
 
    case QUERY_COPY_TIME_ELAPSED:
       /* end - begin */
-      vresult->u64 = agx_gpu_time_to_ns(dev, ptr[0] - ptr[1]);
+      vresult->u64 = agx_gpu_timestamp_to_ns(dev, ptr[0] - ptr[1]);
       return true;
 
    default:
@@ -567,7 +568,7 @@ agx_get_query_address(struct agx_batch *batch, struct agx_query *query)
       agx_add_query_to_batch(batch, query);
       return query->ptr.gpu;
    } else {
-      return 0;
+      return AGX_SCRATCH_PAGE_ADDRESS;
    }
 }
 

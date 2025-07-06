@@ -32,12 +32,11 @@ vk_format_for_size(int bs)
 }
 
 static struct radv_meta_blit2d_surf
-blit_surf_for_image_level_layer(struct radv_image *image, VkImageLayout layout, const VkImageSubresourceLayers *subres,
-                                VkImageAspectFlags aspect_mask)
+blit_surf_for_image_level_layer(struct radv_image *image, VkImageLayout layout, const VkImageSubresourceLayers *subres)
 {
-   VkFormat format = radv_get_aspect_format(image, aspect_mask);
+   VkFormat format = radv_get_aspect_format(image, subres->aspectMask);
 
-   if (!radv_dcc_enabled(image, subres->mipLevel) && !(radv_image_is_tc_compat_htile(image)))
+   if (!radv_dcc_enabled(image, subres->mipLevel) && !(radv_tc_compat_htile_enabled(image, subres->mipLevel)))
       format = vk_format_for_size(vk_format_get_blocksize(format));
 
    format = vk_format_no_srgb(format);
@@ -48,7 +47,7 @@ blit_surf_for_image_level_layer(struct radv_image *image, VkImageLayout layout, 
       .level = subres->mipLevel,
       .layer = subres->baseArrayLayer,
       .image = image,
-      .aspect_mask = aspect_mask,
+      .aspect_mask = subres->aspectMask,
       .current_layout = layout,
    };
 }
@@ -80,11 +79,9 @@ transfer_copy_memory_image(struct radv_cmd_buffer *cmd_buffer, uint64_t buffer_v
 {
    const struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    struct radeon_cmdbuf *cs = cmd_buffer->cs;
-   const VkImageAspectFlags aspect_mask = region->imageSubresource.aspectMask;
 
-   struct radv_sdma_surf buf = radv_sdma_get_buf_surf(buffer_va, image, region, aspect_mask);
-   const struct radv_sdma_surf img =
-      radv_sdma_get_surf(device, image, region->imageSubresource, region->imageOffset, aspect_mask);
+   struct radv_sdma_surf buf = radv_sdma_get_buf_surf(buffer_va, image, region);
+   const struct radv_sdma_surf img = radv_sdma_get_surf(device, image, region->imageSubresource, region->imageOffset);
    const VkExtent3D extent = radv_sdma_get_copy_extent(image, region->imageSubresource, region->imageExtent);
 
    if (radv_sdma_use_unaligned_buffer_image_copy(device, &buf, &img, extent)) {
@@ -100,7 +97,8 @@ transfer_copy_memory_image(struct radv_cmd_buffer *cmd_buffer, uint64_t buffer_v
 
 static void
 copy_memory_to_image(struct radv_cmd_buffer *cmd_buffer, uint64_t buffer_addr, uint64_t buffer_size,
-                     struct radv_image *image, VkImageLayout layout, const VkBufferImageCopy2 *region)
+                     enum radv_copy_flags src_copy_flags, struct radv_image *image, VkImageLayout layout,
+                     const VkBufferImageCopy2 *region)
 {
    if (cmd_buffer->qf == RADV_QUEUE_TRANSFER) {
       transfer_copy_memory_image(cmd_buffer, buffer_addr, image, region, true);
@@ -118,12 +116,9 @@ copy_memory_to_image(struct radv_cmd_buffer *cmd_buffer, uint64_t buffer_addr, u
 
    cs = cmd_buffer->qf == RADV_QUEUE_COMPUTE || !radv_image_is_renderable(device, image);
 
-   /* VK_EXT_conditional_rendering says that copy commands should not be
-    * affected by conditional rendering.
-    */
    radv_meta_save(&saved_state, cmd_buffer,
                   (cs ? RADV_META_SAVE_COMPUTE_PIPELINE : RADV_META_SAVE_GRAPHICS_PIPELINE) | RADV_META_SAVE_CONSTANTS |
-                     RADV_META_SAVE_DESCRIPTORS | RADV_META_SUSPEND_PREDICATING);
+                     RADV_META_SAVE_DESCRIPTORS);
 
    /**
     * From the Vulkan 1.0.6 spec: 18.3 Copying Data Between Images
@@ -145,8 +140,7 @@ copy_memory_to_image(struct radv_cmd_buffer *cmd_buffer, uint64_t buffer_addr, u
    };
 
    /* Create blit surfaces */
-   struct radv_meta_blit2d_surf img_bsurf =
-      blit_surf_for_image_level_layer(image, layout, &region->imageSubresource, region->imageSubresource.aspectMask);
+   struct radv_meta_blit2d_surf img_bsurf = blit_surf_for_image_level_layer(image, layout, &region->imageSubresource);
 
    if (!radv_is_buffer_format_supported(img_bsurf.format, NULL)) {
       uint32_t queue_mask = radv_image_queue_family_mask(image, cmd_buffer->qf, cmd_buffer->qf);
@@ -174,10 +168,10 @@ copy_memory_to_image(struct radv_cmd_buffer *cmd_buffer, uint64_t buffer_addr, u
    struct radv_meta_blit2d_buffer buf_bsurf = {
       .addr = buffer_addr,
       .size = buffer_size,
-      .bs = img_bsurf.bs,
       .format = img_bsurf.format,
       .offset = region->bufferOffset,
       .pitch = buf_layout.row_stride_B / buf_layout.element_size_B,
+      .copy_flags = src_copy_flags,
    };
 
    if (image->vk.image_type == VK_IMAGE_TYPE_3D)
@@ -224,6 +218,10 @@ radv_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer, const VkCopyBufferToIm
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    const struct radv_physical_device *pdev = radv_device_physical(device);
 
+   const enum radv_copy_flags src_copy_flags = radv_get_copy_flags_from_bo(src_buffer->bo);
+
+   radv_suspend_conditional_rendering(cmd_buffer);
+
    radv_cs_add_buffer(device->ws, cmd_buffer->cs, src_buffer->bo);
 
    for (unsigned r = 0; r < pCopyBufferToImageInfo->regionCount; r++) {
@@ -233,18 +231,18 @@ radv_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer, const VkCopyBufferToIm
 
       radv_cs_add_buffer(device->ws, cmd_buffer->cs, dst_image->bindings[bind_idx].bo);
 
-      copy_memory_to_image(cmd_buffer, src_buffer->addr, src_buffer->vk.size, dst_image,
+      copy_memory_to_image(cmd_buffer, src_buffer->vk.device_address, src_buffer->vk.size, src_copy_flags, dst_image,
                            pCopyBufferToImageInfo->dstImageLayout, region);
    }
 
-   if (radv_is_format_emulated(pdev, dst_image->vk.format)) {
+   if (radv_is_format_emulated(pdev, dst_image->vk.format) && cmd_buffer->qf != RADV_QUEUE_TRANSFER) {
       cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_CS_PARTIAL_FLUSH | RADV_CMD_FLAG_PS_PARTIAL_FLUSH |
                                       radv_src_access_flush(cmd_buffer, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                                                             VK_ACCESS_TRANSFER_WRITE_BIT, 0, dst_image, NULL) |
                                       radv_dst_access_flush(cmd_buffer, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                                                             VK_ACCESS_TRANSFER_READ_BIT, 0, dst_image, NULL);
 
-      const enum util_format_layout format_layout = vk_format_description(dst_image->vk.format)->layout;
+      const enum util_format_layout format_layout = radv_format_description(dst_image->vk.format)->layout;
       for (unsigned r = 0; r < pCopyBufferToImageInfo->regionCount; r++) {
          if (format_layout == UTIL_FORMAT_LAYOUT_ASTC) {
             radv_meta_decode_astc(cmd_buffer, dst_image, pCopyBufferToImageInfo->dstImageLayout,
@@ -259,11 +257,14 @@ radv_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer, const VkCopyBufferToIm
          }
       }
    }
+
+   radv_resume_conditional_rendering(cmd_buffer);
 }
 
 static void
 copy_image_to_memory(struct radv_cmd_buffer *cmd_buffer, uint64_t buffer_addr, uint64_t buffer_size,
-                     struct radv_image *image, VkImageLayout layout, const VkBufferImageCopy2 *region)
+                     enum radv_copy_flags dst_copy_flags, struct radv_image *image, VkImageLayout layout,
+                     const VkBufferImageCopy2 *region)
 {
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    if (cmd_buffer->qf == RADV_QUEUE_TRANSFER) {
@@ -273,12 +274,8 @@ copy_image_to_memory(struct radv_cmd_buffer *cmd_buffer, uint64_t buffer_addr, u
 
    struct radv_meta_saved_state saved_state;
 
-   /* VK_EXT_conditional_rendering says that copy commands should not be
-    * affected by conditional rendering.
-    */
    radv_meta_save(&saved_state, cmd_buffer,
-                  RADV_META_SAVE_COMPUTE_PIPELINE | RADV_META_SAVE_CONSTANTS | RADV_META_SAVE_DESCRIPTORS |
-                     RADV_META_SUSPEND_PREDICATING);
+                  RADV_META_SAVE_COMPUTE_PIPELINE | RADV_META_SAVE_CONSTANTS | RADV_META_SAVE_DESCRIPTORS);
 
    /**
     * From the Vulkan 1.0.6 spec: 18.3 Copying Data Between Images
@@ -305,8 +302,7 @@ copy_image_to_memory(struct radv_cmd_buffer *cmd_buffer, uint64_t buffer_addr, u
    };
 
    /* Create blit surfaces */
-   struct radv_meta_blit2d_surf img_info =
-      blit_surf_for_image_level_layer(image, layout, &region->imageSubresource, region->imageSubresource.aspectMask);
+   struct radv_meta_blit2d_surf img_info = blit_surf_for_image_level_layer(image, layout, &region->imageSubresource);
 
    if (!radv_is_buffer_format_supported(img_info.format, NULL)) {
       uint32_t queue_mask = radv_image_queue_family_mask(image, cmd_buffer->qf, cmd_buffer->qf);
@@ -333,10 +329,10 @@ copy_image_to_memory(struct radv_cmd_buffer *cmd_buffer, uint64_t buffer_addr, u
    struct radv_meta_blit2d_buffer buf_info = {
       .addr = buffer_addr,
       .size = buffer_size,
-      .bs = img_info.bs,
       .format = img_info.format,
       .offset = region->bufferOffset,
       .pitch = buf_extent_el.width,
+      .copy_flags = dst_copy_flags,
    };
 
    if (image->vk.image_type == VK_IMAGE_TYPE_3D)
@@ -354,7 +350,7 @@ copy_image_to_memory(struct radv_cmd_buffer *cmd_buffer, uint64_t buffer_addr, u
       /* Perform Blit */
       radv_meta_image_to_buffer(cmd_buffer, &img_info, &buf_info, &rect);
 
-      buf_info.offset += buf_extent_el.width * buf_extent_el.height * buf_info.bs;
+      buf_info.offset += buf_extent_el.width * buf_extent_el.height * img_info.bs;
       img_info.layer++;
       if (image->vk.image_type == VK_IMAGE_TYPE_3D)
          slice_3d++;
@@ -373,6 +369,10 @@ radv_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer, const VkCopyImageToBuf
    VK_FROM_HANDLE(radv_buffer, dst_buffer, pCopyImageToBufferInfo->dstBuffer);
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
 
+   const enum radv_copy_flags dst_copy_flags = radv_get_copy_flags_from_bo(dst_buffer->bo);
+
+   radv_suspend_conditional_rendering(cmd_buffer);
+
    radv_cs_add_buffer(device->ws, cmd_buffer->cs, dst_buffer->bo);
 
    for (unsigned r = 0; r < pCopyImageToBufferInfo->regionCount; r++) {
@@ -382,9 +382,11 @@ radv_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer, const VkCopyImageToBuf
 
       radv_cs_add_buffer(device->ws, cmd_buffer->cs, src_image->bindings[bind_idx].bo);
 
-      copy_image_to_memory(cmd_buffer, dst_buffer->addr, dst_buffer->vk.size, src_image,
+      copy_image_to_memory(cmd_buffer, dst_buffer->vk.device_address, dst_buffer->vk.size, dst_copy_flags, src_image,
                            pCopyImageToBufferInfo->srcImageLayout, region);
    }
+
+   radv_resume_conditional_rendering(cmd_buffer);
 }
 
 static void
@@ -395,15 +397,16 @@ transfer_copy_image(struct radv_cmd_buffer *cmd_buffer, struct radv_image *src_i
    struct radeon_cmdbuf *cs = cmd_buffer->cs;
    unsigned int dst_aspect_mask_remaining = region->dstSubresource.aspectMask;
 
-   u_foreach_bit (b, region->srcSubresource.aspectMask) {
-      const VkImageAspectFlags src_aspect_mask = BITFIELD_BIT(b);
-      const VkImageAspectFlags dst_aspect_mask = BITFIELD_BIT(u_bit_scan(&dst_aspect_mask_remaining));
+   VkImageSubresourceLayers src_subresource = region->srcSubresource;
+   VkImageSubresourceLayers dst_subresource = region->dstSubresource;
 
-      const struct radv_sdma_surf src =
-         radv_sdma_get_surf(device, src_image, region->srcSubresource, region->srcOffset, src_aspect_mask);
-      const struct radv_sdma_surf dst =
-         radv_sdma_get_surf(device, dst_image, region->dstSubresource, region->dstOffset, dst_aspect_mask);
-      const VkExtent3D extent = radv_sdma_get_copy_extent(src_image, region->srcSubresource, region->extent);
+   u_foreach_bit (b, region->srcSubresource.aspectMask) {
+      src_subresource.aspectMask = BITFIELD_BIT(b);
+      dst_subresource.aspectMask = BITFIELD_BIT(u_bit_scan(&dst_aspect_mask_remaining));
+
+      const struct radv_sdma_surf src = radv_sdma_get_surf(device, src_image, src_subresource, region->srcOffset);
+      const struct radv_sdma_surf dst = radv_sdma_get_surf(device, dst_image, dst_subresource, region->dstOffset);
+      const VkExtent3D extent = radv_sdma_get_copy_extent(src_image, src_subresource, region->extent);
 
       if (radv_sdma_use_t2t_scanline_copy(device, &src, &dst, extent)) {
          if (!alloc_transfer_temp_bo(cmd_buffer))
@@ -413,6 +416,31 @@ transfer_copy_image(struct radv_cmd_buffer *cmd_buffer, struct radv_image *src_i
       } else {
          radv_sdma_copy_image(device, cs, &src, &dst, extent);
       }
+   }
+}
+
+static VkFormat
+radv_get_compat_color_ds_format(VkFormat format)
+{
+   switch (format) {
+   case VK_FORMAT_R8_UNORM:
+   case VK_FORMAT_R8_SNORM:
+   case VK_FORMAT_R8_UINT:
+   case VK_FORMAT_R8_SINT:
+      return VK_FORMAT_R8_UINT;
+      break;
+   case VK_FORMAT_R16_SFLOAT:
+   case VK_FORMAT_R16_UNORM:
+   case VK_FORMAT_R16_SNORM:
+   case VK_FORMAT_R16_UINT:
+   case VK_FORMAT_R16_SINT:
+      return VK_FORMAT_R16_UNORM;
+   case VK_FORMAT_R32_SFLOAT:
+   case VK_FORMAT_R32_SINT:
+   case VK_FORMAT_R32_UINT:
+      return VK_FORMAT_R32_SFLOAT;
+   default:
+      unreachable("invalid color format for color to depth/stencil image copy.");
    }
 }
 
@@ -448,12 +476,9 @@ copy_image(struct radv_cmd_buffer *cmd_buffer, struct radv_image *src_image, VkI
 
    cs = cmd_buffer->qf == RADV_QUEUE_COMPUTE || !radv_image_is_renderable(device, dst_image);
 
-   /* VK_EXT_conditional_rendering says that copy commands should not be
-    * affected by conditional rendering.
-    */
    radv_meta_save(&saved_state, cmd_buffer,
                   (cs ? RADV_META_SAVE_COMPUTE_PIPELINE : RADV_META_SAVE_GRAPHICS_PIPELINE) | RADV_META_SAVE_CONSTANTS |
-                     RADV_META_SAVE_DESCRIPTORS | RADV_META_SUSPEND_PREDICATING);
+                     RADV_META_SAVE_DESCRIPTORS);
 
    if (cs) {
       /* For partial copies, HTILE should be decompressed before copying because the metadata is
@@ -461,7 +486,8 @@ copy_image(struct radv_cmd_buffer *cmd_buffer, struct radv_image *src_image, VkI
        */
       uint32_t queue_mask = radv_image_queue_family_mask(dst_image, cmd_buffer->qf, cmd_buffer->qf);
 
-      if (radv_layout_is_htile_compressed(device, dst_image, dst_image_layout, queue_mask) &&
+      if (radv_layout_is_htile_compressed(device, dst_image, region->dstSubresource.mipLevel, dst_image_layout,
+                                          queue_mask) &&
           (region->dstOffset.x || region->dstOffset.y || region->dstOffset.z ||
            region->extent.width != dst_image->vk.extent.width || region->extent.height != dst_image->vk.extent.height ||
            region->extent.depth != dst_image->vk.extent.depth)) {
@@ -486,11 +512,11 @@ copy_image(struct radv_cmd_buffer *cmd_buffer, struct radv_image *src_image, VkI
    }
 
    /* Create blit surfaces */
-   struct radv_meta_blit2d_surf b_src = blit_surf_for_image_level_layer(
-      src_image, src_image_layout, &region->srcSubresource, region->srcSubresource.aspectMask);
+   struct radv_meta_blit2d_surf b_src =
+      blit_surf_for_image_level_layer(src_image, src_image_layout, &region->srcSubresource);
 
-   struct radv_meta_blit2d_surf b_dst = blit_surf_for_image_level_layer(
-      dst_image, dst_image_layout, &region->dstSubresource, region->dstSubresource.aspectMask);
+   struct radv_meta_blit2d_surf b_dst =
+      blit_surf_for_image_level_layer(dst_image, dst_image_layout, &region->dstSubresource);
 
    uint32_t dst_queue_mask = radv_image_queue_family_mask(dst_image, cmd_buffer->qf, cmd_buffer->qf);
    bool dst_compressed =
@@ -521,6 +547,13 @@ copy_image(struct radv_cmd_buffer *cmd_buffer, struct radv_image *src_image, VkI
       b_dst.disable_compression = true;
 
       radv_describe_barrier_end(cmd_buffer);
+   }
+
+   /* Select a compatible color format for color<->depth/stencil copies. */
+   if (vk_format_is_color(src_image->vk.format) && vk_format_is_depth_or_stencil(dst_image->vk.format)) {
+      b_src.format = radv_get_compat_color_ds_format(src_image->vk.format);
+   } else if (vk_format_is_depth_or_stencil(src_image->vk.format) && vk_format_is_color(dst_image->vk.format)) {
+      b_dst.format = radv_get_compat_color_ds_format(dst_image->vk.format);
    }
 
    /**
@@ -588,7 +621,8 @@ copy_image(struct radv_cmd_buffer *cmd_buffer, struct radv_image *src_image, VkI
       /* Fixup HTILE after a copy on compute. */
       uint32_t queue_mask = radv_image_queue_family_mask(dst_image, cmd_buffer->qf, cmd_buffer->qf);
 
-      if (radv_layout_is_htile_compressed(device, dst_image, dst_image_layout, queue_mask)) {
+      if (radv_layout_is_htile_compressed(device, dst_image, region->dstSubresource.mipLevel, dst_image_layout,
+                                          queue_mask)) {
          cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_CS_PARTIAL_FLUSH | RADV_CMD_FLAG_INV_VCACHE;
 
          VkImageSubresourceRange range = {
@@ -617,6 +651,8 @@ radv_CmdCopyImage2(VkCommandBuffer commandBuffer, const VkCopyImageInfo2 *pCopyI
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    const struct radv_physical_device *pdev = radv_device_physical(device);
 
+   radv_suspend_conditional_rendering(cmd_buffer);
+
    for (unsigned r = 0; r < pCopyImageInfo->regionCount; r++) {
       const VkImageCopy2 *region = &pCopyImageInfo->pRegions[r];
       const VkImageAspectFlags src_aspect_mask = region->srcSubresource.aspectMask;
@@ -631,14 +667,14 @@ radv_CmdCopyImage2(VkCommandBuffer commandBuffer, const VkCopyImageInfo2 *pCopyI
                  region);
    }
 
-   if (radv_is_format_emulated(pdev, dst_image->vk.format)) {
+   if (radv_is_format_emulated(pdev, dst_image->vk.format) && cmd_buffer->qf != RADV_QUEUE_TRANSFER) {
       cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_CS_PARTIAL_FLUSH | RADV_CMD_FLAG_PS_PARTIAL_FLUSH |
                                       radv_src_access_flush(cmd_buffer, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                                                             VK_ACCESS_TRANSFER_WRITE_BIT, 0, dst_image, NULL) |
                                       radv_dst_access_flush(cmd_buffer, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                                                             VK_ACCESS_TRANSFER_READ_BIT, 0, dst_image, NULL);
 
-      const enum util_format_layout format_layout = vk_format_description(dst_image->vk.format)->layout;
+      const enum util_format_layout format_layout = radv_format_description(dst_image->vk.format)->layout;
       for (unsigned r = 0; r < pCopyImageInfo->regionCount; r++) {
          VkExtent3D dst_extent = pCopyImageInfo->pRegions[r].extent;
          if (src_image->vk.format != dst_image->vk.format) {
@@ -658,4 +694,6 @@ radv_CmdCopyImage2(VkCommandBuffer commandBuffer, const VkCopyImageInfo2 *pCopyI
          }
       }
    }
+
+   radv_resume_conditional_rendering(cmd_buffer);
 }

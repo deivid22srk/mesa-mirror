@@ -2,18 +2,25 @@ use crate::api::icd::*;
 use crate::core::context::*;
 use crate::core::device::*;
 use crate::core::event::*;
+use crate::core::kernel::*;
 use crate::core::platform::*;
 use crate::impl_cl_type_trait;
 
+use mesa_rust::compiler::nir::NirShader;
 use mesa_rust::pipe::context::PipeContext;
+use mesa_rust::pipe::context::PipeContextPrio;
 use mesa_rust_gen::*;
 use mesa_rust_util::properties::*;
 use rusticl_opencl_gen::*;
 
+use std::cell::RefCell;
 use std::cmp;
+use std::ffi::c_void;
 use std::mem;
 use std::mem::ManuallyDrop;
 use std::ops::Deref;
+use std::ptr;
+use std::ptr::NonNull;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -21,25 +28,81 @@ use std::sync::Weak;
 use std::thread;
 use std::thread::JoinHandle;
 
+struct CSOWrapper<'a> {
+    ctx: &'a PipeContext,
+    cso: NonNull<c_void>,
+}
+
+impl<'a> CSOWrapper<'a> {
+    fn new(ctx: &QueueContext<'a>, nir: &NirShader) -> Option<CSOWrapper<'a>> {
+        Some(Self {
+            ctx: ctx.ctx,
+            cso: NonNull::new(ctx.create_compute_state(nir, nir.shared_size()))?,
+        })
+    }
+}
+
+impl Drop for CSOWrapper<'_> {
+    fn drop(&mut self) {
+        self.ctx.delete_compute_state(self.cso.as_ptr());
+    }
+}
+
+struct QueueKernelState<'a> {
+    builds: Option<Arc<NirKernelBuilds>>,
+    variant: NirKernelVariant,
+    cso: Option<CSOWrapper<'a>>,
+}
+
 /// State tracking wrapper for [PipeContext]
 ///
 /// Used for tracking bound GPU state to lower CPU overhead and centralize state tracking
-pub struct QueueContext {
-    // need to use ManuallyDrop so we can recycle the context without cloning
-    ctx: ManuallyDrop<PipeContext>,
+pub struct QueueContext<'a> {
+    ctx: &'a PipeContext,
     pub dev: &'static Device,
     use_stream: bool,
+    kernel_state: RefCell<QueueKernelState<'a>>,
 }
 
-impl QueueContext {
-    fn new_for(device: &'static Device) -> CLResult<Self> {
-        let ctx = device.create_context().ok_or(CL_OUT_OF_HOST_MEMORY)?;
+impl QueueContext<'_> {
+    // TODO: figure out how to make it &mut self without causing tons of borrowing issues.
+    pub fn bind_kernel(
+        &self,
+        builds: &Arc<NirKernelBuilds>,
+        variant: NirKernelVariant,
+    ) -> CLResult<()> {
+        // this should never panic, but you never know.
+        let mut state = self.kernel_state.borrow_mut();
 
-        Ok(Self {
-            ctx: ManuallyDrop::new(ctx),
-            dev: device,
-            use_stream: device.prefers_real_buffer_in_cb0(),
-        })
+        // If we already set the CSO then we don't have to bind again.
+        if let Some(stored_builds) = &state.builds {
+            if Arc::ptr_eq(stored_builds, builds) && state.variant == variant {
+                return Ok(());
+            }
+        }
+
+        let nir_kernel_build = &builds[variant];
+        match nir_kernel_build.nir_or_cso() {
+            // SAFETY: We keep the cso alive until a new one is set.
+            KernelDevStateVariant::Cso(cso) => unsafe {
+                cso.bind_to_ctx(self);
+            },
+            // TODO: We could cache the cso here.
+            KernelDevStateVariant::Nir(nir) => {
+                let cso = CSOWrapper::new(self, nir).ok_or(CL_OUT_OF_HOST_MEMORY)?;
+                unsafe {
+                    self.bind_compute_state(cso.cso.as_ptr());
+                }
+                state.cso.replace(cso);
+            }
+        };
+
+        // We can only store the new builds after we bound the new cso otherwise we might drop it
+        // too early.
+        state.builds = Some(Arc::clone(builds));
+        state.variant = variant;
+
+        Ok(())
     }
 
     pub fn update_cb0(&self, data: &[u8]) -> CLResult<()> {
@@ -58,18 +121,69 @@ impl QueueContext {
 }
 
 // This should go once we moved all state tracking into QueueContext
-impl Deref for QueueContext {
+impl Deref for QueueContext<'_> {
     type Target = PipeContext;
 
     fn deref(&self) -> &Self::Target {
-        &self.ctx
+        self.ctx
     }
 }
 
-impl Drop for QueueContext {
+impl Drop for QueueContext<'_> {
+    fn drop(&mut self) {
+        self.set_constant_buffer(0, &[]);
+        if self.kernel_state.get_mut().builds.is_some() {
+            // SAFETY: We simply unbind here. The bound cso will only be dropped at the end of this
+            //         drop handler.
+            unsafe {
+                self.ctx.bind_compute_state(ptr::null_mut());
+            }
+        }
+    }
+}
+
+/// The main purpose of this type is to be able to create the context outside of the worker thread
+/// to report back any sort of allocation failures early.
+struct SendableQueueContext {
+    // need to use ManuallyDrop so we can recycle the context without cloning
+    ctx: ManuallyDrop<PipeContext>,
+    dev: &'static Device,
+}
+
+impl SendableQueueContext {
+    fn new(device: &'static Device, prio: cl_queue_priority_khr) -> CLResult<Self> {
+        let prio = if prio & CL_QUEUE_PRIORITY_HIGH_KHR != 0 {
+            PipeContextPrio::High
+        } else if prio & CL_QUEUE_PRIORITY_MED_KHR != 0 {
+            PipeContextPrio::Med
+        } else {
+            PipeContextPrio::Low
+        };
+
+        Ok(Self {
+            ctx: ManuallyDrop::new(device.create_context(prio).ok_or(CL_OUT_OF_HOST_MEMORY)?),
+            dev: device,
+        })
+    }
+
+    /// The returned value can be used to execute operation on the wrapped context in a safe manner.
+    fn ctx(&self) -> QueueContext {
+        QueueContext {
+            ctx: &self.ctx,
+            kernel_state: RefCell::new(QueueKernelState {
+                builds: None,
+                variant: NirKernelVariant::Default,
+                cso: None,
+            }),
+            dev: self.dev,
+            use_stream: self.dev.prefers_real_buffer_in_cb0(),
+        }
+    }
+}
+
+impl Drop for SendableQueueContext {
     fn drop(&mut self) {
         let ctx = unsafe { ManuallyDrop::take(&mut self.ctx) };
-        ctx.set_constant_buffer(0, &[]);
         self.dev.recycle_context(ctx);
     }
 }
@@ -89,7 +203,71 @@ pub struct Queue {
     pub props: cl_command_queue_properties,
     pub props_v2: Properties<cl_queue_properties>,
     state: Mutex<QueueState>,
-    thrd: JoinHandle<()>,
+    _thrd: JoinHandle<()>,
+}
+
+/// Wrapper around Event to set it to an error state on drop. This is useful for dealing with panics
+/// inside the worker thread, so all not yet processed events will bet put into an error state, so
+/// Event::wait won't infinitely spin on the status to change.
+#[repr(transparent)]
+struct QueueEvent(Arc<Event>);
+
+impl QueueEvent {
+    fn call(self, ctx: &QueueContext) -> (cl_int, Arc<Event>) {
+        let res = self.0.call(ctx);
+        (res, self.into_inner())
+    }
+
+    fn deps(&self) -> &[Arc<Event>] {
+        &self.0.deps
+    }
+
+    fn into_inner(self) -> Arc<Event> {
+        // SAFETY: QueueEvent is transparent wrapper so it's safe to transmute the value. We want to
+        //         prevent drop from running on it. Alternatively we could use ManuallyDrop, but
+        //         that also requires an unsafe call (ManuallyDrop::take).
+        unsafe { mem::transmute(self) }
+    }
+
+    fn has_same_queue_as(&self, ev: &Event) -> bool {
+        match (&self.0.queue, &ev.queue) {
+            (Some(a), Some(b)) => Weak::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+
+    fn set_user_status(self, status: cl_int) {
+        self.into_inner().set_user_status(status);
+    }
+}
+
+impl Drop for QueueEvent {
+    fn drop(&mut self) {
+        // Make sure the status isn't an error or success.
+        debug_assert!(self.0.status() > CL_RUNNING as cl_int);
+        self.0.set_user_status(CL_OUT_OF_HOST_MEMORY)
+    }
+}
+
+/// Wrapper around received events, so they automatically go into an error state whenever the queue
+/// thread panics. We should use panic::catch_unwind, but that requires things to be UnwindSafe and
+/// that's not easily doable.
+#[repr(transparent)]
+struct QueueEvents(Vec<QueueEvent>);
+
+impl QueueEvents {
+    fn new(events: Vec<Arc<Event>>) -> Self {
+        Self(events.into_iter().map(QueueEvent).collect())
+    }
+}
+
+impl IntoIterator for QueueEvents {
+    type Item = QueueEvent;
+    type IntoIter = <Vec<QueueEvent> as IntoIterator>::IntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
 }
 
 impl_cl_type_trait!(cl_command_queue, Queue, CL_INVALID_COMMAND_QUEUE);
@@ -117,9 +295,21 @@ impl Queue {
         props: cl_command_queue_properties,
         props_v2: Properties<cl_queue_properties>,
     ) -> CLResult<Arc<Queue>> {
+        // If CL_QUEUE_PRIORITY_KHR is not specified, the default priority CL_QUEUE_PRIORITY_MED_KHR
+        // is used.
+        let mut prio = *props_v2
+            .get(&CL_QUEUE_PRIORITY_KHR.into())
+            .unwrap_or(&CL_QUEUE_PRIORITY_MED_KHR.into())
+            as cl_queue_priority_khr;
+
+        // Fallback to the default priority if it's not supported by the device.
+        if device.context_priority_supported() & prio == 0 {
+            prio = CL_QUEUE_PRIORITY_MED_KHR;
+        }
+
         // we assume that memory allocation is the only possible failure. Any other failure reason
         // should be detected earlier (e.g.: checking for CAPs).
-        let ctx = QueueContext::new_for(device)?;
+        let ctx = SendableQueueContext::new(device, prio)?;
         let (tx_q, rx_t) = mpsc::channel::<Vec<Arc<Event>>>();
         Ok(Arc::new(Self {
             base: CLObjectBase::new(RusticlTypes::Queue),
@@ -132,7 +322,7 @@ impl Queue {
                 last: Weak::new(),
                 chan_in: tx_q,
             }),
-            thrd: thread::Builder::new()
+            _thrd: thread::Builder::new()
                 .name("rusticl queue thread".into())
                 .spawn(move || {
                     // Track the error of all executed events. This is only needed for in-order
@@ -149,27 +339,28 @@ impl Queue {
                     // TODO: use pipe_context::set_device_reset_callback to get notified about gone
                     //       GPU contexts
                     let mut last_err = CL_SUCCESS as cl_int;
+                    let ctx = ctx.ctx();
+                    let mut flushed = Vec::new();
                     loop {
-                        let r = rx_t.recv();
-                        if r.is_err() {
+                        debug_assert!(flushed.is_empty());
+
+                        let Ok(new_events) = rx_t.recv() else {
                             break;
-                        }
+                        };
 
-                        let new_events = r.unwrap();
-                        let mut flushed = Vec::new();
-
+                        let new_events = QueueEvents::new(new_events);
                         for e in new_events {
                             // If we hit any deps from another queue, flush so we don't risk a dead
                             // lock.
-                            if e.deps.iter().any(|ev| ev.queue != e.queue) {
+                            if e.deps().iter().any(|ev| !e.has_same_queue_as(ev)) {
                                 let dep_err = flush_events(&mut flushed, &ctx);
                                 last_err = cmp::min(last_err, dep_err);
                             }
 
                             // check if any dependency has an error
-                            for dep in &e.deps {
+                            for dep in e.deps() {
                                 // We have to wait on user events or events from other queues.
-                                let dep_err = if dep.is_user() || dep.queue != e.queue {
+                                let dep_err = if dep.is_user() || !e.has_same_queue_as(dep) {
                                     dep.wait()
                                 } else {
                                     dep.status()
@@ -187,7 +378,8 @@ impl Queue {
                             // if there is an execution error don't bother signaling it as the  context
                             // might be in a broken state. How queues behave after any event hit an
                             // error is entirely implementation defined.
-                            last_err = e.call(&ctx);
+                            let (err, e) = e.call(&ctx);
+                            last_err = err;
                             if last_err < 0 {
                                 continue;
                             }
@@ -267,10 +459,6 @@ impl Queue {
         Ok(())
     }
 
-    pub fn is_dead(&self) -> bool {
-        self.thrd.is_finished()
-    }
-
     pub fn is_profiling_enabled(&self) -> bool {
         (self.props & (CL_QUEUE_PROFILING_ENABLE as u64)) != 0
     }
@@ -278,11 +466,8 @@ impl Queue {
 
 impl Drop for Queue {
     fn drop(&mut self) {
-        // when deleting the application side object, we have to flush
-        // From the OpenCL spec:
-        // clReleaseCommandQueue performs an implicit flush to issue any previously queued OpenCL
-        // commands in command_queue.
-        // TODO: maybe we have to do it on every release?
-        let _ = self.flush(true);
+        // When reaching this point the queue should have been flushed already, but do it here once
+        // again just to be sure.
+        let _ = self.flush(false);
     }
 }

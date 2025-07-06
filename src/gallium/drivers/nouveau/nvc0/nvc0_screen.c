@@ -176,10 +176,7 @@ nvc0_init_compute_caps(struct nvc0_screen *screen)
       obj_class == GM200_COMPUTE_CLASS ? 96 << 10 :
       (obj_class == GM107_COMPUTE_CLASS ? 64 << 10 : 48 << 10);
 
-   caps->max_private_size = 512 << 10; /* l[] */
-   caps->max_input_size = 4096; /* c[], arbitrary limit */
    caps->subgroup_sizes = 32;
-   caps->images_supported = !!NVC0_MAX_IMAGES;
    caps->max_compute_units = screen->mp_count_compute;
    caps->max_clock_frequency = 512; /* FIXME: arbitrary limit */
    caps->address_bits = 64;
@@ -318,7 +315,6 @@ nvc0_init_screen_caps(struct nvc0_screen *screen)
    caps->cull_distance = true;
    caps->robust_buffer_access_behavior = true;
    caps->shader_group_vote = true;
-   caps->polygon_offset_units_unscaled = true;
    caps->shader_array_components = true;
    caps->legacy_math_rules = true;
    caps->doubles = true;
@@ -328,7 +324,6 @@ nvc0_init_screen_caps(struct nvc0_screen *screen)
    caps->compute = true;
    caps->can_bind_const_buffer_as_vertex = true;
    caps->query_so_overflow = true;
-   caps->tgsi_div = true;
    caps->image_atomic_inc_wrap = true;
    caps->demote_to_helper_invocation = true;
    caps->device_reset_status_query = true;

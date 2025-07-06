@@ -7,7 +7,7 @@ c_args_for_egl = [asan_c_args]
 cpp_args_for_egl = []
 link_args_for_egl = []
 link_deps_for_egl = []
-link_for_egl = [libpipe_loader_dynamic]
+link_for_egl = []
 if with_dri
   link_for_egl += libgallium_dri
 endif
@@ -59,7 +59,7 @@ g_egldispatchstubs_c = custom_target(
   command : [
     prog_python, '@INPUT0@', 'source', '@INPUT1@', '@INPUT2@',
   ],
-  depend_files : [ files('generate/eglFunctionList.py'), genCommon_py, ],
+  depend_files : [ 'generate/eglFunctionList.py', glapi_xml_py_deps],
   capture : true,
 )
 
@@ -73,7 +73,7 @@ g_egldispatchstubs_h = custom_target(
   command : [
     prog_python, '@INPUT0@', 'header', '@INPUT1@', '@INPUT2@',
   ],
-  depend_files : [ files('generate/eglFunctionList.py'), genCommon_py, ],
+  depend_files : [ 'generate/eglFunctionList.py', glapi_xml_py_deps],
   capture : true,
 )
 
@@ -83,6 +83,7 @@ if with_dri
     'drivers/dri2/egl_dri2.h',
   )
   files_egl += sha1_h
+  files_egl += main_dispatch_h
   deps_for_egl += idep_xmlconfig
   link_for_egl += libloader
   incs_for_egl += inc_loader
@@ -107,9 +108,8 @@ if with_dri
   endif
   if with_gbm and not with_platform_android
     files_egl += files('drivers/dri2/platform_drm.c')
-    link_for_egl += libgbm
-    incs_for_egl += [inc_gbm, include_directories('../gbm/main')]
-    deps_for_egl += dep_libdrm
+    incs_for_egl += [include_directories('../gbm/backends/dri')]
+    deps_for_egl += [dep_libdrm, dep_gbm]
   endif
   if with_platform_wayland
     deps_for_egl += [dep_wayland_client, dep_wayland_server, dep_wayland_egl_headers]
@@ -140,6 +140,7 @@ elif with_platform_windows
     '-DEGLAPI=', '-DPUBLIC='
   ]
   files_egl += files('drivers/wgl/egl_wgl.c')
+  files_egl += main_dispatch_h
   incs_for_egl += [inc_wgl, inc_gallium, inc_gallium_aux, inc_mesa, inc_mapi]
   link_for_egl += libgallium_wgl
 
@@ -162,16 +163,6 @@ else
   deps_for_egl += dep_glvnd
   files_egl += [g_egldispatchstubs_h, g_egldispatchstubs_c]
   files_egl += files('main/eglglvnd.c', 'main/egldispatchstubs.c')
-  glvnd_config = configuration_data()
-  glvnd_config.set('glvnd_vendor_name', get_option('glvnd-vendor-name'))
-  configure_file(
-    configuration: glvnd_config,
-    input : 'main/50_mesa.json',
-    output: '50_@0@.json'.format(glvnd_vendor_name),
-    install : true,
-    install_tag : 'runtime',
-    install_dir : join_paths(get_option('datadir'), 'glvnd', 'egl_vendor.d')
-  )
 endif
 
 if with_ld_version_script
@@ -216,7 +207,23 @@ libegl = shared_library(
   vs_module_defs : egl_def
 )
 
-if not with_glvnd
+if with_glvnd
+  configure_file(
+    configuration: {'library_path' : 'libEGL_@0@.so.0'.format(glvnd_vendor_name)},
+    input : 'main/50_mesa.json',
+    output: '50_@0@.json'.format(glvnd_vendor_name),
+    install : true,
+    install_tag : 'runtime',
+    install_dir : join_paths(get_option('datadir'), 'glvnd', 'egl_vendor.d')
+  )
+
+  devenv_glvnd_egl_json_file = configure_file(
+    configuration: {'library_path' : libegl.full_path()},
+    input : 'main/50_mesa.json',
+    output: 'devenv_glvnd_egl.json',
+  )
+  devenv.set('__EGL_VENDOR_LIBRARY_FILENAMES', devenv_glvnd_egl_json_file.full_path())
+else
   pkg.generate(
     name : 'egl',
     description : 'Mesa EGL Library',

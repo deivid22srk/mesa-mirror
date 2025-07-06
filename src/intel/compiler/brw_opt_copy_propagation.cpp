@@ -267,6 +267,7 @@ class brw_copy_prop_dataflow
 public:
    brw_copy_prop_dataflow(linear_ctx *lin_ctx, cfg_t *cfg,
                           const brw_live_variables &live,
+                          const brw_ip_ranges &ips,
                           struct acp *out_acp);
 
    void setup_initial_values();
@@ -276,6 +277,7 @@ public:
 
    cfg_t *cfg;
    const brw_live_variables &live;
+   const brw_ip_ranges &ips;
 
    acp_entry **acp;
    int num_acp;
@@ -287,8 +289,9 @@ public:
 
 brw_copy_prop_dataflow::brw_copy_prop_dataflow(linear_ctx *lin_ctx, cfg_t *cfg,
                                               const brw_live_variables &live,
+                                              const brw_ip_ranges &ips,
                                               struct acp *out_acp)
-   : cfg(cfg), live(live)
+   : cfg(cfg), live(live), ips(ips)
 {
    bd = linear_zalloc_array(lin_ctx, struct block_data, cfg->num_blocks);
 
@@ -544,8 +547,9 @@ void
 brw_copy_prop_dataflow::dump_block_data() const
 {
    foreach_block (block, cfg) {
+      brw_range range = ips.range(block);
       fprintf(stderr, "Block %d [%d, %d] (parents ", block->num,
-             block->start_ip, block->end_ip);
+              range.start, range.end);
       foreach_list_typed(bblock_link, link, link, &block->parents) {
          bblock_t *parent = link->block;
          fprintf(stderr, "%d ", parent->num);
@@ -789,6 +793,12 @@ try_copy_propagate(brw_shader &s, brw_inst *inst,
        (reg_offset(inst->dst) % (REG_SIZE * reg_unit(devinfo))) != (reg_offset(entry->src) % (REG_SIZE * reg_unit(devinfo))))
       return false;
 
+   /* BFloat16 sources always must be packed and not scalars,
+    * so don't propagate those cases.
+    */
+   if (brw_type_is_bfloat(inst->src[arg].type) && entry_stride != 1)
+      return false;
+
    /*
     * Bail if the composition of both regions would be affected by the Xe2+
     * regioning restrictions that apply to integer types smaller than a dword.
@@ -849,21 +859,29 @@ try_copy_propagate(brw_shader &s, brw_inst *inst,
         brw_type_size_bytes(inst->src[arg].type)) % brw_type_size_bytes(entry->src.type) != 0)
       return false;
 
-   /* Since semantics of source modifiers are type-dependent we need to
-    * ensure that the meaning of the instruction remains the same if we
-    * change the type. If the sizes of the types are different the new
-    * instruction will read a different amount of data than the original
-    * and the semantics will always be different.
-    */
-   if (has_source_modifiers &&
-       entry->dst.type != inst->src[arg].type &&
-       (!inst->can_change_types() ||
-        brw_type_size_bits(entry->dst.type) != brw_type_size_bits(inst->src[arg].type)))
-      return false;
+   if (has_source_modifiers) {
+      /* If the sizes of the types are different the new instruction will read
+       * a different amount of data than the original and the semantics will
+       * always be different.
+       */
+      if (brw_type_size_bits(entry->dst.type) !=
+          brw_type_size_bits(inst->src[arg].type))
+         return false;
 
-   if ((entry->src.negate || entry->src.abs) &&
-       is_logic_op(inst->opcode)) {
-      return false;
+      if (is_logic_op(inst->opcode)) {
+         /* For any value of X, X & 1 = -X & 1. In this case, source modifiers
+          * from entry will not be applied to inst (far below).
+          */
+         if (inst->opcode != BRW_OPCODE_AND || !inst->src[1 - arg].is_one())
+            return false;
+      } else if (entry->dst.type != inst->src[arg].type &&
+                 !inst->can_change_types()) {
+         /* Since semantics of source modifiers are type-dependent we need to
+          * ensure that the meaning of the instruction remains the same if we
+          * change the type.
+          */
+         return false;
+      }
    }
 
    /* Save the offset of inst->src[arg] relative to entry->dst for it to be
@@ -914,7 +932,7 @@ try_copy_propagate(brw_shader &s, brw_inst *inst,
    inst->src[arg] = byte_offset(inst->src[arg],
       component * entry_stride * brw_type_size_bytes(entry->src.type) + suboffset);
 
-   if (has_source_modifiers) {
+   if (has_source_modifiers && !is_logic_op(inst->opcode)) {
       if (entry->dst.type != inst->src[arg].type) {
          /* We are propagating source modifiers from a MOV with a different
           * type.  If we got here, then we can just change the source and
@@ -1379,6 +1397,11 @@ opt_copy_propagation_local(brw_shader &s, linear_ctx *lin_ctx,
    bool progress = false;
 
    foreach_inst_in_block(brw_inst, inst, block) {
+      /* The non-defs copy propagation passes should not be called while
+       * LOAD_REG instructions still exist.
+       */
+      assert(inst->opcode != SHADER_OPCODE_LOAD_REG);
+
       /* Try propagating into this instruction. */
       bool constant_progress = false;
       for (int i = inst->sources - 1; i >= 0; i--) {
@@ -1485,6 +1508,7 @@ brw_opt_copy_propagation(brw_shader &s)
    struct acp *out_acp = new (lin_ctx) acp[s.cfg->num_blocks];
 
    const brw_live_variables &live = s.live_analysis.require();
+   const brw_ip_ranges &ips = s.ip_ranges_analysis.require();
 
    /* First, walk through each block doing local copy propagation and getting
     * the set of copies available at the end of the block.
@@ -1507,15 +1531,17 @@ brw_opt_copy_propagation(brw_shader &s)
       for (auto iter = out_acp[block->num].begin();
            iter != out_acp[block->num].end(); ++iter) {
          assert((*iter)->dst.file == VGRF);
-         if (block->start_ip <= live.vgrf_start[(*iter)->dst.nr] &&
-             live.vgrf_end[(*iter)->dst.nr] <= block->end_ip) {
+
+         brw_range block_range = ips.range(block);
+         brw_range vgrf_range  = live.vgrf_range[(*iter)->dst.nr];
+
+         if (block_range.contains(vgrf_range))
             out_acp[block->num].remove(*iter);
-         }
       }
    }
 
    /* Do dataflow analysis for those available copies. */
-   brw_copy_prop_dataflow dataflow(lin_ctx, s.cfg, live, out_acp);
+   brw_copy_prop_dataflow dataflow(lin_ctx, s.cfg, live, ips, out_acp);
 
    /* Next, re-run local copy propagation, this time with the set of copies
     * provided by the dataflow analysis available at the start of a block.
@@ -1573,20 +1599,32 @@ try_copy_propagate_def(brw_shader &s,
    const bool has_source_modifiers = val.abs || val.negate;
 
    if (has_source_modifiers) {
-      if (is_logic_op(inst->opcode) || !inst->can_do_source_mods(devinfo))
+      if (!inst->can_do_source_mods(devinfo))
          return false;
 
-      /* Since semantics of source modifiers are type-dependent we need to
-       * ensure that the meaning of the instruction remains the same if we
-       * change the type. If the sizes of the types are different the new
-       * instruction will read a different amount of data than the original
-       * and the semantics will always be different.
+      /* If the sizes of the types are different the new instruction will read
+       * a different amount of data than the original and the semantics will
+       * always be different.
        */
-      if (def->dst.type != inst->src[arg].type &&
-          (!inst->can_change_types() ||
-           brw_type_size_bits(def->dst.type) !=
-           brw_type_size_bits(inst->src[arg].type)))
+      if (brw_type_size_bits(def->dst.type) !=
+          brw_type_size_bits(inst->src[arg].type)) {
          return false;
+      }
+
+      if (is_logic_op(inst->opcode)) {
+         /* For any value of X, X & 1 = -X & 1. In this case, source modifiers
+          * from entry will not be applied to inst (far below).
+          */
+         if (inst->opcode != BRW_OPCODE_AND || !inst->src[1 - arg].is_one())
+            return false;
+      } else if (def->dst.type != inst->src[arg].type &&
+                 !inst->can_change_types()) {
+         /* Since semantics of source modifiers are type-dependent we need to
+          * ensure that the meaning of the instruction remains the same if we
+          * change the type.
+          */
+         return false;
+      }
    }
 
    /* Send messages with EOT set are restricted to use g112-g127 (and we
@@ -1633,6 +1671,16 @@ try_copy_propagate_def(brw_shader &s,
    const unsigned entry_stride = val.file == FIXED_GRF ? 1 : val.stride;
    if (instruction_requires_packed_data(inst) && entry_stride != 1)
       return false;
+
+   /* load_reg loads a whole VGRF into a def. It is not allowed for the source
+    * to have a stride or a non-zero offset (unless stride == 0). It is
+    * allowed for the source to to be uniform.
+    */
+   if (inst->opcode == SHADER_OPCODE_LOAD_REG &&
+       !is_uniform(val) &&
+       (val.offset != 0 || entry_stride > 1)) {
+      return false;
+   }
 
    const brw_reg_type dst_type = (has_source_modifiers &&
                                   def->dst.type != inst->src[arg].type) ?
@@ -1698,6 +1746,12 @@ try_copy_propagate_def(brw_shader &s,
        (reg_offset(inst->dst) % (REG_SIZE * reg_unit(devinfo))) != (reg_offset(val) % (REG_SIZE * reg_unit(devinfo))))
       return false;
 
+   /* BFloat16 sources always must be packed and not scalars,
+    * so don't propagate those cases.
+    */
+   if (brw_type_is_bfloat(inst->src[arg].type) && entry_stride != 1)
+      return false;
+
    /* The <8;8,0> regions used for FS attributes in multipolygon
     * dispatch mode could violate regioning restrictions, don't copy
     * propagate them in such cases.
@@ -1759,7 +1813,7 @@ try_copy_propagate_def(brw_shader &s,
       inst->exec_size = def->exec_size;
    }
 
-   if (has_source_modifiers) {
+   if (has_source_modifiers && !is_logic_op(inst->opcode)) {
       if (def->dst.type != inst->src[arg].type) {
          /* We are propagating source modifiers from a MOV with a different
           * type.  If we got here, then we can just change the source and
@@ -1841,6 +1895,21 @@ find_value_for_offset(brw_inst *def, const brw_reg &src, unsigned src_size)
       }
       break;
    }
+   case SHADER_OPCODE_LOAD_REG: {
+      val = def->src[0];
+
+      unsigned rel_offset = src.offset - def->dst.offset;
+
+      if (val.stride == 0)
+         rel_offset %= brw_type_size_bytes(def->dst.type);
+
+      if (val.file == IMM)
+         val = extract_imm(val, src.type, rel_offset);
+      else
+         val = byte_offset(def->src[0], rel_offset);
+
+      break;
+   }
    default:
       break;
    }
@@ -1879,11 +1948,20 @@ brw_opt_copy_propagation_defs(brw_shader &s)
                   progress = true;
                   ++uses_deleted[def->dst.nr];
                   if (defs.get_use_count(def->dst) == uses_deleted[def->dst.nr])
-                     def->remove(defs.get_block(def->dst), true);
+                     def->remove();
                }
 
                continue;
             }
+         }
+
+         /* Only propagate through a load_reg if the source is a def or a
+          * UNIFORM (since these are also always invariant). The destination
+          * of a load_reg is always a def (by definition).
+          */
+         if (def->opcode == SHADER_OPCODE_LOAD_REG &&
+             (defs.get(def->src[0]) == NULL && def->src[0].file != UNIFORM)) {
+            continue;
          }
 
          brw_reg val =
@@ -1913,7 +1991,7 @@ brw_opt_copy_propagation_defs(brw_shader &s)
              */
             if (def->conditional_mod == BRW_CONDITIONAL_NONE &&
                 defs.get_use_count(def->dst) == uses_deleted[def->dst.nr]) {
-               def->remove(defs.get_block(def->dst), true);
+               def->remove();
             }
          }
       }
@@ -1925,9 +2003,7 @@ brw_opt_copy_propagation_defs(brw_shader &s)
    }
 
    if (progress) {
-      s.cfg->adjust_block_ips();
-      s.invalidate_analysis(BRW_DEPENDENCY_INSTRUCTION_DATA_FLOW |
-                            BRW_DEPENDENCY_INSTRUCTION_DETAIL);
+      s.invalidate_analysis(BRW_DEPENDENCY_INSTRUCTIONS);
    }
 
    delete [] uses_deleted;

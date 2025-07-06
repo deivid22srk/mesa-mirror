@@ -46,6 +46,23 @@ get_loop_var(nir_def *value, loop_info_state *state)
       return NULL;
 }
 
+/* If a condition is a comparision between a constant and
+ * a basic induction variable we know that it will be eliminated once
+ * the loop is unrolled.
+ */
+static bool
+condition_can_constant_fold(loop_info_state *state, nir_scalar cond_scalar)
+{
+   nir_scalar lhs = nir_scalar_chase_alu_src(cond_scalar, 0);
+   nir_scalar rhs = nir_scalar_chase_alu_src(cond_scalar, 1);
+
+   if (nir_scalar_is_const(lhs) && get_loop_var(rhs.def, state))
+      return true;
+   if (nir_scalar_is_const(rhs) && get_loop_var(lhs.def, state))
+      return true;
+   return false;
+}
+
 /** Calculate an estimated cost in number of instructions
  *
  * We do this so that we don't unroll loops which will later get massively
@@ -69,33 +86,31 @@ instr_cost(loop_info_state *state, nir_instr *instr,
    unsigned cost = 1;
 
    if (nir_op_is_selection(alu->op)) {
-      nir_scalar cond_scalar = { alu->src[0].src.ssa, 0 };
-      if (nir_is_terminator_condition_with_two_inputs(cond_scalar)) {
-         nir_instr *sel_cond = alu->src[0].src.ssa->parent_instr;
-         nir_alu_instr *sel_alu = nir_instr_as_alu(sel_cond);
-
-         nir_scalar rhs, lhs;
-         lhs = nir_scalar_chase_alu_src(cond_scalar, 0);
-         rhs = nir_scalar_chase_alu_src(cond_scalar, 1);
-
-         /* If the selects condition is a comparision between a constant and
-          * a basic induction variable we know that it will be eliminated once
-          * the loop is unrolled so here we assign it a cost of 0.
-          */
-         if ((nir_src_is_const(sel_alu->src[0].src) &&
-              get_loop_var(rhs.def, state)) ||
-             (nir_src_is_const(sel_alu->src[1].src) &&
-              get_loop_var(lhs.def, state))) {
-            /* Also if the selects condition is only used by the select then
-             * remove that alu instructons cost from the cost total also.
-             */
-            if (!list_is_singular(&sel_alu->def.uses) ||
-                nir_def_used_by_if(&sel_alu->def))
-               return 0;
-            else
-               return -1;
-         }
+      bool can_constant_fold = true;
+      for (unsigned i = 0; can_constant_fold && i < alu->def.num_components; i++) {
+         nir_scalar cond_scalar = nir_scalar_chase_alu_src(nir_get_scalar(&alu->def, i), 0);
+         can_constant_fold &= nir_is_terminator_condition_with_two_inputs(cond_scalar) &&
+                              condition_can_constant_fold(state, cond_scalar);
       }
+
+      /* If the condition can be constant folded after the loop is unrolled,
+       * so can the selection.
+       */
+      if (can_constant_fold)
+         return 0;
+   } else if (nir_alu_instr_is_comparison(alu) &&
+              nir_op_infos[alu->op].num_inputs == 2) {
+      bool can_constant_fold = true;
+      for (unsigned i = 0; can_constant_fold && i < alu->def.num_components; i++) {
+         nir_scalar cond_scalar = nir_get_scalar(&alu->def, i);
+         can_constant_fold &= condition_can_constant_fold(state, cond_scalar);
+      }
+
+      if (can_constant_fold)
+         return 0;
+   } else if (nir_op_is_vec_or_mov(alu->op)) {
+      /* movs and vecs are likely free. */
+      return 0;
    }
 
    if (alu->op == nir_op_flrp) {
@@ -636,28 +651,28 @@ invert_comparison_if_needed(nir_op alu_op, bool invert)
       return alu_op;
 
    switch (alu_op) {
-      case nir_op_fge:
-         return nir_op_flt;
-      case nir_op_ige:
-         return nir_op_ilt;
-      case nir_op_uge:
-         return nir_op_ult;
-      case nir_op_flt:
-         return nir_op_fge;
-      case nir_op_ilt:
-         return nir_op_ige;
-      case nir_op_ult:
-         return nir_op_uge;
-      case nir_op_feq:
-         return nir_op_fneu;
-      case nir_op_ieq:
-         return nir_op_ine;
-      case nir_op_fneu:
-         return nir_op_feq;
-      case nir_op_ine:
-         return nir_op_ieq;
-      default:
-         unreachable("Unsuported comparison!");
+   case nir_op_fge:
+      return nir_op_flt;
+   case nir_op_ige:
+      return nir_op_ilt;
+   case nir_op_uge:
+      return nir_op_ult;
+   case nir_op_flt:
+      return nir_op_fge;
+   case nir_op_ilt:
+      return nir_op_ige;
+   case nir_op_ult:
+      return nir_op_uge;
+   case nir_op_feq:
+      return nir_op_fneu;
+   case nir_op_ieq:
+      return nir_op_ine;
+   case nir_op_fneu:
+      return nir_op_feq;
+   case nir_op_ine:
+      return nir_op_ieq;
+   default:
+      unreachable("Unsuported comparison!");
    }
 }
 
@@ -744,8 +759,8 @@ get_iteration_empirical(nir_scalar cond, nir_alu_instr *incr_alu,
 
    const nir_scalar incr = nir_get_scalar(&incr_alu->def, basis.comp);
 
-   const nir_scalar original[] = {basis, limit_basis};
-   nir_const_value replacement[] = {initial, limit};
+   const nir_scalar original[] = { basis, limit_basis };
+   nir_const_value replacement[] = { initial, limit };
 
    while (iter_count <= max_unroll_iterations) {
       bool success;
@@ -998,8 +1013,7 @@ try_find_trip_count_vars_in_logical_op(nir_scalar *cond,
 {
    const nir_op alu_op = nir_scalar_alu_op(*cond);
    bool exit_loop_on_false = alu_op == nir_op_ieq || alu_op == nir_op_inot;
-   nir_scalar logical_op = exit_loop_on_false ?
-      nir_scalar_chase_alu_src(*cond, 0) : *cond;
+   nir_scalar logical_op = exit_loop_on_false ? nir_scalar_chase_alu_src(*cond, 0) : *cond;
 
    if (alu_op == nir_op_ieq) {
       nir_scalar zero = nir_scalar_chase_alu_src(*cond, 1);
@@ -1177,8 +1191,8 @@ find_trip_count(loop_info_state *state, unsigned execution_mode,
        * iterations
        */
       bool can_find_max_trip_count = step_alu->op == nir_op_iadd &&
-         ((alu_op == nir_op_uge && !invert_cond && limit_rhs) ||
-          (alu_op == nir_op_ult && !invert_cond && !limit_rhs));
+                                     ((alu_op == nir_op_uge && !invert_cond && limit_rhs) ||
+                                      (alu_op == nir_op_ult && !invert_cond && !limit_rhs));
 
       /* nir_op_isub should have been lowered away by this point */
       assert(step_alu->op != nir_op_isub);

@@ -457,6 +457,10 @@ get_rat_opcode(const nir_atomic_op opcode)
       return RatInstr::CMPXCHG_INT_RTN;
    case nir_atomic_op_xchg:
       return RatInstr::XCHG_RTN;
+   case nir_atomic_op_inc_wrap:
+      return RatInstr::WRAP_INC_RTN;
+   case nir_atomic_op_dec_wrap:
+      return RatInstr::WRAP_DEC_RTN;
    default:
       unreachable("Unsupported atomic");
    }
@@ -859,7 +863,6 @@ RatInstr::emit_image_load_or_atomic(nir_intrinsic_instr *intrin, Shader& shader)
                                   R600_IMAGE_IMMED_RESOURCE_OFFSET + imageid,
                                   image_offset);
       fetch->set_mfc(3);
-      fetch->set_fetch_flag(FetchInstr::srf_mode);
       fetch->set_fetch_flag(FetchInstr::use_tc);
       fetch->set_fetch_flag(FetchInstr::vpm);
       fetch->set_fetch_flag(FetchInstr::wait_ack);
@@ -915,7 +918,8 @@ RatInstr::emit_image_size(nir_intrinsic_instr *intrin, Shader& shader)
          shader.set_flag(Shader::sh_txs_cube_array_comp);
 
          if (const_offset) {
-            unsigned lookup_resid = const_offset[0].u32 + shader.image_size_const_offset();
+            unsigned lookup_resid = (res_id - R600_IMAGE_REAL_RESOURCE_OFFSET) +
+                                    shader.image_size_const_offset();
             shader.emit_instruction(
                new AluInstr(op1_mov,
                             dest[2],

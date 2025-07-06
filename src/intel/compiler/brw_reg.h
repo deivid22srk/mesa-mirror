@@ -227,6 +227,7 @@ typedef struct brw_reg {
    bool is_negative_one() const;
    bool is_null() const;
    bool is_accumulator() const;
+   bool is_ip() const;
    bool is_address() const;
 
    unsigned address_slot(unsigned byte_offset) const;
@@ -362,6 +363,7 @@ get_exec_type(const enum brw_reg_type type)
    case BRW_TYPE_UV:
       return BRW_TYPE_UW;
    case BRW_TYPE_VF:
+   case BRW_TYPE_BF:
       return BRW_TYPE_F;
    default:
       return type;
@@ -669,6 +671,16 @@ brw_imm_reg(enum brw_reg_type type)
                   BRW_HORIZONTAL_STRIDE_0,
                   0,
                   0);
+}
+
+static inline struct brw_reg
+brw_imm_int(enum brw_reg_type type, int64_t value)
+{
+   assert(type == BRW_TYPE_D || type == BRW_TYPE_UD ||
+          type == BRW_TYPE_Q || type == BRW_TYPE_UQ);
+   brw_reg r = brw_imm_reg(type);
+   r.u64 = value;
+   return r;
 }
 
 /** Construct float immediate register */

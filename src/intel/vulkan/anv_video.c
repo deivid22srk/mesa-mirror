@@ -24,6 +24,7 @@
 #include "anv_private.h"
 
 #include "av1_tables.h"
+#include "vp9_tables.h"
 #include "vk_video/vulkan_video_codecs_common.h"
 
 VkResult
@@ -230,6 +231,27 @@ anv_GetPhysicalDeviceVideoCapabilitiesKHR(VkPhysicalDevice physicalDevice,
       pCapabilities->stdHeaderVersion.specVersion = VK_STD_VULKAN_VIDEO_CODEC_H265_DECODE_SPEC_VERSION;
       break;
    }
+   case VK_VIDEO_CODEC_OPERATION_DECODE_VP9_BIT_KHR: {
+      struct VkVideoDecodeVP9CapabilitiesKHR *ext = (struct VkVideoDecodeVP9CapabilitiesKHR *)
+         vk_find_struct(pCapabilities->pNext, VIDEO_DECODE_VP9_CAPABILITIES_KHR);
+
+      if (pVideoProfile->lumaBitDepth != VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR &&
+          pVideoProfile->lumaBitDepth != VK_VIDEO_COMPONENT_BIT_DEPTH_10_BIT_KHR)
+         return VK_ERROR_VIDEO_PROFILE_FORMAT_NOT_SUPPORTED_KHR;
+
+      pCapabilities->maxDpbSlots = STD_VIDEO_VP9_NUM_REF_FRAMES + 4;
+      pCapabilities->maxActiveReferencePictures = STD_VIDEO_VP9_REFS_PER_FRAME;
+      pCapabilities->pictureAccessGranularity.width = 8;
+      pCapabilities->pictureAccessGranularity.height = 8;
+      pCapabilities->minCodedExtent.width = 8;
+      pCapabilities->minCodedExtent.height = 8;
+
+      ext->maxLevel = 4;
+
+      strcpy(pCapabilities->stdHeaderVersion.extensionName, VK_STD_VULKAN_VIDEO_CODEC_VP9_DECODE_EXTENSION_NAME);
+      pCapabilities->stdHeaderVersion.specVersion = VK_STD_VULKAN_VIDEO_CODEC_VP9_DECODE_SPEC_VERSION;
+      break;
+   }
    default:
       break;
    }
@@ -256,7 +278,8 @@ anv_GetPhysicalDeviceVideoCapabilitiesKHR(VkPhysicalDevice physicalDevice,
          vk_find_struct(pCapabilities->pNext, VIDEO_ENCODE_H264_CAPABILITIES_KHR);
 
       if (ext) {
-         ext->flags = VK_VIDEO_ENCODE_H264_CAPABILITY_HRD_COMPLIANCE_BIT_KHR;
+         ext->flags = VK_VIDEO_ENCODE_H264_CAPABILITY_HRD_COMPLIANCE_BIT_KHR |
+                      VK_VIDEO_ENCODE_H264_CAPABILITY_PER_PICTURE_TYPE_MIN_MAX_QP_BIT_KHR;
          ext->maxLevelIdc = STD_VIDEO_H264_LEVEL_IDC_5_1;
          ext->maxSliceCount = 1;
          ext->maxPPictureL0ReferenceCount = 8;
@@ -268,7 +291,17 @@ anv_GetPhysicalDeviceVideoCapabilitiesKHR(VkPhysicalDevice physicalDevice,
          ext->requiresGopRemainingFrames = 0;
          ext->minQp = 10;
          ext->maxQp = 51;
+         ext->stdSyntaxFlags = VK_VIDEO_ENCODE_H264_STD_CONSTRAINED_INTRA_PRED_FLAG_SET_BIT_KHR |
+                               VK_VIDEO_ENCODE_H264_STD_ENTROPY_CODING_MODE_FLAG_UNSET_BIT_KHR |
+                               VK_VIDEO_ENCODE_H264_STD_ENTROPY_CODING_MODE_FLAG_SET_BIT_KHR |
+                               VK_VIDEO_ENCODE_H264_STD_DEBLOCKING_FILTER_DISABLED_BIT_KHR |
+                               VK_VIDEO_ENCODE_H264_STD_DEBLOCKING_FILTER_ENABLED_BIT_KHR |
+                               VK_VIDEO_ENCODE_H264_STD_DEBLOCKING_FILTER_PARTIAL_BIT_KHR |
+                               VK_VIDEO_ENCODE_H264_STD_TRANSFORM_8X8_MODE_FLAG_SET_BIT_KHR |
+                               VK_VIDEO_ENCODE_H264_STD_CHROMA_QP_INDEX_OFFSET_BIT_KHR |
+                               VK_VIDEO_ENCODE_H264_STD_SECOND_CHROMA_QP_INDEX_OFFSET_BIT_KHR;
       }
+
 
       pCapabilities->minBitstreamBufferOffsetAlignment = 32;
       pCapabilities->minBitstreamBufferSizeAlignment = 4096;
@@ -289,7 +322,7 @@ anv_GetPhysicalDeviceVideoCapabilitiesKHR(VkPhysicalDevice physicalDevice,
          vk_find_struct(pCapabilities->pNext, VIDEO_ENCODE_H265_CAPABILITIES_KHR);
 
       if (ext) {
-         ext->flags = 0;
+         ext->flags = VK_VIDEO_ENCODE_H265_CAPABILITY_PER_PICTURE_TYPE_MIN_MAX_QP_BIT_KHR;
          ext->maxLevelIdc = STD_VIDEO_H265_LEVEL_IDC_5_1;
          ext->ctbSizes = VK_VIDEO_ENCODE_H265_CTB_SIZE_64_BIT_KHR;
          ext->transformBlockSizes = VK_VIDEO_ENCODE_H265_TRANSFORM_BLOCK_SIZE_4_BIT_KHR |
@@ -308,6 +341,10 @@ anv_GetPhysicalDeviceVideoCapabilitiesKHR(VkPhysicalDevice physicalDevice,
          ext->expectDyadicTemporalSubLayerPattern = false;
          ext->prefersGopRemainingFrames = 0;
          ext->requiresGopRemainingFrames = 0;
+         ext->stdSyntaxFlags = VK_VIDEO_ENCODE_H265_STD_SAMPLE_ADAPTIVE_OFFSET_ENABLED_FLAG_SET_BIT_KHR |
+                               VK_VIDEO_ENCODE_H265_STD_PCM_ENABLED_FLAG_SET_BIT_KHR |
+                               VK_VIDEO_ENCODE_H265_STD_TRANSFORM_SKIP_ENABLED_FLAG_SET_BIT_KHR |
+                               VK_VIDEO_ENCODE_H265_STD_CONSTRAINED_INTRA_PRED_FLAG_SET_BIT_KHR;
       }
 
       pCapabilities->minBitstreamBufferOffsetAlignment = 4096;
@@ -344,6 +381,14 @@ anv_GetPhysicalDeviceVideoFormatPropertiesKHR(VkPhysicalDevice physicalDevice,
    const struct VkVideoProfileListInfoKHR *prof_list = (struct VkVideoProfileListInfoKHR *)
       vk_find_struct_const(pVideoFormatInfo->pNext, VIDEO_PROFILE_LIST_INFO_KHR);
 
+   /* We only support VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT with
+    * Y-tiling/Tile4, as supported by the hardware for video decoding.
+    * However, we are unable to determine the tiling without modifiers here.
+    * So just disable them all.
+    */
+   const bool decode_dst = !!(pVideoFormatInfo->imageUsage &
+                              VK_IMAGE_USAGE_VIDEO_DECODE_DST_BIT_KHR);
+
    if (prof_list) {
       for (unsigned i = 0; i < prof_list->profileCount; i++) {
          const VkVideoProfileInfoKHR *profile = &prof_list->pProfiles[i];
@@ -358,12 +403,14 @@ anv_GetPhysicalDeviceVideoFormatPropertiesKHR(VkPhysicalDevice physicalDevice,
                p->imageUsageFlags = pVideoFormatInfo->imageUsage;
             }
 
-            vk_outarray_append_typed(VkVideoFormatPropertiesKHR, &out, p) {
-               p->format = VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
-               p->imageCreateFlags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
-               p->imageType = VK_IMAGE_TYPE_2D;
-               p->imageTiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
-               p->imageUsageFlags = pVideoFormatInfo->imageUsage;
+            if (!decode_dst) {
+               vk_outarray_append_typed(VkVideoFormatPropertiesKHR, &out, p) {
+                  p->format = VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
+                  p->imageCreateFlags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+                  p->imageType = VK_IMAGE_TYPE_2D;
+                  p->imageTiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+                  p->imageUsageFlags = pVideoFormatInfo->imageUsage;
+               }
             }
          }
 
@@ -376,16 +423,21 @@ anv_GetPhysicalDeviceVideoFormatPropertiesKHR(VkPhysicalDevice physicalDevice,
                p->imageTiling = VK_IMAGE_TILING_OPTIMAL;
                p->imageUsageFlags = pVideoFormatInfo->imageUsage;
             }
-            vk_outarray_append_typed(VkVideoFormatPropertiesKHR, &out, p) {
-               p->format = VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16;
-               p->imageCreateFlags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
-               p->imageType = VK_IMAGE_TYPE_2D;
-               p->imageTiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
-               p->imageUsageFlags = pVideoFormatInfo->imageUsage;
+            if (!decode_dst) {
+               vk_outarray_append_typed(VkVideoFormatPropertiesKHR, &out, p) {
+                  p->format = VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16;
+                  p->imageCreateFlags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+                  p->imageType = VK_IMAGE_TYPE_2D;
+                  p->imageTiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+                  p->imageUsageFlags = pVideoFormatInfo->imageUsage;
+               }
             }
          }
       }
    }
+
+   if (*pVideoFormatPropertyCount == 0)
+      return VK_ERROR_VIDEO_PROFILE_FORMAT_NOT_SUPPORTED_KHR;
 
    return vk_outarray_status(&out);
 }
@@ -464,6 +516,57 @@ get_h265_video_mem_size(struct anv_video_session *vid, uint32_t mem_idx)
    return size << 6;
 }
 
+static uint64_t
+get_vp9_video_mem_size(struct anv_video_session *vid, uint32_t mem_idx)
+{
+   uint32_t width_in_ctb =
+      DIV_ROUND_UP(vid->vk.max_coded.width, ANV_MAX_VP9_CTB_SIZE);
+   uint32_t height_in_ctb =
+      DIV_ROUND_UP(vid->vk.max_coded.height, ANV_MAX_VP9_CTB_SIZE);
+   uint64_t size;
+
+   switch (mem_idx) {
+   case ANV_VID_MEM_VP9_DEBLOCK_FILTER_ROW_STORE_LINE:
+   case ANV_VID_MEM_VP9_DEBLOCK_FILTER_ROW_STORE_TILE_LINE:
+      /* if profile <= 1: multiply 18, if profile > 1: multiply 36
+       * But we don't know the profile here, so use 36.
+       */
+      size = width_in_ctb * 36;
+      break;
+   case ANV_VID_MEM_VP9_DEBLOCK_FILTER_ROW_STORE_TILE_COLUMN:
+      size = height_in_ctb * 34;
+      break;
+   case ANV_VID_MEM_VP9_METADATA_LINE:
+   case ANV_VID_MEM_VP9_METADATA_TILE_LINE:
+      size = width_in_ctb * 5;
+      break;
+   case ANV_VID_MEM_VP9_METADATA_TILE_COLUMN:
+      size = height_in_ctb * 5;
+      break;
+   case ANV_VID_MEM_VP9_PROBABILITY_0:
+   case ANV_VID_MEM_VP9_PROBABILITY_1:
+   case ANV_VID_MEM_VP9_PROBABILITY_2:
+   case ANV_VID_MEM_VP9_PROBABILITY_3:
+      size = 32;
+      break;
+   case ANV_VID_MEM_VP9_SEGMENT_ID:
+      size = width_in_ctb * height_in_ctb;
+      break;
+   case ANV_VID_MEM_VP9_HVD_LINE_ROW_STORE:
+   case ANV_VID_MEM_VP9_HVD_TILE_ROW_STORE:
+      size = width_in_ctb;
+      break;
+   case ANV_VID_MEM_VP9_MV_1:
+   case ANV_VID_MEM_VP9_MV_2:
+      size = (width_in_ctb * height_in_ctb * 9);
+      break;
+   default:
+      unreachable("unknown memory");
+   }
+
+   return size << 6;
+}
+
 static void
 get_h264_video_session_mem_reqs(struct anv_video_session *vid,
                                 VkVideoSessionMemoryRequirementsKHR *mem_reqs,
@@ -506,6 +609,31 @@ get_h265_video_session_mem_reqs(struct anv_video_session *vid,
       uint32_t bind_index =
          ANV_VID_MEM_H265_DEBLOCK_FILTER_ROW_STORE_LINE + i;
       uint64_t size = get_h265_video_mem_size(vid, i);
+
+      vk_outarray_append_typed(VkVideoSessionMemoryRequirementsKHR, &out, p) {
+         p->memoryBindIndex = bind_index;
+         p->memoryRequirements.size = size;
+         p->memoryRequirements.alignment = 4096;
+         p->memoryRequirements.memoryTypeBits = memory_types;
+      }
+   }
+}
+
+static void
+get_vp9_video_session_mem_reqs(struct anv_video_session *vid,
+                                VkVideoSessionMemoryRequirementsKHR *mem_reqs,
+                                uint32_t *pVideoSessionMemoryRequirementsCount,
+                                uint32_t memory_types)
+{
+   VK_OUTARRAY_MAKE_TYPED(VkVideoSessionMemoryRequirementsKHR,
+                          out,
+                          mem_reqs,
+                          pVideoSessionMemoryRequirementsCount);
+
+   for (unsigned i = 0; i < ANV_VID_MEM_VP9_DEC_MAX; i++) {
+      uint32_t bind_index =
+         ANV_VID_MEM_VP9_DEBLOCK_FILTER_ROW_STORE_LINE + i;
+      uint64_t size = get_vp9_video_mem_size(vid, i);
 
       vk_outarray_append_typed(VkVideoSessionMemoryRequirementsKHR, &out, p) {
          p->memoryBindIndex = bind_index;
@@ -584,6 +712,27 @@ static const uint8_t av1_buffer_size_ext[ANV_VID_MEM_AV1_MAX][4] = {
    { 1 ,    1    ,    1    ,    1 },  /* lrTileColVBuf, */
 };
 
+const uint32_t av1_mi_size_log2         = 2;
+const uint32_t av1_max_mib_size_log2    = 5;
+
+static void
+get_av1_sb_size(uint32_t *w_in_sb, uint32_t *h_in_sb)
+{
+   const uint32_t width = 4096;
+   const uint32_t height = 4096;
+
+   uint32_t mi_cols = width  >> av1_mi_size_log2;
+   uint32_t mi_rows = height >> av1_mi_size_log2;
+
+   uint32_t width_in_sb = align(mi_cols, (1 << av1_mi_size_log2)) >> av1_mi_size_log2;
+   uint32_t height_in_sb = align(mi_rows, (1 << av1_mi_size_log2)) >> av1_mi_size_log2;
+
+   *w_in_sb = width_in_sb;
+   *h_in_sb = height_in_sb;
+
+   return;
+}
+
 static void
 get_av1_video_session_mem_reqs(struct anv_video_session *vid,
                                VkVideoSessionMemoryRequirementsKHR *mem_reqs,
@@ -594,14 +743,10 @@ get_av1_video_session_mem_reqs(struct anv_video_session *vid,
                           out,
                           mem_reqs,
                           pVideoSessionMemoryRequirementsCount);
-   const uint32_t av1_mi_size_log2         = 2;
-   const uint32_t av1_max_mib_size_log2    = 5;
-   uint32_t width = vid->vk.max_coded.width;
-   uint32_t height = vid->vk.max_coded.height;
-   uint32_t mi_cols = width  >> av1_mi_size_log2;
-   uint32_t mi_rows = height >> av1_mi_size_log2;
-   uint32_t width_in_sb = align(mi_cols, (1 << av1_mi_size_log2)) >> av1_mi_size_log2;
-   uint32_t height_in_sb = align(mi_rows, (1 << av1_mi_size_log2)) >> av1_mi_size_log2;
+
+   uint32_t width_in_sb, height_in_sb;
+   get_av1_sb_size(&width_in_sb, &height_in_sb);
+
    uint32_t max_tile_width_sb = DIV_ROUND_UP(4096, 1 << (av1_max_mib_size_log2 + av1_mi_size_log2));
    uint32_t max_tile_cols = 16; /* TODO. get the profile to work this out */
 
@@ -737,6 +882,12 @@ anv_GetVideoSessionMemoryRequirementsKHR(VkDevice _device,
                                      pVideoSessionMemoryRequirementsCount,
                                      memory_types);
       break;
+   case VK_VIDEO_CODEC_OPERATION_DECODE_VP9_BIT_KHR:
+      get_vp9_video_session_mem_reqs(vid,
+                                     mem_reqs,
+                                     pVideoSessionMemoryRequirementsCount,
+                                     memory_types);
+      break;
    default:
       unreachable("unknown codec");
    }
@@ -774,6 +925,7 @@ anv_BindVideoSessionMemoryKHR(VkDevice _device,
    case VK_VIDEO_CODEC_OPERATION_DECODE_H264_BIT_KHR:
    case VK_VIDEO_CODEC_OPERATION_DECODE_H265_BIT_KHR:
    case VK_VIDEO_CODEC_OPERATION_DECODE_AV1_BIT_KHR:
+   case VK_VIDEO_CODEC_OPERATION_DECODE_VP9_BIT_KHR:
       for (unsigned i = 0; i < bind_mem_count; i++) {
          copy_bind(&vid->vid_mem[bind_mem[i].memoryBindIndex], &bind_mem[i]);
       }
@@ -956,6 +1108,187 @@ anv_init_av1_cdf_tables(struct anv_cmd_buffer *cmd,
    }
 }
 
+#define VP9_CTX_DEFAULT(field) {                                \
+   assert(sizeof(ctx.field) == sizeof(default_##field));        \
+   memcpy(ctx.field, default_##field, sizeof(default_##field)); \
+}
+
+static void
+vp9_prob_buf_update(struct anv_video_session *vid,
+                    void *ptr,
+                    bool key_frame,
+                    const StdVideoVP9Segmentation *seg)
+{
+   vp9_frame_context ctx = { 0, };
+
+   /* Reset all */
+   if (BITSET_TEST(vid->prob_tbl_set, 0)) {
+      ctx.tx_probs = default_tx_probs;
+      VP9_CTX_DEFAULT(coef_probs_4x4);
+      VP9_CTX_DEFAULT(coef_probs_8x8);
+      VP9_CTX_DEFAULT(coef_probs_16x16);
+      VP9_CTX_DEFAULT(coef_probs_32x32);
+
+      VP9_CTX_DEFAULT(skip_probs);
+
+      if (key_frame) {
+         memcpy(ctx.partition_probs, vp9_kf_partition_probs,
+                sizeof(vp9_kf_partition_probs));
+         memcpy(ctx.uv_mode_probs, vp9_kf_uv_mode_probs,
+                sizeof(vp9_kf_uv_mode_probs));
+      } else {
+         VP9_CTX_DEFAULT(inter_mode_probs);
+         VP9_CTX_DEFAULT(switchable_interp_prob);
+         VP9_CTX_DEFAULT(intra_inter_prob);
+         VP9_CTX_DEFAULT(comp_inter_prob);
+         VP9_CTX_DEFAULT(single_ref_prob);
+         VP9_CTX_DEFAULT(comp_ref_prob);
+         VP9_CTX_DEFAULT(y_mode_prob);
+         VP9_CTX_DEFAULT(partition_probs);
+         ctx.nmvc = default_nmv_context;
+         VP9_CTX_DEFAULT(uv_mode_probs);
+      }
+
+      memcpy(ptr, &ctx, sizeof(vp9_frame_context));
+   }
+
+   /* Reset partially */
+   if (BITSET_TEST(vid->prob_tbl_set, 1)) {
+      if (key_frame) {
+         memcpy(ctx.partition_probs, vp9_kf_partition_probs,
+                sizeof(vp9_kf_partition_probs));
+         memcpy(ctx.uv_mode_probs, vp9_kf_uv_mode_probs,
+                sizeof(vp9_kf_uv_mode_probs));
+      } else {
+         VP9_CTX_DEFAULT(inter_mode_probs);
+         VP9_CTX_DEFAULT(switchable_interp_prob);
+         VP9_CTX_DEFAULT(intra_inter_prob);
+         VP9_CTX_DEFAULT(comp_inter_prob);
+         VP9_CTX_DEFAULT(single_ref_prob);
+         VP9_CTX_DEFAULT(comp_ref_prob);
+         VP9_CTX_DEFAULT(y_mode_prob);
+         VP9_CTX_DEFAULT(partition_probs);
+         ctx.nmvc = default_nmv_context;
+         VP9_CTX_DEFAULT(uv_mode_probs);
+      }
+
+      memcpy(ptr + INTER_MODE_PROBS_OFFSET, &ctx.inter_mode_probs, INTER_MODE_PROBS_SIZE);
+   }
+
+   /* Copy seg probs */
+   if (BITSET_TEST(vid->prob_tbl_set, 2)) {
+      memcpy(ctx.seg_tree_probs, seg->segmentation_tree_probs,
+             sizeof(ctx.seg_tree_probs));
+      memcpy(ctx.seg_pred_probs, seg->segmentation_pred_prob,
+             sizeof(ctx.seg_pred_probs));
+      memcpy(ptr + SEG_PROBS_OFFSET, &ctx.seg_tree_probs,
+             SEG_TREE_PROBS + PREDICTION_PROBS);
+   } else if (BITSET_TEST(vid->prob_tbl_set, 3)) {
+      VP9_CTX_DEFAULT(seg_tree_probs);
+      VP9_CTX_DEFAULT(seg_pred_probs);
+      memcpy(ptr + SEG_PROBS_OFFSET, &ctx,
+             SEG_TREE_PROBS + PREDICTION_PROBS);
+   }
+
+   /* TODO for 4, 5 */
+}
+
+void
+anv_update_vp9_tables(struct anv_cmd_buffer *cmd,
+                      struct anv_video_session *vid,
+                      uint32_t prob_id,
+                      bool key_frame,
+                      const StdVideoVP9Segmentation *seg)
+{
+   void *prob_map;
+
+   VkResult result =
+      anv_device_map_bo(cmd->device,
+                        vid->vid_mem[prob_id].mem->bo,
+                        vid->vid_mem[prob_id].offset,
+                        vid->vid_mem[prob_id].size,
+                        NULL /* placed_addr */,
+                        &prob_map);
+
+   if (result != VK_SUCCESS) {
+      anv_batch_set_error(&cmd->batch, result);
+      return;
+   }
+
+   vp9_prob_buf_update(vid, prob_map, key_frame, seg);
+
+   /* Clear probability setting table */
+   for (int i = 0; i < 6; i++)
+      BITSET_CLEAR(vid->prob_tbl_set, i);
+
+   anv_device_unmap_bo(cmd->device,
+                       vid->vid_mem[prob_id].mem->bo,
+                       prob_map,
+                       vid->vid_mem[prob_id].size, false);
+}
+
+void
+anv_calculate_qmul(const struct VkVideoDecodeVP9PictureInfoKHR *vp9_pic,
+                   uint32_t seg_id,
+                   int16_t *ptr)
+{
+   const StdVideoDecodeVP9PictureInfo *std_pic = vp9_pic->pStdPictureInfo;
+   const StdVideoVP9Segmentation *segmentation = std_pic->pSegmentation;
+
+   uint32_t bpp_index = std_pic->pColorConfig->BitDepth > 8 ? 1 : 0;
+
+   uint32_t qyac;
+
+   if (std_pic->flags.segmentation_enabled && segmentation->FeatureEnabled[seg_id]) {
+      if (segmentation->flags.segmentation_abs_or_delta_update) {
+         /* FIXME. which lvl needs to be picked */
+         qyac = segmentation->FeatureData[seg_id][0] & 0xff;
+      } else {
+         qyac = (std_pic->base_q_idx + segmentation->FeatureData[seg_id][0]) & 0xff;
+      }
+   } else {
+      qyac = std_pic->base_q_idx & 0xff;
+   }
+
+   uint32_t qydc = (qyac + std_pic->delta_q_y_dc) & 0xff;
+   uint32_t quvdc = (qyac + std_pic->delta_q_uv_dc) & 0xff;
+   uint32_t quvac = (qyac + std_pic->delta_q_uv_ac) & 0xff;
+
+   int16_t qmul[2][2] = { 0, };
+
+   qmul[0][0] = vp9_dc_qlookup[bpp_index][qydc];
+   qmul[0][1] = vp9_ac_qlookup[bpp_index][qyac];
+   qmul[1][0] = vp9_dc_qlookup[bpp_index][quvdc];
+   qmul[1][1] = vp9_ac_qlookup[bpp_index][quvac];
+
+   memcpy(ptr, qmul, sizeof(qmul));
+}
+
+void
+anv_vp9_reset_segment_id(struct anv_cmd_buffer *cmd, struct anv_video_session *vid)
+{
+   void *map;
+
+   VkResult result =
+      anv_device_map_bo(cmd->device,
+                        vid->vid_mem[ANV_VID_MEM_VP9_SEGMENT_ID].mem->bo,
+                        vid->vid_mem[ANV_VID_MEM_VP9_SEGMENT_ID].offset,
+                        vid->vid_mem[ANV_VID_MEM_VP9_SEGMENT_ID].size,
+                        NULL,
+                        &map);
+
+   if (result != VK_SUCCESS) {
+      anv_batch_set_error(&cmd->batch, result);
+      return;
+   }
+
+   memset(map, 0, vid->vid_mem[ANV_VID_MEM_VP9_SEGMENT_ID].size);
+   anv_device_unmap_bo(cmd->device,
+                       vid->vid_mem[ANV_VID_MEM_VP9_SEGMENT_ID].mem->bo,
+                       map,
+                       vid->vid_mem[ANV_VID_MEM_VP9_SEGMENT_ID].size, NULL);
+}
+
 uint32_t
 anv_video_get_image_mv_size(struct anv_device *device,
                             struct anv_image *image,
@@ -972,14 +1305,14 @@ anv_video_get_image_mv_size(struct anv_device *device,
          unsigned w_mb = DIV_ROUND_UP(image->vk.extent.width, 32);
          unsigned h_mb = DIV_ROUND_UP(image->vk.extent.height, 32);
          size = ALIGN(w_mb * h_mb, 2) << 6;
+      } else if (profile_list->pProfiles[i].videoCodecOperation == VK_VIDEO_CODEC_OPERATION_DECODE_VP9_BIT_KHR) {
+         unsigned w_ctb = DIV_ROUND_UP(image->vk.extent.width, ANV_MAX_VP9_CTB_SIZE);
+         unsigned h_ctb = DIV_ROUND_UP(image->vk.extent.height, ANV_MAX_VP9_CTB_SIZE);
+
+         size = (w_ctb * h_ctb * 9) << 6;
       } else if (profile_list->pProfiles[i].videoCodecOperation == VK_VIDEO_CODEC_OPERATION_DECODE_AV1_BIT_KHR) {
-         const uint32_t av1_mi_size_log2 = 2;
-         uint32_t width = image->vk.extent.width;
-         uint32_t height = image->vk.extent.height;
-         uint32_t mi_cols = width  >> av1_mi_size_log2;
-         uint32_t mi_rows = height >> av1_mi_size_log2;
-         uint32_t width_in_sb = align(mi_cols, (1 << av1_mi_size_log2)) >> av1_mi_size_log2;
-         uint32_t height_in_sb = align(mi_rows, (1 << av1_mi_size_log2)) >> av1_mi_size_log2;
+         uint32_t width_in_sb, height_in_sb;
+         get_av1_sb_size(&width_in_sb, &height_in_sb);
          uint32_t sb_total = width_in_sb * height_in_sb;
 
          size = sb_total * 16;

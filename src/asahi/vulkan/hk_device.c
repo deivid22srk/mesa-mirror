@@ -20,16 +20,19 @@
 #include "asahi/lib/agx_bo.h"
 #include "asahi/lib/agx_device.h"
 #include "asahi/libagx/geometry.h"
+#include "compiler/nir/nir_builder.h"
 #include "util/hash_table.h"
 #include "util/ralloc.h"
 #include "util/simple_mtx.h"
 #include "vulkan/vulkan_core.h"
 #include "vulkan/wsi/wsi_common.h"
+#include "layout.h"
 #include "vk_cmd_enqueue_entrypoints.h"
 #include "vk_common_entrypoints.h"
 #include "vk_debug_utils.h"
 #include "vk_device.h"
 #include "vk_pipeline_cache.h"
+#include "vk_shader.h"
 
 #include <fcntl.h>
 #include <xf86drm.h>
@@ -81,17 +84,13 @@ hk_upload_rodata(struct hk_device *dev)
     * cut an alloc/upload at draw time.
     */
    offs = align(offs, sizeof(uint64_t));
-   agx_pack(&dev->rodata.image_heap, USC_UNIFORM, cfg) {
-      cfg.start_halfs = HK_IMAGE_HEAP_UNIFORM;
-      cfg.size_halfs = 4;
-      cfg.buffer = dev->rodata.bo->va->addr + offs;
-   }
+   dev->rodata.image_heap_ptr = dev->rodata.bo->va->addr + offs;
 
    uint64_t *image_heap_ptr = (void *)map + offs;
    *image_heap_ptr = dev->images.bo->va->addr;
    offs += sizeof(uint64_t);
 
-   /* The geometry state buffer isn't strictly readonly data, but we only have a
+   /* The heap descriptor isn't strictly readonly data, but we only have a
     * single instance of it device-wide and -- after initializing at heap
     * allocate time -- it is read-only from the CPU perspective. The GPU uses it
     * for scratch, but is required to reset it after use to ensure resubmitting
@@ -100,24 +99,8 @@ hk_upload_rodata(struct hk_device *dev)
     * So, we allocate it here for convenience.
     */
    offs = align(offs, sizeof(uint64_t));
-   dev->rodata.geometry_state = dev->rodata.bo->va->addr + offs;
-   offs += sizeof(struct agx_geometry_state);
-
-   /* For null readonly buffers, we need to allocate 16 bytes of zeroes for
-    * robustness2 semantics on read.
-    */
-   offs = align(offs, 16);
-   dev->rodata.zero_sink = dev->rodata.bo->va->addr + offs;
-   memset(map + offs, 0, 16);
-   offs += 16;
-
-   /* For null storage descriptors, we need to reserve 16 bytes to catch writes.
-    * No particular content is required; we cannot get robustness2 semantics
-    * without more work.
-    */
-   offs = align(offs, 16);
-   dev->rodata.null_sink = dev->rodata.bo->va->addr + offs;
-   offs += 16;
+   dev->rodata.heap = dev->rodata.bo->va->addr + offs;
+   offs += sizeof(struct agx_heap);
 
    return VK_SUCCESS;
 }
@@ -289,8 +272,7 @@ static VkResult
 hk_get_timestamp(struct vk_device *device, uint64_t *timestamp)
 {
    struct hk_device *dev = container_of(device, struct hk_device, vk);
-   unreachable("todo");
-   // *timestamp = agx_get_gpu_timestamp(dev);
+   *timestamp = agx_get_gpu_timestamp(&dev->dev);
    return VK_SUCCESS;
 }
 
@@ -306,8 +288,8 @@ hk_upload_null_descriptors(struct hk_device *dev)
    struct agx_pbe_packed null_pbe;
    uint32_t offset_tex, offset_pbe;
 
-   agx_set_null_texture(&null_tex, dev->rodata.null_sink);
-   agx_set_null_pbe(&null_pbe, dev->rodata.null_sink);
+   agx_set_null_texture(&null_tex);
+   agx_set_null_pbe(&null_pbe);
 
    hk_descriptor_table_add(dev, &dev->images, &null_tex, sizeof(null_tex),
                            &offset_tex);
@@ -408,6 +390,14 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    dev->vk.check_status = hk_check_status;
    dev->vk.get_timestamp = hk_get_timestamp;
 
+   /* This holds for current platforms. We do not currently implement
+    * timestamp scaling, this would require changes in the query copy kernel
+    * as well. Calibrated timestamps depends on this.
+    */
+   assert(dev->dev.user_timestamp_to_ns.num ==
+             dev->dev.user_timestamp_to_ns.den &&
+          "user timestamps are in ns");
+
    result = hk_descriptor_table_init(dev, &dev->images, AGX_TEXTURE_LENGTH,
                                      1024, 1024 * 1024);
    if (result != VK_SUCCESS)
@@ -463,6 +453,23 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    if (result != VK_SUCCESS)
       goto fail_mem_cache;
 
+   /* Precompile an empty fragment shader that can be used to handle API-level
+    * null fragment shaders. We do this at device-time to make binds cheap.
+    * Regardless, compiling this shader should be fast.
+    */
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT,
+                                                  &agx_nir_options, "empty FS");
+   struct vk_shader_compile_info info = {
+      .nir = b.shader,
+      .robustness = &vk_robustness_disabled,
+      .stage = MESA_SHADER_FRAGMENT,
+   };
+   hk_compile_shader(dev, &info, NULL, NULL, pAllocator, &dev->null_fs);
+   if (!dev->null_fs) {
+      result = VK_ERROR_OUT_OF_HOST_MEMORY;
+      goto fail_meta;
+   }
+
    *pDevice = hk_device_to_handle(dev);
 
    simple_mtx_init(&dev->scratch.lock, mtx_plain);
@@ -476,6 +483,8 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
 
    return VK_SUCCESS;
 
+fail_meta:
+   hk_device_finish_meta(dev);
 fail_mem_cache:
    vk_pipeline_cache_destroy(dev->mem_cache, NULL);
 fail_queue:
@@ -529,6 +538,10 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    agx_scratch_fini(&dev->scratch.fs);
    agx_scratch_fini(&dev->scratch.cs);
    simple_mtx_destroy(&dev->scratch.lock);
+
+   if (dev->null_fs) {
+      hk_api_shader_destroy(&dev->vk, &dev->null_fs->vk, pAllocator);
+   }
 
    hk_destroy_sampler_heap(dev, &dev->samplers);
    hk_descriptor_table_finish(dev, &dev->images);

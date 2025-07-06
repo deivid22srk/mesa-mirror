@@ -70,7 +70,7 @@ panfrost_precomp_shader_create(
    };
    res->local_size = local_dim;
 
-   struct panfrost_ptr bin =
+   struct pan_ptr bin =
       pan_pool_alloc_aligned(cache->bin_pool, info->binary_size, 64);
 
    if (!bin.gpu)
@@ -80,8 +80,7 @@ panfrost_precomp_shader_create(
    res->code_ptr = bin.gpu;
 
 #if PAN_ARCH <= 7
-   struct panfrost_ptr rsd =
-      pan_pool_alloc_desc(cache->desc_pool, RENDERER_STATE);
+   struct pan_ptr rsd = pan_pool_alloc_desc(cache->desc_pool, RENDERER_STATE);
 
    if (!rsd.gpu)
       goto err;
@@ -92,8 +91,7 @@ panfrost_precomp_shader_create(
 
    res->state_ptr = rsd.gpu;
 #else
-   struct panfrost_ptr spd =
-      pan_pool_alloc_desc(cache->desc_pool, SHADER_PROGRAM);
+   struct pan_ptr spd = pan_pool_alloc_desc(cache->desc_pool, SHADER_PROGRAM);
 
    if (!spd.gpu)
       goto err;
@@ -194,13 +192,13 @@ emit_tls(struct panfrost_batch *batch,
 {
    struct panfrost_context *ctx = batch->ctx;
    struct panfrost_device *dev = pan_device(ctx->base.screen);
-   struct panfrost_ptr t =
-      pan_pool_alloc_desc(&batch->pool.base, LOCAL_STORAGE);
+   struct pan_ptr t = pan_pool_alloc_desc(&batch->pool.base, LOCAL_STORAGE);
 
    struct pan_tls_info info = {
       .tls.size = shader->info.tls_size,
       .wls.size = shader->info.wls_size,
-      .wls.instances = pan_wls_instances(dim),
+      .wls.instances =
+         pan_calc_wls_instances(&shader->local_size, &dev->kmod.props, dim),
    };
 
    if (info.tls.size) {
@@ -210,8 +208,8 @@ emit_tls(struct panfrost_batch *batch,
    }
 
    if (info.wls.size) {
-      unsigned size = pan_wls_adjust_size(info.wls.size) * info.wls.instances *
-                      dev->core_id_range;
+      unsigned size = pan_calc_total_wls_size(info.wls.size, info.wls.instances,
+                                              dev->core_id_range);
 
       struct panfrost_bo *bo = panfrost_batch_get_shared_memory(batch, size, 1);
 
@@ -240,7 +238,7 @@ GENX(panfrost_launch_precomp)(struct panfrost_batch *batch,
       panfrost_precomp_cache_get(dev->precomp_cache, idx);
    assert(shader);
 
-   struct panfrost_ptr push_uniforms = pan_pool_alloc_aligned(
+   struct pan_ptr push_uniforms = pan_pool_alloc_aligned(
       &batch->pool.base, BIFROST_PRECOMPILED_KERNEL_SYSVALS_SIZE + data_size,
       16);
    assert(push_uniforms.gpu);
@@ -261,12 +259,11 @@ GENX(panfrost_launch_precomp)(struct panfrost_batch *batch,
                                                     data_size, &sysvals);
 
 #if PAN_ARCH <= 9
-   struct panfrost_ptr job =
-      pan_pool_alloc_desc(&batch->pool.base, COMPUTE_JOB);
+   struct pan_ptr job = pan_pool_alloc_desc(&batch->pool.base, COMPUTE_JOB);
    assert(job.gpu);
 
 #if PAN_ARCH <= 7
-   panfrost_pack_work_groups_compute(
+   pan_pack_work_groups_compute(
       pan_section_ptr(job.cpu, COMPUTE_JOB, INVOCATION), grid.count[0],
       grid.count[1], grid.count[2], shader->local_size.x, shader->local_size.y,
       shader->local_size.z, false, false);
@@ -320,18 +317,18 @@ GENX(panfrost_launch_precomp)(struct panfrost_batch *batch,
    struct cs_builder *b = batch->csf.cs.builder;
 
    /* No resource table */
-   cs_move64_to(b, cs_reg64(b, 0), 0);
+   cs_move64_to(b, cs_sr_reg64(b, COMPUTE, SRT_0), 0);
 
    uint64_t fau_count =
       DIV_ROUND_UP(BIFROST_PRECOMPILED_KERNEL_SYSVALS_SIZE + data_size, 8);
    uint64_t fau_ptr = push_uniforms.gpu | (fau_count << 56);
-   cs_move64_to(b, cs_reg64(b, 8), fau_ptr);
+   cs_move64_to(b, cs_sr_reg64(b, COMPUTE, FAU_0), fau_ptr);
 
-   cs_move64_to(b, cs_reg64(b, 16), shader->state_ptr);
-   cs_move64_to(b, cs_reg64(b, 24), tsd);
+   cs_move64_to(b, cs_sr_reg64(b, COMPUTE, SPD_0), shader->state_ptr);
+   cs_move64_to(b, cs_sr_reg64(b, COMPUTE, TSD_0), tsd);
 
    /* Global attribute offset */
-   cs_move32_to(b, cs_reg32(b, 32), 0);
+   cs_move32_to(b, cs_sr_reg32(b, COMPUTE, GLOBAL_ATTRIBUTE_OFFSET), 0);
 
    /* Compute workgroup size */
    struct mali_compute_size_workgroup_packed wg_size;
@@ -341,21 +338,21 @@ GENX(panfrost_launch_precomp)(struct panfrost_batch *batch,
       cfg.workgroup_size_z = shader->local_size.z;
       cfg.allow_merging_workgroups = false;
    }
-   cs_move32_to(b, cs_reg32(b, 33), wg_size.opaque[0]);
+   cs_move32_to(b, cs_sr_reg32(b, COMPUTE, WG_SIZE), wg_size.opaque[0]);
 
    /* Job offset */
-   cs_move32_to(b, cs_reg32(b, 34), 0);
-   cs_move32_to(b, cs_reg32(b, 35), 0);
-   cs_move32_to(b, cs_reg32(b, 36), 0);
+   cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_OFFSET_X), 0);
+   cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_OFFSET_Y), 0);
+   cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_OFFSET_Z), 0);
 
    /* Job size */
-   cs_move32_to(b, cs_reg32(b, 37), grid.count[0]);
-   cs_move32_to(b, cs_reg32(b, 38), grid.count[1]);
-   cs_move32_to(b, cs_reg32(b, 39), grid.count[2]);
+   cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_SIZE_X), grid.count[0]);
+   cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_SIZE_Y), grid.count[1]);
+   cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_SIZE_Z), grid.count[2]);
 
    unsigned threads_per_wg =
       shader->local_size.x * shader->local_size.y * shader->local_size.z;
-   unsigned max_thread_cnt = panfrost_compute_max_thread_count(
+   unsigned max_thread_cnt = pan_compute_max_thread_count(
       &dev->kmod.props, shader->info.work_reg_count);
 
    /* Pick the task_axis and task_increment to maximize thread utilization. */
@@ -386,7 +383,6 @@ GENX(panfrost_launch_precomp)(struct panfrost_batch *batch,
 
    assert(task_axis <= MALI_TASK_AXIS_Z);
    assert(task_increment > 0);
-   cs_run_compute(b, task_increment, task_axis, false,
-                  cs_shader_res_sel(0, 0, 0, 0));
+   cs_run_compute(b, task_increment, task_axis, cs_shader_res_sel(0, 0, 0, 0));
 #endif
 }

@@ -1424,7 +1424,9 @@ calculate_urb_setup(const struct intel_device_info *devinfo,
          struct intel_vue_map prev_stage_vue_map;
          elk_compute_vue_map(devinfo, &prev_stage_vue_map,
                              key->input_slots_valid,
-                             nir->info.separate_shader, 1);
+                             nir->info.separate_shader ?
+                             INTEL_VUE_LAYOUT_SEPARATE :
+                             INTEL_VUE_LAYOUT_FIXED, 1);
 
          int first_slot =
             elk_compute_first_urb_slot_required(inputs_read,
@@ -1449,17 +1451,17 @@ calculate_urb_setup(const struct intel_device_info *devinfo,
          if (i == VARYING_SLOT_PSIZ)
             continue;
 
-	 if (key->input_slots_valid & BITFIELD64_BIT(i)) {
-	    /* The back color slot is skipped when the front color is
-	     * also written to.  In addition, some slots can be
-	     * written in the vertex shader and not read in the
-	     * fragment shader.  So the register number must always be
-	     * incremented, mapped or not.
-	     */
-	    if (_mesa_varying_slot_in_fs((gl_varying_slot) i))
-	       prog_data->urb_setup[i] = urb_next;
+         if (key->input_slots_valid & BITFIELD64_BIT(i)) {
+            /* The back color slot is skipped when the front color is
+             * also written to.  In addition, some slots can be
+             * written in the vertex shader and not read in the
+             * fragment shader.  So the register number must always be
+             * incremented, mapped or not.
+             */
+            if (_mesa_varying_slot_in_fs((gl_varying_slot) i))
+               prog_data->urb_setup[i] = urb_next;
             urb_next++;
-	 }
+         }
       }
 
       /*
@@ -1468,7 +1470,7 @@ calculate_urb_setup(const struct intel_device_info *devinfo,
        *
        * See compile_sf_prog() for more info.
        */
-      if (inputs_read & BITFIELD64_BIT(VARYING_SLOT_PNTC))
+      if (inputs_read & VARYING_BIT_PNTC)
          prog_data->urb_setup[VARYING_SLOT_PNTC] = urb_next++;
    }
 
@@ -2228,7 +2230,7 @@ elk_fs_visitor::opt_algebraic()
             if (inst->dst.type != inst->src[0].type &&
                 inst->dst.type != ELK_REGISTER_TYPE_DF &&
                 inst->src[0].type != ELK_REGISTER_TYPE_F)
-               assert(!"unimplemented: saturate mixed types");
+               unreachable("unimplemented: saturate mixed types");
 
             if (elk_saturate_immediate(inst->src[0].type,
                                        &inst->src[0].as_elk_reg())) {
@@ -2397,12 +2399,15 @@ elk_fs_visitor::opt_algebraic()
             inst->remove(block);
             progress = true;
          }
-         if (inst->src[0].equals(inst->src[1])) {
+         if (inst->src[0].equals(inst->src[1]) &&
+             (!elk_reg_type_is_floating_point(inst->dst.type) ||
+              inst->conditional_mod == ELK_CONDITIONAL_NONE)) {
             inst->opcode = ELK_OPCODE_MOV;
             inst->sources = 1;
             inst->src[1] = reg_undef;
             inst->predicate = ELK_PREDICATE_NONE;
             inst->predicate_inverse = false;
+            inst->conditional_mod = ELK_CONDITIONAL_NONE;
             progress = true;
          } else if (inst->saturate && inst->src[1].file == IMM) {
             switch (inst->conditional_mod) {
@@ -2437,6 +2442,7 @@ elk_fs_visitor::opt_algebraic()
                default:
                   break;
                }
+               break;
             default:
                break;
             }
@@ -3408,6 +3414,12 @@ elk_fs_visitor::workaround_source_arf_before_eot()
    return progress;
 }
 
+static bool
+has_compr4(const struct intel_device_info *devinfo)
+{
+   return devinfo->verx10 > 40 && devinfo->verx10 < 60;
+}
+
 bool
 elk_fs_visitor::lower_load_payload()
 {
@@ -3467,7 +3479,7 @@ elk_fs_visitor::lower_load_payload()
          assert(inst->header_size + 4 <= inst->sources);
          for (uint8_t i = inst->header_size; i < inst->header_size + 4; i++) {
             if (inst->src[i].file != BAD_FILE) {
-               if (devinfo->has_compr4) {
+               if (has_compr4(devinfo)) {
                   elk_fs_reg compr4_dst = retype(dst, inst->src[i].type);
                   compr4_dst.nr |= ELK_MRF_COMPR4;
                   ibld.MOV(compr4_dst, inst->src[i]);
@@ -6253,7 +6265,9 @@ elk_fs_visitor::run_fs(bool allow_spilling, bool do_rep_send)
       emit_repclear_shader();
    } else {
       if (nir->info.inputs_read > 0 ||
-          BITSET_TEST(nir->info.system_values_read, SYSTEM_VALUE_FRAG_COORD) ||
+          BITSET_TEST(nir->info.system_values_read, SYSTEM_VALUE_PIXEL_COORD) ||
+          BITSET_TEST(nir->info.system_values_read, SYSTEM_VALUE_FRAG_COORD_Z) ||
+          BITSET_TEST(nir->info.system_values_read, SYSTEM_VALUE_FRAG_COORD_W) ||
           (nir->info.outputs_read > 0 && !wm_key->coherent_fb_fetch)) {
          if (devinfo->ver < 6)
             emit_interpolation_setup_gfx4();
@@ -6349,24 +6363,6 @@ elk_fs_visitor::run_cs(bool allow_spilling)
    return !failed;
 }
 
-static bool
-is_used_in_not_interp_frag_coord(nir_def *def)
-{
-   nir_foreach_use_including_if(src, def) {
-      if (nir_src_is_if(src))
-         return true;
-
-      if (nir_src_parent_instr(src)->type != nir_instr_type_intrinsic)
-         return true;
-
-      nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(nir_src_parent_instr(src));
-      if (intrin->intrinsic != nir_intrinsic_load_frag_coord)
-         return true;
-   }
-
-   return false;
-}
-
 /**
  * Return a bitfield where bit n is set if barycentric interpolation mode n
  * (see enum elk_barycentric_mode) is needed by the fragment shader.
@@ -6399,17 +6395,13 @@ elk_compute_barycentric_interp_modes(const struct intel_device_info *devinfo,
                continue;
             }
 
-            /* Ignore WPOS; it doesn't require interpolation. */
-            if (!is_used_in_not_interp_frag_coord(&intrin->def))
-               continue;
-
             nir_intrinsic_op bary_op = intrin->intrinsic;
             enum elk_barycentric_mode bary =
                elk_barycentric_mode(intrin);
 
             barycentric_interp_modes |= 1 << bary;
 
-            if (devinfo->needs_unlit_centroid_workaround &&
+            if (elk_needs_unlit_centroid_workaround(devinfo) &&
                 bary_op == nir_intrinsic_load_barycentric_centroid)
                barycentric_interp_modes |= 1 << centroid_to_pixel(bary);
          }
@@ -6532,10 +6524,7 @@ elk_nir_move_interpolation_to_top(nir_shader *nir)
          }
       }
 
-      progress = progress || impl_progress;
-
-      nir_metadata_preserve(impl, impl_progress ? nir_metadata_control_flow
-                                                : nir_metadata_all);
+      progress |= nir_progress(impl_progress, impl, nir_metadata_control_flow);
    }
 
    return progress;
@@ -6661,9 +6650,9 @@ elk_nir_populate_wm_prog_data(nir_shader *shader,
    prog_data->uses_vmask = true;
 
    prog_data->uses_src_w =
-      BITSET_TEST(shader->info.system_values_read, SYSTEM_VALUE_FRAG_COORD);
+      BITSET_TEST(shader->info.system_values_read, SYSTEM_VALUE_FRAG_COORD_W);
    prog_data->uses_src_depth =
-      BITSET_TEST(shader->info.system_values_read, SYSTEM_VALUE_FRAG_COORD);
+      BITSET_TEST(shader->info.system_values_read, SYSTEM_VALUE_FRAG_COORD_Z);
 
    calculate_urb_setup(devinfo, key, prog_data, shader);
    elk_compute_flat_inputs(prog_data, shader);

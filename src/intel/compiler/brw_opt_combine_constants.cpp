@@ -764,7 +764,6 @@ brw_combine_constants(struct value *candidates, unsigned num_candidates)
 struct brw_inst_box {
    brw_inst *inst;
    unsigned ip;
-   bblock_t *block;
 };
 
 /** A box for putting fs_regs in a linked list. */
@@ -867,7 +866,7 @@ new_value(struct table *table, void *mem_ctx)
  */
 static unsigned
 box_instruction(struct table *table, void *mem_ctx, brw_inst *inst,
-                unsigned ip, bblock_t *block)
+                unsigned ip)
 {
    /* It is common for box_instruction to be called consecutively for each
     * source of an instruction.  As a result, the most common case for finding
@@ -893,7 +892,6 @@ box_instruction(struct table *table, void *mem_ctx, brw_inst *inst,
    brw_inst_box *ib =  &table->boxes[idx];
 
    ib->inst = inst;
-   ib->block = block;
    ib->ip = ip;
 
    return idx;
@@ -1108,13 +1106,12 @@ static void
 add_candidate_immediate(struct table *table, brw_inst *inst, unsigned ip,
                         unsigned i,
                         bool allow_one_constant,
-                        bblock_t *block,
                         const struct intel_device_info *devinfo,
                         void *const_ctx)
 {
    struct value *v = new_value(table, const_ctx);
 
-   unsigned box_idx = box_instruction(table, const_ctx, inst, ip, block);
+   unsigned box_idx = box_instruction(table, const_ctx, inst, ip);
 
    v->value.u64 = inst->src[i].d64;
    v->bit_size = brw_type_size_bits(inst->src[i].type);
@@ -1319,7 +1316,7 @@ brw_opt_combine_constants(brw_shader &s)
       case SHADER_OPCODE_INT_REMAINDER:
       case SHADER_OPCODE_POW:
          if (inst->src[0].file == IMM) {
-            add_candidate_immediate(&table, inst, ip, 0, false, block,
+            add_candidate_immediate(&table, inst, ip, 0, false,
                                     devinfo, const_ctx);
          }
          break;
@@ -1342,9 +1339,9 @@ brw_opt_combine_constants(brw_shader &s)
             /* MAD can have either src0 or src2 be immediate. Add both as
              * candidates, but mark them "allow one constant."
              */
-            add_candidate_immediate(&table, inst, ip, 0, true, block,
+            add_candidate_immediate(&table, inst, ip, 0, true,
                                     devinfo, const_ctx);
-            add_candidate_immediate(&table, inst, ip, 2, true, block,
+            add_candidate_immediate(&table, inst, ip, 2, true,
                                     devinfo, const_ctx);
          } else {
             for (int i = 0; i < inst->sources; i++) {
@@ -1354,7 +1351,7 @@ brw_opt_combine_constants(brw_shader &s)
                if (can_promote_src_as_imm(devinfo, inst, i))
                   continue;
 
-               add_candidate_immediate(&table, inst, ip, i, false, block,
+               add_candidate_immediate(&table, inst, ip, i, false,
                                        devinfo, const_ctx);
             }
          }
@@ -1368,7 +1365,7 @@ brw_opt_combine_constants(brw_shader &s)
             if (inst->src[i].file != IMM)
                continue;
 
-            add_candidate_immediate(&table, inst, ip, i, false, block,
+            add_candidate_immediate(&table, inst, ip, i, false,
                                     devinfo, const_ctx);
          }
 
@@ -1386,12 +1383,12 @@ brw_opt_combine_constants(brw_shader &s)
                 inst->conditional_mod == BRW_CONDITIONAL_L) {
                assert(inst->src[1].file == IMM);
 
-               add_candidate_immediate(&table, inst, ip, 0, true, block,
+               add_candidate_immediate(&table, inst, ip, 0, true,
                                        devinfo, const_ctx);
-               add_candidate_immediate(&table, inst, ip, 1, true, block,
+               add_candidate_immediate(&table, inst, ip, 1, true,
                                        devinfo, const_ctx);
             } else {
-               add_candidate_immediate(&table, inst, ip, 0, false, block,
+               add_candidate_immediate(&table, inst, ip, 0, false,
                                        devinfo, const_ctx);
             }
          }
@@ -1405,7 +1402,7 @@ brw_opt_combine_constants(brw_shader &s)
       case BRW_OPCODE_SHL:
       case BRW_OPCODE_SHR:
          if (inst->src[0].file == IMM) {
-            add_candidate_immediate(&table, inst, ip, 0, false, block,
+            add_candidate_immediate(&table, inst, ip, 0, false,
                                     devinfo, const_ctx);
          }
          break;
@@ -1462,15 +1459,15 @@ brw_opt_combine_constants(brw_shader &s)
             assert(imm->inst == NULL);
 
             imm->inst = ib->inst;
-            imm->block = ib->block;
+            imm->block = ib->inst->block;
             imm->first_use_ip = ib->ip;
             imm->last_use_ip = ib->ip;
             imm->used_in_single_block = true;
          } else {
-            bblock_t *intersection = idom.intersect(ib->block,
+            bblock_t *intersection = idom.intersect(ib->inst->block,
                                                     imm->block);
 
-            if (ib->block != imm->block)
+            if (ib->inst->block != imm->block)
                imm->used_in_single_block = false;
 
             if (imm->first_use_ip > ib->ip) {
@@ -1482,7 +1479,7 @@ brw_opt_combine_constants(brw_shader &s)
                 * here.
                 */
                imm->inst = ib->inst;
-               imm->block = ib->block;
+               imm->block = ib->inst->block;
             }
 
             if (imm->last_use_ip < ib->ip)
@@ -1531,8 +1528,6 @@ brw_opt_combine_constants(brw_shader &s)
 
    free(regs);
 
-   bool rebuild_cfg = false;
-
    /* Insert MOVs to load the constant values into GRFs. */
    for (int i = 0; i < table.len; i++) {
       struct imm *imm = &table.imm[i];
@@ -1543,48 +1538,20 @@ brw_opt_combine_constants(brw_shader &s)
       exec_node *n;
       bblock_t *insert_block;
       if (imm->inst != nullptr) {
-         n = imm->inst;
          insert_block = imm->block;
+         n = imm->inst;
       } else {
-         if (imm->block->start()->opcode == BRW_OPCODE_DO) {
+         insert_block = imm->block;
+         if (insert_block->start()->opcode == BRW_OPCODE_DO) {
             /* DO blocks are weird. They can contain only the single DO
              * instruction. As a result, MOV instructions cannot be added to
-             * the DO block.
+             * the DO block, so add to the next block which is guaranteed
+             * to not be a DO block.
              */
-            bblock_t *next_block = imm->block->next();
-            if (next_block->starts_with_control_flow()) {
-               /* This is the difficult case. This occurs for code like
-                *
-                *    do {
-                *       do {
-                *          ...
-                *       } while (...);
-                *    } while (...);
-                *
-                * when the MOV instructions need to be inserted between the
-                * two DO instructions.
-                *
-                * To properly handle this scenario, a new block would need to
-                * be inserted. Doing so would require modifying arbitrary many
-                * CONTINUE, BREAK, and WHILE instructions to point to the new
-                * block.
-                *
-                * It is unlikely that this would ever be correct. Instead,
-                * insert the MOV instructions in the known wrong place and
-                * rebuild the CFG at the end of the pass.
-                */
-               insert_block = imm->block;
-               n = insert_block->last_non_control_flow_inst()->next;
-
-               rebuild_cfg = true;
-            } else {
-               insert_block = next_block;
-               n = insert_block->start();
-            }
-         } else {
-            insert_block = imm->block;
-            n = insert_block->last_non_control_flow_inst()->next;
+            insert_block = insert_block->next();
+            assert(insert_block->start()->opcode != BRW_OPCODE_DO);
          }
+         n = insert_block->last_non_control_flow_inst()->next;
       }
 
       /* From the BDW and CHV PRM, 3D Media GPGPU, Special Restrictions:
@@ -1770,26 +1737,9 @@ brw_opt_combine_constants(brw_shader &s)
       }
    }
 
-   if (rebuild_cfg) {
-      /* When the CFG is initially built, the instructions are removed from
-       * the list of instructions stored in brw_shader -- the same exec_node
-       * is used for membership in that list and in a block list.  So we need
-       * to pull them back before rebuilding the CFG.
-       */
-      assert(exec_list_length(&s.instructions) == 0);
-      foreach_block(block, s.cfg) {
-         exec_list_append(&s.instructions, &block->instructions);
-      }
-
-      delete s.cfg;
-      s.cfg = NULL;
-      brw_calculate_cfg(s);
-   }
-
    ralloc_free(const_ctx);
 
-   s.invalidate_analysis(BRW_DEPENDENCY_INSTRUCTIONS | BRW_DEPENDENCY_VARIABLES |
-                         (rebuild_cfg ? BRW_DEPENDENCY_BLOCKS : BRW_DEPENDENCY_NOTHING));
+   s.invalidate_analysis(BRW_DEPENDENCY_INSTRUCTIONS | BRW_DEPENDENCY_VARIABLES);
 
    return true;
 }

@@ -121,6 +121,7 @@ struct ray_query_traversal_vars {
 };
 
 struct ray_query_intersection_vars {
+   rq_variable *primitive_addr;
    rq_variable *primitive_id;
    rq_variable *geometry_id_and_flags;
    rq_variable *instance_addr;
@@ -182,6 +183,8 @@ init_ray_query_intersection_vars(void *ctx, nir_shader *shader, unsigned array_l
 
    const struct glsl_type *vec2_type = glsl_vector_type(GLSL_TYPE_FLOAT, 2);
 
+   result.primitive_addr =
+      rq_variable_create(ctx, shader, array_length, glsl_uint64_t_type(), VAR_NAME("_primitive_addr"));
    result.primitive_id =
       rq_variable_create(ctx, shader, array_length, glsl_uint_type(), VAR_NAME("_primitive_id"));
    result.geometry_id_and_flags = rq_variable_create(ctx, shader, array_length, glsl_uint_type(),
@@ -249,6 +252,7 @@ lower_ray_query(nir_shader *shader, nir_variable *ray_query, struct hash_table *
 static void
 copy_candidate_to_closest(nir_builder *b, nir_def *index, struct ray_query_vars *vars)
 {
+   rq_copy_var(b, index, vars->closest.primitive_addr, vars->candidate.primitive_addr, 0x1);
    rq_copy_var(b, index, vars->closest.barycentrics, vars->candidate.barycentrics, 0x3);
    rq_copy_var(b, index, vars->closest.geometry_id_and_flags, vars->candidate.geometry_id_and_flags,
                0x1);
@@ -379,13 +383,13 @@ lower_rq_load(nir_builder *b, nir_def *index, nir_intrinsic_instr *instr,
    case nir_ray_query_value_intersection_object_ray_direction: {
       nir_def *instance_node_addr = rq_load_var(b, index, intersection->instance_addr);
       nir_def *wto_matrix[3];
-      lvp_load_wto_matrix(b, instance_node_addr, wto_matrix);
+      lvp_load_wto_matrix(b, instance_node_addr, NULL, wto_matrix);
       return lvp_mul_vec3_mat(b, rq_load_var(b, index, vars->direction), wto_matrix, false);
    }
    case nir_ray_query_value_intersection_object_ray_origin: {
       nir_def *instance_node_addr = rq_load_var(b, index, intersection->instance_addr);
       nir_def *wto_matrix[3];
-      lvp_load_wto_matrix(b, instance_node_addr, wto_matrix);
+      lvp_load_wto_matrix(b, instance_node_addr, NULL, wto_matrix);
       return lvp_mul_vec3_mat(b, rq_load_var(b, index, vars->origin), wto_matrix, true);
    }
    case nir_ray_query_value_intersection_object_to_world: {
@@ -415,7 +419,7 @@ lower_rq_load(nir_builder *b, nir_def *index, nir_intrinsic_instr *instr,
       nir_def *instance_node_addr = rq_load_var(b, index, intersection->instance_addr);
 
       nir_def *wto_matrix[3];
-      lvp_load_wto_matrix(b, instance_node_addr, wto_matrix);
+      lvp_load_wto_matrix(b, instance_node_addr, NULL, wto_matrix);
 
       nir_def *vals[3];
       for (unsigned i = 0; i < 3; ++i)
@@ -431,8 +435,7 @@ lower_rq_load(nir_builder *b, nir_def *index, nir_intrinsic_instr *instr,
       return rq_load_var(b, index, vars->origin);
    case nir_ray_query_value_intersection_triangle_vertex_positions:
       return lvp_load_vertex_position(
-         b, rq_load_var(b, index, intersection->instance_addr),
-         rq_load_var(b, index, intersection->primitive_id), column);
+         b, rq_load_var(b, index, intersection->primitive_addr), column);
    default:
       unreachable("Invalid nir_ray_query_value!");
    }
@@ -474,6 +477,7 @@ handle_candidate_triangle(nir_builder *b, struct lvp_triangle_intersection *inte
    nir_def *index = data->index;
 
    rq_store_var(b, index, vars->candidate.barycentrics, intersection->barycentrics, 3);
+   rq_store_var(b, index, vars->candidate.primitive_addr, intersection->base.node_addr, 1);
    rq_store_var(b, index, vars->candidate.primitive_id, intersection->base.primitive_id, 1);
    rq_store_var(b, index, vars->candidate.geometry_id_and_flags,
                 intersection->base.geometry_id_and_flags, 1);
@@ -644,7 +648,7 @@ lvp_nir_lower_ray_queries(struct nir_shader *shader)
          }
       }
 
-      nir_metadata_preserve(function->impl, nir_metadata_none);
+      nir_progress(true, function->impl, nir_metadata_none);
    }
 
    ralloc_free(query_ht);

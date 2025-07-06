@@ -78,7 +78,7 @@ fd6_vertex_state_create(struct pipe_context *pctx, unsigned num_elements,
       fd_ringbuffer_new_object(ctx->pipe, 4 * (num_elements * 4 + 1));
    struct fd_ringbuffer *ring = state->stateobj;
 
-   OUT_PKT4(ring, REG_A6XX_VFD_DECODE(0), 2 * num_elements);
+   OUT_PKT4(ring, REG_A6XX_VFD_FETCH_INSTR(0), 2 * num_elements);
    for (int32_t i = 0; i < num_elements; i++) {
       const struct pipe_vertex_element *elem = &elements[i];
       enum pipe_format pfmt = (enum pipe_format)elem->src_format;
@@ -86,22 +86,22 @@ fd6_vertex_state_create(struct pipe_context *pctx, unsigned num_elements,
       bool isint = util_format_is_pure_integer(pfmt);
       assert(fmt != FMT6_NONE);
 
-      OUT_RING(ring, A6XX_VFD_DECODE_INSTR_IDX(elem->vertex_buffer_index) |
-                        A6XX_VFD_DECODE_INSTR_OFFSET(elem->src_offset) |
-                        A6XX_VFD_DECODE_INSTR_FORMAT(fmt) |
+      OUT_RING(ring, A6XX_VFD_FETCH_INSTR_INSTR_IDX(elem->vertex_buffer_index) |
+                        A6XX_VFD_FETCH_INSTR_INSTR_OFFSET(elem->src_offset) |
+                        A6XX_VFD_FETCH_INSTR_INSTR_FORMAT(fmt) |
                         COND(elem->instance_divisor,
-                             A6XX_VFD_DECODE_INSTR_INSTANCED) |
-                        A6XX_VFD_DECODE_INSTR_SWAP(fd6_vertex_swap(pfmt)) |
-                        A6XX_VFD_DECODE_INSTR_UNK30 |
-                        COND(!isint, A6XX_VFD_DECODE_INSTR_FLOAT));
+                             A6XX_VFD_FETCH_INSTR_INSTR_INSTANCED) |
+                        A6XX_VFD_FETCH_INSTR_INSTR_SWAP(fd6_vertex_swap(pfmt)) |
+                        A6XX_VFD_FETCH_INSTR_INSTR_UNK30 |
+                        COND(!isint, A6XX_VFD_FETCH_INSTR_INSTR_FLOAT));
       OUT_RING(ring,
-               MAX2(1, elem->instance_divisor)); /* VFD_DECODE[j].STEP_RATE */
+               MAX2(1, elem->instance_divisor)); /* VFD_FETCH_INSTR[j].STEP_RATE */
    }
 
    for (int32_t i = 0; i < num_elements; i++) {
       const struct pipe_vertex_element *elem = &elements[i];
 
-      OUT_PKT4(ring, REG_A6XX_VFD_FETCH_STRIDE(elem->vertex_buffer_index), 1);
+      OUT_PKT4(ring, REG_A6XX_VFD_VERTEX_BUFFER_STRIDE(elem->vertex_buffer_index), 1);
       OUT_RING(ring, elem->src_stride);
    }
 
@@ -118,7 +118,7 @@ fd6_vertex_state_delete(struct pipe_context *pctx, void *hwcso)
 }
 
 static void
-validate_surface(struct pipe_context *pctx, struct pipe_surface *psurf)
+validate_surface(struct pipe_context *pctx, const struct pipe_surface *psurf)
    assert_dt
 {
    fd6_validate_format(fd_context(pctx), fd_resource(psurf->texture),
@@ -130,13 +130,13 @@ fd6_set_framebuffer_state(struct pipe_context *pctx,
                           const struct pipe_framebuffer_state *pfb)
    in_dt
 {
-   if (pfb->zsbuf)
-      validate_surface(pctx, pfb->zsbuf);
+   if (pfb->zsbuf.texture)
+      validate_surface(pctx, &pfb->zsbuf);
 
    for (unsigned i = 0; i < pfb->nr_cbufs; i++) {
-      if (!pfb->cbufs[i])
+      if (!pfb->cbufs[i].texture)
          continue;
-      validate_surface(pctx, pfb->cbufs[i]);
+      validate_surface(pctx, &pfb->cbufs[i]);
    }
 
    fd_set_framebuffer_state(pctx, pfb);
@@ -311,9 +311,9 @@ fd6_context_create(struct pipe_screen *pscreen, void *priv,
    struct fd_ringbuffer *ring =
       fd_ringbuffer_new_object(fd6_ctx->base.pipe, 6 * 4);
 
-   OUT_REG(ring, A6XX_GRAS_SAMPLE_CONFIG());
-   OUT_REG(ring, A6XX_RB_SAMPLE_CONFIG());
-   OUT_REG(ring, A6XX_SP_TP_SAMPLE_CONFIG());
+   OUT_REG(ring, A6XX_GRAS_SC_MSAA_SAMPLE_POS_CNTL());
+   OUT_REG(ring, A6XX_RB_MSAA_SAMPLE_POS_CNTL());
+   OUT_REG(ring, A6XX_TPL1_MSAA_SAMPLE_POS_CNTL());
 
    fd6_ctx->sample_locations_disable_stateobj = ring;
 

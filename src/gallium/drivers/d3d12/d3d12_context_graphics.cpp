@@ -977,7 +977,6 @@ d3d12_set_sampler_views(struct pipe_context *pctx,
                         unsigned start_slot,
                         unsigned num_views,
                         unsigned unbind_num_trailing_slots,
-                        bool take_ownership,
                         struct pipe_sampler_view **views)
 {
    struct d3d12_context *ctx = d3d12_context(pctx);
@@ -993,12 +992,7 @@ d3d12_set_sampler_views(struct pipe_context *pctx,
       if (new_view)
          d3d12_increment_sampler_view_bind_count(pctx, shader_type, new_view);
 
-      if (take_ownership) {
-         pipe_sampler_view_reference(&old_view, NULL);
-         old_view = views[i];
-      } else {
-         pipe_sampler_view_reference(&old_view, views[i]);
-      }
+      pipe_sampler_view_reference(&old_view, views[i]);
 
       if (views[i]) {
          dxil_wrap_sampler_state &wss = ctx->tex_wrap_states[shader_type][start_slot + i];
@@ -1424,26 +1418,27 @@ d3d12_set_framebuffer_state(struct pipe_context *pctx,
    struct d3d12_context *ctx = d3d12_context(pctx);
    int samples = -1;
 
-   bool prev_cbufs_or_zsbuf = ctx->fb.nr_cbufs || ctx->fb.zsbuf;
+   bool prev_cbufs_or_zsbuf = ctx->fb.nr_cbufs || ctx->fb.zsbuf.texture;
+   util_framebuffer_init(pctx, state, ctx->fb_cbufs, &ctx->fb_zsbuf);
    util_copy_framebuffer_state(&d3d12_context(pctx)->fb, state);
-   bool new_cbufs_or_zsbuf = ctx->fb.nr_cbufs || ctx->fb.zsbuf;
+   bool new_cbufs_or_zsbuf = ctx->fb.nr_cbufs || ctx->fb.zsbuf.texture;
 
    ctx->gfx_pipeline_state.num_cbufs = state->nr_cbufs;
    ctx->gfx_pipeline_state.has_float_rtv = false;
    for (int i = 0; i < state->nr_cbufs; ++i) {
-      if (state->cbufs[i]) {
-         if (util_format_is_float(state->cbufs[i]->format))
+      if (state->cbufs[i].texture) {
+         if (util_format_is_float(state->cbufs[i].format))
             ctx->gfx_pipeline_state.has_float_rtv = true;
-         ctx->gfx_pipeline_state.rtv_formats[i] = d3d12_get_format(state->cbufs[i]->format);
-         samples = MAX2(samples, (int)state->cbufs[i]->texture->nr_samples);
+         ctx->gfx_pipeline_state.rtv_formats[i] = d3d12_get_format(state->cbufs[i].format);
+         samples = MAX2(samples, (int)state->cbufs[i].texture->nr_samples);
       } else {
          ctx->gfx_pipeline_state.rtv_formats[i] = DXGI_FORMAT_UNKNOWN;
       }
    }
 
-   if (state->zsbuf) {
-      ctx->gfx_pipeline_state.dsv_format = d3d12_get_resource_rt_format(state->zsbuf->format);
-      samples = MAX2(samples, (int)ctx->fb.zsbuf->texture->nr_samples);
+   if (state->zsbuf.texture) {
+      ctx->gfx_pipeline_state.dsv_format = d3d12_get_resource_rt_format(state->zsbuf.format);
+      samples = MAX2(samples, (int)ctx->fb.zsbuf.texture->nr_samples);
    } else
       ctx->gfx_pipeline_state.dsv_format = DXGI_FORMAT_UNKNOWN;
 
@@ -1487,12 +1482,6 @@ d3d12_set_stencil_ref(struct pipe_context *pctx,
        debug_printf("D3D12: Different values for front and back stencil reference are not supported\n");
    ctx->stencil_ref = ref;
    ctx->state_dirty |= D3D12_DIRTY_STENCIL_REF;
-}
-
-static void
-d3d12_set_clip_state(struct pipe_context *pctx,
-                     const struct pipe_clip_state *pcs)
-{
 }
 
 static struct pipe_stream_output_target *
@@ -1928,7 +1917,6 @@ d3d12_clear_render_target(struct pipe_context *pctx,
                           bool render_condition_enabled)
 {
    struct d3d12_context *ctx = d3d12_context(pctx);
-   struct d3d12_surface *surf = d3d12_surface(psurf);
 
    if (!render_condition_enabled && ctx->current_predication)
       ctx->cmdlist->SetPredication(NULL, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
@@ -1993,6 +1981,9 @@ d3d12_clear_render_target(struct pipe_context *pctx,
       }
       util_blitter_clear_render_target(ctx->blitter, psurf, &local_color, dstx, dsty, width, height);
    } else {
+      struct pipe_surface *tmpsurf = pctx->create_surface(pctx, psurf->texture, psurf);
+      struct d3d12_surface *surf = d3d12_surface(tmpsurf);
+
       if (!(util_format_colormask(util_format_description(psurf->format)) &
             PIPE_MASK_A))
          clear_color[3] = 1.0f;
@@ -2002,9 +1993,11 @@ d3d12_clear_render_target(struct pipe_context *pctx,
                           (int)dsty + (int)height };
       ctx->cmdlist->ClearRenderTargetView(surf->desc_handle.cpu_handle,
                                           clear_color, 1, &rect);
+      ctx->has_commands = true;
+      d3d12_batch_reference_surface_texture(d3d12_current_batch(ctx), surf);
+      pipe_surface_unref(pctx, &tmpsurf);
    }
 
-   d3d12_batch_reference_surface_texture(d3d12_current_batch(ctx), surf);
 
    if (!render_condition_enabled && ctx->current_predication) {
       d3d12_enable_predication(ctx);
@@ -2022,7 +2015,8 @@ d3d12_clear_depth_stencil(struct pipe_context *pctx,
                           bool render_condition_enabled)
 {
    struct d3d12_context *ctx = d3d12_context(pctx);
-   struct d3d12_surface *surf = d3d12_surface(psurf);
+   struct pipe_surface *tmpsurf = pctx->create_surface(pctx, psurf->texture, psurf);
+   struct d3d12_surface *surf = d3d12_surface(tmpsurf);
 
    if (!render_condition_enabled && ctx->current_predication)
       ctx->cmdlist->SetPredication(NULL, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
@@ -2044,12 +2038,14 @@ d3d12_clear_depth_stencil(struct pipe_context *pctx,
                        (int)dsty + (int)height };
    ctx->cmdlist->ClearDepthStencilView(surf->desc_handle.cpu_handle, flags,
                                        static_cast<float>(depth), static_cast<UINT8>(stencil), 1, &rect);
+   ctx->has_commands = true;
 
    d3d12_batch_reference_surface_texture(d3d12_current_batch(ctx), surf);
 
    if (!render_condition_enabled && ctx->current_predication) {
       d3d12_enable_predication(ctx);
    }
+   pipe_surface_unref(pctx, &tmpsurf);
 }
 
 static void
@@ -2064,20 +2060,24 @@ d3d12_clear(struct pipe_context *pctx,
    if (buffers & PIPE_CLEAR_COLOR) {
       for (int i = 0; i < ctx->fb.nr_cbufs; ++i) {
          if (buffers & (PIPE_CLEAR_COLOR0 << i)) {
-            struct pipe_surface *psurf = ctx->fb.cbufs[i];
+            struct pipe_surface *psurf = &ctx->fb.cbufs[i];
+            uint16_t width, height;
+            pipe_surface_size(psurf, &width, &height);
             d3d12_clear_render_target(pctx, psurf, color,
-                                      0, 0, psurf->width, psurf->height,
+                                      0, 0, width, height,
                                       true);
          }
       }
    }
 
-   if (buffers & PIPE_CLEAR_DEPTHSTENCIL && ctx->fb.zsbuf) {
-      struct pipe_surface *psurf = ctx->fb.zsbuf;
+   if (buffers & PIPE_CLEAR_DEPTHSTENCIL && ctx->fb.zsbuf.texture) {
+      struct pipe_surface *psurf = &ctx->fb.zsbuf;
+      uint16_t width, height;
+      pipe_surface_size(psurf, &width, &height);
       d3d12_clear_depth_stencil(pctx, psurf,
                                 buffers & PIPE_CLEAR_DEPTHSTENCIL,
                                 depth, stencil,
-                                0, 0, psurf->width, psurf->height,
+                                0, 0, width, height,
                                 true);
    }
 }
@@ -2239,6 +2239,7 @@ d3d12_init_graphics_context_functions(struct d3d12_context *ctx)
 
    ctx->base.create_sampler_view = d3d12_create_sampler_view;
    ctx->base.sampler_view_destroy = d3d12_destroy_sampler_view;
+   ctx->base.sampler_view_release = u_default_sampler_view_release;
 
    ctx->base.create_vertex_elements_state = d3d12_create_vertex_elements_state;
    ctx->base.bind_vertex_elements_state = d3d12_bind_vertex_elements_state;
@@ -2291,7 +2292,6 @@ d3d12_init_graphics_context_functions(struct d3d12_context *ctx)
    ctx->base.set_scissor_states = d3d12_set_scissor_states;
    ctx->base.set_constant_buffer = d3d12_set_constant_buffer;
    ctx->base.set_framebuffer_state = d3d12_set_framebuffer_state;
-   ctx->base.set_clip_state = d3d12_set_clip_state;
    ctx->base.set_blend_color = d3d12_set_blend_color;
    ctx->base.set_sample_mask = d3d12_set_sample_mask;
    ctx->base.set_stencil_ref = d3d12_set_stencil_ref;

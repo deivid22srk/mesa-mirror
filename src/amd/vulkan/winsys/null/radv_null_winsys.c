@@ -10,6 +10,7 @@
 #include "radv_null_winsys_public.h"
 
 #include "util/u_string.h"
+#include "util/u_sync_provider.h"
 #include "radv_null_bo.h"
 #include "radv_null_cs.h"
 #include "vk_sync_dummy.h"
@@ -53,7 +54,7 @@ static const struct {
    [CHIP_NAVI22] = {0x73C0, 8, true},
    [CHIP_NAVI23] = {0x73E0, 8, true},
    [CHIP_NAVI31] = {0x744C, 24, true},
-   [CHIP_GFX1200] = {0x0000, 4, true}, /* TODO: Fill with real info. */
+   [CHIP_GFX1201] = {0x7550, 16, true},
    /* clang-format on */
 };
 
@@ -97,8 +98,8 @@ radv_null_winsys_query_info(struct radeon_winsys *rws, struct radeon_info *gpu_i
    }
 
    gpu_info->pci_id = pci_ids[gpu_info->family].pci_id;
-   gpu_info->max_se = 4;
-   gpu_info->num_se = 4;
+   gpu_info->max_se = pci_ids[gpu_info->family].has_dedicated_vram ? 4 : 1;
+   gpu_info->num_se = gpu_info->max_se;
    if (gpu_info->gfx_level >= GFX10_3)
       gpu_info->max_waves_per_simd = 16;
    else if (gpu_info->gfx_level >= GFX10)
@@ -115,6 +116,7 @@ radv_null_winsys_query_info(struct radeon_winsys *rws, struct radeon_info *gpu_i
    else
       gpu_info->num_physical_sgprs_per_simd = 512;
 
+   gpu_info->has_timeline_syncobj = true;
    gpu_info->has_3d_cube_border_color_mipmap = true;
    gpu_info->has_image_opcodes = true;
    gpu_info->has_attr_ring = gpu_info->gfx_level >= GFX11;
@@ -122,7 +124,7 @@ radv_null_winsys_query_info(struct radeon_winsys *rws, struct radeon_info *gpu_i
    gpu_info->has_ngg_fully_culled_bug = gpu_info->gfx_level == GFX10;
    gpu_info->has_ngg_passthru_no_msg = gpu_info->family >= CHIP_NAVI23;
 
-   if (gpu_info->family == CHIP_NAVI31 || gpu_info->family == CHIP_NAVI32)
+   if (gpu_info->family == CHIP_NAVI31 || gpu_info->family == CHIP_NAVI32 || gpu_info->gfx_level >= GFX12)
       gpu_info->num_physical_wave64_vgprs_per_simd = 768;
    else if (gpu_info->gfx_level >= GFX10)
       gpu_info->num_physical_wave64_vgprs_per_simd = 512;
@@ -141,10 +143,15 @@ radv_null_winsys_query_info(struct radeon_winsys *rws, struct radeon_info *gpu_i
 
    gpu_info->has_image_load_dcc_bug = gpu_info->family == CHIP_NAVI23 || gpu_info->family == CHIP_VANGOGH;
 
-   gpu_info->has_accelerated_dot_product =
-      gpu_info->family == CHIP_VEGA20 || (gpu_info->family >= CHIP_MI100 && gpu_info->family != CHIP_NAVI10);
+   gpu_info->has_distributed_tess =
+      gpu_info->gfx_level >= GFX10 || (gpu_info->gfx_level >= GFX8 && gpu_info->max_se >= 2);
 
-   gpu_info->has_image_bvh_intersect_ray = gpu_info->gfx_level >= GFX10_3;
+   gpu_info->has_accelerated_dot_product =
+      gpu_info->family == CHIP_VEGA20 ||
+      (gpu_info->family >= CHIP_MI100 && gpu_info->family != CHIP_NAVI10 && gpu_info->family != CHIP_GFX1013);
+
+   gpu_info->has_image_bvh_intersect_ray = gpu_info->gfx_level >= GFX10_3 ||
+                                           gpu_info->family == CHIP_GFX1013;
 
    gpu_info->address32_hi = gpu_info->gfx_level >= GFX9 ? 0xffff8000u : 0x0;
 
@@ -154,8 +161,9 @@ radv_null_winsys_query_info(struct radeon_winsys *rws, struct radeon_info *gpu_i
       (gpu_info->family == CHIP_STONEY || gpu_info->family == CHIP_VEGA12 || gpu_info->family == CHIP_RAVEN ||
        gpu_info->family == CHIP_RAVEN2 || gpu_info->family == CHIP_RENOIR || gpu_info->gfx_level >= GFX10_3);
 
-   gpu_info->has_scheduled_fence_dependency = true;
    gpu_info->has_gang_submit = true;
+
+   gpu_info->gart_page_size = 4096;
 }
 
 static const char *
@@ -182,6 +190,12 @@ radv_null_winsys_get_sync_types(struct radeon_winsys *rws)
    return radv_null_winsys(rws)->sync_types;
 }
 
+static struct util_sync_provider *
+radv_null_winsys_get_sync_provider(struct radeon_winsys *rws)
+{
+   return radv_null_winsys(rws)->sync_provider;
+}
+
 struct radeon_winsys *
 radv_null_winsys_create()
 {
@@ -195,11 +209,13 @@ radv_null_winsys_create()
    ws->base.query_info = radv_null_winsys_query_info;
    ws->base.get_fd = radv_null_winsys_get_fd;
    ws->base.get_sync_types = radv_null_winsys_get_sync_types;
+   ws->base.get_sync_provider = radv_null_winsys_get_sync_provider;
    ws->base.get_chip_name = radv_null_winsys_get_chip_name;
    radv_null_bo_init_functions(ws);
    radv_null_cs_init_functions(ws);
 
    ws->sync_types[0] = &vk_sync_dummy_type;
    ws->sync_types[1] = NULL;
+   ws->sync_provider = util_sync_provider_drm(-1);
    return &ws->base;
 }

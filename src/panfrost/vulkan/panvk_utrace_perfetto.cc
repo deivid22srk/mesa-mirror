@@ -20,12 +20,8 @@
 #include "panvk_tracepoints_perfetto.h"
 #include "panvk_utrace.h"
 
-struct PanVKRenderpassIncrementalState {
-   bool was_cleared = true;
-};
-
 struct PanVKRenderpassTraits : public perfetto::DefaultDataSourceTraits {
-   using IncrementalStateType = PanVKRenderpassIncrementalState;
+   using IncrementalStateType = MesaRenderpassIncrementalState;
 };
 
 class PanVKRenderpassDataSource
@@ -43,6 +39,11 @@ get_stage_name(enum panvk_utrace_perfetto_stage stage)
    case PANVK_UTRACE_PERFETTO_STAGE_##x:                                       \
       return #x
       CASE(CMDBUF);
+      CASE(META);
+      CASE(RENDER);
+      CASE(DISPATCH);
+      CASE(BARRIER);
+      CASE(SYNC_WAIT);
 #undef CASE
    default:
       unreachable("bad stage");
@@ -243,6 +244,12 @@ panvk_utrace_perfetto_end_event(
  * (traceq) for processing.  These callbacks are called from traceq.
  */
 PANVK_UTRACE_PERFETTO_PROCESS_EVENT(cmdbuf, CMDBUF)
+PANVK_UTRACE_PERFETTO_PROCESS_EVENT(meta, META)
+PANVK_UTRACE_PERFETTO_PROCESS_EVENT(render, RENDER)
+PANVK_UTRACE_PERFETTO_PROCESS_EVENT(dispatch, DISPATCH)
+PANVK_UTRACE_PERFETTO_PROCESS_EVENT(dispatch_indirect, DISPATCH)
+PANVK_UTRACE_PERFETTO_PROCESS_EVENT(barrier, BARRIER)
+PANVK_UTRACE_PERFETTO_PROCESS_EVENT(sync_wait, SYNC_WAIT)
 
 static uint32_t
 get_gpu_clock_id(void)
@@ -255,7 +262,12 @@ static void
 register_data_source(void)
 {
    perfetto::DataSourceDescriptor dsd;
+#if DETECT_OS_ANDROID
+   // Android tooling expects this data source name
+   dsd.set_name("gpu.renderstages");
+#else
    dsd.set_name("gpu.renderstages.panfrost");
+#endif
    PanVKRenderpassDataSource::Register(dsd);
 }
 

@@ -310,6 +310,20 @@ struct pipe_screen {
                                unsigned usage);
 
    /**
+    * Tell the driver that manages a pipe resource about its label.
+    *
+    * For GL objects that contain one or more pipe resources, make the gallium
+    * driver that manages them aware of their label.
+    *
+    * \param label A NUL-terminated string. It will remain valid only until
+    * the end of the call, so its lifetime must be managed by the implementer.
+    *
+    */
+   void (*set_resource_label)(struct pipe_screen *pscreen,
+                              struct pipe_resource *presource,
+                              const char *label);
+
+   /**
     * Get info for the given pipe resource without the need to get a
     * winsys_handle.
     *
@@ -819,6 +833,36 @@ struct pipe_screen {
                                             struct pipe_video_buffer *target,
                                             enum pipe_video_profile profile,
                                             enum pipe_video_entrypoint entrypoint);
+
+   /**
+    * Allocates a cut-out in the GPU's VM space.
+    */
+   struct pipe_vm_allocation *(*alloc_vm)(struct pipe_screen *screen,
+                                           uint64_t start, uint64_t size);
+
+   /**
+    * Frees a cut-out allocated through alloc_vm.
+    */
+   void (*free_vm)(struct pipe_screen *screen, struct pipe_vm_allocation *alloc);
+
+   /**
+    * Binds an \p address to the given \p resource. \p needs to be created with
+    * PIPE_RESOURCE_FLAG_FRONTEND_VM
+    *
+    * \return true if the operation was successful, false otherwise.
+    */
+   bool (*resource_assign_vma)(struct pipe_screen *screen,
+                               struct pipe_resource *resource,
+                               uint64_t address);
+
+   /**
+    * Returns the virtual address of \p resource. \p resource needs to be created
+    * with PIPE_RESOURCE_FLAG_FIXED_ADDRESS.
+    *
+    * \return the virtual address of the given resource. Returns 0 on failure.
+    */
+   uint64_t (*resource_get_address)(struct pipe_screen *screen,
+                                    struct pipe_resource *resource);
 
    /**
     * pipe_screen is inherited by driver's screen but a simple cast to convert

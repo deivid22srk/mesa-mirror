@@ -302,6 +302,26 @@ finish_to_hw_instr_test()
 }
 
 void
+finish_lower_branches_test()
+{
+   finish_program(program.get(), true, true);
+
+   if (!aco::validate_ir(program.get())) {
+      fail_test("Validation before lower_branches failed");
+      return;
+   }
+
+   aco::lower_branches(program.get());
+
+   if (!aco::validate_ir(program.get())) {
+      fail_test("Validation after lower_branches failed");
+      return;
+   }
+
+   aco_print_program(program.get(), output);
+}
+
+void
 finish_schedule_vopd_test()
 {
    finish_program(program.get());
@@ -646,7 +666,7 @@ get_vk_device(enum amd_gfx_level gfx_level)
    case GFX10: family = CHIP_NAVI10; break;
    case GFX10_3: family = CHIP_NAVI21; break;
    case GFX11: family = CHIP_NAVI31; break;
-   case GFX12: family = CHIP_GFX1200; break;
+   case GFX12: family = CHIP_GFX1201; break;
    default: family = CHIP_UNKNOWN; break;
    }
    return get_vk_device(family);

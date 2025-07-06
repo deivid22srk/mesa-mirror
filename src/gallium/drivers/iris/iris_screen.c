@@ -250,8 +250,6 @@ iris_init_compute_caps(struct iris_screen *screen)
     */
    caps->address_bits = 64;
 
-   snprintf(caps->ir_target, sizeof(caps->ir_target), "gen");
-
    caps->grid_dimension = 3;
 
    caps->max_grid_size[0] =
@@ -271,8 +269,6 @@ iris_init_compute_caps(struct iris_screen *screen)
    /* MaxComputeSharedMemorySize */
    caps->max_local_size = 64 * 1024;
 
-   caps->images_supported = true;
-
    caps->subgroup_sizes = 32 | 16 | 8;
 
    caps->max_subgroups = devinfo->max_cs_workgroup_threads;
@@ -283,12 +279,6 @@ iris_init_compute_caps(struct iris_screen *screen)
    caps->max_clock_frequency = 400; /* TODO */
 
    caps->max_compute_units = intel_device_info_subslice_total(devinfo);
-
-   /* MaxComputeSharedMemorySize */
-   caps->max_private_size = 64 * 1024;
-
-   /* We could probably allow more; this is the OpenCL minimum */
-   caps->max_input_size = 1024;
 }
 
 static void
@@ -379,6 +369,7 @@ iris_init_screen_caps(struct iris_screen *screen)
    caps->compute_shader_derivatives = true;
    caps->invalidate_buffer = true;
    caps->surface_reinterpret_blocks = true;
+   caps->compressed_surface_reinterpret_blocks_layered = devinfo->ver >= 9;
    caps->texture_shadow_lod = true;
    caps->shader_samples_identical = true;
    caps->gl_spirv = true;
@@ -501,6 +492,13 @@ iris_init_screen_caps(struct iris_screen *screen)
 
    caps->max_texture_anisotropy = 16.0f;
    caps->max_texture_lod_bias = 15.0f;
+
+   caps->min_vma = IRIS_MEMZONE_OTHER_START;
+   /* Exclude addresses which would need to be converted to their canonical form.
+    * The easy way to go about this is to take the highest address and simply
+    * shift it right by one, so the highest valid address bit gets unset.
+    */
+   caps->max_vma = intel_48b_address(UINT64_MAX) >> 1;
 }
 
 static uint64_t
@@ -628,32 +626,30 @@ iris_set_damage_region(struct pipe_screen *pscreen, struct pipe_resource *pres,
 {
    struct iris_resource *res = (struct iris_resource *)pres;
 
-   res->use_damage = nrects > 0;
-   if (!res->use_damage)
+   if (nrects == 0) {
+      res->use_damage = false;
       return;
-
-   res->damage.x = INT32_MAX;
-   res->damage.y = INT32_MAX;
-   res->damage.width = 0;
-   res->damage.height = 0;
-
-   for (unsigned i = 0; i < nrects; i++) {
-      res->damage.x = MIN2(res->damage.x, rects[i].x);
-      res->damage.y = MIN2(res->damage.y, rects[i].y);
-      res->damage.width = MAX2(res->damage.width, rects[i].width + rects[i].x);
-      res->damage.height = MAX2(res->damage.height, rects[i].height + rects[i].y);
-
-      if (unlikely(res->damage.x == 0 &&
-                   res->damage.y == 0 &&
-                   res->damage.width == res->base.b.width0 &&
-                   res->damage.height == res->base.b.height0))
-         break;
    }
 
-   res->damage.x = MAX2(res->damage.x, 0);
-   res->damage.y = MAX2(res->damage.y, 0);
-   res->damage.width = MIN2(res->damage.width, res->base.b.width0);
-   res->damage.height = MIN2(res->damage.height, res->base.b.height0);
+   struct pipe_box damage = rects[0];
+   for (unsigned i = 1; i < nrects; i++)
+      u_box_union_2d(&damage, &damage, &rects[i]);
+
+   /* The damage we get from EGL uses a lower-left origin but the hardware
+    * uses upper-left so we need to flip it.
+    */
+   damage.y = res->base.b.height0 - (damage.y + damage.height);
+
+   /* Intersect with the area of the resource */
+   struct pipe_box res_area;
+   u_box_origin_2d(res->base.b.width0, res->base.b.height0, &res_area);
+   u_box_intersect_2d(&damage, &damage, &res_area);
+
+   res->damage = damage;
+   res->use_damage = damage.x != 0 ||
+                     damage.y != 0 ||
+                     damage.width != res->base.b.width0 ||
+                     damage.height != res->base.b.height0;
 }
 
 struct pipe_screen *
@@ -735,6 +731,10 @@ iris_screen_create(int fd, const struct pipe_screen_config *config)
       driQueryOptionb(config->options, "intel_enable_wa_14018912822");
    screen->driconf.enable_tbimr =
       driQueryOptionb(config->options, "intel_tbimr");
+   screen->driconf.enable_vf_distribution =
+      driQueryOptionb(config->options, "intel_vf_distribution");
+   screen->driconf.enable_te_distribution =
+      driQueryOptionb(config->options, "intel_te_distribution");
    screen->driconf.generated_indirect_threshold =
       driQueryOptioni(config->options, "generated_indirect_threshold");
 
@@ -745,6 +745,8 @@ iris_screen_create(int fd, const struct pipe_screen_config *config)
 
    screen->isl_dev.sampler_route_to_lsc =
       driQueryOptionb(config->options, "intel_sampler_route_to_lsc");
+   screen->isl_dev.l1_storage_wt =
+      driQueryOptionb(config->options, "intel_storage_cache_policy_wt");
 
    iris_compiler_init(screen);
 

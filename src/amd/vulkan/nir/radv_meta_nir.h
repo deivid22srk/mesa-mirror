@@ -31,8 +31,8 @@ nir_def *radv_meta_nir_get_global_ids(nir_builder *b, unsigned num_components);
 
 void radv_meta_nir_break_on_count(nir_builder *b, nir_variable *var, nir_def *count);
 
-nir_shader *radv_meta_nir_build_buffer_fill_shader(struct radv_device *dev);
-nir_shader *radv_meta_nir_build_buffer_copy_shader(struct radv_device *dev);
+nir_shader *radv_meta_nir_build_fill_memory_shader(struct radv_device *dev, uint32_t bytes_per_invocation);
+nir_shader *radv_meta_nir_build_copy_memory_shader(struct radv_device *dev, uint32_t bytes_per_invocation);
 
 nir_shader *radv_meta_nir_build_blit_vertex_shader(struct radv_device *dev);
 nir_shader *radv_meta_nir_build_blit_copy_fragment_shader(struct radv_device *dev, enum glsl_sampler_dim tex_dim);
@@ -50,7 +50,6 @@ nir_shader *radv_meta_nir_build_cleari_r32g32b32_compute_shader(struct radv_devi
 
 typedef nir_def *(*radv_meta_nir_texel_fetch_build_func)(struct nir_builder *, struct radv_device *, nir_def *, bool,
                                                          bool);
-nir_def *radv_meta_nir_load_descriptor(nir_builder *b, unsigned desc_set, unsigned binding);
 nir_def *radv_meta_nir_build_blit2d_texel_fetch(struct nir_builder *b, struct radv_device *device, nir_def *tex_pos,
                                                 bool is_3d, bool is_multisampled);
 nir_def *radv_meta_nir_build_blit2d_buffer_fetch(struct nir_builder *b, struct radv_device *device, nir_def *tex_pos,
@@ -89,8 +88,17 @@ enum radv_meta_resolve_type {
    RADV_META_DEPTH_RESOLVE,
    RADV_META_STENCIL_RESOLVE,
 };
-nir_shader *radv_meta_nir_build_resolve_compute_shader(struct radv_device *dev, bool is_integer, bool is_srgb,
-                                                       int samples);
+
+enum radv_meta_resolve_compute_type {
+   RADV_META_RESOLVE_COMPUTE_NORM,
+   RADV_META_RESOLVE_COMPUTE_NORM_SRGB,
+   RADV_META_RESOLVE_COMPUTE_INTEGER,
+   RADV_META_RESOLVE_COMPUTE_FLOAT,
+   RADV_META_RESOLVE_COMPUTE_COUNT,
+};
+
+nir_shader *radv_meta_nir_build_resolve_compute_shader(struct radv_device *dev,
+                                                       enum radv_meta_resolve_compute_type type, int samples);
 nir_shader *radv_meta_nir_build_depth_stencil_resolve_compute_shader(struct radv_device *dev, int samples,
                                                                      enum radv_meta_resolve_type index,
                                                                      VkResolveModeFlagBits resolve_mode);

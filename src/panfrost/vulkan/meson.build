@@ -13,6 +13,7 @@ panvk_entrypoints = custom_target(
     '--out-h', '@OUTPUT0@', '--out-c', '@OUTPUT1@', '--prefix', 'panvk',
     '--device-prefix', 'panvk_v6', '--device-prefix', 'panvk_v7',
     '--device-prefix', 'panvk_v9', '--device-prefix', 'panvk_v10',
+    '--device-prefix', 'panvk_v12', '--device-prefix', 'panvk_v13',
     '--beta', with_vulkan_beta.to_string()
   ],
   depend_files : vk_entrypoints_gen_depend_files,
@@ -62,6 +63,10 @@ valhall_archs = [9, 10]
 valhall_inc_dir = ['valhall']
 valhall_files = []
 
+avalon_archs = [12, 13]
+avalon_inc_dir = ['avalon']
+avalon_files = []
+
 jm_archs = [6, 7]
 jm_inc_dir = ['jm']
 jm_files = [
@@ -71,12 +76,11 @@ jm_files = [
   'jm/panvk_vX_cmd_event.c',
   'jm/panvk_vX_cmd_query.c',
   'jm/panvk_vX_cmd_precomp.c',
-  'jm/panvk_vX_device.c',
   'jm/panvk_vX_event.c',
-  'jm/panvk_vX_queue.c',
+  'jm/panvk_vX_gpu_queue.c',
 ]
 
-csf_archs = [10]
+csf_archs = [10, 12, 13]
 csf_inc_dir = ['csf']
 csf_files = [
   'csf/panvk_vX_cmd_buffer.c',
@@ -85,10 +89,9 @@ csf_files = [
   'csf/panvk_vX_cmd_event.c',
   'csf/panvk_vX_cmd_query.c',
   'csf/panvk_vX_cmd_precomp.c',
-  'csf/panvk_vX_device.c',
   'csf/panvk_vX_event.c',
   'csf/panvk_vX_exception_handler.c',
-  'csf/panvk_vX_queue.c',
+  'csf/panvk_vX_gpu_queue.c',
   'csf/panvk_vX_utrace.c',
 ]
 
@@ -106,6 +109,7 @@ common_per_arch_files = [
   'panvk_vX_descriptor_set.c',
   'panvk_vX_descriptor_set_layout.c',
   'panvk_vX_device.c',
+  'panvk_vX_physical_device.c',
   'panvk_vX_precomp_cache.c',
   'panvk_vX_query_pool.c',
   'panvk_vX_image_view.c',
@@ -114,7 +118,7 @@ common_per_arch_files = [
   'panvk_vX_shader.c',
 ]
 
-foreach arch : [6, 7, 10]
+foreach arch : [6, 7, 10, 12, 13]
   per_arch_files = common_per_arch_files
   inc_panvk_per_arch = []
 
@@ -124,6 +128,9 @@ foreach arch : [6, 7, 10]
   elif arch in valhall_archs
     inc_panvk_per_arch += valhall_inc_dir
     per_arch_files += valhall_files
+  elif arch in avalon_archs
+    inc_panvk_per_arch += avalon_inc_dir
+    per_arch_files += avalon_files
   endif
 
   if arch in jm_archs
@@ -166,12 +173,6 @@ endif
 if with_platform_wayland
   panvk_deps += dep_wayland_client
   libpanvk_files += [wayland_drm_client_protocol_h, wayland_drm_protocol_c]
-endif
-
-if with_platform_android
-  panvk_deps += [dep_android]
-  panvk_flags += '-DVK_USE_PLATFORM_ANDROID_KHR'
-  libpanvk_files += files('panvk_android.c')
 endif
 
 libvulkan_panfrost = shared_library(
@@ -218,6 +219,7 @@ panfrost_icd = custom_target(
   command : [
     prog_python, '@INPUT0@',
     '--api-version', '1.4', '--xml', '@INPUT1@',
+    '--sizeof-pointer', sizeof_pointer,
     '--lib-path', join_paths(get_option('prefix'), get_option('libdir'),
                              'libvulkan_panfrost.so'),
     '--out', '@OUTPUT@',
@@ -236,6 +238,7 @@ _dev_icd = custom_target(
   command : [
     prog_python, '@INPUT0@',
     '--api-version', '1.4', '--xml', '@INPUT1@',
+    '--sizeof-pointer', sizeof_pointer,
     '--lib-path', meson.current_build_dir() / 'libvulkan_panfrost.so',
     '--out', '@OUTPUT@',
   ],

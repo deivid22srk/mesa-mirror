@@ -44,6 +44,8 @@ typedef enum {
    nir_lower_conv64 = (1 << 23),
    nir_lower_uadd_sat64 = (1 << 24),
    nir_lower_iadd3_64 = (1 << 25),
+   nir_lower_bitfield_reverse64 = (1 << 26),
+   nir_lower_bitfield_extract64 = (1 << 27),
 } nir_lower_int64_options;
 
 typedef enum {
@@ -170,6 +172,21 @@ typedef enum {
     */
    nir_io_compaction_rotates_color_channels = BITFIELD_BIT(8),
 
+   /**
+    * Whether to group TES inputs as follows:
+    * - inputs used to compute only POS/CLIP outputs are first
+    * - inputs used to compute both POS/CLIP outputs and other outputs are next
+    * - inputs used to compute only other outputs are last
+    */
+   nir_io_compaction_groups_tes_inputs_into_pos_and_var_groups = BITFIELD_BIT(9),
+
+   /**
+    * RADV expects that high 16 bits of outputs set component >= 4. That's not
+    * legal in NIR, but RADV unfortunately relies on it because it's not
+    * validated.
+    */
+   nir_io_radv_intrinsic_component_workaround = BITFIELD_BIT(10),
+
    /* Options affecting the GLSL compiler or Gallium are below. */
 
    /**
@@ -190,7 +207,7 @@ typedef enum {
     * Whether clip and cull distance arrays should be separate. If this is not
     * set, cull distances will be moved into VARYING_SLOT_CLIP_DISTn after clip
     * distances, and shader_info::clip_distance_array_size will be the index
-    * of the first cull distance. nir_lower_clip_cull_distance_arrays does
+    * of the first cull distance. nir_lower_clip_cull_distance_array_vars does
     * that.
     */
    nir_io_separate_clip_cull_distance_arrays = BITFIELD_BIT(18),
@@ -225,7 +242,9 @@ typedef struct nir_shader_compiler_options {
    bool lower_fsqrt;
    bool lower_sincos;
    bool lower_fmod;
-   /** Lowers ibitfield_extract/ubitfield_extract. */
+   /** Lowers ibitfield_extract/ubitfield_extract for 8, 16 & 32 bits. */
+   bool lower_bitfield_extract8;
+   bool lower_bitfield_extract16;
    bool lower_bitfield_extract;
    /** Lowers bitfield_insert. */
    bool lower_bitfield_insert;
@@ -243,6 +262,7 @@ typedef struct nir_shader_compiler_options {
    bool lower_usub_borrow;
    /** Lowers imul_high/umul_high to 16-bit multiplies and carry operations. */
    bool lower_mul_high;
+   bool lower_mul_high16;
    /** lowers fneg to fmul(x, -1.0). Driver must call nir_opt_algebraic_late() */
    bool lower_fneg;
    /** lowers ineg to isub. Driver must call nir_opt_algebraic_late(). */
@@ -282,9 +302,6 @@ typedef struct nir_shader_compiler_options {
 
    /* lower fdph to fdot4 */
    bool lower_fdph;
-
-   /** lower fdot to fmul and fsum/fadd. */
-   bool lower_fdot;
 
    /* Does the native fdot instruction replicate its result for four
     * components?  If so, then opt_algebraic_late will turn all fdotN
@@ -349,6 +366,11 @@ typedef struct nir_shader_compiler_options {
     * is_indexed_draw (~0/0) & firstvertex
     */
    bool lower_base_vertex;
+
+   /* Indicates that gl_InstanceIndex already includes base index
+    * and doesn't require further lowering.
+    */
+   bool instance_id_includes_base_index;
 
    /**
     * If enabled, gl_HelperInvocation will be lowered as:
@@ -450,6 +472,11 @@ typedef struct nir_shader_compiler_options {
     */
    bool lower_mul_32x16;
 
+   /**
+    * Set if bf2f and f2bf should be lowered to arithmetic.
+    */
+   bool lower_bfloat16_conversions;
+
    bool vectorize_tess_levels;
    bool lower_to_scalar;
    nir_instr_filter_cb lower_to_scalar_filter;
@@ -511,6 +538,11 @@ typedef struct nir_shader_compiler_options {
     * to imul with masked inputs */
    bool has_umul24;
 
+   /** Backend supports imul24_relaxed and umul24_relaxed, if not set they will be lowered
+    * to imul24, umul24 or imul.
+    */
+   bool has_mul24_relaxed;
+
    /** Backend supports 32-bit imad */
    bool has_imad32;
 
@@ -567,6 +599,9 @@ typedef struct nir_shader_compiler_options {
    /** Backend supports sdot_2x16 and udot_2x16 opcodes. */
    bool has_dot_2x16;
 
+   /** Backend supports bfdot2_bfadd opcode. */
+   bool has_bfdot2_bfadd;
+
    /** Backend supports fmulz (and ffmaz if lower_ffma32=false) */
    bool has_fmulz;
 
@@ -602,6 +637,12 @@ typedef struct nir_shader_compiler_options {
 
    /** Backend support msad_u4x8. */
    bool has_msad;
+
+   /** Backend supports f2e4m3fn_satfn */
+   bool has_f2e4m3fn_satfn;
+
+   /** Backend supports load_global_bounded intrinsics. */
+   bool has_load_global_bounded;
 
    /**
     * Is this the Intel vec4 backend?

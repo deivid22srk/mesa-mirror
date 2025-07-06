@@ -554,7 +554,7 @@ public:
    }
 <%
 import itertools
-formats = [("pseudo", [Format.PSEUDO], list(itertools.product(range(5), range(6))) + [(8, 1), (1, 8), (2, 6), (3, 6), (1, 7)]),
+formats = [("pseudo", [Format.PSEUDO], list(itertools.product(range(5), range(7))) + [(8, 1), (1, 8), (1, 7)]),
            ("sop1", [Format.SOP1], [(0, 1), (1, 0), (1, 1), (2, 1), (3, 2)]),
            ("sop2", [Format.SOP2], itertools.product([1, 2], [2, 3])),
            ("sopk", [Format.SOPK], itertools.product([0, 1, 2], [0, 1])),
@@ -565,7 +565,7 @@ formats = [("pseudo", [Format.PSEUDO], list(itertools.product(range(5), range(6)
            ("ldsdir", [Format.LDSDIR], [(1, 1)]),
            ("mubuf", [Format.MUBUF], [(0, 4), (1, 3), (1, 4)]),
            ("mtbuf", [Format.MTBUF], [(0, 4), (1, 3)]),
-           ("mimg", [Format.MIMG], itertools.product([0, 1], [3, 4, 5, 6, 7])),
+           ("mimg", [Format.MIMG], list(itertools.product([0, 1], [3, 4, 5, 6, 7])) + [(3, 8)]),
            ("exp", [Format.EXP], [(0, 4), (0, 5)]),
            ("branch", [Format.PSEUDO_BRANCH], [(0, 0), (0, 1)]),
            ("barrier", [Format.PSEUDO_BARRIER], [(0, 0)]),

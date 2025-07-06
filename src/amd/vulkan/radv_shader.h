@@ -12,6 +12,7 @@
 #define RADV_SHADER_H
 
 #include "util/mesa-blake3.h"
+#include "util/shader_stats.h"
 #include "util/u_math.h"
 #include "vulkan/vulkan.h"
 #include "ac_binary.h"
@@ -89,6 +90,8 @@ struct radv_shader_stage_key {
 
    /* Whether the shader is used with indirect pipeline binds. */
    uint8_t indirect_bindable : 1;
+
+   uint32_t reserved : 18;
 };
 
 struct radv_ps_epilog_key {
@@ -108,6 +111,8 @@ struct radv_ps_epilog_key {
    bool export_sample_mask;
    bool alpha_to_coverage_via_mrtz;
    bool alpha_to_one;
+
+   uint16_t reserved;
 };
 
 struct radv_spirv_to_nir_options {
@@ -125,12 +130,15 @@ struct radv_graphics_state_key {
    uint32_t dynamic_line_rast_mode : 1;
    uint32_t enable_remove_point_size : 1;
    uint32_t unknown_rast_prim : 1;
+   uint32_t dcc_decompress_gfx11 : 1;
+   uint32_t reserved : 12;
 
    struct {
       uint8_t topology;
    } ia;
 
    struct {
+      uint32_t attributes_valid;
       uint32_t instance_rate_inputs;
       uint32_t instance_rate_divisors[MAX_VERTEX_ATTRIBS];
       uint8_t vertex_attribute_formats[MAX_VERTEX_ATTRIBS];
@@ -196,10 +204,10 @@ struct radv_nir_compiler_options {
 
 #define TCS_OFFCHIP_LAYOUT_NUM_PATCHES__SHIFT          0
 #define TCS_OFFCHIP_LAYOUT_NUM_PATCHES__MASK           0x7f
-#define TCS_OFFCHIP_LAYOUT_PATCH_CONTROL_POINTS__SHIFT 12
-#define TCS_OFFCHIP_LAYOUT_PATCH_CONTROL_POINTS__MASK  0x1f
-#define TCS_OFFCHIP_LAYOUT_OUT_PATCH_CP__SHIFT         7
-#define TCS_OFFCHIP_LAYOUT_OUT_PATCH_CP__MASK          0x1f
+#define TCS_OFFCHIP_LAYOUT_PATCH_VERTICES_IN__SHIFT     7
+#define TCS_OFFCHIP_LAYOUT_PATCH_VERTICES_IN__MASK      0x1f
+#define TCS_OFFCHIP_LAYOUT_TCS_MEM_ATTRIB_STRIDE__SHIFT 12
+#define TCS_OFFCHIP_LAYOUT_TCS_MEM_ATTRIB_STRIDE__MASK  0x1f
 #define TCS_OFFCHIP_LAYOUT_NUM_LS_OUTPUTS__SHIFT       17
 #define TCS_OFFCHIP_LAYOUT_NUM_LS_OUTPUTS__MASK        0x3f
 #define TCS_OFFCHIP_LAYOUT_NUM_HS_OUTPUTS__SHIFT       23
@@ -218,8 +226,6 @@ struct radv_nir_compiler_options {
 
 #define NGG_LDS_LAYOUT_GS_OUT_VERTEX_BASE__SHIFT 0
 #define NGG_LDS_LAYOUT_GS_OUT_VERTEX_BASE__MASK  0xffff
-#define NGG_LDS_LAYOUT_SCRATCH_BASE__SHIFT       16
-#define NGG_LDS_LAYOUT_SCRATCH_BASE__MASK        0xffff
 
 #define NGG_STATE_NUM_VERTS_PER_PRIM__SHIFT 0
 #define NGG_STATE_NUM_VERTS_PER_PRIM__MASK  0x7
@@ -266,6 +272,7 @@ struct radv_shader_stage {
    unsigned char shader_sha1[20];
 
    nir_shader *nir;
+   nir_shader *gs_copy_shader;
    nir_shader *internal_nir; /* meta shaders */
 
    struct radv_shader_info info;
@@ -307,6 +314,7 @@ struct radv_vertex_input_state {
    uint8_t component_align_req_minus_1[MAX_VERTEX_ATTRIBS];
    uint8_t format_sizes[MAX_VERTEX_ATTRIBS];
    uint32_t attrib_index_offset[MAX_VERTEX_ATTRIBS]; /* Only used with static strides. */
+   uint32_t non_trivial_format[MAX_VERTEX_ATTRIBS];
 
    bool bindings_match_attrib;
 };
@@ -452,7 +460,7 @@ struct radv_shader {
    char *nir_string;
    char *disasm_string;
    char *ir_string;
-   uint32_t *statistics;
+   struct amd_stats *statistics;
    struct ac_shader_debug_info *debug_info;
    uint32_t debug_info_count;
 };
@@ -665,9 +673,8 @@ get_tcs_input_vertex_stride(unsigned tcs_num_inputs)
    return stride;
 }
 
-void radv_get_tess_wg_info(const struct radv_physical_device *pdev, const struct shader_info *tcs_info,
-                           unsigned tcs_num_input_vertices, unsigned tcs_num_lds_inputs, unsigned tcs_num_vram_outputs,
-                           unsigned tcs_num_vram_patch_outputs, bool all_invocations_define_tess_levels,
+void radv_get_tess_wg_info(const struct radv_physical_device *pdev, const ac_nir_tess_io_info *io_info,
+                           unsigned tcs_vertices_out, unsigned tcs_num_input_vertices, unsigned tcs_num_lds_inputs,
                            unsigned *num_patches_per_wg, unsigned *hw_lds_size);
 
 void radv_lower_ngg(struct radv_device *device, struct radv_shader_stage *ngg_stage,
@@ -717,11 +724,11 @@ enum radv_pipeline_type;
 void radv_shader_combine_cfg_vs_tcs(const struct radv_shader *vs, const struct radv_shader *tcs, uint32_t *rsrc1_out,
                                     uint32_t *rsrc2_out);
 
-void radv_shader_combine_cfg_vs_gs(const struct radv_shader *vs, const struct radv_shader *gs, uint32_t *rsrc1_out,
-                                   uint32_t *rsrc2_out);
+void radv_shader_combine_cfg_vs_gs(const struct radv_device *device, const struct radv_shader *vs,
+                                   const struct radv_shader *gs, uint32_t *rsrc1_out, uint32_t *rsrc2_out);
 
-void radv_shader_combine_cfg_tes_gs(const struct radv_shader *tes, const struct radv_shader *gs, uint32_t *rsrc1_out,
-                                    uint32_t *rsrc2_out);
+void radv_shader_combine_cfg_tes_gs(const struct radv_device *device, const struct radv_shader *tes,
+                                    const struct radv_shader *gs, uint32_t *rsrc1_out, uint32_t *rsrc2_out);
 
 const struct radv_userdata_info *radv_get_user_sgpr_info(const struct radv_shader *shader, int idx);
 

@@ -587,7 +587,7 @@ d3d12_video_bitstream_builder_hevc::build_pps(const struct pipe_h265_enc_pic_par
          const HevcSeqParameterSet& parentSPS,
          uint8_t pic_parameter_set_id,
          const D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC& codecConfig,
-         const D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC1& pictureControl,
+         const D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC& pictureControl,
          std::vector<BYTE> &headerBitstream,
          std::vector<BYTE>::iterator placingPositionStart,
          size_t &writtenBytes)
@@ -610,7 +610,7 @@ d3d12_video_bitstream_builder_hevc::build_pps(const struct pipe_h265_enc_pic_par
    m_latest_pps.tiles_enabled_flag = 0u; // no tiling in D3D12
    m_latest_pps.loop_filter_across_tiles_enabled_flag = 0;
 
-   m_latest_pps.lists_modification_present_flag = 0;
+   m_latest_pps.lists_modification_present_flag = ((codecConfig.ConfigurationFlags & D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_FLAG_ENABLE_LONG_TERM_REFERENCES) != 0) ? 1 : 0;
    m_latest_pps.log2_parallel_merge_level_minus2 = 0;
 
    m_latest_pps.deblocking_filter_control_present_flag = 1;

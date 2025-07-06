@@ -22,7 +22,6 @@
 #include "util/u_tests.h"
 #include "util/u_upload_mgr.h"
 #include "util/xmlconfig.h"
-#include "vl/vl_decoder.h"
 #include "si_utrace.h"
 
 #include "aco_interface.h"
@@ -194,9 +193,11 @@ static void si_destroy_context(struct pipe_context *context)
 {
    struct si_context *sctx = (struct si_context *)context;
 
-   context->set_debug_callback(context, NULL);
+   if (context->set_debug_callback)
+      context->set_debug_callback(context, NULL);
 
    util_unreference_framebuffer_state(&sctx->framebuffer.state);
+   util_framebuffer_init(context, NULL, sctx->framebuffer.fb_cbufs, &sctx->framebuffer.fb_zsbuf);
    si_release_all_descriptors(sctx);
 
    if (sctx->gfx_level >= GFX10 && sctx->has_graphics)
@@ -251,10 +252,6 @@ static void si_destroy_context(struct pipe_context *context)
       sctx->b.delete_vs_state(&sctx->b, sctx->vs_blit_pos);
    if (sctx->vs_blit_pos_layered)
       sctx->b.delete_vs_state(&sctx->b, sctx->vs_blit_pos_layered);
-   if (sctx->vs_blit_color)
-      sctx->b.delete_vs_state(&sctx->b, sctx->vs_blit_color);
-   if (sctx->vs_blit_color_layered)
-      sctx->b.delete_vs_state(&sctx->b, sctx->vs_blit_color_layered);
    if (sctx->vs_blit_texcoord)
       sctx->b.delete_vs_state(&sctx->b, sctx->vs_blit_texcoord);
    if (sctx->cs_clear_buffer_rmw)
@@ -502,17 +499,16 @@ static struct pipe_context *si_create_context(struct pipe_screen *screen, unsign
 
    /* Don't create a context if it's not compute-only and hw is compute-only. */
    if (!sscreen->info.has_graphics && !(flags & PIPE_CONTEXT_COMPUTE_ONLY)) {
-      fprintf(stderr, "radeonsi: can't create a graphics context on a compute chip\n");
+      mesa_loge("radeonsi: can't create a graphics context on a compute chip\n");
       return NULL;
    }
 
    struct si_context *sctx = CALLOC_STRUCT(si_context);
    struct radeon_winsys *ws = sscreen->ws;
    int shader, i;
-   enum radeon_ctx_priority priority;
 
    if (!sctx) {
-      fprintf(stderr, "radeonsi: can't allocate a context\n");
+      mesa_loge("radeonsi: can't allocate a context\n");
       return NULL;
    }
 
@@ -522,6 +518,7 @@ static struct pipe_context *si_create_context(struct pipe_screen *screen, unsign
                         ((sscreen->info.family == CHIP_RAVEN ||
                           sscreen->info.family == CHIP_RAVEN2) &&
                          !sscreen->info.has_dedicated_vram) ||
+                        !sscreen->info.ip[AMD_IP_COMPUTE].num_queues ||
                         !(flags & PIPE_CONTEXT_COMPUTE_ONLY);
 
    if (flags & PIPE_CONTEXT_DEBUG)
@@ -547,40 +544,21 @@ static struct pipe_context *si_create_context(struct pipe_screen *screen, unsign
          &sscreen->b, PIPE_RESOURCE_FLAG_UNMAPPABLE | SI_RESOURCE_FLAG_DRIVER_INTERNAL,
          PIPE_USAGE_DEFAULT, 16 * sscreen->info.max_render_backends, 256);
       if (!sctx->eop_bug_scratch) {
-         fprintf(stderr, "radeonsi: can't create eop_bug_scratch\n");
+         mesa_loge("radeonsi: can't create eop_bug_scratch\n");
          goto fail;
       }
    }
 
-   if (flags & PIPE_CONTEXT_HIGH_PRIORITY) {
-      priority = RADEON_CTX_PRIORITY_HIGH;
-   } else if (flags & PIPE_CONTEXT_LOW_PRIORITY) {
-      priority = RADEON_CTX_PRIORITY_LOW;
-   } else {
-      priority = RADEON_CTX_PRIORITY_MEDIUM;
-   }
-
-   bool allow_context_lost = flags & PIPE_CONTEXT_LOSE_CONTEXT_ON_RESET;
-
    /* Initialize the context handle and the command stream. */
-   sctx->ctx = sctx->ws->ctx_create(sctx->ws, priority, allow_context_lost);
-   if (!sctx->ctx && priority != RADEON_CTX_PRIORITY_MEDIUM) {
-      /* Context priority should be treated as a hint. If context creation
-       * fails with the requested priority, for example because the caller
-       * lacks CAP_SYS_NICE capability or other system resource constraints,
-       * fallback to normal priority.
-       */
-      priority = RADEON_CTX_PRIORITY_MEDIUM;
-      sctx->ctx = sctx->ws->ctx_create(sctx->ws, priority, allow_context_lost);
-   }
+   sctx->ctx = sctx->ws->ctx_create(sctx->ws, sctx->context_flags);
    if (!sctx->ctx) {
-      fprintf(stderr, "radeonsi: can't create radeon_winsys_ctx\n");
+      mesa_loge("radeonsi: can't create radeon_winsys_ctx\n");
       goto fail;
    }
 
    if (!ws->cs_create(&sctx->gfx_cs, sctx->ctx, sctx->has_graphics ? AMD_IP_GFX : AMD_IP_COMPUTE,
                       (void *)si_flush_gfx_cs, sctx)) {
-      fprintf(stderr, "radeonsi: can't create gfx_cs\n");
+      mesa_loge("radeonsi: can't create gfx_cs\n");
       sctx->gfx_cs.priv = NULL;
       goto fail;
    }
@@ -593,7 +571,7 @@ static struct pipe_context *si_create_context(struct pipe_screen *screen, unsign
 
    sctx->cached_gtt_allocator = u_upload_create(&sctx->b, 16 * 1024, 0, PIPE_USAGE_STAGING, 0);
    if (!sctx->cached_gtt_allocator) {
-      fprintf(stderr, "radeonsi: can't create cached_gtt_allocator\n");
+      mesa_loge("radeonsi: can't create cached_gtt_allocator\n");
       goto fail;
    }
 
@@ -608,7 +586,7 @@ static struct pipe_context *si_create_context(struct pipe_screen *screen, unsign
                                                                : PIPE_USAGE_STREAM,
                       SI_RESOURCE_FLAG_32BIT); /* same flags as const_uploader */
    if (!sctx->b.stream_uploader) {
-      fprintf(stderr, "radeonsi: can't create stream_uploader\n");
+      mesa_loge("radeonsi: can't create stream_uploader\n");
       goto fail;
    }
 
@@ -619,7 +597,7 @@ static struct pipe_context *si_create_context(struct pipe_screen *screen, unsign
          u_upload_create(&sctx->b, 256 * 1024, 0, PIPE_USAGE_DEFAULT,
                          SI_RESOURCE_FLAG_32BIT);
       if (!sctx->b.const_uploader) {
-         fprintf(stderr, "radeonsi: can't create const_uploader\n");
+         mesa_loge("radeonsi: can't create const_uploader\n");
          goto fail;
       }
    }
@@ -628,24 +606,31 @@ static struct pipe_context *si_create_context(struct pipe_screen *screen, unsign
    if (sscreen->info.has_3d_cube_border_color_mipmap) {
       sctx->border_color_table = malloc(SI_MAX_BORDER_COLORS * sizeof(*sctx->border_color_table));
       if (!sctx->border_color_table) {
-         fprintf(stderr, "radeonsi: can't create border_color_table\n");
+         mesa_loge("radeonsi: can't create border_color_table\n");
          goto fail;
       }
 
       sctx->border_color_buffer = si_resource(pipe_buffer_create(
          screen, 0, PIPE_USAGE_DEFAULT, SI_MAX_BORDER_COLORS * sizeof(*sctx->border_color_table)));
       if (!sctx->border_color_buffer) {
-         fprintf(stderr, "radeonsi: can't create border_color_buffer\n");
+         mesa_loge("radeonsi: can't create border_color_buffer\n");
          goto fail;
       }
 
       sctx->border_color_map =
          ws->buffer_map(ws, sctx->border_color_buffer->buf, NULL, PIPE_MAP_WRITE);
       if (!sctx->border_color_map) {
-         fprintf(stderr, "radeonsi: can't map border_color_buffer\n");
+         mesa_loge("radeonsi: can't map border_color_buffer\n");
          goto fail;
       }
    }
+
+#if !AMD_LLVM_AVAILABLE
+   sctx->shader.vs.key.ge.use_aco = 1;
+   sctx->shader.gs.key.ge.use_aco = 1;
+   sctx->shader.tcs.key.ge.use_aco = 1;
+   sctx->shader.tes.key.ge.use_aco = 1;
+#endif
 
    sctx->ngg = sscreen->use_ngg;
    si_shader_change_notify(sctx);
@@ -683,7 +668,7 @@ static struct pipe_context *si_create_context(struct pipe_screen *screen, unsign
 
       sctx->blitter = util_blitter_create(&sctx->b);
       if (sctx->blitter == NULL) {
-         fprintf(stderr, "radeonsi: can't create blitter\n");
+         mesa_loge("radeonsi: can't create blitter\n");
          goto fail;
       }
       sctx->blitter->skip_viewport_restore = true;
@@ -747,9 +732,6 @@ static struct pipe_context *si_create_context(struct pipe_screen *screen, unsign
       sctx->b.create_video_buffer = si_video_buffer_create;
       if (screen->resource_create_with_modifiers)
          sctx->b.create_video_buffer_with_modifiers = si_video_buffer_create_with_modifiers;
-   } else {
-      sctx->b.create_video_codec = vl_create_decoder;
-      sctx->b.create_video_buffer = vl_video_buffer_create;
    }
 
    /* GFX7 cannot unbind a constant buffer (S_BUFFER_LOAD doesn't skip loads
@@ -762,7 +744,7 @@ static struct pipe_context *si_create_context(struct pipe_screen *screen, unsign
                                     PIPE_USAGE_DEFAULT, 16,
                                     sctx->screen->info.tcc_cache_line_size);
       if (!sctx->null_const_buf.buffer) {
-         fprintf(stderr, "radeonsi: can't create null_const_buf\n");
+         mesa_loge("radeonsi: can't create null_const_buf\n");
          goto fail;
       }
       sctx->null_const_buf.buffer_size = sctx->null_const_buf.buffer->width0;
@@ -792,7 +774,7 @@ static struct pipe_context *si_create_context(struct pipe_screen *screen, unsign
 
    sctx->dirty_implicit_resources = _mesa_pointer_hash_table_create(NULL);
    if (!sctx->dirty_implicit_resources) {
-      fprintf(stderr, "radeonsi: can't create dirty_implicit_resources\n");
+      mesa_loge("radeonsi: can't create dirty_implicit_resources\n");
       goto fail;
    }
 
@@ -826,7 +808,7 @@ static struct pipe_context *si_create_context(struct pipe_screen *screen, unsign
                                     PIPE_USAGE_DEFAULT, 4,
                                     sscreen->info.tcc_cache_line_size);
       if (!sctx->wait_mem_scratch) {
-         fprintf(stderr, "radeonsi: can't create wait_mem_scratch\n");
+         mesa_loge("radeonsi: can't create wait_mem_scratch\n");
          goto fail;
       }
 
@@ -835,10 +817,7 @@ static struct pipe_context *si_create_context(struct pipe_screen *screen, unsign
    }
 
    if (sctx->gfx_level == GFX7) {
-      /* Clear the NULL constant buffer, because loads should return zeros.
-       * Note that this forces CP DMA to be used, because clover deadlocks
-       * for some reason when the compute codepath is used.
-       */
+      /* Clear the NULL constant buffer, because loads should return zeros. */
       uint32_t clear_value = 0;
       si_cp_dma_clear_buffer(sctx, &sctx->gfx_cs, sctx->null_const_buf.buffer, 0,
                              sctx->null_const_buf.buffer->width0, clear_value);
@@ -899,15 +878,34 @@ static struct pipe_context *si_create_context(struct pipe_screen *screen, unsign
       goto fail;
 
    /* Initialize compute_tmpring_size. */
-   ac_get_scratch_tmpring_size(&sctx->screen->info, 0,
-                               &sctx->max_seen_compute_scratch_bytes_per_wave,
-                               &sctx->compute_tmpring_size);
+   si_get_scratch_tmpring_size(sctx, 0, true, &sctx->compute_tmpring_size);
 
    return &sctx->b;
 fail:
-   fprintf(stderr, "radeonsi: Failed to create a context.\n");
+   mesa_loge("radeonsi: Failed to create a context.\n");
    si_destroy_context(&sctx->b);
    return NULL;
+}
+
+void
+si_get_scratch_tmpring_size(struct si_context *sctx, unsigned bytes_per_wave,
+                            bool is_compute, unsigned *spi_tmpring_size)
+{
+   bytes_per_wave = ac_compute_scratch_wavesize(&sctx->screen->info, bytes_per_wave);
+
+   if (is_compute) {
+      sctx->max_seen_compute_scratch_bytes_per_wave =
+         MAX2(sctx->max_seen_compute_scratch_bytes_per_wave, bytes_per_wave);
+   } else {
+      sctx->max_seen_scratch_bytes_per_wave =
+         MAX2(sctx->max_seen_scratch_bytes_per_wave, bytes_per_wave);
+   }
+
+   /* TODO: We could decrease WAVES to make the whole buffer fit into the infinity cache. */
+   ac_get_scratch_tmpring_size(&sctx->screen->info, sctx->screen->info.max_scratch_waves,
+                               is_compute ? sctx->max_seen_compute_scratch_bytes_per_wave
+                                          : sctx->max_seen_scratch_bytes_per_wave,
+                               spi_tmpring_size);
 }
 
 static bool si_is_resource_busy(struct pipe_screen *screen, struct pipe_resource *resource,
@@ -1004,11 +1002,9 @@ void si_destroy_screen(struct pipe_screen *pscreen)
    }
 
    si_resource_reference(&sscreen->attribute_pos_prim_ring, NULL);
+   si_resource_reference(&sscreen->attribute_pos_prim_ring_tmz, NULL);
    pipe_resource_reference(&sscreen->tess_rings, NULL);
    pipe_resource_reference(&sscreen->tess_rings_tmz, NULL);
-
-   util_queue_destroy(&sscreen->shader_compiler_queue);
-   util_queue_destroy(&sscreen->shader_compiler_queue_opt_variants);
 
    for (unsigned i = 0; i < ARRAY_SIZE(sscreen->aux_contexts); i++) {
       if (!sscreen->aux_contexts[i].ctx)
@@ -1026,6 +1022,9 @@ void si_destroy_screen(struct pipe_screen *pscreen)
       mtx_unlock(&sscreen->aux_contexts[i].lock);
       mtx_destroy(&sscreen->aux_contexts[i].lock);
    }
+
+   util_queue_destroy(&sscreen->shader_compiler_queue);
+   util_queue_destroy(&sscreen->shader_compiler_queue_opt_variants);
 
    simple_mtx_destroy(&sscreen->async_compute_context_lock);
    if (sscreen->async_compute_context) {
@@ -1110,6 +1109,18 @@ static void si_test_vmfault(struct si_screen *sscreen, uint64_t test_flags)
    exit(0);
 }
 
+static void
+parse_hex(char *out, const char *in, unsigned length)
+{
+   for (unsigned i = 0; i < length; ++i)
+      out[i] = 0;
+
+   for (unsigned i = 0; i < 2 * length; ++i) {
+      unsigned v = in[i] <= '9' ? in[i] - '0' : (in[i] >= 'a' ? (in[i] - 'a' + 10) : (in[i] - 'A' + 10));
+      out[i / 2] |= v << (4 * (1 - i % 2));
+   }
+}
+
 static void si_disk_cache_create(struct si_screen *sscreen)
 {
    /* Don't use the cache if shader dumping is enabled. */
@@ -1122,8 +1133,17 @@ static void si_disk_cache_create(struct si_screen *sscreen)
 
    _mesa_sha1_init(&ctx);
 
+#ifdef RADEONSI_BUILD_ID_OVERRIDE
+   {
+      unsigned size = strlen(RADEONSI_BUILD_ID_OVERRIDE) / 2;
+      char *data = alloca(size);
+      parse_hex(data, RADEONSI_BUILD_ID_OVERRIDE, size);
+      _mesa_sha1_update(&ctx, data, size);
+   }
+#else
    if (!disk_cache_get_function_identifier(si_disk_cache_create, &ctx))
       return;
+#endif
 
 #if AMD_LLVM_AVAILABLE
    if (!disk_cache_get_function_identifier(LLVMInitializeAMDGPUTargetInfo, &ctx))
@@ -1332,13 +1352,26 @@ static struct pipe_screen *radeonsi_screen_create_impl(struct radeon_winsys *ws,
 
    sscreen->nir_options = CALLOC_STRUCT(nir_shader_compiler_options);
 
-   si_init_screen_get_functions(sscreen);
    si_init_screen_buffer_functions(sscreen);
    si_init_screen_fence_functions(sscreen);
    si_init_screen_state_functions(sscreen);
    si_init_screen_texture_functions(sscreen);
    si_init_screen_query_functions(sscreen);
    si_init_screen_live_shader_cache(sscreen);
+
+   if (sscreen->info.gfx_level >= GFX11) {
+      sscreen->use_ngg = true;
+      sscreen->use_ngg_culling = sscreen->info.max_render_backends >= 2 &&
+                                 !(sscreen->debug_flags & DBG(NO_NGG_CULLING));
+   } else {
+      sscreen->use_ngg = !(sscreen->debug_flags & DBG(NO_NGG)) &&
+                         sscreen->info.gfx_level >= GFX10 &&
+                         (sscreen->info.family != CHIP_NAVI14 ||
+                          sscreen->info.is_pro_graphics);
+      sscreen->use_ngg_culling = sscreen->use_ngg &&
+                                 sscreen->info.max_render_backends >= 2 &&
+                                 !(sscreen->debug_flags & DBG(NO_NGG_CULLING));
+   }
 
    sscreen->has_draw_indirect_multi =
       (sscreen->info.family >= CHIP_POLARIS10) ||
@@ -1349,6 +1382,7 @@ static struct pipe_screen *radeonsi_screen_create_impl(struct radeon_winsys *ws,
       (sscreen->info.gfx_level == GFX6 && sscreen->info.pfp_fw_version >= 79 &&
        sscreen->info.me_fw_version >= 142);
 
+   si_init_screen_get_functions(sscreen);
    si_init_shader_caps(sscreen);
    si_init_compute_caps(sscreen);
    si_init_screen_caps(sscreen);
@@ -1452,24 +1486,8 @@ static struct pipe_screen *radeonsi_screen_create_impl(struct radeon_winsys *ws,
    if (!debug_get_bool_option("RADEON_DISABLE_PERFCOUNTERS", false))
       si_init_perfcounters(sscreen);
 
-   ac_get_hs_info(&sscreen->info, &sscreen->hs);
-
    if (sscreen->debug_flags & DBG(NO_OUT_OF_ORDER))
       sscreen->info.has_out_of_order_rast = false;
-
-   if (sscreen->info.gfx_level >= GFX11) {
-      sscreen->use_ngg = true;
-      sscreen->use_ngg_culling = sscreen->info.max_render_backends >= 2 &&
-                                 !(sscreen->debug_flags & DBG(NO_NGG_CULLING));
-   } else {
-      sscreen->use_ngg = !(sscreen->debug_flags & DBG(NO_NGG)) &&
-                         sscreen->info.gfx_level >= GFX10 &&
-                         (sscreen->info.family != CHIP_NAVI14 ||
-                          sscreen->info.is_pro_graphics);
-      sscreen->use_ngg_culling = sscreen->use_ngg &&
-                                 sscreen->info.max_render_backends >= 2 &&
-                                 !(sscreen->debug_flags & DBG(NO_NGG_CULLING));
-   }
 
    /* Only set this for the cases that are known to work, which are:
     * - GFX9 if bpp >= 4 (in bytes)
@@ -1646,6 +1664,8 @@ struct pipe_screen *radeonsi_screen_create(int fd, const struct pipe_screen_conf
 #ifdef HAVE_AMDGPU_VIRTIO
    if (strcmp(version->name, "virtio_gpu") == 0) {
       rw = amdgpu_winsys_create(fd, config, radeonsi_screen_create_impl, true);
+   } else if (debug_get_bool_option("AMD_FORCE_VPIPE", false)) {
+      rw = amdgpu_winsys_create(-1, config, radeonsi_screen_create_impl, true);
    } else
 #endif
    {

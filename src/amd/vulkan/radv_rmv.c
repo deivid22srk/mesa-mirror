@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include "ac_gpu_info.h"
 #include "radv_buffer.h"
+#include "radv_descriptor_pool.h"
 #include "radv_descriptor_set.h"
 #include "radv_device_memory.h"
 #include "radv_event.h"
@@ -554,7 +555,8 @@ radv_rmv_log_buffer_bind(struct radv_device *device, VkBuffer _buffer)
 
    VK_FROM_HANDLE(radv_buffer, buffer, _buffer);
    simple_mtx_lock(&device->vk.memory_trace_data.token_mtx);
-   log_resource_bind_locked(device, (uint64_t)_buffer, buffer->bo->initial_domain, buffer->addr, buffer->vk.size);
+   log_resource_bind_locked(device, (uint64_t)_buffer, buffer->bo->initial_domain, buffer->vk.device_address,
+                            buffer->vk.size);
    simple_mtx_unlock(&device->vk.memory_trace_data.token_mtx);
 }
 

@@ -96,13 +96,6 @@ radv_meta_nir_build_resolve_shader_core(struct radv_device *device, nir_builder 
 }
 
 nir_def *
-radv_meta_nir_load_descriptor(nir_builder *b, unsigned desc_set, unsigned binding)
-{
-   nir_def *rsrc = nir_vulkan_resource_index(b, 3, 32, nir_imm_int(b, 0), .desc_set = desc_set, .binding = binding);
-   return nir_trim_vector(b, rsrc, 2);
-}
-
-nir_def *
 radv_meta_nir_get_global_ids(nir_builder *b, unsigned num_components)
 {
    unsigned mask = BITFIELD_MASK(num_components);
@@ -130,21 +123,23 @@ radv_meta_nir_break_on_count(nir_builder *b, nir_variable *var, nir_def *count)
 }
 
 nir_shader *
-radv_meta_nir_build_buffer_fill_shader(struct radv_device *dev)
+radv_meta_nir_build_fill_memory_shader(struct radv_device *dev, uint32_t bytes_per_invocation)
 {
-   nir_builder b = radv_meta_nir_init_shader(dev, MESA_SHADER_COMPUTE, "meta_buffer_fill");
+   assert(bytes_per_invocation == 4 || bytes_per_invocation == 16);
+
+   nir_builder b = radv_meta_nir_init_shader(dev, MESA_SHADER_COMPUTE, "meta_fill_memory_%dB", bytes_per_invocation);
    b.shader->info.workgroup_size[0] = 64;
 
    nir_def *pconst = nir_load_push_constant(&b, 4, 32, nir_imm_int(&b, 0), .range = 16);
    nir_def *buffer_addr = nir_pack_64_2x32(&b, nir_channels(&b, pconst, 0b0011));
    nir_def *max_offset = nir_channel(&b, pconst, 2);
-   nir_def *data = nir_swizzle(&b, nir_channel(&b, pconst, 3), (unsigned[]){0, 0, 0, 0}, 4);
+   nir_def *data = nir_swizzle(&b, nir_channel(&b, pconst, 3), (unsigned[]){0, 0, 0, 0}, bytes_per_invocation / 4);
 
    nir_def *global_id =
       nir_iadd(&b, nir_imul_imm(&b, nir_channel(&b, nir_load_workgroup_id(&b), 0), b.shader->info.workgroup_size[0]),
                nir_load_local_invocation_index(&b));
 
-   nir_def *offset = nir_imin(&b, nir_imul_imm(&b, global_id, 16), max_offset);
+   nir_def *offset = nir_umin(&b, nir_imul_imm(&b, global_id, bytes_per_invocation), max_offset);
    nir_def *dst_addr = nir_iadd(&b, buffer_addr, nir_u2u64(&b, offset));
    nir_build_store_global(&b, data, dst_addr, .align_mul = 4);
 
@@ -152,9 +147,14 @@ radv_meta_nir_build_buffer_fill_shader(struct radv_device *dev)
 }
 
 nir_shader *
-radv_meta_nir_build_buffer_copy_shader(struct radv_device *dev)
+radv_meta_nir_build_copy_memory_shader(struct radv_device *dev, uint32_t bytes_per_invocation)
 {
-   nir_builder b = radv_meta_nir_init_shader(dev, MESA_SHADER_COMPUTE, "meta_buffer_copy");
+   assert(bytes_per_invocation == 1 || bytes_per_invocation == 16);
+
+   const uint32_t num_components = bytes_per_invocation == 1 ? 1 : 4;
+   const uint32_t bit_size = bytes_per_invocation == 1 ? 8 : 32;
+
+   nir_builder b = radv_meta_nir_init_shader(dev, MESA_SHADER_COMPUTE, "meta_copy_memory_%dB", bytes_per_invocation);
    b.shader->info.workgroup_size[0] = 64;
 
    nir_def *pconst = nir_load_push_constant(&b, 4, 32, nir_imm_int(&b, 0), .range = 16);
@@ -166,10 +166,11 @@ radv_meta_nir_build_buffer_copy_shader(struct radv_device *dev)
       nir_iadd(&b, nir_imul_imm(&b, nir_channel(&b, nir_load_workgroup_id(&b), 0), b.shader->info.workgroup_size[0]),
                nir_load_local_invocation_index(&b));
 
-   nir_def *offset = nir_u2u64(&b, nir_imin(&b, nir_imul_imm(&b, global_id, 16), max_offset));
+   nir_def *offset = nir_u2u64(&b, nir_umin(&b, nir_imul_imm(&b, global_id, bytes_per_invocation), max_offset));
 
-   nir_def *data = nir_build_load_global(&b, 4, 32, nir_iadd(&b, src_addr, offset), .align_mul = 4);
-   nir_build_store_global(&b, data, nir_iadd(&b, dst_addr, offset), .align_mul = 4);
+   nir_def *data =
+      nir_build_load_global(&b, num_components, bit_size, nir_iadd(&b, src_addr, offset), .align_mul = bit_size / 8);
+   nir_build_store_global(&b, data, nir_iadd(&b, dst_addr, offset), .align_mul = bit_size / 8);
 
    return b.shader;
 }
@@ -1274,14 +1275,32 @@ radv_meta_build_resolve_srgb_conversion(nir_builder *b, nir_def *input)
    return nir_vec(b, comp, 4);
 }
 
-nir_shader *
-radv_meta_nir_build_resolve_compute_shader(struct radv_device *dev, bool is_integer, bool is_srgb, int samples)
+static const char *
+radv_meta_resolve_compute_type_name(enum radv_meta_resolve_compute_type type)
 {
-   enum glsl_base_type img_base_type = is_integer ? GLSL_TYPE_UINT : GLSL_TYPE_FLOAT;
+   switch (type) {
+   case RADV_META_RESOLVE_COMPUTE_NORM:
+      return "norm";
+   case RADV_META_RESOLVE_COMPUTE_NORM_SRGB:
+      return "srgb";
+   case RADV_META_RESOLVE_COMPUTE_INTEGER:
+      return "integer";
+   case RADV_META_RESOLVE_COMPUTE_FLOAT:
+      return "float";
+   default:
+      unreachable("invalid compute resolve type");
+   }
+}
+
+nir_shader *
+radv_meta_nir_build_resolve_compute_shader(struct radv_device *dev, enum radv_meta_resolve_compute_type type,
+                                           int samples)
+{
+   enum glsl_base_type img_base_type = type == RADV_META_RESOLVE_COMPUTE_INTEGER ? GLSL_TYPE_UINT : GLSL_TYPE_FLOAT;
    const struct glsl_type *sampler_type = glsl_sampler_type(GLSL_SAMPLER_DIM_MS, false, false, img_base_type);
    const struct glsl_type *img_type = glsl_image_type(GLSL_SAMPLER_DIM_2D, false, img_base_type);
    nir_builder b = radv_meta_nir_init_shader(dev, MESA_SHADER_COMPUTE, "meta_resolve_cs-%d-%s", samples,
-                                         is_integer ? "int" : (is_srgb ? "srgb" : "float"));
+                                             radv_meta_resolve_compute_type_name(type));
    b.shader->info.workgroup_size[0] = 8;
    b.shader->info.workgroup_size[1] = 8;
 
@@ -1303,11 +1322,15 @@ radv_meta_nir_build_resolve_compute_shader(struct radv_device *dev, bool is_inte
 
    nir_variable *color = nir_local_variable_create(b.impl, glsl_vec4_type(), "color");
 
-   radv_meta_nir_build_resolve_shader_core(dev, &b, is_integer, samples, input_img, color, src_coord);
+   radv_meta_nir_build_resolve_shader_core(dev, &b, type == RADV_META_RESOLVE_COMPUTE_INTEGER, samples, input_img,
+                                           color, src_coord);
 
    nir_def *outval = nir_load_var(&b, color);
-   if (is_srgb)
+   if (type == RADV_META_RESOLVE_COMPUTE_NORM_SRGB)
       outval = radv_meta_build_resolve_srgb_conversion(&b, outval);
+
+   if (type == RADV_META_RESOLVE_COMPUTE_NORM || type == RADV_META_RESOLVE_COMPUTE_NORM_SRGB)
+      outval = nir_f2f32(&b, nir_f2f16_rtz(&b, outval));
 
    nir_def *img_coord = nir_vec4(&b, nir_channel(&b, dst_coord, 0), nir_channel(&b, dst_coord, 1), nir_undef(&b, 1, 32),
                                  nir_undef(&b, 1, 32));

@@ -46,6 +46,9 @@ tu_default_tps = []
 # Tracepoint definitions:
 #
 
+command_buffer_arg = ArgStruct(type='struct tu_cmd_buffer *', var='cmd')
+command_buffer_struct = Arg(type='VkCommandBuffer', name='command_buffer_handle', var='vk_command_buffer_to_handle(&cmd->vk)', c_format='%" PRIu64 "', to_prim_type='(uint64_t){}', perfetto_field=True)
+
 def begin_end_tp(name, args=[], tp_struct=None, tp_print=None,
                  end_args=[], end_tp_struct=None, end_tp_print=None,
                  tp_default_enabled=True, marker_tp=True,
@@ -53,6 +56,12 @@ def begin_end_tp(name, args=[], tp_struct=None, tp_print=None,
     global tu_default_tps
     if tp_default_enabled:
         tu_default_tps.append(name)
+
+    # Make all the GPU render stage events take a cmdbuf, so that the
+    # command_buffer field can be set appropriately in the UI.
+    tp_struct = [command_buffer_struct] + (tp_struct if tp_struct else [])
+    args = [command_buffer_arg] + (args if args else [])
+
     Tracepoint('start_{0}'.format(name),
                toggle_name=name,
                args=args,
@@ -69,13 +78,19 @@ def begin_end_tp(name, args=[], tp_struct=None, tp_print=None,
                tp_markers='tu_cs_trace_end' if marker_tp else None)
 
 begin_end_tp('cmd_buffer',
-    args=[ArgStruct(type='const struct tu_cmd_buffer *', var='cmd'),
-          Arg(type='str',                       var='TUdebugFlags', c_format='%s', length_arg='96', copy_func='strncpy'),
+    args=[Arg(type='str',                       var='TUdebugFlags', c_format='%s', length_arg='96', copy_func='strncpy'),
           Arg(type='str',                       var='IR3debugFlags', c_format='%s', length_arg='96', copy_func='strncpy')],
     tp_struct=[Arg(type='const char *',         name='appName',              var='cmd->device->instance->vk.app_info.app_name', c_format='%s'),
                Arg(type='const char *',         name='engineName',           var='cmd->device->instance->vk.app_info.engine_name', c_format='%s'),
-               Arg(type='VkCommandBufferLevel', name='level',                var='cmd->vk.level', c_format='%s', to_prim_type='vk_CommandBufferLevel_to_str({})'),
-               Arg(type='uint8_t',              name='render_pass_continue', var='!!(cmd->usage_flags & VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT)', c_format='%u')])
+               Arg(type='uint8_t',              name='oneTimeSubmit',        var='(cmd->usage_flags & VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)', c_format='%u'),
+               Arg(type='uint8_t',              name='simultaneousUse',      var='(cmd->usage_flags & VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT)', c_format='%u')],
+    end_args=[ArgStruct(type='const struct tu_cmd_buffer *', var='cmd')],
+    end_tp_struct=[Arg(type='uint32_t',         name='renderpasses',         var='cmd->state.total_renderpasses', c_format='%u'),
+                   Arg(type='uint32_t',         name='dispatches',           var='cmd->state.total_dispatches', c_format='%u')])
+
+begin_end_tp('secondary_cmd_buffer', tp_default_enabled=False,
+    tp_struct=[Arg(type='uint8_t',              name='render_pass_continue', var='!!(cmd->usage_flags & VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT)', c_format='%u')])
+
 
 begin_end_tp('render_pass',
     args=[ArgStruct(type='const struct tu_framebuffer *', var='fb'),
@@ -89,7 +104,7 @@ begin_end_tp('render_pass',
     tp_struct=[Arg(type='uint16_t', name='width',               var='fb->width',                                            c_format='%u'),
                Arg(type='uint16_t', name='height',              var='fb->height',                                           c_format='%u'),
                Arg(type='uint8_t',  name='attachment_count',    var='fb->attachment_count',                                 c_format='%u'),
-               Arg(type='uint16_t', name='numberOfBins',        var='tiling->tile_count.width * tiling->tile_count.height', c_format='%u'),
+               Arg(type='uint16_t', name='numberOfBins',        var='tiling->vsc.tile_count.width * tiling->vsc.tile_count.height', c_format='%u'),
                Arg(type='uint16_t', name='binWidth',            var='tiling->tile0.width',                                  c_format='%u'),
                Arg(type='uint16_t', name='binHeight',           var='tiling->tile0.height',                                 c_format='%u'),],
     # Args known only at the end of the renderpass:
@@ -99,7 +114,8 @@ begin_end_tp('render_pass',
               Arg(type='uint32_t',                              var='avgPerSampleBandwidth',                                c_format='%u'),
               Arg(type='bool',                                  var='lrz',                                                  c_format='%s', to_prim_type='({} ? "true" : "false")'),
               Arg(type='const char *',                          var='lrzDisableReason',                                     c_format='%s'),
-              Arg(type='uint32_t',                              var='lrzDisabledAtDraw',                                    c_format='%u'),
+              Arg(type='int32_t',                               var='lrzDisabledAtDraw',                                    c_format='%d'),
+              Arg(type='int32_t',                               var='lrzWriteDisabledAtDraw',                               c_format='%d'),
               Arg(type='uint32_t',                              var='lrzStatus', c_format='%s', to_prim_type='(fd_lrz_gpu_dir_to_str((enum fd_lrz_gpu_dir)({} & 0xff)))', is_indirect=True),])
 
 

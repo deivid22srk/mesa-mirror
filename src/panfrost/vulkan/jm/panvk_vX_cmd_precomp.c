@@ -30,7 +30,7 @@ panvk_per_arch(dispatch_precomp)(struct panvk_precomp_ctx *ctx,
    assert(shader);
    assert(batch && "Need current batch to be present!");
 
-   struct panfrost_ptr push_uniforms = panvk_cmd_alloc_dev_mem(
+   struct pan_ptr push_uniforms = panvk_cmd_alloc_dev_mem(
       cmdbuf, desc, BIFROST_PRECOMPILED_KERNEL_SYSVALS_SIZE + data_size, 16);
 
    assert(push_uniforms.gpu);
@@ -44,18 +44,18 @@ panvk_per_arch(dispatch_precomp)(struct panvk_precomp_ctx *ctx,
    bifrost_precompiled_kernel_prepare_push_uniforms(push_uniforms.cpu, data,
                                                     data_size, &sysvals);
 
-   struct panfrost_ptr job = panvk_cmd_alloc_desc(cmdbuf, COMPUTE_JOB);
+   struct pan_ptr job = panvk_cmd_alloc_desc(cmdbuf, COMPUTE_JOB);
    assert(job.gpu);
 
-   panfrost_pack_work_groups_compute(
+   pan_pack_work_groups_compute(
       pan_section_ptr(job.cpu, COMPUTE_JOB, INVOCATION), grid.count[0],
-      grid.count[1], grid.count[2], shader->local_size.x, shader->local_size.y,
-      shader->local_size.z, false, false);
+      grid.count[1], grid.count[2], shader->cs.local_size.x,
+      shader->cs.local_size.y, shader->cs.local_size.z, false, false);
 
    pan_section_pack(job.cpu, COMPUTE_JOB, PARAMETERS, cfg) {
-      cfg.job_task_split = util_logbase2_ceil(shader->local_size.x + 1) +
-                           util_logbase2_ceil(shader->local_size.y + 1) +
-                           util_logbase2_ceil(shader->local_size.z + 1);
+      cfg.job_task_split = util_logbase2_ceil(shader->cs.local_size.x + 1) +
+                           util_logbase2_ceil(shader->cs.local_size.y + 1) +
+                           util_logbase2_ceil(shader->cs.local_size.z + 1);
    }
 
    struct pan_compute_dim dim = {.x = grid.count[0],

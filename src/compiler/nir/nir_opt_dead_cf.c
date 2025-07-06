@@ -217,6 +217,7 @@ node_is_dead(nir_cf_node *node)
             case nir_intrinsic_load_deref:
             case nir_intrinsic_load_ssbo:
             case nir_intrinsic_load_global:
+            case nir_intrinsic_load_ssbo_intel:
                /* If there's a memory barrier after the loop, a load might be
                 * required to happen before some other instruction after the
                 * barrier, so it is not valid to eliminate it -- unless we
@@ -388,7 +389,7 @@ opt_dead_cf_impl(nir_function_impl *impl)
    bool progress = dead_cf_list(&impl->body, &dummy);
 
    if (progress) {
-      nir_metadata_preserve(impl, nir_metadata_none);
+      nir_progress(true, impl, nir_metadata_none);
       nir_rematerialize_derefs_in_use_blocks_impl(impl);
 
       /* The CF manipulation code called by this pass is smart enough to keep
@@ -402,7 +403,7 @@ opt_dead_cf_impl(nir_function_impl *impl)
        */
       nir_repair_ssa_impl(impl);
    } else {
-      nir_metadata_preserve(impl, nir_metadata_all);
+      nir_no_progress(impl);
    }
 
    return progress;

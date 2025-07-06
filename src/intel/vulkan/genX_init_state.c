@@ -31,10 +31,6 @@
 
 #include "vk_standard_sample_locations.h"
 
-#if GFX_VERx10 >= 125 && ANV_SUPPORT_RT_GRL
-#include "grl/genX_grl.h"
-#endif
-
 #include "genX_mi_builder.h"
 
 #include "vk_util.h"
@@ -366,6 +362,10 @@ init_common_queue_state(struct anv_queue *queue, struct anv_batch *batch)
          };
 #if INTEL_NEEDS_WA_14017794102 || INTEL_NEEDS_WA_14023061436
          btd.BTDMidthreadpreemption = false;
+#endif
+
+#if GFX_VER >= 30
+         btd.RTMemStructures64bModeEnable = true;
 #endif
       }
    }
@@ -896,13 +896,8 @@ genX(init_physical_device_state)(ASSERTED struct anv_physical_device *pdevice)
    assert(pdevice->info.verx10 == GFX_VERx10);
 
 #if GFX_VERx10 >= 125 && ANV_SUPPORT_RT
-#if ANV_SUPPORT_RT_GRL
-   genX(grl_load_rt_uuid)(pdevice->rt_uuid);
-   pdevice->max_grl_scratch_size = genX(grl_max_scratch_size)();
-#else
    STATIC_ASSERT(sizeof(ANV_RT_UUID_MACRO) == VK_UUID_SIZE);
    memcpy(pdevice->rt_uuid, ANV_RT_UUID_MACRO, VK_UUID_SIZE);
-#endif
 #endif
 
    pdevice->cmd_emit_timestamp = genX(cmd_emit_timestamp);
@@ -1129,11 +1124,11 @@ genX(emit_sample_pattern)(struct anv_batch *batch,
       for (uint32_t i = 1; i <= 16; i *= 2) {
          switch (i) {
          case VK_SAMPLE_COUNT_1_BIT:
-            if (sl && sl->per_pixel == i) {
-               INTEL_SAMPLE_POS_1X_ARRAY(sp._1xSample, sl->locations);
-            } else {
-               INTEL_SAMPLE_POS_1X(sp._1xSample);
-            }
+            /* We don't do 1x MSAA, and we can't support custom sample
+             * positions without MSAA, so always program the default for this
+             * case.
+             */
+            INTEL_SAMPLE_POS_1X(sp._1xSample);
             break;
          case VK_SAMPLE_COUNT_2_BIT:
             if (sl && sl->per_pixel == i) {
@@ -1359,7 +1354,8 @@ VkResult genX(CreateSampler)(
          .TextureBorderColorMode = DX10OGL,
 
 #if GFX_VER >= 11
-         .CPSLODCompensationEnable = true,
+         /* This field is marked as disabled on Gfx20+ */
+         .CPSLODCompensationEnable = device->info->ver < 20,
 #endif
 
          .LODPreClampMode = CLAMP_MODE_OGL,

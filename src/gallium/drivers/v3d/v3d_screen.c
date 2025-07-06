@@ -194,8 +194,6 @@ v3d_init_compute_caps(struct v3d_screen *screen)
 
         caps->address_bits = 32;
 
-        snprintf(caps->ir_target, sizeof(caps->ir_target), "v3d");
-
         caps->grid_dimension = 3;
 
         /* GL_MAX_COMPUTE_SHADER_WORK_GROUP_COUNT: The CSD has a
@@ -220,16 +218,12 @@ v3d_init_compute_caps(struct v3d_screen *screen)
         /* GL_MAX_COMPUTE_SHARED_MEMORY_SIZE */
         caps->max_local_size = 32768;
 
-        caps->max_private_size =
-        caps->max_input_size = 4096;
-
         struct sysinfo si;
         sysinfo(&si);
         caps->max_global_size = si.totalram;
         caps->max_mem_alloc_size = MIN2(V3D_MAX_BUFFER_RANGE, si.totalram);
 
         caps->max_compute_units = 1;
-        caps->images_supported = true;
         caps->subgroup_sizes = 16;
 }
 
@@ -338,6 +332,9 @@ v3d_init_screen_caps(struct v3d_screen *screen)
         caps->max_texture_array_layers = V3D_MAX_ARRAY_LAYERS;
 
         caps->max_render_targets = V3D_MAX_RENDER_TARGETS(screen->devinfo.ver);
+        caps->fbfetch = caps->max_render_targets;
+        caps->fbfetch_coherent = true;
+        caps->max_dual_source_render_targets = 1;
 
         caps->vendor_id = 0x14E4;
 
@@ -372,6 +369,7 @@ v3d_init_screen_caps(struct v3d_screen *screen)
 
         caps->native_fence_fd = true;
 
+        caps->clip_planes = 0;
         caps->depth_clip_disable = screen->devinfo.ver >= 71;
 
         caps->min_line_width =
@@ -555,6 +553,8 @@ v3d_screen_get_compiler_options(struct pipe_screen *pscreen,
                 .lower_insert_word = true,
                 .lower_bitfield_insert = true,
                 .lower_bitfield_extract = true,
+                .lower_bitfield_extract16 = true,
+                .lower_bitfield_extract8 = true,
                 .lower_bitfield_reverse = true,
                 .lower_bit_count = true,
                 .lower_cs_local_id_to_index = true,

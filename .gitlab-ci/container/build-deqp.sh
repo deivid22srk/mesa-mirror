@@ -6,14 +6,13 @@
 # DEBIAN_TEST_ANDROID_TAG
 # DEBIAN_TEST_GL_TAG
 # DEBIAN_TEST_VK_TAG
-# KERNEL_ROOTFS_TAG
 
 set -ue -o pipefail
 
 # shellcheck disable=SC2153
 deqp_api=${DEQP_API,,}
 
-uncollapsed_section_start deqp-$deqp_api "Building dEQP $DEQP_API"
+section_start deqp-$deqp_api "Building dEQP $DEQP_API"
 
 set -x
 
@@ -24,10 +23,10 @@ set -x
 # - the GL release produces `glcts`, and
 # - the GLES release produces `deqp-gles*` and `deqp-egl`
 
-DEQP_MAIN_COMMIT=a9988483c0864d7190e5e6264ccead95423dfd00
+DEQP_MAIN_COMMIT=9cc8e038994c32534b3d2c4ba88c1dc49ef53228
 DEQP_VK_VERSION=1.4.1.1
-DEQP_GL_VERSION=4.6.5.0
-DEQP_GLES_VERSION=3.2.11.0
+DEQP_GL_VERSION=4.6.6.0
+DEQP_GLES_VERSION=3.2.12.0
 
 # Patches to VulkanCTS may come from commits in their repo (listed in
 # cts_commits_to_backport) or patch files stored in our repo (in the patch
@@ -37,8 +36,8 @@ DEQP_GLES_VERSION=3.2.11.0
 
 # shellcheck disable=SC2034
 main_cts_commits_to_backport=(
-    # If you find yourself wanting to add something in here, consider whether
-    # bumping DEQP_MAIN_COMMIT is not a better solution :)
+  # If you find yourself wanting to add something in here, consider whether
+  # bumping DEQP_MAIN_COMMIT is not a better solution :)
 )
 
 # shellcheck disable=SC2034
@@ -47,6 +46,8 @@ main_cts_patch_files=(
 
 # shellcheck disable=SC2034
 vk_cts_commits_to_backport=(
+  # Stop querying device address from unbound buffers
+  046343f46f7d39d53b47842d7fd8ed3279528046
 )
 
 # shellcheck disable=SC2034
@@ -55,39 +56,30 @@ vk_cts_patch_files=(
 
 # shellcheck disable=SC2034
 gl_cts_commits_to_backport=(
-  # Add #include <cmath> in deMath.h when being compiled by C++
-  71808fe7d0a640dfd703e845d93ba1c5ab751055
-  # Revert "Add #include <cmath> in deMath.h when being compiled by C++ compiler"
-  # This also adds an alternative fix along with the revert.
-  6164879a0acce258637d261592a9c395e564b361
+  # Add testing for GL_PRIMITIVES_SUBMITTED_ARB query.
+  e075ce73ddc5973aa46a5236c715bb281c9501fa
 )
 
 # shellcheck disable=SC2034
 gl_cts_patch_files=(
   build-deqp-gl_Build-Don-t-build-Vulkan-utilities-for-GL-builds.patch
+  build-deqp-gl_Revert-Add-missing-context-deletion.patch
+  build-deqp-gl_Revert-Fix-issues-with-GLX-reset-notification-strate.patch
+  build-deqp-gl_Revert-Fix-spurious-failures-when-using-a-config-wit.patch
 )
 
 # shellcheck disable=SC2034
 # GLES builds also EGL
 gles_cts_commits_to_backport=(
-  # Add #include <cmath> in deMath.h when being compiled by C++
-  71808fe7d0a640dfd703e845d93ba1c5ab751055
-  # Revert "Add #include <cmath> in deMath.h when being compiled by C++ compiler"
-  # This also adds an alternative fix along with the revert.
-  6164879a0acce258637d261592a9c395e564b361
 )
 
 # shellcheck disable=SC2034
 gles_cts_patch_files=(
   build-deqp-gl_Build-Don-t-build-Vulkan-utilities-for-GL-builds.patch
+  build-deqp-gl_Revert-Add-missing-context-deletion.patch
+  build-deqp-gl_Revert-Fix-issues-with-GLX-reset-notification-strate.patch
+  build-deqp-gl_Revert-Fix-spurious-failures-when-using-a-config-wit.patch
 )
-
-if [ "${DEQP_TARGET}" = 'android' ]; then
-  gles_cts_patch_files+=(
-    build-deqp-gles_Allow-running-on-Android-from-the-command-line.patch
-    build-deqp-gles_Android-prints-to-stdout-instead-of-logcat.patch
-  )
-fi
 
 
 ### Careful editing anything below this line
@@ -117,7 +109,7 @@ git checkout FETCH_HEAD
 DEQP_COMMIT=$(git rev-parse FETCH_HEAD)
 
 if [ "$DEQP_VERSION" = "$DEQP_MAIN_COMMIT" ]; then
-  merge_base="$(curl -s https://api.github.com/repos/KhronosGroup/VK-GL-CTS/compare/main...$DEQP_MAIN_COMMIT | jq -r .merge_base_commit.sha)"
+  merge_base="$(curl-with-retry -s https://api.github.com/repos/KhronosGroup/VK-GL-CTS/compare/main...$DEQP_MAIN_COMMIT | jq -r .merge_base_commit.sha)"
   if [[ "$merge_base" != "$DEQP_MAIN_COMMIT" ]]; then
     echo "VK-GL-CTS commit $DEQP_MAIN_COMMIT is not a commit from the main branch."
     exit 1
@@ -137,8 +129,7 @@ for commit in "${!cts_commits_to_backport}"
 do
   PATCH_URL="https://github.com/KhronosGroup/VK-GL-CTS/commit/$commit.patch"
   echo "Apply patch to ${DEQP_API} CTS from $PATCH_URL"
-  curl -L --retry 4 -f --retry-all-errors --retry-delay 60 $PATCH_URL | \
-    GIT_COMMITTER_DATE=$(LC_TIME=C date -d@0) git am -
+  curl-with-retry $PATCH_URL | GIT_COMMITTER_DATE=$(LC_TIME=C date -d@0) git am -
 done
 
 cts_patch_files="${prefix}_cts_patch_files[@]"
@@ -165,6 +156,14 @@ done
 # libpng (sigh).  The archives get their checksums checked anyway, and git
 # always goes through ssh or https.
 python3 external/fetch_sources.py --insecure
+
+case "${DEQP_API}" in
+  VK-main)
+    # Video tests rely on external files
+    python3 external/fetch_video_decode_samples.py
+    python3 external/fetch_video_encode_samples.py
+    ;;
+esac
 
 if [[ "$DEQP_API" = tools ]]; then
   # Save the testlog stylesheets:
@@ -279,7 +278,7 @@ if [ "$DEQP_API" != tools ]; then
 
     # Compress the caselists, since Vulkan's in particular are gigantic; higher
     # compression levels provide no real measurable benefit.
-    zstd -1 --rm mustpass/*.txt
+    zstd -f -1 --rm mustpass/*.txt
 fi
 
 if [ "$DEQP_API" = tools ]; then
@@ -290,6 +289,7 @@ if [ "$DEQP_API" = tools ]; then
 fi
 
 # Remove other mustpass files, since we saved off the ones we wanted to conventient locations above.
+rm -rf assets/**/mustpass/
 rm -rf external/**/mustpass/
 rm -rf external/vulkancts/modules/vulkan/vk-main*
 rm -rf external/vulkancts/modules/vulkan/vk-default

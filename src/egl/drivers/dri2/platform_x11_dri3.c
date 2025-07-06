@@ -521,7 +521,7 @@ struct dri2_egl_display_vtbl dri3_x11_display_vtbl = {
    .close_screen_notify = dri3_close_screen_notify,
 };
 
-enum dri2_egl_driver_fail
+bool
 dri3_x11_connect(struct dri2_egl_display *dri2_dpy, bool zink, bool swrast)
 {
    dri2_dpy->fd_render_gpu =
@@ -529,13 +529,17 @@ dri3_x11_connect(struct dri2_egl_display *dri2_dpy, bool zink, bool swrast)
    if (dri2_dpy->fd_render_gpu < 0) {
       int conn_error = xcb_connection_has_error(dri2_dpy->conn);
       if (!swrast) {
+#ifdef HAVE_X11_DRI2
          _eglLog(_EGL_INFO, "DRI3: Could not get DRI3 device");
-
+#else
+         _eglLog(_EGL_WARNING, "DRI3 error: Could not get DRI3 device");
+         _eglLog(_EGL_WARNING, "Activate DRI3 at Xorg or build mesa with DRI2");
+#endif
          if (conn_error)
             _eglLog(_EGL_WARNING, "DRI3: Failed to initialize");
       }
 
-      return DRI2_EGL_DRIVER_FAILED;
+      return false;
    }
 
    loader_get_user_preferred_fd(&dri2_dpy->fd_render_gpu,
@@ -547,14 +551,14 @@ dri3_x11_connect(struct dri2_egl_display *dri2_dpy, bool zink, bool swrast)
    if (!zink && !strcmp(dri2_dpy->driver_name, "zink")) {
       close(dri2_dpy->fd_render_gpu);
       dri2_dpy->fd_render_gpu = -1;
-      return DRI2_EGL_DRIVER_PREFER_ZINK;
+      return false;
    }
 
    if (!dri2_dpy->driver_name) {
       _eglLog(_EGL_WARNING, "DRI3: No driver found");
       close(dri2_dpy->fd_render_gpu);
       dri2_dpy->fd_render_gpu = -1;
-      return DRI2_EGL_DRIVER_FAILED;
+      return false;
    }
 
 #ifdef HAVE_WAYLAND_PLATFORM
@@ -565,5 +569,5 @@ dri3_x11_connect(struct dri2_egl_display *dri2_dpy, bool zink, bool swrast)
       drmGetRenderDeviceNameFromFd(dri2_dpy->fd_render_gpu);
 #endif
 
-   return DRI2_EGL_DRIVER_LOADED;
+   return true;
 }

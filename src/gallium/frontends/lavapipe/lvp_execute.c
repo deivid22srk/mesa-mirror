@@ -80,6 +80,13 @@ struct lvp_render_attachment {
    bool read_only;
 };
 
+struct lvp_conditional_rendering_state {
+   struct pipe_resource *buffer;
+   uint32_t offset;
+   bool condition;
+   bool enabled;
+};
+
 struct rendering_state {
    struct pipe_context *pctx;
    struct lvp_device *device;
@@ -171,7 +178,6 @@ struct rendering_state {
 
    VkRect2D render_area;
    bool suspending;
-   bool render_cond;
    uint32_t color_att_count;
    struct lvp_render_attachment color_att[PIPE_MAX_COLOR_BUFS];
    struct lvp_render_attachment depth_att;
@@ -204,6 +210,8 @@ struct rendering_state {
    struct util_dynarray internal_buffers;
 
    struct lvp_pipeline *exec_graph;
+
+   struct lvp_conditional_rendering_state conditional_rendering;
 
    struct {
       struct lvp_shader *compute_shader;
@@ -1216,35 +1224,28 @@ handle_descriptor_sets_cmd(struct vk_cmd_queue_entry *cmd, struct rendering_stat
    handle_descriptor_sets(bds, state);
 }
 
-static struct pipe_surface *create_img_surface_bo(struct rendering_state *state,
+static struct pipe_surface create_img_surface_bo(struct rendering_state *state,
                                                   VkImageSubresourceRange *range,
                                                   struct pipe_resource *bo,
                                                   enum pipe_format pformat,
-                                                  int width,
-                                                  int height,
                                                   int base_layer, int layer_count,
                                                   int level)
 {
    if (pformat == PIPE_FORMAT_NONE)
-      return NULL;
+      return (struct pipe_surface){0};
 
-   const struct pipe_surface template = {
+   struct pipe_surface template = {
       .format = pformat,
-      .width = width,
-      .height = height,
-      .u.tex.first_layer = range->baseArrayLayer + base_layer,
-      .u.tex.last_layer = range->baseArrayLayer + base_layer + layer_count - 1,
-      .u.tex.level = range->baseMipLevel + level,
+      .texture = bo,
+      .first_layer = range->baseArrayLayer + base_layer,
+      .last_layer = range->baseArrayLayer + base_layer + layer_count - 1,
+      .level = range->baseMipLevel + level,
    };
-
-   return state->pctx->create_surface(state->pctx,
-                                      bo, &template);
-
+   return template;
 }
-static struct pipe_surface *create_img_surface(struct rendering_state *state,
+static struct pipe_surface create_img_surface(struct rendering_state *state,
                                                struct lvp_image_view *imgv,
-                                               VkFormat format, int width,
-                                               int height,
+                                               VkFormat format,
                                                int base_layer, int layer_count)
 {
    VkImageSubresourceRange imgv_subres =
@@ -1252,23 +1253,14 @@ static struct pipe_surface *create_img_surface(struct rendering_state *state,
 
    return create_img_surface_bo(state, &imgv_subres, imgv->image->planes[0].bo,
                                 lvp_vk_format_to_pipe_format(format),
-                                width, height, base_layer, layer_count, 0);
+                                base_layer, layer_count, 0);
 }
 
 static void add_img_view_surface(struct rendering_state *state,
-                                 struct lvp_image_view *imgv, int width, int height,
+                                 struct lvp_image_view *imgv,
                                  int layer_count)
 {
-   if (imgv->surface) {
-      if ((imgv->surface->u.tex.last_layer - imgv->surface->u.tex.first_layer) != (layer_count - 1))
-         pipe_surface_reference(&imgv->surface, NULL);
-   }
-
-   if (!imgv->surface) {
-      imgv->surface = create_img_surface(state, imgv, imgv->vk.format,
-                                         width, height,
-                                         0, layer_count);
-   }
+   imgv->surface = create_img_surface(state, imgv, imgv->vk.format, 0, layer_count);
 }
 
 static bool
@@ -1293,30 +1285,27 @@ static void clear_attachment_layers(struct rendering_state *state,
                                     uint32_t sclear_val,
                                     union pipe_color_union *col_val)
 {
-   struct pipe_surface *clear_surf = create_img_surface(state,
-                                                        imgv,
-                                                        imgv->vk.format,
-                                                        state->framebuffer.width,
-                                                        state->framebuffer.height,
-                                                        base_layer,
-                                                        layer_count);
+   struct pipe_surface clear_surf = create_img_surface(state,
+                                                       imgv,
+                                                       imgv->vk.format,
+                                                       base_layer,
+                                                       layer_count);
 
    if (ds_clear_flags) {
       state->pctx->clear_depth_stencil(state->pctx,
-                                       clear_surf,
+                                       &clear_surf,
                                        ds_clear_flags,
                                        dclear_val, sclear_val,
                                        rect->offset.x, rect->offset.y,
                                        rect->extent.width, rect->extent.height,
                                        true);
    } else {
-      state->pctx->clear_render_target(state->pctx, clear_surf,
+      state->pctx->clear_render_target(state->pctx, &clear_surf,
                                        col_val,
                                        rect->offset.x, rect->offset.y,
                                        rect->extent.width, rect->extent.height,
                                        true);
    }
-   state->pctx->surface_destroy(state->pctx, clear_surf);
 }
 
 static void render_clear(struct rendering_state *state)
@@ -1333,7 +1322,6 @@ static void render_clear(struct rendering_state *state)
       color_clear_val.ui[3] = value.color.uint32[3];
 
       struct lvp_image_view *imgv = state->color_att[i].imgv;
-      assert(imgv->surface);
 
       if (state->framebuffer.viewmask) {
          u_foreach_bit(i, state->framebuffer.viewmask)
@@ -1341,7 +1329,7 @@ static void render_clear(struct rendering_state *state)
                                     i, 1, 0, 0, 0, &color_clear_val);
       } else {
          state->pctx->clear_render_target(state->pctx,
-                                          imgv->surface,
+                                          &imgv->surface,
                                           &color_clear_val,
                                           state->render_area.offset.x,
                                           state->render_area.offset.y,
@@ -1371,7 +1359,7 @@ static void render_clear(struct rendering_state *state)
                                     i, 1, ds_clear_flags, dclear_val, sclear_val, NULL);
       } else {
          state->pctx->clear_depth_stencil(state->pctx,
-                                          state->ds_imgv->surface,
+                                          &state->ds_imgv->surface,
                                           ds_clear_flags,
                                           dclear_val, sclear_val,
                                           state->render_area.offset.x,
@@ -1400,7 +1388,7 @@ static void render_clear_fast(struct rendering_state *state)
    if (state->framebuffer.viewmask)
       goto slow_clear;
 
-   if (state->render_cond)
+   if (state->conditional_rendering.enabled)
       goto slow_clear;
 
    uint32_t buffers = 0;
@@ -1453,7 +1441,6 @@ destroy_multisample_surface(struct rendering_state *state, struct lvp_image_view
    struct lvp_image_view *base = imgv->multisample;
    base->multisample = NULL;
    free((void*)imgv->image);
-   pipe_surface_reference(&imgv->surface, NULL);
    free(imgv);
    return base;
 }
@@ -1588,7 +1575,7 @@ replicate_attachment(struct rendering_state *state,
                      struct lvp_image_view *src,
                      struct lvp_image_view *dst)
 {
-   unsigned level = dst->surface->u.tex.level;
+   unsigned level = dst->surface.level;
    const struct pipe_box box = {
       .x = 0,
       .y = 0,
@@ -1606,7 +1593,7 @@ create_multisample_surface(struct rendering_state *state, struct lvp_image_view 
 {
    assert(!imgv->multisample);
 
-   struct pipe_resource templ = *imgv->surface->texture;
+   struct pipe_resource templ = *imgv->surface.texture;
    templ.nr_samples = samples;
    struct lvp_image *image = mem_dup(imgv->image, sizeof(struct lvp_image));
    image->vk.samples = samples;
@@ -1615,9 +1602,8 @@ create_multisample_surface(struct rendering_state *state, struct lvp_image_view 
 
    struct lvp_image_view *multi = mem_dup(imgv, sizeof(struct lvp_image_view));
    multi->image = image;
-   multi->surface = state->pctx->create_surface(state->pctx, image->planes[0].bo, imgv->surface);
-   struct pipe_resource *ref = image->planes[0].bo;
-   pipe_resource_reference(&ref, NULL);
+   multi->surface = imgv->surface;
+   multi->surface.texture = image->planes[0].bo;
    imgv->multisample = multi;
    multi->multisample = imgv;
    if (replicate)
@@ -1731,16 +1717,15 @@ handle_begin_rendering(struct vk_cmd_queue_entry *cmd,
       if (state->color_att[i].imgv) {
          struct lvp_image_view *imgv = state->color_att[i].imgv;
          add_img_view_surface(state, imgv,
-                              state->framebuffer.width, state->framebuffer.height,
                               state->framebuffer.layers);
          if (state->forced_sample_count && imgv->image->vk.samples == 1)
             state->color_att[i].imgv = create_multisample_surface(state, imgv, state->forced_sample_count,
                                                                   att_needs_replicate(state, imgv, state->color_att[i].load_op));
          state->framebuffer.cbufs[i] = state->color_att[i].imgv->surface;
-         assert(state->render_area.offset.x + state->render_area.extent.width <= state->framebuffer.cbufs[i]->texture->width0);
-         assert(state->render_area.offset.y + state->render_area.extent.height <= state->framebuffer.cbufs[i]->texture->height0);
+         assert(state->render_area.offset.x + state->render_area.extent.width <= state->framebuffer.cbufs[i].texture->width0);
+         assert(state->render_area.offset.y + state->render_area.extent.height <= state->framebuffer.cbufs[i].texture->height0);
       } else {
-         state->framebuffer.cbufs[i] = NULL;
+         memset(&state->framebuffer.cbufs[i], 0, sizeof(state->framebuffer.cbufs[i]));
       }
    }
 
@@ -1756,7 +1741,6 @@ handle_begin_rendering(struct vk_cmd_queue_entry *cmd,
                                                state->stencil_att.imgv;
       struct lvp_image_view *imgv = state->ds_imgv;
       add_img_view_surface(state, imgv,
-                           state->framebuffer.width, state->framebuffer.height,
                            state->framebuffer.layers);
       if (state->forced_sample_count && imgv->image->vk.samples == 1) {
          VkAttachmentLoadOp load_op;
@@ -1772,11 +1756,11 @@ handle_begin_rendering(struct vk_cmd_queue_entry *cmd,
                                                      att_needs_replicate(state, imgv, load_op));
       }
       state->framebuffer.zsbuf = state->ds_imgv->surface;
-      assert(state->render_area.offset.x + state->render_area.extent.width <= state->framebuffer.zsbuf->texture->width0);
-      assert(state->render_area.offset.y + state->render_area.extent.height <= state->framebuffer.zsbuf->texture->height0);
+      assert(state->render_area.offset.x + state->render_area.extent.width <= state->framebuffer.zsbuf.texture->width0);
+      assert(state->render_area.offset.y + state->render_area.extent.height <= state->framebuffer.zsbuf.texture->height0);
    } else {
       state->ds_imgv = NULL;
-      state->framebuffer.zsbuf = NULL;
+      memset(&state->framebuffer.zsbuf, 0, sizeof(state->framebuffer.zsbuf));
    }
 
    state->pctx->set_framebuffer_state(state->pctx,
@@ -1795,6 +1779,12 @@ static void handle_end_rendering(struct vk_cmd_queue_entry *cmd,
    if (!state->poison_mem)
       return;
 
+   /* ensure that textures are correctly framebuffer-referenced in llvmpipe */
+   if (state->fb_remapped) {
+      state->fb_remapped = false;
+      emit_fb_state(state);
+   }
+
    union pipe_color_union color_clear_val;
    memset(color_clear_val.ui, rand() % UINT8_MAX, sizeof(color_clear_val.ui));
 
@@ -1806,7 +1796,7 @@ static void handle_end_rendering(struct vk_cmd_queue_entry *cmd,
                                        i, 1, 0, 0, 0, &color_clear_val);
          } else {
             state->pctx->clear_render_target(state->pctx,
-                                             state->color_att[i].imgv->surface,
+                                             &state->color_att[i].imgv->surface,
                                              &color_clear_val,
                                              state->render_area.offset.x,
                                              state->render_area.offset.y,
@@ -1830,7 +1820,7 @@ static void handle_end_rendering(struct vk_cmd_queue_entry *cmd,
                                     i, 1, ds_clear_flags, dclear_val, sclear_val, NULL);
       } else {
          state->pctx->clear_depth_stencil(state->pctx,
-                                          state->ds_imgv->surface,
+                                          &state->ds_imgv->surface,
                                           ds_clear_flags,
                                           dclear_val, sclear_val,
                                           state->render_area.offset.x,
@@ -2965,14 +2955,18 @@ static void handle_copy_query_pool_results(struct vk_cmd_queue_entry *cmd,
          uint8_t *map = pipe_buffer_map(state->pctx, lvp_buffer_from_handle(copycmd->dst_buffer)->bo, PIPE_MAP_WRITE, &transfer);
          map += offset;
 
-         if (flags & VK_QUERY_RESULT_64_BIT) {
+         if (copycmd->flags & VK_QUERY_RESULT_64_BIT) {
             uint64_t *dst = (uint64_t *)map;
             uint64_t *src = (uint64_t *)pool->data;
             *dst = src[i];
+            if (copycmd->flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT)
+               *(dst + 1) = 1;
          } else {
             uint32_t *dst = (uint32_t *)map;
             uint64_t *src = (uint64_t *)pool->data;
             *dst = (uint32_t) (src[i] & UINT32_MAX);
+            if (copycmd->flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT)
+               *(dst + 1) = 1;
          }
 
          state->pctx->buffer_unmap(state->pctx, transfer);
@@ -3040,9 +3034,15 @@ static void handle_clear_color_image(struct vk_cmd_queue_entry *cmd,
                                      struct rendering_state *state)
 {
    LVP_FROM_HANDLE(lvp_image, image, cmd->u.clear_color_image.image);
+
+   enum pipe_format format = image->planes[0].bo->format;
+   const struct util_format_description *desc = util_format_description(format);
+   if (util_format_is_int64(desc))
+      format = util_format_get_array(desc->channel[0].type, 32, desc->nr_channels * 2, false, true);
+
    union util_color uc;
    uint32_t *col_val = uc.ui;
-   util_pack_color_union(image->planes[0].bo->format, &uc, (void*)cmd->u.clear_color_image.color);
+   util_pack_color_union(format, &uc, (void*)cmd->u.clear_color_image.color);
    for (unsigned i = 0; i < cmd->u.clear_color_image.range_count; i++) {
       VkImageSubresourceRange *range = &cmd->u.clear_color_image.ranges[i];
       struct pipe_box box;
@@ -3086,7 +3086,7 @@ static void handle_clear_ds_image(struct vk_cmd_queue_entry *cmd,
 
       uint32_t level_count = vk_image_subresource_level_count(&image->vk, range);
       for (unsigned j = 0; j < level_count; j++) {
-         struct pipe_surface *surf;
+         struct pipe_surface surf;
          unsigned width, height, depth;
          width = u_minify(image->planes[0].bo->width0, range->baseMipLevel + j);
          height = u_minify(image->planes[0].bo->height0, range->baseMipLevel + j);
@@ -3099,17 +3099,15 @@ static void handle_clear_ds_image(struct vk_cmd_queue_entry *cmd,
 
          surf = create_img_surface_bo(state, range,
                                       image->planes[0].bo, image->planes[0].bo->format,
-                                      width, height,
                                       0, depth, j);
 
          state->pctx->clear_depth_stencil(state->pctx,
-                                          surf,
+                                          &surf,
                                           ds_clear_flags,
                                           cmd->u.clear_depth_stencil_image.depth_stencil->depth,
                                           cmd->u.clear_depth_stencil_image.depth_stencil->stencil,
                                           0, 0,
                                           width, height, false);
-         state->pctx->surface_destroy(state->pctx, surf);
       }
    }
 }
@@ -3393,6 +3391,7 @@ static void handle_draw_indirect_byte_count(struct vk_cmd_queue_entry *cmd,
                     dibc->counter_buffer_offset,
                     4, &draw.count);
 
+   draw.count -= dibc->counter_offset;
    state->info.start_instance = cmd->u.draw_indirect_byte_count_ext.first_instance;
    state->info.instance_count = cmd->u.draw_indirect_byte_count_ext.instance_count;
    state->info.index_size = 0;
@@ -3401,21 +3400,35 @@ static void handle_draw_indirect_byte_count(struct vk_cmd_queue_entry *cmd,
    state->pctx->draw_vbo(state->pctx, &state->info, 0, NULL, &draw, 1);
 }
 
+static void
+lvp_emit_conditional_rendering(struct rendering_state *state)
+{
+   if (state->conditional_rendering.enabled) {
+      state->pctx->render_condition_mem(
+         state->pctx,
+         state->conditional_rendering.buffer,
+         state->conditional_rendering.offset,
+         state->conditional_rendering.condition);
+   } else {
+      state->pctx->render_condition_mem(state->pctx, NULL, 0, false);
+   }
+}
+
 static void handle_begin_conditional_rendering(struct vk_cmd_queue_entry *cmd,
                                                struct rendering_state *state)
 {
    struct VkConditionalRenderingBeginInfoEXT *bcr = cmd->u.begin_conditional_rendering_ext.conditional_rendering_begin;
-   state->render_cond = true;
-   state->pctx->render_condition_mem(state->pctx,
-                                     lvp_buffer_from_handle(bcr->buffer)->bo,
-                                     bcr->offset,
-                                     bcr->flags & VK_CONDITIONAL_RENDERING_INVERTED_BIT_EXT);
+   state->conditional_rendering.buffer = lvp_buffer_from_handle(bcr->buffer)->bo;
+   state->conditional_rendering.offset = bcr->offset;
+   state->conditional_rendering.condition = bcr->flags & VK_CONDITIONAL_RENDERING_INVERTED_BIT_EXT;
+   state->conditional_rendering.enabled = true;
+   lvp_emit_conditional_rendering(state);
 }
 
 static void handle_end_conditional_rendering(struct rendering_state *state)
 {
-   state->render_cond = false;
-   state->pctx->render_condition_mem(state->pctx, NULL, 0, false);
+   state->conditional_rendering.enabled = false;
+   lvp_emit_conditional_rendering(state);
 }
 
 static void handle_set_vertex_input(struct vk_cmd_queue_entry *cmd,
@@ -4442,9 +4455,12 @@ handle_copy_acceleration_structure(struct vk_cmd_queue_entry *cmd, struct render
 
    struct pipe_box box = { 0 };
    u_box_1d(src->offset, MIN2(src->size, dst->size), &box);
-   state->pctx->resource_copy_region(state->pctx, lvp_buffer_from_handle(dst->buffer)->bo, 0,
+   state->pctx->resource_copy_region(state->pctx,
+                                     lvp_buffer_from_handle(
+                                        vk_buffer_to_handle(dst->buffer))->bo, 0,
                                      dst->offset, 0, 0,
-                                     lvp_buffer_from_handle(src->buffer)->bo, 0, &box);
+                                     lvp_buffer_from_handle(
+                                        vk_buffer_to_handle(src->buffer))->bo, 0, &box);
 }
 
 static void
@@ -4529,8 +4545,10 @@ handle_write_acceleration_structures_properties(struct vk_cmd_queue_entry *cmd, 
    }
 }
 
-static void emit_ray_tracing_state(struct rendering_state *state)
+static void
+lvp_trace_rays(struct rendering_state *state, VkTraceRaysIndirectCommand2KHR *command)
 {
+   /* Emit ray tracing state. */
    bool pcbuf_dirty = state->pcbuf_dirty[MESA_SHADER_RAYGEN];
    if (pcbuf_dirty)
       update_pcbuf(state, MESA_SHADER_COMPUTE, MESA_SHADER_RAYGEN);
@@ -4547,14 +4565,32 @@ static void emit_ray_tracing_state(struct rendering_state *state)
    state->pcbuf_dirty[MESA_SHADER_COMPUTE] = true;
    state->constbuf_dirty[MESA_SHADER_COMPUTE] = true;
    state->compute_shader_dirty = true;
+
+   /* Dispatch. The spec states that conditional rendering only affects compute dispatches
+    * so ray tracing dispatches have to suspend it.
+    */
+   state->trace_rays_info.grid[0] = DIV_ROUND_UP(command->width, state->trace_rays_info.block[0]);
+   state->trace_rays_info.grid[1] = DIV_ROUND_UP(command->height, state->trace_rays_info.block[1]);
+   state->trace_rays_info.grid[2] = DIV_ROUND_UP(command->depth, state->trace_rays_info.block[2]);
+
+   bool conditional_rendering_enabled = state->conditional_rendering.enabled;
+   if (conditional_rendering_enabled) {
+      state->conditional_rendering.enabled = false;
+      lvp_emit_conditional_rendering(state);
+   }
+
+   state->pctx->launch_grid(state->pctx, &state->trace_rays_info);
+
+   if (conditional_rendering_enabled) {
+      state->conditional_rendering.enabled = true;
+      lvp_emit_conditional_rendering(state);
+   }
 }
 
 static void
 handle_trace_rays(struct vk_cmd_queue_entry *cmd, struct rendering_state *state)
 {
    struct vk_cmd_trace_rays_khr *trace = &cmd->u.trace_rays_khr;
-
-   emit_ray_tracing_state(state);
 
    VkTraceRaysIndirectCommand2KHR *command = lvp_push_internal_buffer(
       state, MESA_SHADER_COMPUTE, sizeof(VkTraceRaysIndirectCommand2KHR));
@@ -4576,19 +4612,13 @@ handle_trace_rays(struct vk_cmd_queue_entry *cmd, struct rendering_state *state)
       .depth = trace->depth,
    };
 
-   state->trace_rays_info.grid[0] = DIV_ROUND_UP(trace->width, state->trace_rays_info.block[0]);
-   state->trace_rays_info.grid[1] = DIV_ROUND_UP(trace->height, state->trace_rays_info.block[1]);
-   state->trace_rays_info.grid[2] = DIV_ROUND_UP(trace->depth, state->trace_rays_info.block[2]);
-
-   state->pctx->launch_grid(state->pctx, &state->trace_rays_info);
+   lvp_trace_rays(state, command);
 }
 
 static void
 handle_trace_rays_indirect(struct vk_cmd_queue_entry *cmd, struct rendering_state *state)
 {
    struct vk_cmd_trace_rays_indirect_khr *trace = &cmd->u.trace_rays_indirect_khr;
-
-   emit_ray_tracing_state(state);
 
    size_t indirect_offset;
    VkBuffer _indirect = get_buffer(state, (void *)(uintptr_t)trace->indirect_device_address, &indirect_offset);
@@ -4619,21 +4649,15 @@ handle_trace_rays_indirect(struct vk_cmd_queue_entry *cmd, struct rendering_stat
       .depth = src->depth,
    };
 
-   state->trace_rays_info.grid[0] = DIV_ROUND_UP(src->width, state->trace_rays_info.block[0]);
-   state->trace_rays_info.grid[1] = DIV_ROUND_UP(src->height, state->trace_rays_info.block[1]);
-   state->trace_rays_info.grid[2] = DIV_ROUND_UP(src->depth, state->trace_rays_info.block[2]);
-
    state->pctx->buffer_unmap(state->pctx, transfer);
 
-   state->pctx->launch_grid(state->pctx, &state->trace_rays_info);
+   lvp_trace_rays(state, command);
 }
 
 static void
 handle_trace_rays_indirect2(struct vk_cmd_queue_entry *cmd, struct rendering_state *state)
 {
    struct vk_cmd_trace_rays_indirect2_khr *trace = &cmd->u.trace_rays_indirect2_khr;
-
-   emit_ray_tracing_state(state);
 
    size_t indirect_offset;
    VkBuffer _indirect = get_buffer(state, (void *)(uintptr_t)trace->indirect_device_address, &indirect_offset);
@@ -4648,13 +4672,9 @@ handle_trace_rays_indirect2(struct vk_cmd_queue_entry *cmd, struct rendering_sta
       state, MESA_SHADER_COMPUTE, sizeof(VkTraceRaysIndirectCommand2KHR));
    *command = *src;
 
-   state->trace_rays_info.grid[0] = DIV_ROUND_UP(src->width, state->trace_rays_info.block[0]);
-   state->trace_rays_info.grid[1] = DIV_ROUND_UP(src->height, state->trace_rays_info.block[1]);
-   state->trace_rays_info.grid[2] = DIV_ROUND_UP(src->depth, state->trace_rays_info.block[2]);
-
    state->pctx->buffer_unmap(state->pctx, transfer);
 
-   state->pctx->launch_grid(state->pctx, &state->trace_rays_info);
+   lvp_trace_rays(state, command);
 }
 
 static void

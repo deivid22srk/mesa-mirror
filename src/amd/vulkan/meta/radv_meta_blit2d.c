@@ -10,7 +10,6 @@
 #include "nir/radv_meta_nir.h"
 #include "radv_entrypoints.h"
 #include "radv_meta.h"
-#include "vk_common_entrypoints.h"
 #include "vk_format.h"
 #include "vk_shader_module.h"
 
@@ -81,14 +80,31 @@ blit2d_bind_src(struct radv_cmd_buffer *cmd_buffer, VkPipelineLayout layout, str
                   .format = depth_format ? depth_format : src_buf->format},
          }});
 
-      vk_common_CmdPushConstants(radv_cmd_buffer_to_handle(cmd_buffer), layout, VK_SHADER_STAGE_FRAGMENT_BIT, 16, 4,
-                                 &src_buf->pitch);
+      const VkPushConstantsInfoKHR pc_info = {
+         .sType = VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO_KHR,
+         .layout = layout,
+         .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+         .offset = 16,
+         .size = 4,
+         .pValues = &src_buf->pitch,
+      };
+
+      radv_CmdPushConstants2(radv_cmd_buffer_to_handle(cmd_buffer), &pc_info);
    } else {
       create_iview(cmd_buffer, src_img, &tmp->iview, depth_format, aspects);
 
-      if (src_type == BLIT2D_SRC_TYPE_IMAGE_3D)
-         vk_common_CmdPushConstants(radv_cmd_buffer_to_handle(cmd_buffer), layout, VK_SHADER_STAGE_FRAGMENT_BIT, 16, 4,
-                                    &src_img->layer);
+      if (src_type == BLIT2D_SRC_TYPE_IMAGE_3D) {
+         const VkPushConstantsInfoKHR pc_info = {
+            .sType = VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO_KHR,
+            .layout = layout,
+            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+            .offset = 16,
+            .size = 4,
+            .pValues = &src_img->layer,
+         };
+
+         radv_CmdPushConstants2(radv_cmd_buffer_to_handle(cmd_buffer), &pc_info);
+      }
 
       radv_meta_bind_descriptors(cmd_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 1,
                                  (VkDescriptorGetInfoEXT[]){{.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT,
@@ -143,11 +159,21 @@ radv_meta_blit2d_normal_dst(struct radv_cmd_buffer *cmd_buffer, struct radv_meta
          if (vk_format_is_color(src_img->image->vk.format) && vk_format_is_depth_or_stencil(dst->image->vk.format)) {
             assert(src_img->aspect_mask == VK_IMAGE_ASPECT_COLOR_BIT);
             src_aspect_mask = src_img->aspect_mask;
+         } else if (vk_format_is_depth_or_stencil(src_img->image->vk.format) &&
+                    vk_format_is_color(dst->image->vk.format)) {
+            if (src_img->aspect_mask == VK_IMAGE_ASPECT_STENCIL_BIT) {
+               depth_format = vk_format_stencil_only(src_img->image->vk.format);
+            } else {
+               assert(src_img->aspect_mask == VK_IMAGE_ASPECT_DEPTH_BIT);
+               depth_format = vk_format_depth_only(src_img->image->vk.format);
+            }
          }
       }
 
       struct radv_image_view dst_iview;
-      create_iview(cmd_buffer, dst, &dst_iview, depth_format, aspect_mask);
+      create_iview(cmd_buffer, dst, &dst_iview,
+                   aspect_mask & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) ? depth_format : 0,
+                   aspect_mask);
 
       const VkRenderingAttachmentInfo att_info = {
          .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
@@ -213,8 +239,16 @@ radv_meta_blit2d_normal_dst(struct radv_cmd_buffer *cmd_buffer, struct radv_meta
          rect->src_y + rect->height,
       };
 
-      vk_common_CmdPushConstants(radv_cmd_buffer_to_handle(cmd_buffer), layout, VK_SHADER_STAGE_VERTEX_BIT, 0, 16,
-                                 vertex_push_constants);
+      const VkPushConstantsInfoKHR pc_info = {
+         .sType = VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO_KHR,
+         .layout = layout,
+         .stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
+         .offset = 0,
+         .size = sizeof(vertex_push_constants),
+         .pValues = vertex_push_constants,
+      };
+
+      radv_CmdPushConstants2(radv_cmd_buffer_to_handle(cmd_buffer), &pc_info);
 
       struct blit2d_src_temps src_temps;
       blit2d_bind_src(cmd_buffer, layout, src_img, src_buf, &src_temps, src_type,

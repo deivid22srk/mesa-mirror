@@ -715,7 +715,7 @@ glXGetDriverConfig(const char *driverName)
    if (!e)
       goto out;
 
-   e->config = pipe_loader_get_driinfo_xml(driverName);
+   e->config = driGetDriInfoXML(driverName);
    e->driverName = strdup(driverName);
    if (!e->config || !e->driverName) {
       free(e->config);
@@ -760,10 +760,6 @@ const __DRIbackgroundCallableExtension driBackgroundCallable = {
 
    .setBackgroundContext    = driSetBackgroundContext,
    .isThreadSafe            = driIsThreadSafe,
-};
-
-const __DRIuseInvalidateExtension dri2UseInvalidate = {
-   .base = { __DRI_USE_INVALIDATE, 1 }
 };
 
 Bool

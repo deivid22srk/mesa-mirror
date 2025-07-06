@@ -43,8 +43,15 @@ begin_debug_marker(VkCommandBuffer commandBuffer,
       step;
    switch (step) {
    case VK_ACCELERATION_STRUCTURE_BUILD_STEP_TOP:
+   {
+      va_list args;
+      va_start(args, format);
+      cmd_buffer->state.rt.num_tlas = va_arg(args, uint32_t);
+      cmd_buffer->state.rt.num_blas = va_arg(args, uint32_t);
+      va_end(args);
       trace_intel_begin_as_build(&cmd_buffer->trace);
       break;
+   }
    case VK_ACCELERATION_STRUCTURE_BUILD_STEP_BUILD_LEAVES:
       trace_intel_begin_as_build_leaves(&cmd_buffer->trace);
       break;
@@ -61,8 +68,15 @@ begin_debug_marker(VkCommandBuffer commandBuffer,
       trace_intel_begin_as_ploc_build_internal(&cmd_buffer->trace);
       break;
    case VK_ACCELERATION_STRUCTURE_BUILD_STEP_ENCODE:
+   {
+      va_list args;
+      va_start(args, format);
+      cmd_buffer->state.rt.num_leaves = va_arg(args, uint32_t);
+      cmd_buffer->state.rt.num_ir_nodes = va_arg(args, uint32_t);
+      va_end(args);
       trace_intel_begin_as_encode(&cmd_buffer->trace);
       break;
+   }
    default:
       unreachable("Invalid build step");
    }
@@ -72,39 +86,31 @@ static void
 end_debug_marker(VkCommandBuffer commandBuffer)
 {
    ANV_FROM_HANDLE(anv_cmd_buffer, cmd_buffer, commandBuffer);
-   struct anv_cmd_compute_state *comp_state = &cmd_buffer->state.compute;
-   struct anv_compute_pipeline *pipeline =
-      anv_pipeline_to_compute(comp_state->base.pipeline);
 
    cmd_buffer->state.rt.debug_marker_count--;
    switch (cmd_buffer->state.rt.debug_markers[cmd_buffer->state.rt.debug_marker_count]) {
    case VK_ACCELERATION_STRUCTURE_BUILD_STEP_TOP:
       trace_intel_end_as_build(&cmd_buffer->trace,
-                               pipeline->source_hash);
+                               cmd_buffer->state.rt.num_tlas,
+                               cmd_buffer->state.rt.num_blas);
       break;
    case VK_ACCELERATION_STRUCTURE_BUILD_STEP_BUILD_LEAVES:
-      trace_intel_end_as_build_leaves(&cmd_buffer->trace,
-                                      pipeline->source_hash);
+      trace_intel_end_as_build_leaves(&cmd_buffer->trace);
       break;
    case VK_ACCELERATION_STRUCTURE_BUILD_STEP_MORTON_GENERATE:
-      trace_intel_end_as_morton_generate(&cmd_buffer->trace,
-                                         pipeline->source_hash);
+      trace_intel_end_as_morton_generate(&cmd_buffer->trace);
       break;
    case VK_ACCELERATION_STRUCTURE_BUILD_STEP_MORTON_SORT:
-      trace_intel_end_as_morton_sort(&cmd_buffer->trace,
-                                     pipeline->source_hash);
+      trace_intel_end_as_morton_sort(&cmd_buffer->trace);
       break;
    case VK_ACCELERATION_STRUCTURE_BUILD_STEP_LBVH_BUILD_INTERNAL:
-      trace_intel_end_as_lbvh_build_internal(&cmd_buffer->trace,
-                                             pipeline->source_hash);
+      trace_intel_end_as_lbvh_build_internal(&cmd_buffer->trace);
       break;
    case VK_ACCELERATION_STRUCTURE_BUILD_STEP_PLOC_BUILD_INTERNAL:
-      trace_intel_end_as_ploc_build_internal(&cmd_buffer->trace,
-                                             pipeline->source_hash);
+      trace_intel_end_as_ploc_build_internal(&cmd_buffer->trace);
       break;
    case VK_ACCELERATION_STRUCTURE_BUILD_STEP_ENCODE:
-      trace_intel_end_as_encode(&cmd_buffer->trace,
-                                pipeline->source_hash);
+      trace_intel_end_as_encode(&cmd_buffer->trace, cmd_buffer->state.rt.num_leaves, cmd_buffer->state.rt.num_ir_nodes);
       break;
    default:
       unreachable("Invalid build step");
@@ -223,16 +229,23 @@ debug_record_as_to_bvh_dump(struct anv_cmd_buffer *cmd_buffer,
    }
 }
 
+#define STRINGIFY_HELPER(x) #x
+#define STRINGIFY(x) STRINGIFY_HELPER(x)
+
+#define ENCODE_SPV_PATH STRINGIFY(bvh/genX(encode).spv.h)
+#define HEADER_SPV_PATH STRINGIFY(bvh/genX(header).spv.h)
+#define COPY_SPV_PATH STRINGIFY(bvh/genX(copy).spv.h)
+
 static const uint32_t encode_spv[] = {
-#include "bvh/encode.spv.h"
+#include ENCODE_SPV_PATH
 };
 
 static const uint32_t header_spv[] = {
-#include "bvh/header.spv.h"
+#include HEADER_SPV_PATH
 };
 
 static const uint32_t copy_spv[] = {
-#include "bvh/copy.spv.h"
+#include COPY_SPV_PATH
 };
 
 static VkResult
@@ -334,24 +347,21 @@ get_bvh_layout(VkGeometryTypeKHR geometry_type, uint32_t leaf_count,
 }
 
 static VkDeviceSize
-anv_get_as_size(VkDevice device,
-                const VkAccelerationStructureBuildGeometryInfoKHR *pBuildInfo,
-                uint32_t leaf_count)
+anv_get_as_size(VkDevice device, const struct vk_acceleration_structure_build_state *state)
 {
    struct bvh_layout layout;
-   get_bvh_layout(vk_get_as_geometry_type(pBuildInfo), leaf_count, &layout);
+   get_bvh_layout(vk_get_as_geometry_type(state->build_info), state->leaf_node_count, &layout);
    return layout.size;
 }
 
-static uint32_t
-anv_get_encode_key(VkAccelerationStructureTypeKHR type,
-                   VkBuildAccelerationStructureFlagBitsKHR flags)
+static void
+anv_get_build_config(VkDevice device, struct vk_acceleration_structure_build_state *state)
 {
-   return 0;
+   state->config.encode_key[1] = (state->build_info->flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT_KHR) ? 1 : 0;
 }
 
 static VkResult
-anv_encode_bind_pipeline(VkCommandBuffer commandBuffer, uint32_t key)
+anv_encode_bind_pipeline(VkCommandBuffer commandBuffer, const struct vk_acceleration_structure_build_state *state)
 {
    VK_FROM_HANDLE(anv_cmd_buffer, cmd_buffer, commandBuffer);
    struct anv_device *device = cmd_buffer->device;
@@ -372,21 +382,19 @@ anv_encode_bind_pipeline(VkCommandBuffer commandBuffer, uint32_t key)
 }
 
 static void
-anv_encode_as(VkCommandBuffer commandBuffer,
-              const VkAccelerationStructureBuildGeometryInfoKHR *build_info,
-              const VkAccelerationStructureBuildRangeInfoKHR *build_range_infos,
-              VkDeviceAddress intermediate_as_addr,
-              VkDeviceAddress intermediate_header_addr, uint32_t leaf_count,
-              uint32_t key,
-              struct vk_acceleration_structure *dst)
+anv_encode_as(VkCommandBuffer commandBuffer, const struct vk_acceleration_structure_build_state *state)
 {
    if (INTEL_DEBUG(DEBUG_BVH_NO_BUILD))
       return;
 
    VK_FROM_HANDLE(anv_cmd_buffer, cmd_buffer, commandBuffer);
+   VK_FROM_HANDLE(vk_acceleration_structure, dst, state->build_info->dstAccelerationStructure);
    struct anv_device *device = cmd_buffer->device;
 
-   VkGeometryTypeKHR geometry_type = vk_get_as_geometry_type(build_info);
+   uint64_t intermediate_header_addr = state->build_info->scratchData.deviceAddress + state->scratch.header_offset;
+   uint64_t intermediate_bvh_addr = state->build_info->scratchData.deviceAddress + state->scratch.ir_offset;
+
+   VkGeometryTypeKHR geometry_type = vk_get_as_geometry_type(state->build_info);
 
    VkPipeline pipeline;
    VkPipelineLayout layout;
@@ -400,15 +408,15 @@ anv_encode_as(VkCommandBuffer commandBuffer,
    STATIC_ASSERT(sizeof(struct anv_internal_node) == ANV_RT_INTERNAL_NODE_SIZE);
 
    struct bvh_layout bvh_layout;
-   get_bvh_layout(geometry_type, leaf_count, &bvh_layout);
+   get_bvh_layout(geometry_type, state->leaf_node_count, &bvh_layout);
 
    const struct encode_args args = {
-      .intermediate_bvh = intermediate_as_addr,
+      .intermediate_bvh = intermediate_bvh_addr,
       .output_bvh = vk_acceleration_structure_get_va(dst) +
                     bvh_layout.bvh_offset,
       .header = intermediate_header_addr,
       .output_bvh_offset = bvh_layout.bvh_offset,
-      .leaf_node_count = leaf_count,
+      .leaf_node_count = state->leaf_node_count,
       .geometry_type = geometry_type,
    };
 
@@ -430,20 +438,12 @@ anv_encode_as(VkCommandBuffer commandBuffer,
       (cmd_buffer, indirect_addr, true /* is_unaligned_size_x */);
 }
 
-static uint32_t
-anv_get_header_key(VkAccelerationStructureTypeKHR type,
-                   VkBuildAccelerationStructureFlagBitsKHR flags)
-{
-   return (flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT_KHR) ?
-           1 : 0;
-}
-
 static VkResult
-anv_init_header_bind_pipeline(VkCommandBuffer commandBuffer, uint32_t key)
+anv_init_header_bind_pipeline(VkCommandBuffer commandBuffer, const struct vk_acceleration_structure_build_state *state)
 {
    VK_FROM_HANDLE(anv_cmd_buffer, cmd_buffer, commandBuffer);
 
-   if (key == 1) {
+   if (state->config.encode_key[1] == 1) {
       VkPipeline pipeline;
       VkPipelineLayout layout;
       VkResult result = get_pipeline_spv(cmd_buffer->device, "header",
@@ -461,21 +461,19 @@ anv_init_header_bind_pipeline(VkCommandBuffer commandBuffer, uint32_t key)
 }
 
 static void
-anv_init_header(VkCommandBuffer commandBuffer,
-                const VkAccelerationStructureBuildGeometryInfoKHR *build_info,
-                const VkAccelerationStructureBuildRangeInfoKHR *build_range_infos,
-                VkDeviceAddress intermediate_as_addr,
-                VkDeviceAddress intermediate_header_addr, uint32_t leaf_count,
-                uint32_t key,
-                struct vk_acceleration_structure *dst)
+anv_init_header(VkCommandBuffer commandBuffer, const struct vk_acceleration_structure_build_state *state)
 {
    VK_FROM_HANDLE(anv_cmd_buffer, cmd_buffer, commandBuffer);
+   VK_FROM_HANDLE(vk_acceleration_structure, dst, state->build_info->dstAccelerationStructure);
    struct anv_device *device = cmd_buffer->device;
 
-   VkGeometryTypeKHR geometry_type = vk_get_as_geometry_type(build_info);
+   uint64_t intermediate_header_addr = state->build_info->scratchData.deviceAddress + state->scratch.header_offset;
+   uint64_t intermediate_bvh_addr = state->build_info->scratchData.deviceAddress + state->scratch.ir_offset;
+
+   VkGeometryTypeKHR geometry_type = vk_get_as_geometry_type(state->build_info);
 
    struct bvh_layout bvh_layout;
-   get_bvh_layout(geometry_type, leaf_count, &bvh_layout);
+   get_bvh_layout(geometry_type, state->leaf_node_count, &bvh_layout);
 
    VkDeviceAddress header_addr = vk_acceleration_structure_get_va(dst);
 
@@ -483,9 +481,9 @@ anv_init_header(VkCommandBuffer commandBuffer,
                                  copy_dispatch_size);
 
    uint32_t instance_count = geometry_type == VK_GEOMETRY_TYPE_INSTANCES_KHR ?
-                             leaf_count : 0;
+                             state->leaf_node_count : 0;
 
-   if (key == 1) {
+   if (state->config.encode_key[1] == 1) {
       /* Add a barrier to ensure the writes from encode.comp is ready to be
        * read by header.comp
        */
@@ -545,17 +543,22 @@ anv_init_header(VkCommandBuffer commandBuffer,
 
       header.size = header.compacted_size;
 
+#if GFX_VERx10 >= 300
+      header.enable_64b_rt = 1;
+#else
+      header.enable_64b_rt = 0;
+#endif
+
       size_t header_size = sizeof(struct anv_accel_struct_header) - base;
       assert(base % sizeof(uint32_t) == 0);
       assert(header_size % sizeof(uint32_t) == 0);
       uint32_t *header_ptr = (uint32_t *)((char *)&header + base);
 
       struct anv_address addr = anv_address_from_u64(header_addr + base);
-      anv_cmd_buffer_update_addr(cmd_buffer, addr, 0, header_size,
-                                 header_ptr, false);
+      anv_cmd_buffer_update_addr(cmd_buffer, addr, header_size, header_ptr);
    }
 
-   if (INTEL_DEBUG(DEBUG_BVH_ANY)) {
+   if (INTEL_DEBUG_BVH_ANY) {
       genx_batch_emit_pipe_control(&cmd_buffer->batch, cmd_buffer->device->info,
                                    cmd_buffer->state.current_pipeline,
                                    ANV_PIPE_END_OF_PIPE_SYNC_BIT |
@@ -563,8 +566,8 @@ anv_init_header(VkCommandBuffer commandBuffer,
                                    ANV_PIPE_HDC_PIPELINE_FLUSH_BIT |
                                    ANV_PIPE_UNTYPED_DATAPORT_CACHE_FLUSH_BIT);
       debug_record_as_to_bvh_dump(cmd_buffer, header_addr, bvh_layout.size,
-                                  intermediate_header_addr, intermediate_as_addr,
-                                  leaf_count, geometry_type);
+                                  intermediate_header_addr, intermediate_bvh_addr,
+                                  state->leaf_node_count, geometry_type);
    }
 }
 
@@ -572,7 +575,7 @@ static const struct vk_acceleration_structure_build_ops anv_build_ops = {
    .begin_debug_marker = begin_debug_marker,
    .end_debug_marker = end_debug_marker,
    .get_as_size = anv_get_as_size,
-   .get_encode_key = { anv_get_encode_key, anv_get_header_key },
+   .get_build_config = anv_get_build_config,
    .encode_bind_pipeline = { anv_encode_bind_pipeline,
                              anv_init_header_bind_pipeline },
    .encode_as = { anv_encode_as, anv_init_header },
@@ -723,10 +726,6 @@ genX(CmdCopyAccelerationStructureKHR)(
       return;
    }
 
-   ANV_FROM_HANDLE(anv_pipeline, anv_pipeline, pipeline);
-   struct anv_compute_pipeline *compute_pipeline =
-      anv_pipeline_to_compute(anv_pipeline);
-
    struct anv_cmd_saved_state saved;
    anv_cmd_buffer_save_state(cmd_buffer,
                              ANV_CMD_SAVED_STATE_COMPUTE_PIPELINE |
@@ -763,14 +762,13 @@ genX(CmdCopyAccelerationStructureKHR)(
    }
 
    anv_genX(cmd_buffer->device->info, CmdDispatchIndirect)(
-      commandBuffer, src->buffer,
+      commandBuffer, vk_buffer_to_handle(src->buffer),
       src->offset + offsetof(struct anv_accel_struct_header,
                              copy_dispatch_size));
 
    anv_cmd_buffer_restore_state(cmd_buffer, &saved);
 
-   trace_intel_end_as_copy(&cmd_buffer->trace,
-                           compute_pipeline->source_hash);
+   trace_intel_end_as_copy(&cmd_buffer->trace);
 }
 
 void
@@ -794,10 +792,6 @@ genX(CmdCopyAccelerationStructureToMemoryKHR)(
       vk_command_buffer_set_error(&cmd_buffer->vk, result);
       return;
    }
-
-   ANV_FROM_HANDLE(anv_pipeline, anv_pipeline, pipeline);
-   struct anv_compute_pipeline *compute_pipeline =
-      anv_pipeline_to_compute(anv_pipeline);
 
    struct anv_cmd_saved_state saved;
    anv_cmd_buffer_save_state(cmd_buffer,
@@ -839,14 +833,13 @@ genX(CmdCopyAccelerationStructureToMemoryKHR)(
    }
 
    anv_genX(device->info, CmdDispatchIndirect)(
-      commandBuffer, src->buffer,
+      commandBuffer, vk_buffer_to_handle(src->buffer),
       src->offset + offsetof(struct anv_accel_struct_header,
                              copy_dispatch_size));
 
    anv_cmd_buffer_restore_state(cmd_buffer, &saved);
 
-   trace_intel_end_as_copy(&cmd_buffer->trace,
-                           compute_pipeline->source_hash);
+   trace_intel_end_as_copy(&cmd_buffer->trace);
 }
 
 void
@@ -869,10 +862,6 @@ genX(CmdCopyMemoryToAccelerationStructureKHR)(
       vk_command_buffer_set_error(&cmd_buffer->vk, result);
       return;
    }
-
-   ANV_FROM_HANDLE(anv_pipeline, anv_pipeline, pipeline);
-   struct anv_compute_pipeline *compute_pipeline =
-      anv_pipeline_to_compute(anv_pipeline);
 
    struct anv_cmd_saved_state saved;
    anv_cmd_buffer_save_state(cmd_buffer,
@@ -903,8 +892,7 @@ genX(CmdCopyMemoryToAccelerationStructureKHR)(
    vk_common_CmdDispatch(commandBuffer, 512, 1, 1);
    anv_cmd_buffer_restore_state(cmd_buffer, &saved);
 
-   trace_intel_end_as_copy(&cmd_buffer->trace,
-                           compute_pipeline->source_hash);
+   trace_intel_end_as_copy(&cmd_buffer->trace);
 }
 
 void

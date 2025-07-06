@@ -1399,15 +1399,18 @@ do_copy(lower_context* ctx, Builder& bld, const copy_operation& copy, bool* pres
 }
 
 void
+swap_bytes_bperm(Builder& bld, Definition def, Operand op)
+{
+   assert(def.physReg().reg() == op.physReg().reg());
+   uint8_t swiz[] = {4, 5, 6, 7};
+   std::swap(swiz[def.physReg().byte()], swiz[op.physReg().byte()]);
+   create_bperm(bld, swiz, def, Operand::zero());
+}
+
+void
 swap_subdword_gfx11(Builder& bld, Definition def, Operand op)
 {
-   if (def.physReg().reg() == op.physReg().reg()) {
-      assert(def.bytes() != 2); /* handled by caller */
-      uint8_t swiz[] = {4, 5, 6, 7};
-      std::swap(swiz[def.physReg().byte()], swiz[op.physReg().byte()]);
-      create_bperm(bld, swiz, def, Operand::zero());
-      return;
-   }
+   assert(def.physReg().reg() != op.physReg().reg()); /* handled by caller */
 
    if (def.bytes() == 2) {
       Operand def_as_op = Operand(def.physReg(), def.regClass());
@@ -1446,7 +1449,7 @@ swap_subdword_gfx11(Builder& bld, Definition def, Operand op)
        * into the same VGPR.
        */
       swap_subdword_gfx11(bld, Definition(def_other_half, v2b), Operand(op_half, v2b));
-      swap_subdword_gfx11(bld, def, Operand(def_other_half.advance(op.physReg().byte() & 1), v1b));
+      swap_bytes_bperm(bld, def, Operand(def_other_half.advance(op.physReg().byte() & 1), v1b));
       swap_subdword_gfx11(bld, Definition(def_other_half, v2b), Operand(op_half, v2b));
    }
 }
@@ -1532,6 +1535,9 @@ do_swap(lower_context* ctx, Builder& bld, const copy_operation& copy, bool prese
       } else if (def.bytes() == 2 && def.physReg().reg() == op.physReg().reg()) {
          bld.vop3(aco_opcode::v_alignbyte_b32, Definition(def.physReg(), v1), def_as_op, op,
                   Operand::c32(2u));
+      } else if (def.bytes() == 1 && def.physReg().reg() == op.physReg().reg() &&
+                 ctx->program->gfx_level >= GFX10) {
+         swap_bytes_bperm(bld, def, op);
       } else {
          assert(def.regClass().is_subdword());
          if (ctx->program->gfx_level >= GFX11) {
@@ -1593,6 +1599,40 @@ do_pack_2x16(lower_context* ctx, Builder& bld, Definition def, Operand lo, Opera
       else
          bld.vop3(aco_opcode::v_alignbyte_b32, def, hi, lo, Operand::c32(2u));
       return;
+   }
+
+   if (ctx->program->gfx_level >= GFX10 && !lo.constantEquals(0) && !hi.constantEquals(0)) {
+      uint8_t swiz[4];
+      Operand ops[2] = {lo, hi};
+      for (unsigned i = 0; i < 2; i++) {
+         ops[i] =
+            ops[i].isConstant() ? Operand::c32((int32_t)(int16_t)ops[i].constantValue()) : ops[i];
+
+         swiz[i * 2 + 0] = i * 4 + ops[i].physReg().byte();
+         swiz[i * 2 + 1] = i * 4 + ops[i].physReg().byte() + 1;
+
+         if (ops[i].isLiteral()) {
+            Operand b0 = Operand::c32((int32_t)(int8_t)ops[i].constantValue());
+            Operand b1 = Operand::c32((int32_t)(int8_t)(ops[i].constantValue() >> 8));
+            if (!b0.isLiteral() &&
+                (b1.constantValue() == 0x00 || b1.constantValue() == 0xffffffff)) {
+               ops[i] = b0;
+               swiz[i * 2 + 1] = b1.constantValue() ? 13 : 12;
+            } else if (!b1.isLiteral() &&
+                       (b0.constantValue() == 0x00 || b0.constantValue() == 0xffffffff)) {
+               ops[i] = b1;
+               swiz[i * 2 + 0] = b0.constantValue() ? 13 : 12;
+               swiz[i * 2 + 1]--;
+            } else if (b0.constantValue() == b1.constantValue()) {
+               ops[i] = b0;
+               swiz[i * 2 + 1]--;
+            }
+         }
+      }
+      if (!ops[0].isLiteral() && !ops[1].isLiteral()) {
+         create_bperm(bld, swiz, def, ops[0], ops[1]);
+         return;
+      }
    }
 
    Definition def_lo = Definition(def.physReg(), v2b);
@@ -1766,8 +1806,7 @@ handle_operands(std::map<PhysReg, copy_operation>& copy_map, lower_context* ctx,
    bool skip_partial_copies = true;
    for (auto it = copy_map.begin();;) {
       if (copy_map.empty()) {
-         ctx->program->statistics[aco_statistic_copies] +=
-            ctx->instructions.size() - num_instructions_before;
+         ctx->program->statistics.copies += ctx->instructions.size() - num_instructions_before;
          return;
       }
       if (it == copy_map.end()) {
@@ -2045,8 +2084,7 @@ handle_operands(std::map<PhysReg, copy_operation>& copy_map, lower_context* ctx,
             break;
       }
    }
-   ctx->program->statistics[aco_statistic_copies] +=
-      ctx->instructions.size() - num_instructions_before;
+   ctx->program->statistics.copies += ctx->instructions.size() - num_instructions_before;
 }
 
 void
@@ -2082,7 +2120,7 @@ handle_operands_linear_vgpr(std::map<PhysReg, copy_operation>& copy_map, lower_c
       pi->scratch_sgpr = scratch_sgpr;
    }
 
-   ctx->program->statistics[aco_statistic_copies] += scratch_sgpr == scc ? 2 : 4;
+   ctx->program->statistics.copies += scratch_sgpr == scc ? 2 : 4;
 }
 
 void
@@ -2389,6 +2427,7 @@ lower_to_hw_instr(Program* program)
                      discard_exit_block = discard_block;
                   }
                   block = &program->blocks[block_idx];
+                  ctx.block = block;
 
                   /* sendmsg(dealloc_vgprs) releases scratch, so it isn't safe if there is an
                    * in-progress scratch store. */
@@ -2847,6 +2886,21 @@ lower_to_hw_instr(Program* program)
                         ((32 - 1) << 11) | shader_cycles_hi);
                break;
             }
+            case aco_opcode::p_callee_stack_ptr: {
+               unsigned caller_stack_size =
+                  ctx.program->config->scratch_bytes_per_wave / ctx.program->wave_size;
+               unsigned scratch_param_size = instr->operands[0].constantValue();
+               unsigned callee_stack_start = caller_stack_size + scratch_param_size;
+               if (ctx.program->gfx_level < GFX9)
+                  callee_stack_start *= ctx.program->wave_size;
+               if (instr->operands.size() < 2)
+                  bld.sop1(aco_opcode::s_mov_b32, instr->definitions[0],
+                           Operand::c32(callee_stack_start));
+               else
+                  bld.sop2(aco_opcode::s_add_u32, instr->definitions[0], Definition(scc, s1),
+                           instr->operands[1], Operand::c32(callee_stack_start));
+               break;
+            }
             default: break;
             }
          } else if (instr->isReduction()) {
@@ -2888,14 +2942,20 @@ lower_to_hw_instr(Program* program)
             ctx.instructions.emplace_back(std::move(instr));
 
             emit_set_mode(bld, block->fp_mode, set_round, false);
-         } else if (instr->opcode == aco_opcode::p_v_cvt_pk_u8_f32) {
-            Definition def = instr->definitions[0];
-            VALU_instruction& valu =
-               bld.vop3(aco_opcode::v_cvt_pk_u8_f32, def, instr->operands[0],
-                        Operand::c32(def.physReg().byte()), Operand(def.physReg(), v1))
-                  ->valu();
-            valu.abs = instr->valu().abs;
-            valu.neg = instr->valu().neg;
+         } else if (instr->opcode == aco_opcode::p_v_cvt_pk_fp8_f32_ovfl) {
+            /* FP8/BF8 uses FP16_OVFL(1) to clamp to max finite result. Temporarily set it for the
+             * instruction.
+             * "((size - 1) << 11 | (offset << 6) | register" (MODE is encoded as register 1, we
+             * want to set a single bit at offset 23)
+             */
+            bld.sopk(aco_opcode::s_setreg_imm32_b32, Operand::literal32(1),
+                     (0 << 11) | (23 << 6) | 1);
+
+            instr->opcode = aco_opcode::v_cvt_pk_fp8_f32;
+            ctx.instructions.emplace_back(std::move(instr));
+
+            bld.sopk(aco_opcode::s_setreg_imm32_b32, Operand::literal32(0),
+                     (0 << 11) | (23 << 6) | 1);
          } else if (instr->isMIMG() && instr->mimg().strict_wqm) {
             lower_image_sample(&ctx, instr);
             ctx.instructions.emplace_back(std::move(instr));

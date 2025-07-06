@@ -611,9 +611,9 @@ cs_launch(struct vl_compositor *c,
 
    /* Bind the image */
    struct pipe_image_view image = {0};
-   image.resource = c->fb_state.cbufs[0]->texture;
+   image.resource = c->fb_state.cbufs[0].texture;
    image.shader_access = image.access = PIPE_IMAGE_ACCESS_READ_WRITE;
-   image.format = c->fb_state.cbufs[0]->texture->format;
+   image.format = c->fb_state.cbufs[0].texture->format;
 
    ctx->set_shader_images(c->pipe, PIPE_SHADER_COMPUTE, 0, 1, 0, &image);
 
@@ -669,13 +669,11 @@ calc_proj(struct vl_compositor_layer *layer,
           struct pipe_resource *texture,
           float m[2][4])
 {
-   enum vl_compositor_mirror mirror = layer->mirror;
+   unsigned mirror = layer->mirror;
    float ratio_x = (float)texture->width0 / layer->sampler_views[0]->texture->width0;
    float ratio_y = (float)texture->height0 / layer->sampler_views[0]->texture->height0;
    float width = layer->sampler_views[0]->texture->width0;
    float height = layer->sampler_views[0]->texture->height0;
-   float translate_x = texture->width0 * ratio_x;
-   float translate_y = texture->height0 * ratio_y;
 
    memset(m, 0, sizeof(float) * 2 * 4);
 
@@ -688,41 +686,41 @@ calc_proj(struct vl_compositor_layer *layer,
    case VL_COMPOSITOR_ROTATE_90:
       m[0][1] = 1.0;
       m[1][0] = -1.0;
-      m[1][2] = translate_y;
+      m[1][2] = texture->height0;
       width = layer->sampler_views[0]->texture->height0;
       height = layer->sampler_views[0]->texture->width0;
+      if (mirror != VL_COMPOSITOR_MIRROR_NONE)
+         mirror = ~mirror;
       break;
    case VL_COMPOSITOR_ROTATE_180:
       m[0][0] = 1.0;
       m[1][1] = 1.0;
-      if (mirror != VL_COMPOSITOR_MIRROR_VERTICAL)
-         mirror = VL_COMPOSITOR_MIRROR_VERTICAL;
+      if (mirror == VL_COMPOSITOR_MIRROR_NONE)
+         mirror = VL_COMPOSITOR_MIRROR_HORIZONTAL | VL_COMPOSITOR_MIRROR_VERTICAL;
       else
-         mirror = VL_COMPOSITOR_MIRROR_HORIZONTAL;
+         mirror = ~mirror;
       break;
    case VL_COMPOSITOR_ROTATE_270:
       m[0][1] = -1.0;
       m[1][0] = 1.0;
-      m[0][2] = translate_x;
+      m[0][2] = texture->width0;
       width = layer->sampler_views[0]->texture->height0;
       height = layer->sampler_views[0]->texture->width0;
+      if (mirror != VL_COMPOSITOR_MIRROR_NONE)
+         mirror = ~mirror;
       break;
    }
 
-   switch (mirror) {
-   default:
-   case VL_COMPOSITOR_MIRROR_NONE:
-      break;
-   case VL_COMPOSITOR_MIRROR_HORIZONTAL:
+   if (mirror & VL_COMPOSITOR_MIRROR_HORIZONTAL) {
       m[0][0] *= -1;
       m[0][1] *= -1;
-      m[0][2] = translate_x - m[0][2];
-      break;
-   case VL_COMPOSITOR_MIRROR_VERTICAL:
+      m[0][2] = texture->width0 - m[0][2];
+   }
+
+   if (mirror & VL_COMPOSITOR_MIRROR_VERTICAL) {
       m[1][0] *= -1;
       m[1][1] *= -1;
-      m[1][2] = translate_y - m[1][2];
-      break;
+      m[1][2] = texture->height0 - m[1][2];
    }
 
    float scale_x = (width * (layer->src.br.x - layer->src.tl.x)) / layer->viewport.scale[0];
@@ -730,10 +728,8 @@ calc_proj(struct vl_compositor_layer *layer,
 
    m[0][0] *= scale_x;
    m[0][1] *= scale_x;
-   m[0][2] *= scale_x;
    m[1][0] *= scale_y;
    m[1][1] *= scale_y;
-   m[1][2] *= scale_y;
 
    float crop_x = (layer->src.tl.x * width) * ratio_x;
    float crop_y = (layer->src.tl.y * height) * ratio_y;
@@ -861,7 +857,7 @@ draw_layers(struct vl_compositor       *c,
          c->pipe->bind_sampler_states(c->pipe, PIPE_SHADER_COMPUTE, 0,
                         num_sampler_views, layer->samplers);
          c->pipe->set_sampler_views(c->pipe, PIPE_SHADER_COMPUTE, 0,
-                        num_sampler_views, 0, false, samplers);
+                        num_sampler_views, 0, samplers);
 
          cs_launch(c, layer->cs, &(drawn.area));
 
@@ -869,7 +865,7 @@ draw_layers(struct vl_compositor       *c,
          c->pipe->set_shader_images(c->pipe, PIPE_SHADER_COMPUTE, 0, 0, 1, NULL);
          c->pipe->set_constant_buffer(c->pipe, PIPE_SHADER_COMPUTE, 0, false, NULL);
          c->pipe->set_sampler_views(c->pipe, PIPE_SHADER_COMPUTE, 0, 0,
-                        num_sampler_views, false, NULL);
+                        num_sampler_views, NULL);
          c->pipe->bind_compute_state(c->pipe, NULL);
          c->pipe->bind_sampler_states(c->pipe, PIPE_SHADER_COMPUTE, 0,
                         num_sampler_views, NULL);
@@ -895,22 +891,21 @@ vl_compositor_cs_render(struct vl_compositor_state *s,
    assert(c && s);
    assert(dst_surface);
 
-   c->fb_state.width = dst_surface->width;
-   c->fb_state.height = dst_surface->height;
-   c->fb_state.cbufs[0] = dst_surface;
+   pipe_surface_size(dst_surface, &c->fb_state.width, &c->fb_state.height);
+   c->fb_state.cbufs[0] = *dst_surface;
 
    if (!s->scissor_valid) {
       s->scissor.minx = 0;
       s->scissor.miny = 0;
-      s->scissor.maxx = dst_surface->width;
-      s->scissor.maxy = dst_surface->height;
+      s->scissor.maxx = c->fb_state.width;
+      s->scissor.maxy = c->fb_state.height;
    }
 
    if (clear_dirty && dirty_area &&
        (dirty_area->x0 < dirty_area->x1 || dirty_area->y0 < dirty_area->y1)) {
 
       c->pipe->clear_render_target(c->pipe, dst_surface, &s->clear_color,
-                       0, 0, dst_surface->width, dst_surface->height, false);
+                       0, 0, c->fb_state.width, c->fb_state.height, false);
       dirty_area->x0 = dirty_area->y0 = VL_COMPOSITOR_MAX_DIRTY;
       dirty_area->x1 = dirty_area->y1 = VL_COMPOSITOR_MIN_DIRTY;
    }

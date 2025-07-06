@@ -93,11 +93,16 @@ static const struct test {
 
    INSTR_7XX(2004c005_00000405, "cov.f32u32 r1.y, (last)r1.y"),
 
+   INSTR_7XX(200440c0_ae800004, "movs.f32f32 r48.x, r1.x, 93"),
+   INSTR_7XX(201100c0_c000040b, "movs.s16s16 hr48.x, (last)hr2.w, a0.x"),
+
    /* cat2 */
    INSTR_6XX(40104002_0c210001, "add.f hr0.z, r0.y, c<a0.x + 33>"),
    INSTR_6XX(40b80804_10408004, "(nop3) cmps.f.lt r1.x, (abs)r1.x, c16.x"),
    INSTR_6XX(47308a02_00002000, "(rpt2)bary.f (ei)r0.z, (r)0, r0.x"),
+   INSTR_6XX(47308802_00002000, "(nop1) bary.f (ei)r0.z, 0, r0.x"),
    INSTR_6XX(47348000_00002000, "flat.b (ei)r0.x, 0, r0.x"),
+   INSTR_6XX(473c8000_00002000, "(nop2) flat.b (ei)r0.x, 0, r0.x"),
    INSTR_6XX(43480801_00008001, "(nop3) absneg.s hr0.y, (abs)hr0.y"),
    INSTR_6XX(42280807_27ff0000, "(nop3) add.s hr1.w, hr0.x, h(-1)"),
    INSTR_6XX(40a500f8_2c000004, "cmps.f.ne p0.x, hr1.x, h(0.0)"),
@@ -135,6 +140,7 @@ static const struct test {
    /* custom test with qcom_dot8 function from cl_qcom_dot_product8 */
    INSTR_6XX(66818c02_0002e003, "(sat)(nop3) dp2acc.mixed.low r0.z, r0.w, r0.w, r0.z"), /* (nop3) dp2acc (sat)r0.z, (signed)(low)(r)r0.w, (low)(r)r0.w, r0.z */
    INSTR_6XX(6681c802_8002a003, "(nop3) dp4acc.unsigned.low r0.z, r0.w, r0.w, (neg)r0.z"), /* (nop3) dp4acc r0.z, (unsigned)(r)r0.w, (r)r0.w, (neg)r0.z */
+   INSTR_6XX(7681c002_00002002, "(sy)dp4acc.unsigned.low r0.z, r0.z, r0.w, r0.x"),
 
    INSTR_7XX(61808000_04020400, "madsh.m16 r0.x, (last)r0.x, r0.y, (last)r0.z"),
    INSTR_7XX(64838806_04088406, "(nop3) sel.b32 r1.z, (last)r1.z, r1.w, (last)r2.x"),
@@ -499,26 +505,26 @@ static const struct test {
    INSTR_7XX(fbc21000_00000000, "(sy)(ss)(jp)lock"),
 
    /* dEQP-VK.pipeline.monolithic.sampler.border_swizzle.r4g4b4a4_unorm_pack16.rg1a.opaque_white.gather_1.no_swizzle_hint */
-   INSTR_7XX(e45401a0_bfba7736, "alias.tex.f32.1 r40.x, (-1.456763)"),
+   INSTR_7XX(e41401a0_bfba7736, "alias.tex.f32.1 r40.x, (-1.456763)"),
    /* dEQP-VK.synchronization.op.single_queue.event.write_draw_indexed_read_image_geometry.image_128x128_r32g32b32a32_sfloat */
-   INSTR_7XX(e44c0009_00000007, "alias.tex.f32.0 r2.y, c1.w"),
+   INSTR_7XX(e40c0009_00000007, "alias.tex.f32.0 r2.y, c1.w"),
    /* dEQP-VK.binding_model.shader_access.primary_cmd_buf.storage_image.geometry.single_descriptor.2d_base_mip */
-   INSTR_7XX(ec5501a0_00000006, "(jp)alias.tex.b32.1 r40.x, (0x6)"),
+   INSTR_7XX(ec1501a0_00000006, "(jp)alias.tex.b32.1 r40.x, (0x6)"),
    /* dEQP-VK.subgroups.quad.graphics.subgroupquadbroadcast_i16vec2 */
-   INSTR_7XX(e45100a0_00000002, "alias.tex.b16.0 hr40.x, h(0x2)"),
+   INSTR_7XX(e41100a0_00000002, "alias.tex.b16.0 hr40.x, h(0x2)"),
 
    /* dEQP-VK.glsl.derivate.dfdx.constant.float */
-   INSTR_7XX(e4508003_00003c00, "alias.rt.f16.0 rt0.w, h(1.000000)"),
-   INSTR_7XX(f4488000_00000000, "(sy)alias.rt.f16.0 rt0.x, hc0.x"),
+   INSTR_7XX(e4108003_00003c00, "alias.rt.f16.0 rt0.w, h(1.000000)"),
+   INSTR_7XX(f4088000_00000000, "(sy)alias.rt.f16.0 rt0.x, hc0.x"),
 
    /* dEQP-VK.glsl.opaque_type_indexing.ubo.const_literal_fragment */
-   INSTR_7XX(e44c8008_00000010, "alias.rt.f32.0 rt2.x, c4.x"),
+   INSTR_7XX(e40c8008_00000010, "alias.rt.f32.0 rt2.x, c4.x"),
 
    /* dEQP-VK.dynamic_rendering.primary_cmd_buff.suballocation.multisample_resolve.layers_3.r16g16_unorm.samples_4_resolve_level_4 */
-   INSTR_7XX(e4548008_3f800000, "alias.rt.f32.0 rt2.x, (1.000000)"),
+   INSTR_7XX(e4148008_3f800000, "alias.rt.f32.0 rt2.x, (1.000000)"),
 
    /* dEQP-VK.renderpass.suballocation.multisample_resolve.layers_3.r8g8b8a8_uint.samples_2_baseLayer1 */
-   INSTR_7XX(e4558007_000000ff, "alias.rt.b32.0 rt1.w, (0xff)"),
+   INSTR_7XX(e4158007_000000ff, "alias.rt.b32.0 rt1.w, (0xff)"),
 
    INSTR_6XX(ffffffff_ffffffff, "raw 0xFFFFFFFFFFFFFFFF"),
    /* clang-format on */

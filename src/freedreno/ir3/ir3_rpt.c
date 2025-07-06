@@ -39,6 +39,8 @@ ir3_nir_vectorize_filter(const nir_instr *instr, const void *data)
 
    struct nir_alu_instr *alu = nir_instr_as_alu(instr);
 
+   if (alu->def.bit_size == 64)
+      return 0;
    if (!ir3_supports_vectorized_nir_op(alu->op))
       return 0;
 
@@ -282,6 +284,13 @@ merge_instr(struct ir3_instruction *instr)
          break;
 
       instr->repeat++;
+
+      /* The false dependencies of the new repeated instruction should be the
+       * union of the dependencies of its parts.
+       */
+      for (unsigned i = 0; i < rpt->deps_count; i++) {
+         ir3_instr_add_dep(instr, rpt->deps[i]);
+      }
 
       /* We cannot remove the rpt immediately since when it is the instruction
        * after instr, foreach_instr_safe will fail. So mark it instead and

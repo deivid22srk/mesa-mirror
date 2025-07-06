@@ -39,11 +39,13 @@ static uint32_t
 xe_gem_create(struct iris_bufmgr *bufmgr,
               const struct intel_memory_class_instance **regions,
               uint16_t regions_count, uint64_t size,
-              enum iris_heap heap_flags, unsigned alloc_flags)
+              enum iris_heap heap_flags, enum bo_alloc_flags alloc_flags)
 {
-   /* Xe still don't have support for protected content */
-   if (alloc_flags & BO_ALLOC_PROTECTED)
-      return -EINVAL;
+   struct drm_xe_ext_set_property pxp_ext = {
+      .base.name = DRM_XE_GEM_CREATE_EXTENSION_SET_PROPERTY,
+      .property = DRM_XE_GEM_CREATE_SET_PROPERTY_PXP_TYPE,
+      .value = DRM_XE_PXP_TYPE_HWDRM,
+   };
 
    uint32_t vm_id = iris_bufmgr_get_global_vm_id(bufmgr);
    vm_id = alloc_flags & BO_ALLOC_SHARED ? 0 : vm_id;
@@ -52,22 +54,31 @@ xe_gem_create(struct iris_bufmgr *bufmgr,
    /* TODO: we might need to consider scanout for shared buffers too as we
     * do not know what the process this is shared with will do with it
     */
-   if (alloc_flags & BO_ALLOC_SCANOUT)
+   const struct intel_device_info *devinfo = iris_bufmgr_get_device_info(bufmgr);
+   if (alloc_flags & BO_ALLOC_SCANOUT) {
       flags |= DRM_XE_GEM_CREATE_FLAG_SCANOUT;
-   if (!intel_vram_all_mappable(iris_bufmgr_get_device_info(bufmgr)) &&
+      /* Xe2+ discrete platforms (BMG) requires continuously allocated
+       * physical memory for CCS compressed images to display. Xe KMD will do
+       * this when it gets scanout flag and a size of multiplies of 64KB.
+       * The alignment of the size is not per-plane, so we do it in the
+       * drivers instead of ISL.
+       */
+      if (devinfo->has_local_mem && (alloc_flags & BO_ALLOC_COMPRESSED))
+         size = align64(size, 64 * 1024);
+   }
+   if (!intel_vram_all_mappable(devinfo) &&
        (heap_flags == IRIS_HEAP_DEVICE_LOCAL_PREFERRED ||
         heap_flags == IRIS_HEAP_DEVICE_LOCAL_CPU_VISIBLE_SMALL_BAR))
       flags |= DRM_XE_GEM_CREATE_FLAG_NEEDS_VISIBLE_VRAM;
 
    struct drm_xe_gem_create gem_create = {
      .vm_id = vm_id,
-     .size = align64(size, iris_bufmgr_get_device_info(bufmgr)->mem_alignment),
+     .size = align64(size, devinfo->mem_alignment),
      .flags = flags,
    };
    for (uint16_t i = 0; i < regions_count; i++)
       gem_create.placement |= BITFIELD_BIT(regions[i]->instance);
 
-   const struct intel_device_info *devinfo = iris_bufmgr_get_device_info(bufmgr);
    const struct intel_device_info_pat_entry *pat_entry;
    pat_entry = iris_heap_to_pat_entry(devinfo, heap_flags, alloc_flags & BO_ALLOC_SCANOUT);
    switch (pat_entry->mmap) {
@@ -81,6 +92,9 @@ xe_gem_create(struct iris_bufmgr *bufmgr,
       unreachable("missing");
       gem_create.cpu_caching = DRM_XE_GEM_CPU_CACHING_WC;
    }
+
+   if (alloc_flags & BO_ALLOC_PROTECTED)
+      gem_create.extensions = (uintptr_t)&pxp_ext;
 
    if (intel_ioctl(iris_bufmgr_get_fd(bufmgr), DRM_IOCTL_XE_GEM_CREATE,
                    &gem_create))
@@ -104,7 +118,7 @@ xe_gem_mmap(struct iris_bufmgr *bufmgr, struct iris_bo *bo)
 }
 
 static inline int
-xe_gem_vm_bind_op(struct iris_bo *bo, uint32_t op)
+xe_gem_vm_bind_op(struct iris_bo *bo, uint32_t op, enum bo_alloc_flags iris_flags)
 {
    struct iris_bufmgr *bufmgr = bo->bufmgr;
    struct intel_bind_timeline *bind_timeline = iris_bufmgr_get_bind_timeline(bufmgr);
@@ -136,6 +150,8 @@ xe_gem_vm_bind_op(struct iris_bo *bo, uint32_t op)
 
    if (bo->real.capture)
       flags |= DRM_XE_VM_BIND_FLAG_DUMPABLE;
+   if (iris_flags & BO_ALLOC_PROTECTED)
+      flags |= DRM_XE_VM_BIND_FLAG_CHECK_PXP;
 
    struct drm_xe_vm_bind args = {
       .vm_id = iris_bufmgr_get_global_vm_id(bufmgr),
@@ -162,15 +178,15 @@ xe_gem_vm_bind_op(struct iris_bo *bo, uint32_t op)
 }
 
 static bool
-xe_gem_vm_bind(struct iris_bo *bo)
+xe_gem_vm_bind(struct iris_bo *bo, enum bo_alloc_flags flags)
 {
-   return xe_gem_vm_bind_op(bo, DRM_XE_VM_BIND_OP_MAP) == 0;
+   return xe_gem_vm_bind_op(bo, DRM_XE_VM_BIND_OP_MAP, flags) == 0;
 }
 
 static bool
 xe_gem_vm_unbind(struct iris_bo *bo)
 {
-   return xe_gem_vm_bind_op(bo, DRM_XE_VM_BIND_OP_UNMAP) == 0;
+   return xe_gem_vm_bind_op(bo, DRM_XE_VM_BIND_OP_UNMAP, 0) == 0;
 }
 
 static bool

@@ -31,6 +31,7 @@
 #include "util/simple_mtx.h"
 #include "util/sparse_array.h"
 #include "util/u_atomic.h"
+#include "util/perf/cpu_trace.h"
 
 #include "kmod/panthor_kmod.h"
 
@@ -434,6 +435,9 @@ struct pan_kmod_ops {
 
    /* Query the current GPU timestamp */
    uint64_t (*query_timestamp)(const struct pan_kmod_dev *dev);
+
+   /* Label the BO */
+   void (*bo_set_label)(struct pan_kmod_dev *dev, struct pan_kmod_bo *bo, const char *label);
 };
 
 /* KMD information. */
@@ -476,6 +480,12 @@ struct pan_kmod_dev {
    /* User private data. Use pan_kmod_dev_{set,get}_user_priv() to access it. */
    void *user_priv;
 };
+
+#define pan_kmod_ioctl(fd, op, arg)                                          \
+   ({                                                                        \
+      MESA_TRACE_SCOPE("pan_kmod_ioctl op=" #op);                            \
+      drmIoctl(fd, op, arg);                                                 \
+   })
 
 struct pan_kmod_dev *
 pan_kmod_dev_create(int fd, uint32_t flags,
@@ -565,7 +575,8 @@ pan_kmod_bo_export(struct pan_kmod_bo *bo)
 {
    int fd;
 
-   if (drmPrimeHandleToFD(bo->dev->fd, bo->handle, DRM_CLOEXEC, &fd)) {
+   if (drmPrimeHandleToFD(bo->dev->fd, bo->handle, DRM_CLOEXEC | DRM_RDWR,
+                          &fd)) {
       mesa_loge("drmPrimeHandleToFD() failed (err=%d)", errno);
       return -1;
    }
@@ -624,6 +635,13 @@ pan_kmod_bo_mmap(struct pan_kmod_bo *bo, off_t bo_offset, size_t size, int prot,
    }
 
    return host_addr;
+}
+
+static inline void
+pan_kmod_set_bo_label(struct pan_kmod_dev *dev, struct pan_kmod_bo *bo, const char *label)
+{
+   if (dev->ops->bo_set_label)
+      dev->ops->bo_set_label(dev, bo, label);
 }
 
 static inline size_t

@@ -74,6 +74,8 @@
 #include "util/u_vector.h"
 #include "egl_dri2.h"
 #include "egldefines.h"
+#include "mapi/glapi/glapi.h"
+#include "dispatch.h"
 
 #define NUM_ATTRIBS 16
 
@@ -97,27 +99,9 @@ dri_set_background_context(void *loaderPrivate)
 }
 
 static void
-dri2_gl_flush_get(_glapi_proc *glFlush)
-{
-   *glFlush = _mesa_glapi_get_proc_address("glFlush");
-}
-
-static void
 dri2_gl_flush()
 {
-   static void (*glFlush)(void);
-   static util_once_flag once = UTIL_ONCE_FLAG_INIT;
-
-   util_call_once_data(&once, (util_call_once_data_func)dri2_gl_flush_get,
-                       &glFlush);
-
-   /* if glFlush is not available things are horribly broken */
-   if (!glFlush) {
-      _eglLog(_EGL_WARNING, "DRI2: failed to find glFlush entry point");
-      return;
-   }
-
-   glFlush();
+   CALL_Flush(GET_DISPATCH(), ());
 }
 
 static GLboolean
@@ -155,10 +139,6 @@ const __DRIbackgroundCallableExtension background_callable_extension = {
 
    .setBackgroundContext = dri_set_background_context,
    .isThreadSafe = dri_is_thread_safe,
-};
-
-const __DRIuseInvalidateExtension use_invalidate = {
-   .base = {__DRI_USE_INVALIDATE, 1},
 };
 
 static void
@@ -585,18 +565,14 @@ const __DRIimageLookupExtension image_lookup_extension = {
    .lookupEGLImageValidated = dri2_lookup_egl_image_validated,
 };
 
-EGLBoolean
-dri2_load_driver(_EGLDisplay *disp)
+void
+dri2_detect_swrast(_EGLDisplay *disp)
 {
    struct dri2_egl_display *dri2_dpy = dri2_egl_display(disp);
 
-   dri2_dpy->kopper = disp->Options.Zink && !debug_get_bool_option("LIBGL_KOPPER_DISABLE", false);
-   dri2_dpy->kopper_without_modifiers = dri2_dpy->kopper && debug_get_bool_option("LIBGL_KOPPER_DRI2", false);
    dri2_dpy->swrast = (disp->Options.ForceSoftware && !dri2_dpy->kopper && strcmp(dri2_dpy->driver_name, "vmwgfx")) ||
                       !dri2_dpy->driver_name || strstr(dri2_dpy->driver_name, "swrast");
    dri2_dpy->swrast_not_kms = dri2_dpy->swrast && (!dri2_dpy->driver_name || strcmp(dri2_dpy->driver_name, "kms_swrast"));
-
-   return EGL_TRUE;
 }
 
 static const char *
@@ -612,11 +588,21 @@ dri2_query_driver_config(_EGLDisplay *disp)
    struct dri2_egl_display *dri2_dpy = dri2_egl_display_lock(disp);
    char *ret;
 
-   ret = pipe_loader_get_driinfo_xml(dri2_dpy->driver_name);
+   ret = driGetDriInfoXML(dri2_dpy->driver_name);
 
    mtx_unlock(&dri2_dpy->lock);
 
    return ret;
+}
+
+static bool
+dri2_query_device_info(const void* driver_device_identifier,
+                       struct egl_device_info *device_info)
+{
+   const char* drm_device_name = (const char*)driver_device_identifier;
+   return dri_get_drm_device_info(
+      drm_device_name, device_info->device_uuid, device_info->driver_uuid,
+      &device_info->vendor_name, &device_info->renderer_name, &device_info->driver_name);
 }
 
 void
@@ -894,9 +880,13 @@ dri2_initialize(_EGLDisplay *disp)
       p_atomic_inc(&dri2_dpy->ref_count);
       return EGL_TRUE;
    }
+   dri2_dpy = dri2_display_create(disp);
+   if (!dri2_dpy)
+      return EGL_FALSE;
 
    loader_set_logger(_eglLog);
 
+   bool allow_dri2 = false;
    switch (disp->Platform) {
    case _EGL_PLATFORM_SURFACELESS:
       ret = dri2_initialize_surfaceless(disp);
@@ -906,7 +896,17 @@ dri2_initialize(_EGLDisplay *disp)
       break;
    case _EGL_PLATFORM_X11:
    case _EGL_PLATFORM_XCB:
-      ret = dri2_initialize_x11(disp);
+      ret = dri2_initialize_x11(disp, &allow_dri2);
+      /* platform_x11 detects dri2 availability */
+      if (!ret && allow_dri2) {
+         /* this is a fallthrough using the same dri2_dpy from dri3,
+         * so the existing one must be destroyed and a new one created
+         * the caller will switch to the new display automatically
+         */
+         dri2_display_destroy(disp);
+         dri2_display_create(disp);
+         ret = dri2_initialize_x11_dri2(disp);
+      }
       break;
    case _EGL_PLATFORM_DRM:
       ret = dri2_initialize_drm(disp);
@@ -922,8 +922,10 @@ dri2_initialize(_EGLDisplay *disp)
       return EGL_FALSE;
    }
 
-   if (!ret)
+   if (!ret) {
+      dri2_display_destroy(disp);
       return EGL_FALSE;
+   }
 
    if (_eglGetArraySize(disp->Configs) == 0) {
       _eglError(EGL_NOT_INITIALIZED, "failed to add any EGLConfigs");
@@ -1027,7 +1029,7 @@ dri2_display_destroy(_EGLDisplay *disp)
 }
 
 struct dri2_egl_display *
-dri2_display_create(void)
+dri2_display_create(_EGLDisplay *disp)
 {
    struct dri2_egl_display *dri2_dpy = calloc(1, sizeof *dri2_dpy);
    if (!dri2_dpy) {
@@ -1038,6 +1040,9 @@ dri2_display_create(void)
    dri2_dpy->fd_render_gpu = -1;
    dri2_dpy->fd_display_gpu = -1;
    dri2_dpy->multibuffers_available = true;
+   dri2_dpy->kopper = disp->Options.Zink && !debug_get_bool_option("LIBGL_KOPPER_DISABLE", false);
+   dri2_dpy->kopper_without_modifiers = dri2_dpy->kopper && debug_get_bool_option("LIBGL_KOPPER_DRI2", false);
+   disp->DriverData = (void *)dri2_dpy;
 
    return dri2_dpy;
 }
@@ -1903,25 +1908,6 @@ dri2_create_image_khr_renderbuffer(_EGLDisplay *disp, _EGLContext *ctx,
 }
 
 #ifdef HAVE_WAYLAND_PLATFORM
-
-/* This structure describes how a wl_buffer maps to one or more
- * dri_image structures.  A wl_drm_buffer stores the wl_drm format code and the
- * offsets and strides of the planes in the buffer.  This table maps a
- * wl_drm format code to a description of the planes in the buffer
- * that lets us create a struct dri_image for each of the planes. */
-
-static const struct wl_drm_components_descriptor {
-   uint32_t dri_components;
-   EGLint components;
-   int nplanes;
-} wl_drm_components[] = {
-   {__DRI_IMAGE_COMPONENTS_RGB, EGL_TEXTURE_RGB, 1},
-   {__DRI_IMAGE_COMPONENTS_RGBA, EGL_TEXTURE_RGBA, 1},
-   {__DRI_IMAGE_COMPONENTS_Y_U_V, EGL_TEXTURE_Y_U_V_WL, 3},
-   {__DRI_IMAGE_COMPONENTS_Y_UV, EGL_TEXTURE_Y_UV_WL, 2},
-   {__DRI_IMAGE_COMPONENTS_Y_XUXV, EGL_TEXTURE_Y_XUXV_WL, 2},
-};
-
 static _EGLImage *
 dri2_create_image_wayland_wl_buffer(_EGLDisplay *disp, _EGLContext *ctx,
                                     EGLClientBuffer _buffer,
@@ -1929,7 +1915,6 @@ dri2_create_image_wayland_wl_buffer(_EGLDisplay *disp, _EGLContext *ctx,
 {
    struct wl_drm_buffer *buffer;
    struct dri2_egl_display *dri2_dpy = dri2_egl_display(disp);
-   const struct wl_drm_components_descriptor *f;
    struct dri_image *dri_image;
    _EGLImageAttribs attrs;
    int32_t plane;
@@ -1943,12 +1928,6 @@ dri2_create_image_wayland_wl_buffer(_EGLDisplay *disp, _EGLContext *ctx,
       return NULL;
 
    plane = attrs.PlaneWL;
-   f = buffer->driver_format;
-   if (plane < 0 || plane >= f->nplanes) {
-      _eglError(EGL_BAD_PARAMETER,
-                "dri2_create_image_wayland_wl_buffer (plane out of bounds)");
-      return NULL;
-   }
 
    dri_image = dri2_from_planar(buffer->driver_buffer, plane, NULL);
    if (dri_image == NULL && plane == 0)
@@ -2283,6 +2262,8 @@ dri2_num_fourcc_format_planes(EGLint format)
    case DRM_FORMAT_Y410:
    case DRM_FORMAT_Y412:
    case DRM_FORMAT_Y416:
+   case DRM_FORMAT_YUV420_8BIT:
+   case DRM_FORMAT_YUV420_10BIT:
       return 1;
 
    case DRM_FORMAT_NV12:
@@ -2308,6 +2289,15 @@ dri2_num_fourcc_format_planes(EGLint format)
    case DRM_FORMAT_YVU422:
    case DRM_FORMAT_YUV444:
    case DRM_FORMAT_YVU444:
+   case DRM_FORMAT_S010:
+   case DRM_FORMAT_S210:
+   case DRM_FORMAT_S410:
+   case DRM_FORMAT_S012:
+   case DRM_FORMAT_S212:
+   case DRM_FORMAT_S412:
+   case DRM_FORMAT_S016:
+   case DRM_FORMAT_S216:
+   case DRM_FORMAT_S416:
       return 3;
 
    default:
@@ -2805,34 +2795,16 @@ dri2_wl_reference_buffer(void *user_data, uint32_t name, int fd,
 {
    _EGLDisplay *disp = user_data;
    struct dri2_egl_display *dri2_dpy = dri2_egl_display(disp);
-   struct dri_image *img;
-   int dri_components = 0;
 
    if (fd == -1)
-      img = dri2_from_names(
+      buffer->driver_buffer = dri2_from_names(
          dri2_dpy->dri_screen_render_gpu, buffer->width, buffer->height,
          buffer->format, (int *)&name, 1, buffer->stride, buffer->offset, NULL);
    else
-      img = dri2_from_dma_bufs(
+      buffer->driver_buffer = dri2_from_dma_bufs(
          dri2_dpy->dri_screen_render_gpu, buffer->width, buffer->height,
          buffer->format, DRM_FORMAT_MOD_INVALID, &fd, 1, buffer->stride,
          buffer->offset, 0, 0, 0, 0, 0, NULL, NULL);
-
-   if (img == NULL)
-      return;
-
-   dri2_query_image(img, __DRI_IMAGE_ATTRIB_COMPONENTS,
-                               &dri_components);
-
-   buffer->driver_format = NULL;
-   for (int i = 0; i < ARRAY_SIZE(wl_drm_components); i++)
-      if (wl_drm_components[i].dri_components == dri_components)
-         buffer->driver_format = &wl_drm_components[i];
-
-   if (buffer->driver_format == NULL)
-      dri2_destroy_image(img);
-   else
-      buffer->driver_buffer = img;
 }
 
 static void
@@ -2910,16 +2882,14 @@ dri2_query_wayland_buffer_wl(_EGLDisplay *disp,
 {
    struct dri2_egl_display *dri2_dpy = dri2_egl_display(disp);
    struct wl_drm_buffer *buffer;
-   const struct wl_drm_components_descriptor *format;
 
    buffer = wayland_drm_buffer_get(dri2_dpy->wl_server_drm, buffer_resource);
    if (!buffer)
       return EGL_FALSE;
 
-   format = buffer->driver_format;
    switch (attribute) {
    case EGL_TEXTURE_FORMAT:
-      *value = format->components;
+      *value = buffer->egl_components;
       return EGL_TRUE;
    case EGL_WIDTH:
       *value = buffer->width;
@@ -3343,6 +3313,7 @@ const _EGLDriver _eglDriver = {
    .QuerySurface = dri2_query_surface,
    .QueryDriverName = dri2_query_driver_name,
    .QueryDriverConfig = dri2_query_driver_config,
+   .QueryDeviceInfo = dri2_query_device_info,
 #ifdef HAVE_LIBDRM
    .CreateDRMImageMESA = dri2_create_drm_image_mesa,
    .ExportDRMImageMESA = dri2_export_drm_image_mesa,

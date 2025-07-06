@@ -18,7 +18,7 @@ RESOURCE_TRACKER_ENTRIES = [
     "vkGetImageMemoryRequirements",
     "vkGetImageMemoryRequirements2",
     "vkGetImageMemoryRequirements2KHR",
-    "vkGetImageSubresourceLayout",
+    "vkGetImageDrmFormatModifierPropertiesEXT",
     "vkBindImageMemory",
     "vkBindImageMemory2",
     "vkBindImageMemory2KHR",
@@ -53,6 +53,8 @@ RESOURCE_TRACKER_ENTRIES = [
     "vkDestroySamplerYcbcrConversionKHR",
     "vkUpdateDescriptorSetWithTemplate",
     "vkUpdateDescriptorSetWithTemplateKHR",
+    "vkGetPhysicalDeviceFormatProperties2",
+    "vkGetPhysicalDeviceFormatProperties2KHR",
     "vkGetPhysicalDeviceImageFormatProperties2",
     "vkGetPhysicalDeviceImageFormatProperties2KHR",
     "vkBeginCommandBuffer",
@@ -83,6 +85,7 @@ RESOURCE_TRACKER_ENTRIES = [
     "vkQueueSignalReleaseImageANDROID",
     "vkCmdPipelineBarrier",
     "vkCreateGraphicsPipelines",
+    "vkCmdClearColorImage",
     # Fuchsia
     "vkGetMemoryZirconHandleFUCHSIA",
     "vkGetMemoryZirconHandlePropertiesFUCHSIA",
@@ -93,6 +96,14 @@ RESOURCE_TRACKER_ENTRIES = [
     "vkSetBufferCollectionImageConstraintsFUCHSIA",
     "vkSetBufferCollectionBufferConstraintsFUCHSIA",
     "vkGetBufferCollectionPropertiesFUCHSIA",
+    "vkSetPrivateData",
+    "vkSetPrivateDataKHR",
+    "vkGetPrivateData",
+    "vkGetPrivateDataKHR",
+    "vkCreatePrivateDataSlot",
+    "vkCreatePrivateDataSlotEXT",
+    "vkDestroyPrivateDataSlot",
+    "vkDestroyPrivateDataSlotEXT",
 ]
 
 SUCCESS_VAL = {

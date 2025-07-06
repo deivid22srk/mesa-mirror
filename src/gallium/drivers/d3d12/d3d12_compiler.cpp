@@ -141,6 +141,7 @@ compile_nir(struct d3d12_context *ctx, struct d3d12_shader_selector *sel,
    opts.input_clip_size = key->input_clip_size;
    opts.environment = DXIL_ENVIRONMENT_GL;
    opts.shader_model_max = screen->max_shader_model;
+   opts.advanced_texture_ops = screen->opts14.AdvancedTextureOpsSupported;
 #ifdef _WIN32
    opts.validator_version_max = dxil_get_validator_version(ctx->dxil_validator);
 #endif
@@ -956,7 +957,7 @@ d3d12_fill_shader_key(struct d3d12_selection_context *sel_ctx,
       if (sel_ctx->ctx->gfx_pipeline_state.blend &&
           sel_ctx->ctx->gfx_pipeline_state.blend->desc.RenderTarget[0].LogicOpEnable &&
           !sel_ctx->ctx->gfx_pipeline_state.has_float_rtv) {
-         key->fs.cast_to_uint = util_format_is_unorm(sel_ctx->ctx->fb.cbufs[0]->format);
+         key->fs.cast_to_uint = util_format_is_unorm(sel_ctx->ctx->fb.cbufs[0].format);
          key->fs.cast_to_int = !key->fs.cast_to_uint;
       }
       if (sel_ctx->needs_point_sprite_lowering) {

@@ -87,7 +87,7 @@ struct radv_shader_args {
    /* NGG */
    struct ac_arg ngg_state;
    struct ac_arg ngg_lds_layout;
-   struct ac_arg ngg_query_buf_va; /* GFX12+ */
+   struct ac_arg ngg_query_buf_va; /* GFX11+ */
 
    /* NGG GS */
    struct ac_arg ngg_culling_settings;
@@ -105,17 +105,6 @@ struct radv_shader_args {
    struct ac_arg depth;
    struct ac_arg stencil;
    struct ac_arg sample_mask;
-
-   /* TCS */
-   /* # [0:6] = the number of tessellation patches minus one, max = 127
-    * # [7:11] = the number of output patch control points minus one, max = 31
-    * # [12:16] = the number of input patch control points minus one, max = 31
-    * # [17:22] = the number of LS outputs, up to 32
-    * # [23:28] = the number of HS per-vertex outputs, up to 32
-    * # [29:30] = tess_primitive_mode
-    * # [31] = whether TES reads tess factors
-    */
-   struct ac_arg tcs_offchip_layout;
 
    /* GS */
    struct ac_arg vgt_esgs_ring_itemsize;

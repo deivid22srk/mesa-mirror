@@ -17,6 +17,7 @@
 #include "radv_instance.h"
 #include "radv_queue.h"
 #include "radv_radeon_winsys.h"
+#include "ac_uvd_dec.h"
 #include "ac_vcn_enc.h"
 #include "wsi_common.h"
 
@@ -46,7 +47,9 @@ struct radv_physical_device_cache_key {
    uint32_t disable_aniso_single_level : 1;
    uint32_t disable_shrink_image_store : 1;
    uint32_t disable_sinking_load_input_fs : 1;
+   uint32_t disable_trunc_coord : 1;
    uint32_t emulate_rt : 1;
+   uint32_t bvh8 : 1;
    uint32_t ge_wave32 : 1;
    uint32_t invariant_geom : 1;
    uint32_t no_fmask : 1;
@@ -61,6 +64,8 @@ struct radv_physical_device_cache_key {
    uint32_t use_llvm : 1;
    uint32_t use_ngg : 1;
    uint32_t use_ngg_culling : 1;
+
+   uint32_t reserved : 10;
 };
 
 enum radv_video_enc_hw_ver {
@@ -68,6 +73,7 @@ enum radv_video_enc_hw_ver {
    RADV_VIDEO_ENC_HW_2,
    RADV_VIDEO_ENC_HW_3,
    RADV_VIDEO_ENC_HW_4,
+   RADV_VIDEO_ENC_HW_5,
 };
 
 struct radv_physical_device {
@@ -94,6 +100,9 @@ struct radv_physical_device {
 
    /* Whether to enable FMASK compression for MSAA textures (GFX6-GFX10.3) */
    bool use_fmask;
+
+   /* Whether to enable HTILE compression for depth/stencil images. */
+   bool use_hiz;
 
    /* Whether to enable NGG. */
    bool use_ngg;
@@ -154,7 +163,6 @@ struct radv_physical_device {
 
    uint32_t gs_table_depth;
 
-   struct ac_hs_info hs;
    struct ac_task_info task_info;
 
    struct radv_binning_settings binning_settings;
@@ -174,8 +182,7 @@ struct radv_physical_device {
    } vid_dec_reg;
    enum amd_ip_type vid_decode_ip;
    uint32_t vid_addr_gfx_mode;
-   uint32_t stream_handle_base;
-   uint32_t stream_handle_counter;
+   struct ac_uvd_stream_handle stream_handle;
    uint32_t av1_version;
    rvcn_enc_cmd_t vcn_enc_cmds;
    enum radv_video_enc_hw_ver enc_hw_ver;
@@ -198,19 +205,16 @@ radv_physical_device_instance(const struct radv_physical_device *pdev)
 static inline bool
 radv_dedicated_sparse_queue_enabled(const struct radv_physical_device *pdev)
 {
-   const struct radv_instance *instance = radv_physical_device_instance(pdev);
-
    /* Dedicated sparse queue requires VK_QUEUE_SUBMIT_MODE_THREADED, which is incompatible with
     * VK_DEVICE_TIMELINE_MODE_EMULATED. */
-   return pdev->info.has_timeline_syncobj && !instance->drirc.disable_dedicated_sparse_queue;
+   return pdev->info.has_timeline_syncobj;
 }
 
 static inline bool
 radv_has_shader_buffer_float_minmax(const struct radv_physical_device *pdev, unsigned bitsize)
 {
    return (pdev->info.gfx_level <= GFX7 && !pdev->use_llvm) || pdev->info.gfx_level == GFX10 ||
-          pdev->info.gfx_level == GFX10_3 ||
-          ((pdev->info.gfx_level == GFX11 || pdev->info.gfx_level == GFX11_5) && bitsize == 32);
+          pdev->info.gfx_level == GFX10_3 || (pdev->info.gfx_level >= GFX11 && bitsize == 32);
 }
 
 static inline bool
@@ -255,6 +259,8 @@ bool radv_enable_rt(const struct radv_physical_device *pdev);
 
 bool radv_emulate_rt(const struct radv_physical_device *pdev);
 
+bool radv_use_bvh8(const struct radv_physical_device *pdev);
+
 uint32_t radv_find_memory_index(const struct radv_physical_device *pdev, VkMemoryPropertyFlags flags);
 
 VkResult create_null_physical_device(struct vk_instance *vk_instance);
@@ -263,5 +269,14 @@ VkResult create_drm_physical_device(struct vk_instance *vk_instance, struct _drm
                                     struct vk_physical_device **out);
 
 void radv_physical_device_destroy(struct vk_physical_device *vk_pdev);
+
+bool radv_compute_queue_enabled(const struct radv_physical_device *pdev);
+
+static inline uint32_t
+radv_get_sampled_image_desc_size(const struct radv_physical_device *pdev)
+{
+   /* Main descriptor + FMASK desccriptor if needed. */
+   return 32 + (pdev->use_fmask ? 32 : 0);
+}
 
 #endif /* RADV_PHYSICAL_DEVICE_H */

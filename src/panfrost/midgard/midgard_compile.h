@@ -32,7 +32,7 @@
 void midgard_preprocess_nir(nir_shader *nir, unsigned gpu_id);
 
 void midgard_compile_shader_nir(nir_shader *nir,
-                                const struct panfrost_compile_inputs *inputs,
+                                const struct pan_compile_inputs *inputs,
                                 struct util_dynarray *binary,
                                 struct pan_shader_info *info);
 
@@ -70,6 +70,8 @@ static const nir_shader_compiler_options midgard_nir_options = {
    .lower_bitfield_reverse = true,
    .lower_bitfield_insert = true,
    .lower_bitfield_extract = true,
+   .lower_bitfield_extract8 = true,
+   .lower_bitfield_extract16 = true,
    .lower_extract_byte = true,
    .lower_extract_word = true,
    .lower_insert_byte = true,

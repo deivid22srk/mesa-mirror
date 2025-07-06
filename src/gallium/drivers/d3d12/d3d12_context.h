@@ -28,12 +28,15 @@
 #include "d3d12_descriptor_pool.h"
 #include "d3d12_pipeline_state.h"
 
+#ifdef HAVE_GALLIUM_D3D12_GRAPHICS
 #include "dxil_nir_lower_int_samplers.h"
+#endif // HAVE_GALLIUM_D3D12_GRAPHICS
 
 #include "pipe/p_context.h"
 #include "pipe/p_state.h"
 #include "util/list.h"
 #include "util/slab.h"
+#include "util/u_framebuffer.h"
 #include "util/u_suballoc.h"
 #include "util/u_threaded_context.h"
 
@@ -183,6 +186,7 @@ struct d3d12_context {
    struct blitter_context *blitter;
    uint flags;
    bool queries_disabled;
+   bool has_commands;
 
 #ifdef __cplusplus
    ResourceStateManager *resource_state_manager;
@@ -203,6 +207,7 @@ struct d3d12_context {
    struct hash_table *compute_transform_cache;
 
    struct pipe_constant_buffer cbufs[PIPE_SHADER_TYPES][PIPE_MAX_CONSTANT_BUFFERS];
+   PIPE_FB_SURFACES; //STOP USING THIS
    struct pipe_framebuffer_state fb;
    struct pipe_vertex_buffer vbs[PIPE_MAX_ATTRIBS];
    D3D12_VERTEX_BUFFER_VIEW vbvs[PIPE_MAX_ATTRIBS];
@@ -324,7 +329,7 @@ d3d12_enable_fake_so_buffers(struct d3d12_context *ctx, unsigned factor);
 bool
 d3d12_disable_fake_so_buffers(struct d3d12_context *ctx);
 
-void
+bool
 d3d12_flush_cmdlist(struct d3d12_context *ctx);
 
 void

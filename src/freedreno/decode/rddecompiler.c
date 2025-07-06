@@ -24,11 +24,7 @@
 
 #include "util/u_math.h"
 
-#include "adreno_common.xml.h"
-#include "adreno_pm4.xml.h"
-#include "freedreno_pm4.h"
-
-#include "a6xx.xml.h"
+#include "fd6_hw.h"
 #include "common/freedreno_dev_info.h"
 
 #include "util/hash_table.h"
@@ -209,12 +205,12 @@ static struct {
    uint32_t regbase;
    uint32_t (*fxn)(const char *name, uint32_t regbase, uint32_t *dwords, int level);
 } reg_a6xx[] = {
-   {REG_A6XX_SP_VS_OBJ_START, decompile_shader},
-   {REG_A6XX_SP_HS_OBJ_START, decompile_shader},
-   {REG_A6XX_SP_DS_OBJ_START, decompile_shader},
-   {REG_A6XX_SP_GS_OBJ_START, decompile_shader},
-   {REG_A6XX_SP_FS_OBJ_START, decompile_shader},
-   {REG_A6XX_SP_CS_OBJ_START, decompile_shader},
+   {REG_A6XX_SP_VS_BASE, decompile_shader},
+   {REG_A6XX_SP_HS_BASE, decompile_shader},
+   {REG_A6XX_SP_DS_BASE, decompile_shader},
+   {REG_A6XX_SP_GS_BASE, decompile_shader},
+   {REG_A6XX_SP_PS_BASE, decompile_shader},
+   {REG_A6XX_SP_CS_BASE, decompile_shader},
 
    {0, NULL},
 }, *type0_reg;
@@ -323,11 +319,9 @@ decompile_domain(uint32_t pkt, uint32_t *dwords, uint32_t sizedwords,
 
    if (pkt == CP_LOAD_STATE6_FRAG || pkt == CP_LOAD_STATE6_GEOM) {
       enum a6xx_state_type state_type =
-         (dwords[0] & CP_LOAD_STATE6_0_STATE_TYPE__MASK) >>
-         CP_LOAD_STATE6_0_STATE_TYPE__SHIFT;
+         pkt_field_get(CP_LOAD_STATE6_0_STATE_TYPE, dwords[0]);
       enum a6xx_state_src state_src =
-         (dwords[0] & CP_LOAD_STATE6_0_STATE_SRC__MASK) >>
-         CP_LOAD_STATE6_0_STATE_SRC__SHIFT;
+         pkt_field_get(CP_LOAD_STATE6_0_STATE_SRC, dwords[0]);
 
       /* TODO: decompile all other state */
       if (state_type == ST6_SHADER && state_src == SS6_INDIRECT) {

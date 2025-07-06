@@ -193,6 +193,8 @@ get_device_extensions(const struct v3dv_physical_device *device,
       .KHR_swapchain                        = true,
       .KHR_swapchain_mutable_format         = true,
       .KHR_incremental_present              = true,
+      .KHR_present_id2                      = true,
+      .KHR_present_wait2                    = true,
 #endif
       .KHR_variable_pointers                = true,
       .KHR_vertex_attribute_divisor         = true,
@@ -238,7 +240,8 @@ get_device_extensions(const struct v3dv_physical_device *device,
       .EXT_vertex_attribute_divisor         = true,
    };
 #if DETECT_OS_ANDROID
-   if (vk_android_get_ugralloc() != NULL) {
+   struct u_gralloc *gralloc = vk_android_get_ugralloc();
+   if (gralloc && u_gralloc_get_type(gralloc) != U_GRALLOC_TYPE_FALLBACK) {
       ext->ANDROID_external_memory_android_hardware_buffer = true;
       ext->ANDROID_native_buffer = true;
    }
@@ -258,7 +261,7 @@ get_features(const struct v3dv_physical_device *physical_device,
       .geometryShader = true,
       .tessellationShader = false,
       .sampleRateShading = true,
-      .dualSrcBlend = false,
+      .dualSrcBlend = true,
       .logicOp = true,
       .multiDrawIndirect = false,
       .drawIndirectFirstInstance = true,
@@ -612,16 +615,6 @@ v3dv_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
 
    VG(VALGRIND_CREATE_MEMPOOL(instance, 0, false));
 
-#if DETECT_OS_ANDROID
-   struct u_gralloc *u_gralloc = vk_android_init_ugralloc();
-
-   if (u_gralloc && u_gralloc_get_type(u_gralloc) == U_GRALLOC_TYPE_FALLBACK) {
-      mesa_logw(
-         "v3dv: Gralloc is not supported. Android extensions are disabled.");
-      vk_android_destroy_ugralloc();
-   }
-#endif
-
    *pInstance = v3dv_instance_to_handle(instance);
 
    return VK_SUCCESS;
@@ -679,10 +672,6 @@ v3dv_DestroyInstance(VkInstance _instance,
 
    if (!instance)
       return;
-
-#if DETECT_OS_ANDROID
-   vk_android_destroy_ugralloc();
-#endif
 
    VG(VALGRIND_DESTROY_MEMPOOL(instance));
 
@@ -881,19 +870,6 @@ get_device_properties(const struct v3dv_physical_device *device,
                       VK_SUBGROUP_FEATURE_QUAD_BIT;
    }
 
-#if DETECT_OS_ANDROID
-   /* Used to determine the sharedImage prop in
-    * VkPhysicalDevicePresentationPropertiesANDROID
-    */
-   uint64_t front_rendering_usage = 0;
-   struct u_gralloc *gralloc = u_gralloc_create(U_GRALLOC_TYPE_AUTO);
-   if (gralloc != NULL) {
-      u_gralloc_get_front_rendering_usage(gralloc, &front_rendering_usage);
-      u_gralloc_destroy(&gralloc);
-   }
-   VkBool32 shared_image = front_rendering_usage ? VK_TRUE : VK_FALSE;
-#endif
-
    /* FIXME: this will probably require an in-depth review */
    *properties = (struct vk_properties) {
       /* VkPhysicalDeviceProperties, limits and sparse props below */
@@ -967,7 +943,7 @@ get_device_properties(const struct v3dv_physical_device *device,
       /* Fragment limits */
       .maxFragmentInputComponents               = max_varying_components,
       .maxFragmentOutputAttachments             = 4,
-      .maxFragmentDualSrcAttachments            = 0,
+      .maxFragmentDualSrcAttachments            = 1,
       .maxFragmentCombinedOutputResources       = max_rts +
                                                   MAX_STORAGE_BUFFERS +
                                                   MAX_STORAGE_IMAGES,
@@ -1045,7 +1021,7 @@ get_device_properties(const struct v3dv_physical_device *device,
       .subgroupSize = V3D_CHANNELS,
       .subgroupSupportedStages = VK_SHADER_STAGE_COMPUTE_BIT |
                                  VK_SHADER_STAGE_FRAGMENT_BIT,
-      .subgroupSupportedOperations = VK_SUBGROUP_FEATURE_BASIC_BIT,
+      .subgroupSupportedOperations = subgroup_ops,
       .subgroupQuadOperationsInAllStages = false,
       .pointClippingBehavior = VK_POINT_CLIPPING_BEHAVIOR_ALL_CLIP_PLANES,
       .maxMultiviewViewCount = MAX_MULTIVIEW_VIEW_COUNT,
@@ -1193,7 +1169,7 @@ get_device_properties(const struct v3dv_physical_device *device,
 
 #if DETECT_OS_ANDROID
       /* VkPhysicalDevicePresentationPropertiesANDROID */
-      .sharedImage = shared_image,
+      .sharedImage = !!vk_android_get_front_buffer_usage(),
 #endif
 
       /* VkPhysicalDeviceDrmPropertiesEXT */
@@ -1229,8 +1205,6 @@ get_device_properties(const struct v3dv_physical_device *device,
       .maxSubgroupSize = V3D_CHANNELS,
       .maxComputeWorkgroupSubgroups = 16, /* 256 / 16 */
       .requiredSubgroupSizeStages = VK_SHADER_STAGE_COMPUTE_BIT,
-
-      .subgroupSupportedOperations = subgroup_ops,
 
       /* VK_KHR_maintenance5 */
       .earlyFragmentMultisampleCoverageAfterSampleCounting = true,
@@ -1515,12 +1489,7 @@ try_display_device(struct v3dv_instance *instance, const char *path,
     * drivers for different types of connectors and the one with a connected
     * output may not be vc4, which unlike Raspberry Pi 4, doesn't drive the
     * DSI output for example.
-    *
-    * If the display device isn't the DRM master, we can't get its resources.
     */
-   if (!drmIsMaster(*fd))
-      goto fail;
-
    drmModeResPtr mode_res = drmModeGetResources(*fd);
    if (!mode_res) {
       mesa_loge("Failed to get DRM mode resources: %s\n", strerror(errno));
@@ -1596,10 +1565,12 @@ enumerate_devices(struct vk_instance *vk_instance)
       if (devices[i]->bustype != DRM_BUS_PLATFORM)
          continue;
 
-      if ((devices[i]->available_nodes & 1 << DRM_NODE_RENDER))
+      if ((devices[i]->available_nodes & 1 << DRM_NODE_RENDER)) {
          try_device(devices[i]->nodes[DRM_NODE_RENDER], &render_fd, "v3d");
-      if ((devices[i]->available_nodes & 1 << DRM_NODE_PRIMARY))
+      } else if (primary_fd == -1 &&
+                 (devices[i]->available_nodes & 1 << DRM_NODE_PRIMARY)) {
          try_display_device(instance, devices[i]->nodes[DRM_NODE_PRIMARY], &primary_fd);
+      }
 #endif
 
       if (render_fd >= 0 && primary_fd >= 0)
@@ -2213,9 +2184,13 @@ v3dv_AllocateMemory(VkDevice _device,
    assert(pAllocateInfo->sType == VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO);
 
    /* We always allocate device memory in multiples of a page, so round up
-    * requested size to that.
+    * requested size to that. We need to add a V3D_TFU_READHAEAD padding to
+    * avoid invalid reads done by the TFU unit after the end of the last page
+    * allocated.
     */
-   const VkDeviceSize alloc_size = align64(pAllocateInfo->allocationSize, 4096);
+
+   const VkDeviceSize alloc_size = align64(pAllocateInfo->allocationSize +
+                                           V3D_TFU_READAHEAD_SIZE, 4096);
 
    if (unlikely(alloc_size > MAX_MEMORY_ALLOCATION_SIZE))
       return vk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
@@ -2559,7 +2534,7 @@ v3dv_BindImageMemory2(VkDevice _device,
       }
 
       const VkBindImageMemorySwapchainInfoKHR *swapchain_info =
-         vk_find_struct_const(pBindInfos->pNext,
+         vk_find_struct_const(pBindInfos[i].pNext,
                               BIND_IMAGE_MEMORY_SWAPCHAIN_INFO_KHR);
       if (swapchain_info && swapchain_info->swapchain) {
 #if !DETECT_OS_ANDROID

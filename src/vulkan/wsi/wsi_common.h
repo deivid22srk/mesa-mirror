@@ -273,6 +273,7 @@ struct wsi_device {
    WSI_CB(GetSemaphoreFdKHR);
    WSI_CB(ResetFences);
    WSI_CB(QueueSubmit);
+   WSI_CB(SetDebugUtilsObjectNameEXT);
    WSI_CB(WaitForFences);
    WSI_CB(MapMemory);
    WSI_CB(UnmapMemory);
@@ -325,11 +326,6 @@ wsi_device_setup_syncobj_fd(struct wsi_device *wsi_device,
    __VkIcdType *__name = __VkIcdType ## _from_handle(__handle)
 
 ICD_DEFINE_NONDISP_HANDLE_CASTS(VkIcdSurfaceBase, VkSurfaceKHR)
-
-VkResult
-wsi_common_get_images(VkSwapchainKHR _swapchain,
-                      uint32_t *pSwapchainImageCount,
-                      VkImage *pSwapchainImages);
 
 VkImage
 wsi_common_get_image(VkSwapchainKHR _swapchain, uint32_t index);

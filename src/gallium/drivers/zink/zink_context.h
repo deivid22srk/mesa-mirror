@@ -54,14 +54,6 @@ struct zink_vertex_elements_state;
    util_debug_message(&ctx->dbg, PERF_INFO, __VA_ARGS__); \
 } while(0)
 
-static inline struct zink_resource *
-zink_descriptor_surface_resource(struct zink_descriptor_surface *ds)
-{
-   return ds->is_buffer ?
-          zink_descriptor_mode == ZINK_DESCRIPTOR_MODE_DB ? zink_resource(ds->db.pres) : zink_resource(ds->bufferview->pres) :
-          (struct zink_resource*)ds->surface->base.texture;
-}
-
 static inline bool
 zink_fb_clear_enabled(const struct zink_context *ctx, unsigned idx)
 {
@@ -149,8 +141,6 @@ zink_batch_no_rp(struct zink_context *ctx);
 void
 zink_batch_no_rp_safe(struct zink_context *ctx);
 
-VkImageView
-zink_prep_fb_attachment(struct zink_context *ctx, struct zink_surface *surf, unsigned i);
 void
 zink_update_vk_sample_locations(struct zink_context *ctx);
 
@@ -189,7 +179,7 @@ zink_init_draw_functions(struct zink_context *ctx, struct zink_screen *screen);
 void
 zink_init_grid_functions(struct zink_context *ctx);
 struct zink_context *
-zink_tc_context_unwrap(struct pipe_context *pctx, bool threaded);
+zink_tc_context_unwrap(struct pipe_context *pctx);
 
 void
 zink_update_barriers(struct zink_context *ctx, bool is_compute,
@@ -202,7 +192,7 @@ void
 zink_cmd_debug_marker_end(struct zink_context *ctx, VkCommandBuffer cmdbuf,bool emitted);
 void
 zink_copy_buffer(struct zink_context *ctx, struct zink_resource *dst, struct zink_resource *src,
-                 unsigned dst_offset, unsigned src_offset, unsigned size);
+                 unsigned dst_offset, unsigned src_offset, unsigned size, bool unsync);
 #ifdef __cplusplus
 }
 #endif
@@ -236,7 +226,7 @@ void
 zink_draw_rectangle(struct blitter_context *blitter, void *vertex_elements_cso,
                     blitter_get_vs_func get_vs, int x1, int y1, int x2, int y2,
                     float depth, unsigned num_instances, enum blitter_attrib_type type,
-                    const union blitter_attrib *attrib);
+                    const struct blitter_attrib *attrib);
 
 static inline struct u_rect
 zink_rect_from_box(const struct pipe_box *box)
@@ -269,38 +259,15 @@ bool
 zink_resource_rebind(struct zink_context *ctx, struct zink_resource *res);
 
 void
-zink_rebind_framebuffer(struct zink_context *ctx, struct zink_resource *res);
-void
 zink_set_null_fs(struct zink_context *ctx);
 
 void
 zink_copy_image_buffer(struct zink_context *ctx, struct zink_resource *dst, struct zink_resource *src,
-                       unsigned dst_level, unsigned dstx, unsigned dsty, unsigned dstz,
-                       unsigned src_level, const struct pipe_box *src_box, enum pipe_map_flags map_flags);
+                       unsigned buffer_offset,
+                       unsigned buffer_stride,
+                       unsigned buffer_layer_stride,
+                       unsigned level, const struct pipe_box *src_box, enum pipe_map_flags map_flags);
 
-void
-zink_destroy_buffer_view(struct zink_screen *screen, struct zink_buffer_view *buffer_view);
-
-struct pipe_surface *
-zink_get_dummy_pipe_surface(struct zink_context *ctx, int samples_index);
-struct zink_surface *
-zink_get_dummy_surface(struct zink_context *ctx, int samples_index);
-
-void
-debug_describe_zink_buffer_view(char *buf, const struct zink_buffer_view *ptr);
-
-static inline void
-zink_buffer_view_reference(struct zink_screen *screen,
-                           struct zink_buffer_view **dst,
-                           struct zink_buffer_view *src)
-{
-   struct zink_buffer_view *old_dst = dst ? *dst : NULL;
-
-   if (pipe_reference_described(old_dst ? &old_dst->reference : NULL, &src->reference,
-                                (debug_reference_descriptor)debug_describe_zink_buffer_view))
-      zink_destroy_buffer_view(screen, old_dst);
-   if (dst) *dst = src;
-}
 #endif
 
 #endif

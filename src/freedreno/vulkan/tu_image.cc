@@ -169,11 +169,11 @@ void
 tu_cs_image_ref_2d(struct tu_cs *cs, const struct fdl6_view *iview, uint32_t layer, bool src)
 {
    tu_cs_emit_qw(cs, iview->base_addr + iview->layer_size * layer);
-   /* SP_PS_2D_SRC_PITCH has shifted pitch field */
+   /* TPL1_A2D_SRC_TEXTURE_PITCH has shifted pitch field */
    if (src)
-      tu_cs_emit(cs, SP_PS_2D_SRC_PITCH(CHIP, .pitch = iview->pitch).value);
+      tu_cs_emit(cs, TPL1_A2D_SRC_TEXTURE_PITCH(CHIP, .pitch = iview->pitch).value);
    else
-      tu_cs_emit(cs, A6XX_RB_2D_DST_PITCH(iview->pitch).value);
+      tu_cs_emit(cs, A6XX_RB_A2D_DEST_BUFFER_PITCH(iview->pitch).value);
 }
 TU_GENX(tu_cs_image_ref_2d);
 
@@ -341,6 +341,10 @@ ubwc_possible(struct tu_device *device,
               uint32_t mip_levels,
               bool use_z24uint_s8uint)
 {
+   /* TODO: enable for a702 */
+   if (info->a6xx.is_a702)
+      return false;
+
    /* no UBWC with compressed formats, E5B9G9R9, S8_UINT
     * (S8_UINT because separate stencil doesn't have UBWC-enable bit)
     */
@@ -381,7 +385,7 @@ ubwc_possible(struct tu_device *device,
     * and we can't change the descriptor so we can't do this.
     */
    if (((usage | stencil_usage) & VK_IMAGE_USAGE_STORAGE_BIT) &&
-       !info->a7xx.supports_ibo_ubwc) {
+       !info->a7xx.supports_uav_ubwc) {
       return false;
    }
 
@@ -500,9 +504,11 @@ tu_image_update_layout(struct tu_device *device, struct tu_image *image,
     * but gralloc doesn't know this.  So if we are explicitly told that it is
     * UBWC, then override how the image was created.
     */
+   bool force_ubwc = false;
    if (modifier == DRM_FORMAT_MOD_QCOM_COMPRESSED) {
       assert(!image->force_linear_tile);
       image->ubwc_enabled = true;
+      force_ubwc = true;
    }
 
    /* R8G8 images have a special tiled layout which we don't implement yet in
@@ -548,6 +554,7 @@ tu_image_update_layout(struct tu_device *device, struct tu_image *image,
                        image->vk.array_layers,
                        image->vk.image_type == VK_IMAGE_TYPE_3D,
                        image->is_mutable,
+                       force_ubwc,
                        plane_layouts ? &plane_layout : NULL)) {
          assert(plane_layouts); /* can only fail with explicit layout */
          return vk_error(device, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT);
@@ -1163,10 +1170,10 @@ tu_DestroyImageView(VkDevice _device,
  */
 void
 tu_fragment_density_map_sample(const struct tu_image_view *fdm,
-                               uint32_t x, uint32_t y,
+                               int32_t x, int32_t y,
                                uint32_t width, uint32_t height,
-                               uint32_t layers,
-                               struct tu_frag_area *areas)
+                               uint32_t layer,
+                               struct tu_frag_area *area)
 {
    assert(fdm->image->layout[0].tile_mode == TILE6_LINEAR);
 
@@ -1176,20 +1183,19 @@ tu_fragment_density_map_sample(const struct tu_image_view *fdm,
    fdm_shift_x = CLAMP(fdm_shift_x, MIN_FDM_TEXEL_SIZE_LOG2, MAX_FDM_TEXEL_SIZE_LOG2);
    fdm_shift_y = CLAMP(fdm_shift_y, MIN_FDM_TEXEL_SIZE_LOG2, MAX_FDM_TEXEL_SIZE_LOG2);
 
-   uint32_t i = x >> fdm_shift_x;
-   uint32_t j = y >> fdm_shift_y;
+   int32_t i = x >> fdm_shift_x;
+   int32_t j = y >> fdm_shift_y;
+
+   i = CLAMP(i, 0, fdm->vk.extent.width - 1);
+   j = CLAMP(j, 0, fdm->vk.extent.height - 1);
 
    unsigned cpp = fdm->image->layout[0].cpp;
    unsigned pitch = fdm->view.pitch;
 
-   void *pixel = (char *)fdm->image->map + fdm->view.offset + cpp * i + pitch * j;
-   for (unsigned i = 0; i < layers; i++) {
-      float density_src[4], density[4];
-      util_format_unpack_rgba(fdm->view.format, density_src, pixel, 1);
-      pipe_swizzle_4f(density, density_src, fdm->swizzle);
-      areas[i].width = 1.0f / density[0];
-      areas[i].height = 1.0f / density[1];
-
-      pixel = (char *)pixel + fdm->view.layer_size;
-   }
+   void *pixel = (char *)fdm->image->map + fdm->view.offset + fdm->view.layer_size * layer + cpp * i + pitch * j;
+   float density_src[4], density[4];
+   util_format_unpack_rgba(fdm->view.format, density_src, pixel, 1);
+   pipe_swizzle_4f(density, density_src, fdm->swizzle);
+   area->width = 1.0f / density[0];
+   area->height = 1.0f / density[1];
 }

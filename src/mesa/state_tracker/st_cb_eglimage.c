@@ -83,6 +83,19 @@ is_format_supported(struct pipe_screen *screen, enum pipe_format format,
                                                  PIPE_TEXTURE_2D, nr_samples,
                                                  nr_storage_samples, usage);
          break;
+      case PIPE_FORMAT_Y10X6_U10X6_V10X6_420_UNORM:
+      case PIPE_FORMAT_Y10X6_U10X6_V10X6_422_UNORM:
+      case PIPE_FORMAT_Y10X6_U10X6_V10X6_444_UNORM:
+      case PIPE_FORMAT_Y12X4_U12X4_V12X4_420_UNORM:
+      case PIPE_FORMAT_Y12X4_U12X4_V12X4_422_UNORM:
+      case PIPE_FORMAT_Y12X4_U12X4_V12X4_444_UNORM:
+      case PIPE_FORMAT_Y16_U16_V16_420_UNORM:
+      case PIPE_FORMAT_Y16_U16_V16_422_UNORM:
+      case PIPE_FORMAT_Y16_U16_V16_444_UNORM:
+         supported = screen->is_format_supported(screen, PIPE_FORMAT_R16_UNORM,
+                                                 PIPE_TEXTURE_2D, nr_samples,
+                                                 nr_storage_samples, usage);
+         break;
       case PIPE_FORMAT_Y210:
       case PIPE_FORMAT_Y212:
       case PIPE_FORMAT_Y216:
@@ -233,6 +246,42 @@ is_fmt_as_r10_g10b10_supported(struct pipe_screen *screen, struct st_egl_image *
 }
 
 static bool
+is_yuv420_as_r8g8b8_supported(struct pipe_screen *screen,
+                              struct st_egl_image *out,
+                              unsigned usage, bool *native_supported)
+{
+   if (out->format == PIPE_FORMAT_Y8U8V8_420_UNORM_PACKED &&
+       out->texture->format == PIPE_FORMAT_R8G8B8_420_UNORM_PACKED &&
+       screen->is_format_supported(screen, PIPE_FORMAT_R8G8B8_420_UNORM_PACKED,
+                                   PIPE_TEXTURE_2D,
+                                   out->texture->nr_samples,
+                                   out->texture->nr_storage_samples,
+                                   usage)) {
+      *native_supported = false;
+      return true;
+   }
+   return false;
+}
+
+static bool
+is_yuv420_as_r10g10b10_supported(struct pipe_screen *screen,
+                                 struct st_egl_image *out,
+                                 unsigned usage, bool *native_supported)
+{
+   if (out->format == PIPE_FORMAT_Y10U10V10_420_UNORM_PACKED &&
+       out->texture->format == PIPE_FORMAT_R10G10B10_420_UNORM_PACKED &&
+       screen->is_format_supported(screen, PIPE_FORMAT_R10G10B10_420_UNORM_PACKED,
+                                   PIPE_TEXTURE_2D,
+                                   out->texture->nr_samples,
+                                   out->texture->nr_storage_samples,
+                                   usage)) {
+      *native_supported = false;
+      return true;
+   }
+   return false;
+}
+
+static bool
 is_i420_as_r8_g8_b8_420_supported(struct pipe_screen *screen,
                                   struct st_egl_image *out,
                                   unsigned usage, bool *native_supported)
@@ -287,6 +336,8 @@ st_get_egl_image(struct gl_context *ctx, GLeglImageOES image_handle,
    if (!is_fmt_as_r8_g8b8_supported(screen, out, usage, native_supported) &&
        !is_fmt_as_r10_g10b10_supported(screen, out, usage, native_supported) &&
        !is_i420_as_r8_g8_b8_420_supported(screen, out, usage, native_supported) &&
+       !is_yuv420_as_r8g8b8_supported(screen, out, usage, native_supported) &&
+       !is_yuv420_as_r10g10b10_supported(screen, out, usage, native_supported) &&
        !is_format_supported(screen, out->format, out->texture->nr_samples,
                             out->texture->nr_storage_samples, usage,
                             native_supported)) {
@@ -349,26 +400,19 @@ st_egl_image_target_renderbuffer_storage(struct gl_context *ctx,
    if (st_get_egl_image(ctx, image_handle, PIPE_BIND_RENDER_TARGET, false,
                         "glEGLImageTargetRenderbufferStorage",
                         &stimg, &native_supported)) {
-      struct pipe_context *pipe = st_context(ctx)->pipe;
-      struct pipe_surface *ps, surf_tmpl;
+      struct pipe_surface surf_tmpl;
 
       u_surface_default_template(&surf_tmpl, stimg.texture);
-      surf_tmpl.format = stimg.format;
-      surf_tmpl.u.tex.level = stimg.level;
-      surf_tmpl.u.tex.first_layer = stimg.layer;
-      surf_tmpl.u.tex.last_layer = stimg.layer;
-      ps = pipe->create_surface(pipe, stimg.texture, &surf_tmpl);
-      pipe_resource_reference(&stimg.texture, NULL);
+      surf_tmpl.level = stimg.level;
+      surf_tmpl.first_layer = stimg.layer;
+      surf_tmpl.last_layer = stimg.layer;
 
-      if (!ps)
-         return;
-
-      rb->Format = st_pipe_format_to_mesa_format(ps->format);
-      rb->_BaseFormat = st_pipe_format_to_base_format(ps->format);
+      rb->Format = st_pipe_format_to_mesa_format(surf_tmpl.format);
+      rb->_BaseFormat = st_pipe_format_to_base_format(surf_tmpl.format);
       rb->InternalFormat = rb->_BaseFormat;
 
-      st_set_ws_renderbuffer_surface(rb, ps);
-      pipe_surface_reference(&ps, NULL);
+      st_set_ws_renderbuffer_surface(rb, &surf_tmpl);
+      pipe_resource_reference(&stimg.texture, NULL);
    }
 }
 
@@ -411,6 +455,16 @@ st_bind_egl_image(struct gl_context *ctx,
     */
    if (!native_supported) {
       switch (stimg->format) {
+      case PIPE_FORMAT_Y8U8V8_420_UNORM_PACKED:
+         assert(stimg->texture->format == PIPE_FORMAT_R8G8B8_420_UNORM_PACKED);
+         texFormat = MESA_FORMAT_R8G8B8X8_UNORM;
+         texObj->RequiredTextureImageUnits = 1;
+         break;
+      case PIPE_FORMAT_Y10U10V10_420_UNORM_PACKED:
+         assert(stimg->texture->format == PIPE_FORMAT_R10G10B10_420_UNORM_PACKED);
+         texFormat = MESA_FORMAT_R10G10B10X2_UNORM;
+         texObj->RequiredTextureImageUnits = 1;
+         break;
       case PIPE_FORMAT_NV12:
       case PIPE_FORMAT_NV21:
          if (stimg->texture->format == PIPE_FORMAT_R8_G8B8_420_UNORM ||
@@ -482,6 +536,18 @@ st_bind_egl_image(struct gl_context *ctx,
             texObj->RequiredTextureImageUnits = 3;
          }
          break;
+      case PIPE_FORMAT_Y10X6_U10X6_V10X6_420_UNORM:
+      case PIPE_FORMAT_Y10X6_U10X6_V10X6_422_UNORM:
+      case PIPE_FORMAT_Y10X6_U10X6_V10X6_444_UNORM:
+      case PIPE_FORMAT_Y12X4_U12X4_V12X4_420_UNORM:
+      case PIPE_FORMAT_Y12X4_U12X4_V12X4_422_UNORM:
+      case PIPE_FORMAT_Y12X4_U12X4_V12X4_444_UNORM:
+      case PIPE_FORMAT_Y16_U16_V16_420_UNORM:
+      case PIPE_FORMAT_Y16_U16_V16_422_UNORM:
+      case PIPE_FORMAT_Y16_U16_V16_444_UNORM:
+         texFormat = MESA_FORMAT_R_UNORM16;
+         texObj->RequiredTextureImageUnits = 3;
+         break;
       case PIPE_FORMAT_YUYV:
       case PIPE_FORMAT_YVYU:
       case PIPE_FORMAT_UYVY:
@@ -518,6 +584,7 @@ st_bind_egl_image(struct gl_context *ctx,
       }
    } else {
       texFormat = st_pipe_format_to_mesa_format(stimg->format);
+
       /* Use previously derived internalformat as specified by
        * EXT_EGL_image_storage.
        */

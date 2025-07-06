@@ -166,6 +166,7 @@ INSTANTIATE_TEST_SUITE_P(Opcodes, DisasmTest,
       disasm_state{ {0x00801036, 0x15400804, 0x01540050, 0x00000002}, "clamp0_max        t0.x___, u0.yyyy, u0.zzzz, void\n"},
       disasm_state{ {0x0080103b, 0x00001804, 0x40000000, 0x00400028}, "iaddsat.s32       t0.x___, t1.xxxx, void, -t2.xxxx\n"},
       disasm_state{ {0x01001008, 0x15400804, 0xd00100c0, 0x00000007}, "imod.u16          t0._y__, t0.yyyy, 1, void\n"},
+      disasm_state{ {0x07811009, 0x15001f20, 0x01ff00c0, 0x78021008}, "txf               t1, tex0.xyzw, t1.xyyy, t1.wwww, 4352\n", FLAG_FAILING_ASM},
       disasm_state{ {0x0080103c, 0x00001804, 0x40000140, 0x00000000}, "imullo0.s32       t0.x___, t1.xxxx, t2.xxxx, void\n"},
       disasm_state{ {0x00801000, 0x00001804, 0x40010140, 0x00000000}, "imulhi0.s32       t0.x___, t1.xxxx, t2.xxxx, void\n"},
       disasm_state{ {0x00801004, 0x00201804, 0x40010040, 0x00000000}, "idiv0.s16         t0.x___, t1.xxxx, t0.xxxx, void\n"},
@@ -346,6 +347,17 @@ INSTANTIATE_TEST_SUITE_P(texldlpcf, DisasmTest,
       // taken from dEQP-GLES3.functional.shaders.texture_functions.texturelod.sampler2dshadow_vertex (GC7000)
       disasm_state{ {0x04011809, 0x00000004, 0x00000000, 0x002a8018}, "mov.sat           t1.___w, void, void, t1.zzzz\n"},
       disasm_state{ {0x0081102f, 0x29001800, 0x00010140, 0x003fc018}, "texldlpcf         t1.x___, tex0.xxxx, t1.xyzz, t2.xxxx, t1.wwww\n"},
+      disasm_state{ {0x07011009, 0x00000004, 0x00000000, 0x20390018}, "mov               t1._yzw, void, void, u1.xyzw\n"}
+   )
+);
+// clang-format on
+
+// clang-format off
+INSTANTIATE_TEST_SUITE_P(texldgpcf, DisasmTest,
+   testing::Values(
+      // taken from dEQP-GLES3.functional.shaders.texture_functions.texturegrad.sampler2dshadow_fragment (GC7000)
+      disasm_state{ {0x04011809, 0x00000004, 0x00000000, 0x003fc018}, "mov.sat           t1.___w, void, void, t1.wwww\n"},
+      disasm_state{ {0x00811030, 0x39001800, 0x01490140, 0x00290038}, "texldgpcf         t1.x___, tex0.xxxx, t1.xyzw, t2.xyzz, t3.xyzz\n"},
       disasm_state{ {0x07011009, 0x00000004, 0x00000000, 0x20390018}, "mov               t1._yzw, void, void, u1.xyzw\n"}
    )
 );

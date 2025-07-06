@@ -1,5 +1,6 @@
 /*
  * Copyright © 2024 Collabora Ltd.
+ * Copyright © 2025 Arm Ltd.
  * SPDX-License-Identifier: MIT
  */
 
@@ -21,6 +22,7 @@
 #include "panvk_queue.h"
 
 #include "vk_command_buffer.h"
+#include "vk_synchronization.h"
 
 #include "util/list.h"
 #include "util/perf/u_trace.h"
@@ -85,30 +87,43 @@ get_fbd_size(bool has_zs_ext, uint32_t rt_count)
    (TILER_OOM_CTX_FIELD_OFFSET(fbds) +                                         \
     (PANVK_IR_##_pass##_PASS * sizeof(uint64_t)))
 
+struct panvk_cs_timestamp_query {
+   struct cs_single_link_list_node node;
+   uint64_t reports;
+   uint64_t avail;
+};
+
 struct panvk_cs_occlusion_query {
-   uint64_t next;
+   struct cs_single_link_list_node node;
    uint64_t syncobj;
 };
 
 struct panvk_cs_subqueue_context {
    uint64_t syncobjs;
+#if PAN_ARCH == 10
+   /* must follow syncobjs immediately for cs_load_to */
    uint32_t iter_sb;
+#else
    uint32_t pad;
+#endif
+   uint32_t last_error;
+   uint64_t reg_dump_addr;
    struct {
       struct panvk_cs_desc_ringbuf desc_ringbuf;
       uint64_t tiler_heap;
       uint64_t geom_buf;
-      uint64_t oq_chain;
+      struct cs_single_link_list oq_chain;
+      /* Timestamp queries that need to happen after the current rp. */
+      struct cs_single_link_list ts_chain;
+      struct cs_single_link_list ts_done_chain;
    } render;
    struct {
       uint32_t counter;
       uint64_t fbds[PANVK_IR_PASS_COUNT];
       uint32_t td_count;
       uint32_t layer_count;
-      uint64_t reg_dump_addr;
    } tiler_oom_ctx;
    struct {
-      uint64_t syncobjs;
       struct {
          uint64_t cs;
       } tracebuf;
@@ -118,7 +133,7 @@ struct panvk_cs_subqueue_context {
 struct panvk_cache_flush_info {
    enum mali_cs_flush_mode l2;
    enum mali_cs_flush_mode lsc;
-   bool others;
+   enum mali_cs_other_flush_mode others;
 };
 
 struct panvk_cs_deps {
@@ -130,6 +145,9 @@ struct panvk_cs_deps {
 
    struct {
       uint32_t wait_subqueue_mask;
+      bool conditional;
+      enum mali_cs_condition cond;
+      struct cs_index cond_value;
    } dst[PANVK_SUBQUEUE_COUNT];
 };
 
@@ -147,20 +165,18 @@ enum panvk_sb_ids {
 #define SB_ID(nm)       PANVK_SB_##nm
 #define SB_ITER(x)      (PANVK_SB_ITER_START + (x))
 #define SB_WAIT_ITER(x) BITFIELD_BIT(PANVK_SB_ITER_START + (x))
-#define SB_ALL_ITERS_MASK                                                      \
-   BITFIELD_RANGE(PANVK_SB_ITER_START, PANVK_SB_ITER_COUNT)
-#define SB_ALL_MASK     BITFIELD_MASK(8)
-
-static inline uint32_t
-next_iter_sb(uint32_t sb)
-{
-   return sb + 1 < PANVK_SB_ITER_COUNT ? sb + 1 : 0;
-}
 
 enum panvk_cs_regs {
    /* RUN_IDVS staging regs. */
    PANVK_CS_REG_RUN_IDVS_SR_START = 0,
+
+#if PAN_ARCH >= 12
+   PANVK_CS_REG_RUN_IDVS_SR_END = 65,
+#elif PAN_ARCH == 11
+   PANVK_CS_REG_RUN_IDVS_SR_END = 63,
+#else
    PANVK_CS_REG_RUN_IDVS_SR_END = 60,
+#endif
 
    /* RUN_FRAGMENT staging regs.
     * SW ABI:
@@ -178,6 +194,17 @@ enum panvk_cs_regs {
     * all queues. Note that some queues have extra space they can use
     * as scratch space.*/
    PANVK_CS_REG_SCRATCH_START = 66,
+
+   /* On v12+, we have 128 registers so that gives us way more space to work with */
+#if PAN_ARCH >= 12
+   PANVK_CS_REG_SCRATCH_END = 115,
+
+   /* Driver context. */
+   PANVK_CS_REG_PROGRESS_SEQNO_START = 116,
+   PANVK_CS_REG_PROGRESS_SEQNO_END = 121,
+   PANVK_CS_REG_SUBQUEUE_CTX_START = 122,
+   PANVK_CS_REG_SUBQUEUE_CTX_END = 123,
+#else
    PANVK_CS_REG_SCRATCH_END = 83,
 
    /* Driver context. */
@@ -185,6 +212,7 @@ enum panvk_cs_regs {
    PANVK_CS_REG_PROGRESS_SEQNO_END = 89,
    PANVK_CS_REG_SUBQUEUE_CTX_START = 90,
    PANVK_CS_REG_SUBQUEUE_CTX_END = 91,
+#endif
 };
 
 #define CS_REG_SCRATCH_COUNT                                                   \
@@ -211,26 +239,6 @@ cs_scratch_reg64(struct cs_builder *b, unsigned reg)
 }
 
 static inline struct cs_index
-cs_sr_reg_tuple(struct cs_builder *b, unsigned start, unsigned count)
-{
-   assert(start + count - 1 < PANVK_CS_REG_SCRATCH_START);
-   return cs_reg_tuple(b, start, count);
-}
-
-static inline struct cs_index
-cs_sr_reg32(struct cs_builder *b, unsigned reg)
-{
-   return cs_sr_reg_tuple(b, reg, 1);
-}
-
-static inline struct cs_index
-cs_sr_reg64(struct cs_builder *b, unsigned reg)
-{
-   assert(reg % 2 == 0);
-   return cs_sr_reg_tuple(b, reg, 2);
-}
-
-static inline struct cs_index
 cs_subqueue_ctx_reg(struct cs_builder *b)
 {
    return cs_reg64(b, PANVK_CS_REG_SUBQUEUE_CTX_START);
@@ -251,8 +259,6 @@ struct panvk_cs_reg_upd_context {
 
 struct panvk_cs_state {
    struct cs_builder builder;
-
-   struct cs_load_store_tracker ls_tracker;
 
    /* Used to debug register writes in invalid contexts. */
    struct {
@@ -369,7 +375,7 @@ panvk_cs_reg_whitelist(cmdbuf_regs, {PANVK_CS_REG_RUN_IDVS_SR_START,
 #define cs_update_cmdbuf_regs(__b) panvk_cs_reg_upd_ctx(__b, cmdbuf_regs)
 
 struct panvk_tls_state {
-   struct panfrost_ptr desc;
+   struct pan_ptr desc;
    struct pan_tls_info info;
    unsigned max_wg_count;
 };
@@ -382,8 +388,6 @@ struct panvk_cmd_buffer {
    struct panvk_pool tls_pool;
    struct list_head push_sets;
 
-   uint32_t flush_id;
-
    struct {
       struct u_trace uts[PANVK_SUBQUEUE_COUNT];
    } utrace;
@@ -394,6 +398,7 @@ struct panvk_cmd_buffer {
       struct panvk_push_constant_state push_constants;
       struct panvk_cs_state cs[PANVK_SUBQUEUE_COUNT];
       struct panvk_tls_state tls;
+      bool contains_timestamp_queries;
    } state;
 };
 
@@ -432,12 +437,21 @@ panvk_cmd_get_desc_state(struct panvk_cmd_buffer *cmdbuf,
    }
 }
 
+static bool
+panvk_cache_flush_is_nop(const struct panvk_cache_flush_info *cache_flush)
+{
+   return cache_flush->l2 == MALI_CS_FLUSH_MODE_NONE &&
+          cache_flush->lsc == MALI_CS_FLUSH_MODE_NONE &&
+          cache_flush->others == MALI_CS_OTHER_FLUSH_MODE_NONE;
+}
+
 extern const struct vk_command_buffer_ops panvk_per_arch(cmd_buffer_ops);
 
 void panvk_per_arch(cmd_flush_draws)(struct panvk_cmd_buffer *cmdbuf);
 
-void panvk_per_arch(cs_pick_iter_sb)(struct panvk_cmd_buffer *cmdbuf,
-                                     enum panvk_subqueue_id subqueue);
+void panvk_per_arch(cs_next_iter_sb)(struct panvk_cmd_buffer *cmdbuf,
+                                     enum panvk_subqueue_id subqueue,
+                                     struct cs_index scratch_regs);
 
 void panvk_per_arch(get_cs_deps)(struct panvk_cmd_buffer *cmdbuf,
                                  const VkDependencyInfo *in,
@@ -456,15 +470,15 @@ panvk_per_arch(calculate_task_axis_and_increment)(
 {
    /* Pick the task_axis and task_increment to maximize thread
     * utilization. */
-   unsigned threads_per_wg =
-      shader->local_size.x * shader->local_size.y * shader->local_size.z;
-   unsigned max_thread_cnt = panfrost_compute_max_thread_count(
+   unsigned threads_per_wg = shader->cs.local_size.x * shader->cs.local_size.y *
+                             shader->cs.local_size.z;
+   unsigned max_thread_cnt = pan_compute_max_thread_count(
       &phys_dev->kmod.props, shader->info.work_reg_count);
    unsigned threads_per_task = threads_per_wg;
    unsigned local_size[3] = {
-      shader->local_size.x,
-      shader->local_size.y,
-      shader->local_size.z,
+      shader->cs.local_size.x,
+      shader->cs.local_size.y,
+      shader->cs.local_size.z,
    };
 
    for (unsigned i = 0; i < 3; i++) {
@@ -492,4 +506,69 @@ panvk_per_arch(calculate_task_axis_and_increment)(
    assert(*task_increment > 0);
 }
 
+static VkPipelineStageFlags2
+panvk_get_subqueue_stages(enum panvk_subqueue_id subqueue)
+{
+   switch (subqueue) {
+   case PANVK_SUBQUEUE_VERTEX_TILER:
+      return VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT |
+             VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT |
+             VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT |
+             VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
+   case PANVK_SUBQUEUE_FRAGMENT:
+      return VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+             VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+             VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
+             VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
+             VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_RESOLVE_BIT |
+             VK_PIPELINE_STAGE_2_BLIT_BIT | VK_PIPELINE_STAGE_2_CLEAR_BIT;
+   case PANVK_SUBQUEUE_COMPUTE:
+      return VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+             VK_PIPELINE_STAGE_2_COPY_BIT;
+   default:
+      unreachable("Invalid subqueue id");
+   }
+}
+
+static uint32_t
+vk_stage_to_subqueue_mask(VkPipelineStageFlagBits2 vk_stage)
+{
+   assert(util_bitcount64(vk_stage) == 1);
+   /* Handle special stages. */
+   if (vk_stage == VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT)
+      return BITFIELD_BIT(PANVK_SUBQUEUE_VERTEX_TILER) |
+             BITFIELD_BIT(PANVK_SUBQUEUE_COMPUTE);
+   if (vk_stage == VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT)
+      return BITFIELD_BIT(PANVK_SUBQUEUE_FRAGMENT) |
+             BITFIELD_BIT(PANVK_SUBQUEUE_COMPUTE);
+   if (vk_stage == VK_PIPELINE_STAGE_2_HOST_BIT)
+      /* We need to map host to something, so map it to compute to not interfer
+       * with drawing. */
+      return BITFIELD_BIT(PANVK_SUBQUEUE_COMPUTE);
+
+   /* Handle other compound stages by expanding. */
+   vk_stage = vk_expand_pipeline_stage_flags2(vk_stage);
+
+   VkPipelineStageFlags2 flags[PANVK_SUBQUEUE_COUNT];
+   for (uint32_t sq = 0; sq < PANVK_SUBQUEUE_COUNT; ++sq)
+      flags[sq] = panvk_get_subqueue_stages(sq);
+
+   uint32_t result = 0;
+
+   if (flags[PANVK_SUBQUEUE_VERTEX_TILER] & vk_stage)
+      result |= BITFIELD_BIT(PANVK_SUBQUEUE_VERTEX_TILER);
+
+   if (flags[PANVK_SUBQUEUE_FRAGMENT] & vk_stage)
+      result |= BITFIELD_BIT(PANVK_SUBQUEUE_FRAGMENT);
+
+   if (flags[PANVK_SUBQUEUE_COMPUTE] & vk_stage)
+      result |= BITFIELD_BIT(PANVK_SUBQUEUE_COMPUTE);
+
+   /* All stages should map to at least one subqueue. */
+   assert(util_bitcount(result) > 0);
+   return result;
+}
+
+void panvk_per_arch(emit_barrier)(struct panvk_cmd_buffer *cmdbuf,
+                                  struct panvk_cs_deps deps);
 #endif /* PANVK_CMD_BUFFER_H */

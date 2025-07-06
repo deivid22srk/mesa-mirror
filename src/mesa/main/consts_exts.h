@@ -187,6 +187,7 @@ struct gl_extensions
    GLboolean EXT_shader_image_load_formatted;
    GLboolean EXT_shader_image_load_store;
    GLboolean EXT_shader_integer_mix;
+   GLboolean EXT_shader_realtime_clock;
    GLboolean EXT_shader_samples_identical;
    GLboolean EXT_sRGB;
    GLboolean EXT_stencil_two_side;
@@ -333,6 +334,7 @@ struct gl_shader_compiler_options
    GLboolean LowerPrecisionInt16;
    GLboolean LowerPrecisionDerivatives;
    GLboolean LowerPrecisionFloat16Uniforms;
+   GLboolean LowerPrecision16BitLoadDst;
 
    /**
     * This enables lowering of 16b constants.  Some drivers may not
@@ -350,15 +352,6 @@ struct gl_shader_compiler_options
    /*@}*/
 
    GLuint MaxIfDepth;               /**< Maximum nested IF blocks */
-
-   /**
-    * Optimize code for array of structures backends.
-    *
-    * This is a proxy for:
-    *   - preferring DP4 instructions (rather than MUL/MAD) for
-    *     matrix * vector operations, such as position transformation.
-    */
-   GLboolean OptimizeForAOS;
 
    /** Clamp UBO and SSBO block indices so they don't go out-of-bounds. */
    GLboolean ClampBlockIndicesToArrayBounds;
@@ -925,6 +918,9 @@ struct gl_constants
 
    /** Override GL_MAP_UNSYNCHRONIZED_BIT */
    bool ForceMapBufferSynchronized;
+
+   /** Override GL_DEPTH_COMPONENT type from unsigned short to unsigned int */
+   bool ForceDepthComponentTypeInt;
 
    /** GL_ARB_get_program_binary */
    GLuint NumProgramBinaryFormats;

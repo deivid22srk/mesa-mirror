@@ -399,11 +399,11 @@ match_expression(const nir_algebraic_table *table, const nir_search_expression *
     * swizzle through.  We can only properly propagate swizzles if the
     * instruction is vectorized.
     *
-    * The only exception is swizzle_y, for which we have a special condition,
+    * The only exception is swizzle, for which we have a special condition,
     * so that we can do pack64_2x32_split(unpack(a).x, unpack(a).y) --> a.
     */
-   if (expr->swizzle_y) {
-      if (num_components != 1 || swizzle[0] != 1)
+   if (expr->swizzle >= 0) {
+      if (num_components != 1 || swizzle[0] != expr->swizzle)
          return false;
    } else {
       if (nir_op_infos[instr->op].output_size != 0) {
@@ -606,8 +606,12 @@ dump_value(const nir_algebraic_table *table, const nir_search_value *val)
          CASE(b2f)
          CASE(b2i)
          CASE(i2i)
+         CASE(u2u)
+         CASE(f2f)
          CASE(f2i)
+         CASE(f2u)
          CASE(i2f)
+         CASE(u2f)
 #undef CASE
       default:
          fprintf(stderr, "%s", nir_op_infos[expr->opcode].name);
@@ -899,8 +903,7 @@ nir_algebraic_impl(nir_function_impl *impl,
     */
    struct util_dynarray states = { 0 };
    if (!util_dynarray_resize(&states, uint16_t, impl->ssa_alloc)) {
-      nir_metadata_preserve(impl, nir_metadata_all);
-      return false;
+      return nir_no_progress(impl);
    }
    memset(states.data, 0, states.size);
 
@@ -950,11 +953,5 @@ nir_algebraic_impl(nir_function_impl *impl,
    ralloc_free(range_ht);
    util_dynarray_fini(&states);
 
-   if (progress) {
-      nir_metadata_preserve(impl, nir_metadata_control_flow);
-   } else {
-      nir_metadata_preserve(impl, nir_metadata_all);
-   }
-
-   return progress;
+   return nir_progress(progress, impl, nir_metadata_control_flow);
 }

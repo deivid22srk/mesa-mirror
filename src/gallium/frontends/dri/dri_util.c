@@ -81,7 +81,6 @@ setupLoaderExtensions(struct dri_screen *screen,
    static const struct dri_extension_match matches[] = {
        {__DRI_DRI2_LOADER, 1, offsetof(struct dri_screen, dri2.loader), true},
        {__DRI_IMAGE_LOOKUP, 1, offsetof(struct dri_screen, dri2.image), true},
-       {__DRI_USE_INVALIDATE, 1, offsetof(struct dri_screen, dri2.useInvalidate), true},
        {__DRI_BACKGROUND_CALLABLE, 1, offsetof(struct dri_screen, dri2.backgroundCallable), true},
        {__DRI_SWRAST_LOADER, 1, offsetof(struct dri_screen, swrast_loader), true},
        {__DRI_IMAGE_LOADER, 1, offsetof(struct dri_screen, image.loader), true},
@@ -112,11 +111,6 @@ driCreateNewScreen3(int scrn, int fd,
        return NULL;
 
     setupLoaderExtensions(screen, loader_extensions);
-    // dri2 drivers require working invalidate
-    if (fd != -1 && !screen->dri2.useInvalidate) {
-       free(screen);
-       return NULL;
-    }
 
     screen->loaderPrivate = data;
 
@@ -1054,4 +1048,53 @@ struct pipe_screen *
 dri_get_pipe_screen(struct dri_screen *screen)
 {
    return screen->base.screen;
+}
+
+char *
+driGetDriInfoXML(const char* driverName)
+{
+   return pipe_loader_get_driinfo_xml(driverName);
+}
+
+bool
+dri_get_drm_device_info(const char *device_name, uint8_t *device_uuid, uint8_t *driver_uuid,
+                        char **vendor_name, char **renderer_name, char **driver_name)
+{
+   struct pipe_loader_device *pldev;
+   struct pipe_screen *pscreen;
+   int fd;
+
+   fd = loader_open_device(device_name);
+   if (fd == -1) {
+      return false;
+   }
+   if (!pipe_loader_drm_probe_fd(&pldev, fd, false)) {
+      close(fd);
+      return false;
+   }
+   pscreen = pipe_loader_create_screen(pldev, true);
+   if (!pscreen) {
+      pipe_loader_release(&pldev, 1);
+      close(fd);
+      return false;
+   }
+   if (!pscreen->get_device_uuid || !pscreen->get_driver_uuid ||
+       !pscreen->get_device_vendor || !pscreen->get_name) {
+      pscreen->destroy(pscreen);
+      pipe_loader_release(&pldev, 1);
+      close(fd);
+      return false;
+   }
+
+   pscreen->get_device_uuid(pscreen, (char *)device_uuid);
+   pscreen->get_driver_uuid(pscreen, (char *)driver_uuid);
+   *vendor_name = strdup(pscreen->get_device_vendor(pscreen));
+   *renderer_name = strdup(pscreen->get_name(pscreen));
+   *driver_name = loader_get_driver_for_fd(fd);
+
+   pscreen->destroy(pscreen);
+   pipe_loader_release(&pldev, 1);
+   close(fd);
+
+   return true;
 }

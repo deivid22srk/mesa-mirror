@@ -71,13 +71,13 @@ EPHEMERAL=(
     "llvm-${LLVM_VERSION}-dev"
     make
     meson
-    openssh-server
     patch
     pkgconf
     protobuf-compiler
     python3-dev
     python3-pip
     python3-setuptools
+    python3-venv
     python3-wheel
     wayland-protocols
     xz-utils
@@ -87,6 +87,7 @@ DEPS=(
     apt-utils
     clinfo
     curl
+    dropbear
     git
     git-lfs
     inetutils-syslogd
@@ -105,6 +106,7 @@ DEPS=(
     "libllvm${LLVM_VERSION}"
     liblz4-1
     libpng16-16
+    libproc2-0
     libpython3.11
     libubsan1
     libvulkan1
@@ -129,6 +131,7 @@ DEPS=(
     python3-simplejson
     python3-six
     python3-yaml
+    sntp
     socat
     spirv-tools
     sysvinit-core
@@ -142,6 +145,14 @@ DEPS=(
     xauth
     xvfb
     zlib1g
+)
+
+HW_DEPS=(
+    netcat-openbsd
+    mount
+    python3-distutils
+    python3-serial
+    tzdata
     zstd
 )
 
@@ -151,30 +162,23 @@ apt-get dist-upgrade -y
 apt-get install --purge -y \
       sysvinit-core libelogind0
 
-apt-get install -y --no-remove "${DEPS[@]}"
+apt-get install -y --no-remove "${DEPS[@]}" "${HW_DEPS[@]}"
 
 apt-get install -y --no-install-recommends "${EPHEMERAL[@]}"
 
 . .gitlab-ci/container/container_pre_build.sh
 
-# Needed for ci-fairy, this revision is able to upload files to MinIO
-# and doesn't depend on git
-pip3 install --break-system-packages git+http://gitlab.freedesktop.org/freedesktop/ci-templates@ffe4d1b10aab7534489f0c4bbc4c5899df17d3f2
+# Needed for ci-fairy s3cp
+pip3 install --break-system-packages "ci-fairy[s3] @ git+https://gitlab.freedesktop.org/freedesktop/ci-templates@$MESA_TEMPLATES_COMMIT"
 
 # Needed for manipulation with traces yaml files.
 pip3 install --break-system-packages yq
 
 section_end debian_setup
 
-############### Download prebuilt kernel
+############### Build ci-kdl
 
-if [ "$DEBIAN_ARCH" = amd64 ]; then
-  uncollapsed_section_start kernel "Downloading kernel"
-  export KERNEL_IMAGE_NAME=bzImage
-  mkdir -p /lava-files/
-  . .gitlab-ci/container/download-prebuilt-kernel.sh
-  section_end kernel
-fi
+. .gitlab-ci/container/build-kdl.sh
 
 ############### Build mold
 
@@ -200,7 +204,6 @@ fi
 
 # crosvm build fails on ARMv7 due to Xlib type-size issues
 if [ "$DEBIAN_ARCH" != "armhf" ]; then
-  uncollapsed_section_switch crosvm "Building crosvm"
   . .gitlab-ci/container/build-crosvm.sh
 fi
 
@@ -209,8 +212,6 @@ fi
 . .gitlab-ci/container/build-deqp-runner.sh
 
 ############### Build apitrace
-
-uncollapsed_section_switch apitrace "Building apitrace"
 
 . .gitlab-ci/container/build-apitrace.sh
 

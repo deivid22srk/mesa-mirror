@@ -135,10 +135,6 @@ llvmpipe_init_shader_caps(struct pipe_screen *screen)
          break;
       case PIPE_SHADER_TESS_CTRL:
       case PIPE_SHADER_TESS_EVAL:
-         /* Tessellation shader needs llvm coroutines support */
-         if (!GALLIVM_COROUTINES)
-            continue;
-         FALLTHROUGH;
       case PIPE_SHADER_VERTEX:
       case PIPE_SHADER_GEOMETRY:
          draw_init_shader_caps(caps);
@@ -180,9 +176,6 @@ llvmpipe_init_compute_caps(struct pipe_screen *screen)
    caps->grid_dimension = 3;
    caps->max_global_size = 1 << 31;
    caps->max_mem_alloc_size = 1 << 31;
-   caps->max_private_size = 1 << 31;
-   caps->max_input_size = 1576;
-   caps->images_supported = !!LP_MAX_TGSI_SHADER_IMAGES;
    caps->subgroup_sizes = lp_native_vector_width / 32;
    caps->max_subgroups = 1024 / (lp_native_vector_width / 32);
    caps->max_compute_units = 8;
@@ -276,7 +269,7 @@ llvmpipe_init_screen_caps(struct pipe_screen *screen)
    caps->vertex_color_clamped = true;
    caps->glsl_feature_level_compatibility =
    caps->glsl_feature_level = 450;
-   caps->compute = GALLIVM_COROUTINES;
+   caps->compute = true;
    caps->user_vertex_buffers = true;
    caps->tgsi_texcoord = true;
    caps->draw_indirect = true;
@@ -307,7 +300,6 @@ llvmpipe_init_screen_caps(struct pipe_screen *screen)
    caps->doubles = true;
    caps->int64 = true;
    caps->query_so_overflow = true;
-   caps->tgsi_div = true;
    caps->vendor_id = 0xFFFFFFFF;
    caps->device_id = 0xFFFFFFFF;
 
@@ -429,6 +421,8 @@ static const struct nir_shader_compiler_options gallivm_nir_options = {
    .lower_flrp64 = true,
    .lower_fsat = true,
    .lower_bitfield_insert = true,
+   .lower_bitfield_extract8 = true,
+   .lower_bitfield_extract16 = true,
    .lower_bitfield_extract = true,
    .lower_fdph = true,
    .lower_ffma16 = true,
@@ -446,6 +440,7 @@ static const struct nir_shader_compiler_options gallivm_nir_options = {
    .lower_pack_unorm_2x16 = true,
    .lower_pack_unorm_4x8 = true,
    .lower_pack_half_2x16 = true,
+   .lower_pack_64_4x16 = true,
    .lower_pack_split = true,
    .lower_unpack_snorm_2x16 = true,
    .lower_unpack_snorm_4x8 = true,
@@ -460,7 +455,7 @@ static const struct nir_shader_compiler_options gallivm_nir_options = {
    .lower_usub_borrow = true,
    .lower_mul_2x32_64 = true,
    .lower_ifind_msb = true,
-   .lower_int64_options = nir_lower_imul_2x32_64,
+   .lower_int64_options = nir_lower_imul_2x32_64 | nir_lower_bitfield_extract64,
    .lower_doubles_options = nir_lower_dround_even,
    .max_unroll_iterations = 32,
    .lower_to_scalar = true,
@@ -539,22 +534,28 @@ lp_storage_image_format_supported(enum pipe_format format)
    case PIPE_FORMAT_R11G11B10_FLOAT:
    case PIPE_FORMAT_R32_FLOAT:
    case PIPE_FORMAT_R16_FLOAT:
+   case PIPE_FORMAT_R64G64B64A64_UINT:
    case PIPE_FORMAT_R32G32B32A32_UINT:
    case PIPE_FORMAT_R16G16B16A16_UINT:
    case PIPE_FORMAT_R10G10B10A2_UINT:
    case PIPE_FORMAT_R8G8B8A8_UINT:
+   case PIPE_FORMAT_R64G64_UINT:
    case PIPE_FORMAT_R32G32_UINT:
    case PIPE_FORMAT_R16G16_UINT:
    case PIPE_FORMAT_R8G8_UINT:
+   case PIPE_FORMAT_R64_UINT:
    case PIPE_FORMAT_R32_UINT:
    case PIPE_FORMAT_R16_UINT:
    case PIPE_FORMAT_R8_UINT:
+   case PIPE_FORMAT_R64G64B64A64_SINT:
    case PIPE_FORMAT_R32G32B32A32_SINT:
    case PIPE_FORMAT_R16G16B16A16_SINT:
    case PIPE_FORMAT_R8G8B8A8_SINT:
+   case PIPE_FORMAT_R64G64_SINT:
    case PIPE_FORMAT_R32G32_SINT:
    case PIPE_FORMAT_R16G16_SINT:
    case PIPE_FORMAT_R8G8_SINT:
+   case PIPE_FORMAT_R64_SINT:
    case PIPE_FORMAT_R32_SINT:
    case PIPE_FORMAT_R16_SINT:
    case PIPE_FORMAT_R8_SINT:
@@ -633,17 +634,15 @@ llvmpipe_is_format_supported(struct pipe_screen *_screen,
           format_desc->block.bits != 96) {
          return false;
       }
+   }
 
+   if (bind & (PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_VERTEX_BUFFER)) {
       /* Disable 64-bit integer formats for RT/samplers.
        * VK CTS crashes with these and they don't make much sense.
+       * Vertex fetch also does not handle them correctly.
        */
-      int c = util_format_get_first_non_void_channel(format_desc->format);
-      if (c >= 0) {
-         if (format_desc->channel[c].pure_integer &&
-             format_desc->channel[c].size == 64)
-            return false;
-      }
-
+      if (util_format_is_int64(format_desc))
+         return false;
    }
 
    if (!(bind & PIPE_BIND_VERTEX_BUFFER) &&
@@ -680,13 +679,22 @@ llvmpipe_is_format_supported(struct pipe_screen *_screen,
        target == PIPE_BUFFER)
       return false;
 
-   if (format_desc->colorspace == UTIL_FORMAT_COLORSPACE_YUV) {
-      if (format == PIPE_FORMAT_UYVY ||
-          format == PIPE_FORMAT_YUYV ||
-          format == PIPE_FORMAT_NV12)
-         return true;
+   if (format_desc->colorspace == UTIL_FORMAT_COLORSPACE_YUV)
       return false;
-   }
+
+   /* Prevent YUV formats from taking incomplete fast paths in
+    * st_get_sampler_view_format.
+    */
+   if (format == PIPE_FORMAT_R8G8_R8B8_UNORM ||
+       format == PIPE_FORMAT_R8B8_R8G8_UNORM ||
+       format == PIPE_FORMAT_G8R8_B8R8_UNORM ||
+       format == PIPE_FORMAT_B8R8_G8R8_UNORM ||
+       format == PIPE_FORMAT_R8_G8B8_420_UNORM ||
+       format == PIPE_FORMAT_R8_B8G8_420_UNORM ||
+       format == PIPE_FORMAT_R8_G8B8_422_UNORM ||
+       format == PIPE_FORMAT_R8_G8_B8_420_UNORM ||
+       format == PIPE_FORMAT_R8_B8_G8_420_UNORM)
+      return false;
 
    /*
     * Everything can be supported by u_format
@@ -742,6 +750,12 @@ llvmpipe_destroy_screen(struct pipe_screen *_screen)
 #if defined(HAVE_LIBDRM) && defined(HAVE_LINUX_UDMABUF_H)
    if (screen->udmabuf_fd != -1)
       close(screen->udmabuf_fd);
+   if (screen->dummy_sync_fd != -1)
+      close(screen->dummy_sync_fd);
+   if (screen->dummy_dmabuf) {
+      _screen->free_memory_fd(_screen,
+                              (struct pipe_memory_allocation*)screen->dummy_dmabuf);
+   }
 #endif
 
 #if DETECT_OS_LINUX
@@ -801,11 +815,11 @@ update_cache_sha1_cpu(struct mesa_sha1 *ctx)
    const struct util_cpu_caps_t *cpu_caps = util_get_cpu_caps();
    /*
     * Don't need the cpu cache affinity stuff. The rest
-    * is contained in first 5 dwords.
+    * is contained in first 4 dwords.
     */
    STATIC_ASSERT(offsetof(struct util_cpu_caps_t, num_L3_caches)
-                 == 5 * sizeof(uint32_t));
-   _mesa_sha1_update(ctx, cpu_caps, 5 * sizeof(uint32_t));
+                 == 4 * sizeof(uint32_t));
+   _mesa_sha1_update(ctx, cpu_caps, 4 * sizeof(uint32_t));
 }
 
 
@@ -975,7 +989,6 @@ llvmpipe_create_screen(struct sw_winsys *winsys)
    screen->base.get_disk_shader_cache = lp_get_disk_shader_cache;
    llvmpipe_init_screen_resource_funcs(&screen->base);
 
-   screen->allow_cl = !!getenv("LP_CL");
    screen->num_threads = util_get_cpu_caps()->nr_cpus > 1
       ? util_get_cpu_caps()->nr_cpus : 0;
    screen->num_threads = debug_get_num_option("LP_NUM_THREADS",

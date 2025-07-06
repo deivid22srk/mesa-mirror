@@ -22,6 +22,9 @@
 
 #include "pan_kmod_backend.h"
 
+/* Maximum kmod BO label length, including NUL-terminator */
+#define PANTHOR_BO_LABEL_MAXLEN 4096
+
 const struct pan_kmod_ops panthor_kmod_ops;
 
 /* Objects used to track VAs returned through async unmaps. */
@@ -117,7 +120,7 @@ panthor_kmod_dev_create(int fd, uint32_t flags, drmVersionPtr version,
       .pointer = (uint64_t)(uintptr_t)&panthor_dev->props.gpu,
    };
 
-   int ret = drmIoctl(fd, DRM_IOCTL_PANTHOR_DEV_QUERY, &query);
+   int ret = pan_kmod_ioctl(fd, DRM_IOCTL_PANTHOR_DEV_QUERY, &query);
    if (ret) {
       mesa_loge("DRM_IOCTL_PANTHOR_DEV_QUERY failed (err=%d)", errno);
       goto err_free_dev;
@@ -129,7 +132,7 @@ panthor_kmod_dev_create(int fd, uint32_t flags, drmVersionPtr version,
       .pointer = (uint64_t)(uintptr_t)&panthor_dev->props.csif,
    };
 
-   ret = drmIoctl(fd, DRM_IOCTL_PANTHOR_DEV_QUERY, &query);
+   ret = pan_kmod_ioctl(fd, DRM_IOCTL_PANTHOR_DEV_QUERY, &query);
    if (ret) {
       mesa_loge("DRM_IOCTL_PANTHOR_DEV_QUERY failed (err=%d)", errno);
       goto err_free_dev;
@@ -142,7 +145,7 @@ panthor_kmod_dev_create(int fd, uint32_t flags, drmVersionPtr version,
          .pointer = (uint64_t)(uintptr_t)&panthor_dev->props.timestamp,
       };
 
-      ret = drmIoctl(fd, DRM_IOCTL_PANTHOR_DEV_QUERY, &query);
+      ret = pan_kmod_ioctl(fd, DRM_IOCTL_PANTHOR_DEV_QUERY, &query);
       if (ret) {
          mesa_loge("DRM_IOCTL_PANTHOR_DEV_QUERY failed (err=%d)", errno);
          goto err_free_dev;
@@ -150,6 +153,18 @@ panthor_kmod_dev_create(int fd, uint32_t flags, drmVersionPtr version,
    }
 
    /* Map the LATEST_FLUSH_ID register at device creation time. */
+   if (version->version_major > 1 || version->version_minor >= 5) {
+      struct drm_panthor_set_user_mmio_offset user_mmio_offset = {
+         .offset = DRM_PANTHOR_USER_MMIO_OFFSET,
+      };
+
+      ret = drmIoctl(fd, DRM_IOCTL_PANTHOR_SET_USER_MMIO_OFFSET, &user_mmio_offset);
+      if (ret) {
+         mesa_loge("DRM_IOCTL_PANTHOR_SET_USER_MMIO_OFFSET, failed (err=%d)", errno);
+         goto err_free_dev;
+      }
+   }
+
    panthor_dev->flush_id = os_mmap(0, getpagesize(), PROT_READ, MAP_SHARED, fd,
                                    DRM_PANTHOR_USER_FLUSH_ID_MMIO_OFFSET);
    if (panthor_dev->flush_id == MAP_FAILED) {
@@ -164,7 +179,7 @@ panthor_kmod_dev_create(int fd, uint32_t flags, drmVersionPtr version,
          .pointer = (uint64_t)(uintptr_t)&panthor_dev->props.group_priorities,
       };
 
-      ret = drmIoctl(fd, DRM_IOCTL_PANTHOR_DEV_QUERY, &query);
+      ret = pan_kmod_ioctl(fd, DRM_IOCTL_PANTHOR_DEV_QUERY, &query);
       if (ret) {
          mesa_loge("DRM_IOCTL_PANTHOR_DEV_QUERY failed (err=%d)", errno);
          goto err_free_dev;
@@ -341,7 +356,7 @@ panthor_kmod_bo_alloc(struct pan_kmod_dev *dev,
       .exclusive_vm_id = panthor_vm ? panthor_vm->base.handle : 0,
    };
 
-   int ret = drmIoctl(dev->fd, DRM_IOCTL_PANTHOR_BO_CREATE, &req);
+   int ret = pan_kmod_ioctl(dev->fd, DRM_IOCTL_PANTHOR_BO_CREATE, &req);
    if (ret) {
       mesa_loge("DRM_IOCTL_PANTHOR_BO_CREATE failed (err=%d)", errno);
       goto err_free_bo;
@@ -438,7 +453,8 @@ panthor_kmod_bo_export(struct pan_kmod_bo *bo, int dmabuf_fd)
             return -1;
          }
 
-         ret = drmIoctl(dmabuf_fd, DMA_BUF_IOCTL_IMPORT_SYNC_FILE, &isync);
+         ret = pan_kmod_ioctl(dmabuf_fd, DMA_BUF_IOCTL_IMPORT_SYNC_FILE,
+                              &isync);
          close(isync.fd);
          if (ret) {
             mesa_loge("DMA_BUF_IOCTL_IMPORT_SYNC_FILE failed (err=%d)", errno);
@@ -467,7 +483,8 @@ static off_t
 panthor_kmod_bo_get_mmap_offset(struct pan_kmod_bo *bo)
 {
    struct drm_panthor_bo_mmap_offset req = {.handle = bo->handle};
-   int ret = drmIoctl(bo->dev->fd, DRM_IOCTL_PANTHOR_BO_MMAP_OFFSET, &req);
+   int ret = pan_kmod_ioctl(bo->dev->fd, DRM_IOCTL_PANTHOR_BO_MMAP_OFFSET,
+                            &req);
 
    if (ret) {
       mesa_loge("DRM_IOCTL_PANTHOR_BO_MMAP_OFFSET failed (err=%d)", errno);
@@ -505,7 +522,7 @@ panthor_kmod_bo_wait(struct pan_kmod_bo *bo, int64_t timeout_ns,
          .flags = for_read_only_access ? DMA_BUF_SYNC_READ : DMA_BUF_SYNC_RW,
       };
 
-      ret = drmIoctl(dmabuf_fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &esync);
+      ret = pan_kmod_ioctl(dmabuf_fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &esync);
       close(dmabuf_fd);
 
       if (ret) {
@@ -582,7 +599,7 @@ panthor_kmod_bo_attach_sync_point(struct pan_kmod_bo *bo, uint32_t sync_handle,
          return -1;
       }
 
-      ret = drmIoctl(dmabuf_fd, DMA_BUF_IOCTL_IMPORT_SYNC_FILE, &isync);
+      ret = pan_kmod_ioctl(dmabuf_fd, DMA_BUF_IOCTL_IMPORT_SYNC_FILE, &isync);
       close(dmabuf_fd);
       close(isync.fd);
       if (ret) {
@@ -647,7 +664,7 @@ panthor_kmod_bo_get_sync_point(struct pan_kmod_bo *bo, uint32_t *sync_handle,
          .flags = for_read_only_access ? DMA_BUF_SYNC_READ : DMA_BUF_SYNC_RW,
       };
 
-      ret = drmIoctl(dmabuf_fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &esync);
+      ret = pan_kmod_ioctl(dmabuf_fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &esync);
       close(dmabuf_fd);
       if (ret) {
          mesa_loge("DMA_BUF_IOCTL_EXPORT_SYNC_FILE failed (err=%d)", errno);
@@ -717,7 +734,7 @@ panthor_kmod_vm_create(struct pan_kmod_dev *dev, uint32_t flags,
       .user_va_range = user_va_start + user_va_range,
    };
 
-   if (drmIoctl(dev->fd, DRM_IOCTL_PANTHOR_VM_CREATE, &req)) {
+   if (pan_kmod_ioctl(dev->fd, DRM_IOCTL_PANTHOR_VM_CREATE, &req)) {
       mesa_loge("DRM_IOCTL_PANTHOR_VM_CREATE failed (err=%d)", errno);
       goto err_destroy_sync;
    }
@@ -776,7 +793,7 @@ panthor_kmod_vm_destroy(struct pan_kmod_vm *vm)
    struct panthor_kmod_vm *panthor_vm =
       container_of(vm, struct panthor_kmod_vm, base);
    struct drm_panthor_vm_destroy req = {.id = vm->handle};
-   int ret = drmIoctl(vm->dev->fd, DRM_IOCTL_PANTHOR_VM_DESTROY, &req);
+   int ret = pan_kmod_ioctl(vm->dev->fd, DRM_IOCTL_PANTHOR_VM_DESTROY, &req);
    if (ret)
       mesa_loge("DRM_IOCTL_PANTHOR_VM_DESTROY failed (err=%d)", errno);
 
@@ -1041,7 +1058,7 @@ panthor_kmod_vm_bind(struct pan_kmod_vm *vm, enum pan_kmod_vm_op_mode mode,
       }
    }
 
-   ret = drmIoctl(vm->dev->fd, DRM_IOCTL_PANTHOR_VM_BIND, &req);
+   ret = pan_kmod_ioctl(vm->dev->fd, DRM_IOCTL_PANTHOR_VM_BIND, &req);
    if (ret)
       mesa_loge("DRM_IOCTL_PANTHOR_VM_BIND failed (err=%d)", errno);
 
@@ -1097,7 +1114,8 @@ static enum pan_kmod_vm_state
 panthor_kmod_vm_query_state(struct pan_kmod_vm *vm)
 {
    struct drm_panthor_vm_get_state query = {.vm_id = vm->handle};
-   int ret = drmIoctl(vm->dev->fd, DRM_IOCTL_PANTHOR_VM_GET_STATE, &query);
+   int ret = pan_kmod_ioctl(vm->dev->fd, DRM_IOCTL_PANTHOR_VM_GET_STATE,
+                            &query);
 
    if (ret || query.state == DRM_PANTHOR_VM_STATE_UNUSABLE)
       return PAN_KMOD_VM_FAULTY;
@@ -1178,13 +1196,37 @@ panthor_kmod_query_timestamp(const struct pan_kmod_dev *dev)
       .pointer = (uint64_t)(uintptr_t)&timestamp_info,
    };
 
-   int ret = drmIoctl(dev->fd, DRM_IOCTL_PANTHOR_DEV_QUERY, &query);
+   int ret = pan_kmod_ioctl(dev->fd, DRM_IOCTL_PANTHOR_DEV_QUERY, &query);
    if (ret) {
       mesa_loge("DRM_IOCTL_PANTHOR_DEV_QUERY failed (err=%d)", errno);
       return 0;
    }
 
    return timestamp_info.current_timestamp;
+}
+
+static void
+panthor_kmod_bo_label(struct pan_kmod_dev *dev, struct pan_kmod_bo *bo, const char *label)
+{
+   char truncated_label[PANTHOR_BO_LABEL_MAXLEN];
+
+   if (!(dev->driver.version.major > 1 || dev->driver.version.minor >= 4))
+      return;
+
+    if (strnlen(label, PANTHOR_BO_LABEL_MAXLEN) == PANTHOR_BO_LABEL_MAXLEN) {
+      strncpy(truncated_label, label, PANTHOR_BO_LABEL_MAXLEN - 1);
+      truncated_label[PANTHOR_BO_LABEL_MAXLEN - 1] = '\0';
+      label = truncated_label;
+   }
+
+   struct drm_panthor_bo_set_label set_label = (struct drm_panthor_bo_set_label) {
+      .handle = bo->handle,
+      .label = (uint64_t)(uintptr_t)label,
+   };
+
+   int ret = pan_kmod_ioctl(dev->fd, DRM_IOCTL_PANTHOR_BO_SET_LABEL, &set_label);
+   if (ret)
+      mesa_loge("DRM_IOCTL_PANTHOR_BO_SET_LABEL failed (err=%d)", errno);
 }
 
 const struct pan_kmod_ops panthor_kmod_ops = {
@@ -1203,4 +1245,5 @@ const struct pan_kmod_ops panthor_kmod_ops = {
    .vm_bind = panthor_kmod_vm_bind,
    .vm_query_state = panthor_kmod_vm_query_state,
    .query_timestamp = panthor_kmod_query_timestamp,
+   .bo_set_label = panthor_kmod_bo_label,
 };

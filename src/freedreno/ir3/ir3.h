@@ -28,7 +28,6 @@ struct ir3_instruction;
 struct ir3_block;
 
 struct ir3_info {
-   void *data; /* used internally in ir3 assembler */
    /* Size in bytes of the shader binary, including NIR constants and
     * padding
     */
@@ -149,8 +148,13 @@ typedef enum ir3_register_flags {
    IR3_REG_EARLY_CLOBBER = BIT(17),
 
    /* If this is the last usage of a specific value in the register, the
-    * register cannot be read without being written to first after this. 
-    * Note: This effectively has the same semantics as IR3_REG_KILL.
+    * register cannot be read without being written to first after this.
+    * This maps to the "(last)" attribute on source GPRs in shader
+    * instructions which was introduced in A7XX.
+    *
+    * Note: This effectively has the same semantics as IR3_REG_KILL but
+    * is tracked after register assignment. Additionally, this doesn't
+    * cover any const or shared registers.
     */
    IR3_REG_LAST_USE = BIT(18),
 
@@ -898,6 +902,9 @@ void ir3_reg_set_last_array(struct ir3_instruction *instr,
 void ir3_instr_set_address(struct ir3_instruction *instr,
                            struct ir3_instruction *addr);
 
+struct ir3_instruction *ir3_create_addr1(struct ir3_builder *build,
+                                         unsigned const_val);
+
 static inline bool
 ir3_instr_check_mark(struct ir3_instruction *instr)
 {
@@ -1007,6 +1014,7 @@ is_terminator(struct ir3_instruction *instr)
    case OPC_BRAA:
    case OPC_BRAO:
    case OPC_SHPS:
+   case OPC_SHPE:
    case OPC_GETONE:
    case OPC_GETLAST:
    case OPC_PREDT:
@@ -1134,6 +1142,14 @@ is_subgroup_cond_mov_macro(struct ir3_instruction *instr)
       return false;
    }
 }
+
+enum ir3_subreg_move {
+   IR3_SUBREG_MOVE_NONE,
+   IR3_SUBREG_MOVE_LOWER,
+   IR3_SUBREG_MOVE_UPPER,
+};
+
+enum ir3_subreg_move ir3_is_subreg_move(struct ir3_instruction *instr);
 
 static inline bool
 is_alu(struct ir3_instruction *instr)
@@ -1513,6 +1529,18 @@ writes_addr1(struct ir3_instruction *instr)
 }
 
 static inline bool
+reads_addr0(struct ir3_instruction *instr)
+{
+   return instr->address && instr->address->num == regid(REG_A0, 0);
+}
+
+static inline bool
+reads_addr1(struct ir3_instruction *instr)
+{
+   return instr->address && instr->address->num == regid(REG_A0, 1);
+}
+
+static inline bool
 writes_pred(struct ir3_instruction *instr)
 {
    /* Note: only the first dest can write to p0 */
@@ -1840,6 +1868,9 @@ ir3_output_conv_type(struct ir3_instruction *instr, bool *can_fold)
    case OPC_MUL_S24:
    case OPC_MAD_S24:
       return TYPE_S32;
+
+   case OPC_MOVS:
+      return full_type(instr->cat1.src_type);
 
    /* We assume that any move->move folding that could be done was done by
     * NIR.
@@ -2290,19 +2321,23 @@ struct ir3_shader_variant;
 bool ir3_dce(struct ir3 *ir, struct ir3_shader_variant *so);
 
 /* fp16 conversion folding */
-bool ir3_cf(struct ir3 *ir);
+bool ir3_cf(struct ir3 *ir, struct ir3_shader_variant *so);
 
 /* shared mov folding */
 bool ir3_shared_fold(struct ir3 *ir);
 
 /* copy-propagate: */
-bool ir3_cp(struct ir3 *ir, struct ir3_shader_variant *so);
+bool ir3_cp(struct ir3 *ir, struct ir3_shader_variant *so,
+            bool lower_imm_to_const);
 
 /* common subexpression elimination: */
 bool ir3_cse(struct ir3 *ir);
 
 /* Make arrays SSA */
 bool ir3_array_to_ssa(struct ir3 *ir);
+
+/* Initialize immediates lowered to consts by ir3_cp in the preamble. */
+bool ir3_imm_const_to_preamble(struct ir3 *ir, struct ir3_shader_variant *so);
 
 /* scheduling: */
 bool ir3_sched_add_deps(struct ir3 *ir);
@@ -2365,6 +2400,21 @@ ir3_instr_move_after_phis(struct ir3_instruction *instr,
       ir3_instr_move_after(instr, last_phi);
    else
       ir3_instr_move_before_block(instr, block);
+}
+
+static inline struct ir3_block *
+ir3_cursor_current_block(struct ir3_cursor cursor)
+{
+   switch (cursor.option) {
+   case IR3_CURSOR_BEFORE_BLOCK:
+   case IR3_CURSOR_AFTER_BLOCK:
+      return cursor.block;
+   case IR3_CURSOR_BEFORE_INSTR:
+   case IR3_CURSOR_AFTER_INSTR:
+      return cursor.instr->block;
+   }
+
+   unreachable("illegal cursor option");
 }
 
 static inline struct ir3_cursor
@@ -2619,6 +2669,29 @@ ir3_COV_rpt(struct ir3_builder *build, unsigned nrpt,
 }
 
 static inline struct ir3_instruction *
+ir3_MOVS(struct ir3_builder *build, struct ir3_instruction *src,
+         struct ir3_instruction *invocation, type_t type)
+{
+   bool use_a0 = writes_addr0(invocation);
+   struct ir3_instruction *instr =
+      ir3_build_instr(build, OPC_MOVS, 1, use_a0 ? 1 : 2);
+   ir3_register_flags flags = type_flags(type);
+
+   __ssa_dst(instr)->flags |= flags | IR3_REG_SHARED;
+   __ssa_src(instr, src, 0);
+
+   if (use_a0) {
+      ir3_instr_set_address(instr, invocation);
+   } else {
+      __ssa_src(instr, invocation, 0);
+   }
+
+   instr->cat1.src_type = type;
+   instr->cat1.dst_type = type;
+   return instr;
+}
+
+static inline struct ir3_instruction *
 ir3_MOVMSK(struct ir3_builder *build, unsigned components)
 {
    struct ir3_instruction *instr = ir3_build_instr(build, OPC_MOVMSK, 1, 0);
@@ -2645,6 +2718,57 @@ ir3_BALLOT_MACRO(struct ir3_builder *build, struct ir3_instruction *src,
 
    return instr;
 }
+
+struct ir3_instruction *ir3_create_collect(struct ir3_builder *build,
+                                           struct ir3_instruction *const *arr,
+                                           unsigned arrsz);
+
+#define ir3_collect(build, ...)                                                \
+   ({                                                                          \
+      struct ir3_instruction *__arr[] = {__VA_ARGS__};                         \
+      ir3_create_collect(build, __arr, ARRAY_SIZE(__arr));                     \
+   })
+
+void ir3_split_dest(struct ir3_builder *build, struct ir3_instruction **dst,
+                    struct ir3_instruction *src, unsigned base, unsigned n);
+struct ir3_instruction *ir3_split_off_scalar(struct ir3_builder *build,
+                                             struct ir3_instruction *src,
+                                             unsigned bit_size);
+
+static inline struct ir3_instruction *
+ir3_64b(struct ir3_builder *build, struct ir3_instruction *lo,
+        struct ir3_instruction *hi)
+{
+   assert((lo->dsts[0]->flags & IR3_REG_SHARED) ==
+          (hi->dsts[0]->flags & IR3_REG_SHARED));
+   return ir3_collect(build, lo, hi);
+}
+
+static inline struct ir3_instruction *
+ir3_64b_immed(struct ir3_builder *build, uint64_t val)
+{
+   return ir3_64b(build, create_immed(build, (uint32_t)val),
+                  create_immed(build, val >> 32));
+}
+
+static inline struct ir3_instruction *
+ir3_64b_get_lo(struct ir3_instruction *instr)
+{
+   assert(instr->opc == OPC_META_COLLECT && instr->srcs_count == 2);
+   return instr->srcs[0]->def->instr;
+}
+
+static inline struct ir3_instruction *
+ir3_64b_get_hi(struct ir3_instruction *instr)
+{
+   assert(instr->opc == OPC_META_COLLECT && instr->srcs_count == 2);
+   return instr->srcs[1]->def->instr;
+}
+
+struct ir3_instruction *ir3_store_const(struct ir3_shader_variant *so,
+                                        struct ir3_builder *build,
+                                        struct ir3_instruction *src,
+                                        unsigned dst);
 
 /* clang-format off */
 #define __INSTR0(flag, name, opc)                                              \
@@ -3272,5 +3396,70 @@ regmask_get(regmask_t *regmask, struct ir3_register *reg)
    return false;
 }
 /* ************************************************************************* */
+
+struct ir3_nop_state {
+   unsigned full_ready[GPR_REG_SIZE];
+   unsigned half_ready[GPR_REG_SIZE];
+};
+
+struct ir3_legalize_state {
+   regmask_t needs_ss;
+   regmask_t needs_ss_scalar_full; /* half scalar ALU producer -> full scalar ALU consumer */
+   regmask_t needs_ss_scalar_half; /* full scalar ALU producer -> half scalar ALU consumer */
+   regmask_t needs_ss_war; /* write after read */
+   regmask_t needs_sy_war; /* WAR that can only be resolved using (sy) */
+   regmask_t needs_ss_or_sy_war;  /* WAR for sy-producer sources */
+   regmask_t needs_ss_scalar_war; /* scalar ALU write -> ALU write */
+   regmask_t needs_ss_or_sy_scalar_war;
+   regmask_t needs_sy;
+   bool needs_ss_for_const;
+   bool needs_sy_for_const;
+
+   /* Next instruction needs (ss)/(sy), no matter its dsts/srcs. */
+   bool force_ss;
+   bool force_sy;
+
+   /* Each of these arrays contains the cycle when the corresponding register
+    * becomes "ready" i.e. does not require any more nops. There is a special
+    * mechanism to let ALU instructions read compatible (i.e. same halfness)
+    * destinations of another ALU instruction with less delay, so this can
+    * depend on what type the consuming instruction is, which is why there are
+    * multiple arrays. The cycle is counted relative to the start of the block.
+    */
+
+   /* When ALU instructions reading the given full/half register will be ready.
+    */
+   struct ir3_nop_state alu_nop;
+
+   /* When non-ALU (e.g. cat5) instructions reading the given full/half register
+    * will be ready.
+    */
+   struct ir3_nop_state non_alu_nop;
+
+   /* When p0.x-w, a0.x, and a1.x are ready. */
+   unsigned pred_ready[4];
+   unsigned addr_ready[2];
+
+   unsigned cycle;
+};
+
+typedef struct ir3_legalize_state *(*ir3_get_block_legalize_state_cb)(
+   struct ir3_block *);
+
+void ir3_init_legalize_state(struct ir3_legalize_state *state,
+                             struct ir3_compiler *compiler);
+void ir3_merge_pred_legalize_states(struct ir3_legalize_state *state,
+                                    struct ir3_block *block,
+                                    ir3_get_block_legalize_state_cb get_state);
+void ir3_update_legalize_state(struct ir3_legalize_state *state,
+                               struct ir3_compiler *compiler,
+                               struct ir3_instruction *n);
+enum ir3_instruction_flags
+ir3_required_sync_flags(struct ir3_legalize_state *state,
+                        struct ir3_compiler *compiler,
+                        struct ir3_instruction *n);
+unsigned ir3_required_delay(struct ir3_legalize_state *state,
+                            struct ir3_compiler *compiler,
+                            struct ir3_instruction *instr);
 
 #endif /* IR3_H_ */

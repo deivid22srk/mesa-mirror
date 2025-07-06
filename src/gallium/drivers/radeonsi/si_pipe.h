@@ -106,6 +106,8 @@ struct ac_llvm_compiler;
 #define SI_RESOURCE_FLAG_32BIT             (PIPE_RESOURCE_FLAG_DRV_PRIV << 6)
 #define SI_RESOURCE_FLAG_CLEAR             (PIPE_RESOURCE_FLAG_DRV_PRIV << 7)
 
+#define SI_SQTT_STATE_DIRTY_BIT            BITFIELD_BIT(PIPE_SHADER_COMPUTE + 1)
+
 enum si_has_gs {
    GS_OFF,
    GS_ON,
@@ -519,7 +521,6 @@ struct si_screen {
    unsigned pa_sc_raster_config_1;
    unsigned se_tile_repeat;
    unsigned gs_table_depth;
-   struct ac_hs_info hs;
    unsigned eqaa_force_coverage_samples;
    unsigned eqaa_force_z_samples;
    unsigned eqaa_force_color_samples;
@@ -660,6 +661,7 @@ struct si_screen {
    struct util_vertex_state_cache vertex_state_cache;
 
    struct si_resource *attribute_pos_prim_ring;
+   struct si_resource *attribute_pos_prim_ring_tmz;
 
    simple_mtx_t tess_ring_lock;
    struct pipe_resource *tess_rings;
@@ -673,15 +675,11 @@ struct si_screen {
 struct si_compute {
    struct si_shader_selector sel;
    struct si_shader shader;
-
-   unsigned ir_type;
-   unsigned input_size;
 };
 
 struct si_sampler_view {
    struct pipe_sampler_view base;
-   /* [0..7] = image descriptor
-    * [4..7] = buffer descriptor */
+   /* [0..7] = image or buffer descriptor */
    uint32_t state[8];
    uint32_t fmask_state[8];
    const struct legacy_surf_level *base_level_info;
@@ -703,7 +701,6 @@ struct si_sampler_state {
 struct si_cs_shader_state {
    struct si_compute *program;
    struct si_compute *emitted_program;
-   unsigned offset;
    uint32_t variable_shared_size;
 };
 
@@ -727,6 +724,7 @@ struct si_images {
 
 struct si_framebuffer {
    struct pipe_framebuffer_state state;
+   PIPE_FB_SURFACES; //STOP USING THIS
    unsigned colorbuf_enabled_4bit;
    unsigned spi_shader_col_format;
    unsigned spi_shader_col_format_alpha;
@@ -973,8 +971,6 @@ struct si_context {
    void *custom_blend_dcc_decompress;
    void *vs_blit_pos;
    void *vs_blit_pos_layered;
-   void *vs_blit_color;
-   void *vs_blit_color_layered;
    void *vs_blit_texcoord;
    void *cs_clear_buffer_rmw;
    void *cs_ubyte_to_ushort;
@@ -1086,16 +1082,18 @@ struct si_context {
    /* shader information */
    uint64_t ps_inputs_read_or_disabled;
    struct si_vertex_elements *vertex_elements;
-   unsigned num_vertex_elements;
+   unsigned num_vertex_elements;  /* 0 if the VS uses blit SGPRs to compute VS inputs */
    unsigned cs_max_waves_per_sh;
    uint32_t compute_tmpring_size;
+   bool vertex_elements_but_no_buffers;
    bool uses_nontrivial_vs_inputs;
    bool force_trivial_vs_inputs;
-   bool do_update_shaders;
+   uint8_t dirty_shaders_mask; /* 0: vs, 1: tcs, 2: tes, 3: gs, 4: ps, 5: cs, 6: misc (e.g. sqtt) */
    bool compute_shaderbuf_sgprs_dirty;
    bool compute_image_sgprs_dirty;
    bool vs_uses_base_instance;
    bool vs_uses_draw_id;
+   bool vs_uses_vs_state_indexed;
    uint8_t patch_vertices;
    bool has_tessellation; /* whether si_screen::tess_rings* are valid */
 
@@ -1130,7 +1128,6 @@ struct si_context {
 
    /* Vertex buffers. */
    bool vertex_buffers_dirty;
-   uint8_t num_vertex_buffers;
    uint16_t vertex_buffer_unaligned; /* bitmask of not dword-aligned buffers */
    struct pipe_vertex_buffer vertex_buffer[SI_NUM_VERTEX_BUFFERS];
 
@@ -1168,6 +1165,8 @@ struct si_context {
    /* Emitted draw state. */
    bool ngg : 1;
    bool disable_instance_packing : 1;
+   bool fixed_func_face_culling_needed : 1;
+   bool fixed_func_face_culling_has_effect : 1;
    uint16_t ngg_culling;
    unsigned last_index_size;
    unsigned last_instance_count;
@@ -1202,6 +1201,7 @@ struct si_context {
    bool last_tess_uses_primid;
    unsigned num_patches_per_workgroup;
    unsigned tcs_offchip_layout;
+   unsigned tes_offchip_layout;
    unsigned tes_offchip_ring_va_sgpr;
    unsigned ls_hs_rsrc2;
    unsigned ls_hs_config;
@@ -1345,6 +1345,8 @@ struct si_context {
    enum rgp_sqtt_marker_event_type sqtt_next_event;
    bool sqtt_enabled;
 
+   bool perfetto_enabled;
+
    unsigned context_flags;
 
    /* Shaders. */
@@ -1442,6 +1444,8 @@ struct pipe_resource *si_buffer_from_winsys_buffer(struct pipe_screen *screen,
 void si_replace_buffer_storage(struct pipe_context *ctx, struct pipe_resource *dst,
                                struct pipe_resource *src, unsigned num_rebinds,
                                uint32_t rebind_mask, uint32_t delete_buffer_id);
+bool si_reallocate_buffer_change_flags(struct si_context *sctx, struct pipe_resource *buf,
+                                       unsigned usage, unsigned bind);
 void si_init_screen_buffer_functions(struct si_screen *sscreen);
 void si_init_buffer_functions(struct si_context *sctx);
 
@@ -1622,6 +1626,8 @@ struct ac_llvm_compiler *si_create_llvm_compiler(struct si_screen *sscreen);
 void si_init_aux_async_compute_ctx(struct si_screen *sscreen);
 struct si_context *si_get_aux_context(struct si_aux_context *ctx);
 void si_put_aux_context_flush(struct si_aux_context *ctx);
+void si_get_scratch_tmpring_size(struct si_context *sctx, unsigned bytes_per_wave,
+                                 bool is_compute, unsigned *spi_tmpring_size);
 void si_destroy_screen(struct pipe_screen *pscreen);
 
 /* si_perfcounters.c */
@@ -1831,6 +1837,18 @@ si_get_vs_inline(struct si_context *sctx, enum si_has_tess has_tess, enum si_has
       return &sctx->shader.tes;
 
    return &sctx->shader.vs;
+}
+
+static ALWAYS_INLINE struct si_shader *
+si_get_api_vs_inline(struct si_context *sctx, enum amd_gfx_level gfx_level,
+                     enum si_has_tess has_tess, enum si_has_gs has_gs)
+{
+   if (gfx_level >= GFX9 && has_tess)
+      return sctx->queued.named.hs; /* this can also be the passthrough TCS */
+   else if (gfx_level >= GFX9 && has_gs)
+      return sctx->shader.gs.current;
+   else
+      return sctx->shader.vs.current;
 }
 
 static inline struct si_shader_ctx_state *si_get_vs(struct si_context *sctx)
@@ -2139,7 +2157,7 @@ static inline void si_set_clip_discard_distance(struct si_context *sctx, float d
 static inline void
 si_update_ngg_sgpr_state_provoking_vtx(struct si_context *sctx, struct si_shader *hw_vs, bool ngg)
 {
-   if (ngg && hw_vs && hw_vs->uses_vs_state_provoking_vertex) {
+   if (ngg && hw_vs && hw_vs->info.uses_gs_state_provoking_vtx_first) {
       SET_FIELD(sctx->current_gs_state, GS_STATE_PROVOKING_VTX_FIRST,
                 sctx->queued.named.rasterizer->flatshade_first);
    }
@@ -2148,7 +2166,7 @@ si_update_ngg_sgpr_state_provoking_vtx(struct si_context *sctx, struct si_shader
 static inline void
 si_update_ngg_sgpr_state_out_prim(struct si_context *sctx, struct si_shader *hw_vs, bool ngg)
 {
-   if (ngg && hw_vs && hw_vs->uses_gs_state_outprim)
+   if (ngg && hw_vs && hw_vs->info.uses_gs_state_outprim)
       SET_FIELD(sctx->current_gs_state, GS_STATE_OUTPRIM, sctx->gs_out_prim);
 }
 
@@ -2215,6 +2233,18 @@ static inline void si_emit_barrier_direct(struct si_context *sctx)
       sctx->emit_barrier(sctx, &sctx->gfx_cs);
       sctx->dirty_atoms &= ~SI_ATOM_BIT(barrier);
    }
+}
+
+static inline bool si_is_buffer_idle(struct si_context *sctx, struct si_resource *buf,
+                                     unsigned usage)
+{
+   return !si_cs_is_buffer_referenced(sctx, buf->buf, usage) &&
+          sctx->ws->buffer_wait(sctx->ws, buf->buf, 0, usage | RADEON_USAGE_DISALLOW_SLOW_REPLY);
+}
+
+static inline bool si_vs_uses_vbos(struct si_shader_selector *sel)
+{
+   return !sel || !sel->info.base.vs.blit_sgprs_amd;
 }
 
 #define PRINT_ERR(fmt, args...)                                                                    \

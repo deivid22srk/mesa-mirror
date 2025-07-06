@@ -1127,6 +1127,7 @@ nir_visitor::visit(ir_call *ir)
          op = nir_intrinsic_image_deref_sparse_load;
          break;
       case ir_intrinsic_shader_clock:
+      case ir_intrinsic_shader_clock_realtime:
          op = nir_intrinsic_shader_clock;
          break;
       case ir_intrinsic_begin_invocation_interlock:
@@ -1642,7 +1643,9 @@ nir_visitor::visit(ir_call *ir)
          break;
       }
       case nir_intrinsic_shader_clock:
-         nir_intrinsic_set_memory_scope(instr, SCOPE_SUBGROUP);
+         nir_intrinsic_set_memory_scope(instr,
+            ir->callee->intrinsic_id == ir_intrinsic_shader_clock ?
+            SCOPE_SUBGROUP : SCOPE_DEVICE);
          FALLTHROUGH;
       case nir_intrinsic_begin_invocation_interlock:
       case nir_intrinsic_end_invocation_interlock:
@@ -2795,6 +2798,12 @@ void
 nir_visitor::visit(ir_dereference_array *ir)
 {
    nir_def *index = evaluate_rvalue(ir->array_index);
+
+   /* In NIR, array indices must match the pointer size (32-bits for arrays),
+    * but in GLSL IR, we might "optimize" the array index to a 16-bit integer.
+    * We need to upcast in that case to keep the NIR valid.
+    */
+   index = nir_i2iN(&b, index, this->deref->def.bit_size);
 
    ir->array->accept(this);
 

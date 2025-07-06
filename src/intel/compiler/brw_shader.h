@@ -83,6 +83,7 @@ public:
    ~brw_shader();
 
    void import_uniforms(brw_shader *v);
+   void import_per_primitive_offsets(const int *per_primitive_offsets);
 
    void assign_curb_setup();
    void convert_attr_sources_to_hw_regs(brw_inst *inst);
@@ -139,6 +140,7 @@ public:
    brw_analysis<brw_performance, brw_shader> performance_analysis;
    brw_analysis<brw_idom_tree, brw_shader> idom_analysis;
    brw_analysis<brw_def_analysis, brw_shader> def_analysis;
+   brw_analysis<brw_ip_ranges, brw_shader> ip_ranges_analysis;
 
    /** Number of uniform variable components visited. */
    unsigned uniforms;
@@ -201,6 +203,11 @@ public:
       unsigned control_data_header_size_bits;
    } gs;
 
+   struct {
+      /* Offset of per-primitive locations in bytes */
+      int per_primitive_offsets[VARYING_SLOT_MAX];
+   } fs;
+
    unsigned grf_used;
    bool spilled_any_registers;
    bool needs_register_pressure;
@@ -245,6 +252,12 @@ inline brw_reg
 brw_dynamic_msaa_flags(const struct brw_wm_prog_data *wm_prog_data)
 {
    return brw_uniform_reg(wm_prog_data->msaa_flags_param, BRW_TYPE_UD);
+}
+
+inline brw_reg
+brw_dynamic_per_primitive_remap(const struct brw_wm_prog_data *wm_prog_data)
+{
+   return brw_uniform_reg(wm_prog_data->per_primitive_remap_param, BRW_TYPE_UD);
 }
 
 enum intel_barycentric_mode brw_barycentric_mode(const struct brw_wm_prog_key *key,
@@ -294,6 +307,7 @@ void brw_assign_regs_trivial(brw_shader &s);
 bool brw_lower_3src_null_dest(brw_shader &s);
 bool brw_lower_alu_restrictions(brw_shader &s);
 bool brw_lower_barycentrics(brw_shader &s);
+bool brw_lower_bfloat_conversion(brw_shader &s, brw_inst *inst);
 bool brw_lower_constant_loads(brw_shader &s);
 bool brw_lower_csel(brw_shader &s);
 bool brw_lower_derivatives(brw_shader &s);
@@ -312,7 +326,7 @@ bool brw_lower_send_descriptors(brw_shader &s);
 bool brw_lower_send_gather(brw_shader &s);
 bool brw_lower_sends_overlapping_payload(brw_shader &s);
 bool brw_lower_simd_width(brw_shader &s);
-bool brw_lower_src_modifiers(brw_shader &s, bblock_t *block, brw_inst *inst, unsigned i);
+bool brw_lower_src_modifiers(brw_shader &s, brw_inst *inst, unsigned i);
 bool brw_lower_sub_sat(brw_shader &s);
 bool brw_lower_subgroup_ops(brw_shader &s);
 bool brw_lower_uniform_pull_constant_loads(brw_shader &s);
@@ -352,3 +366,6 @@ unsigned brw_get_lowered_simd_width(const brw_shader *shader,
 
 brw_reg brw_allocate_vgrf(brw_shader &s, brw_reg_type type, unsigned count);
 brw_reg brw_allocate_vgrf_units(brw_shader &s, unsigned units_of_REGSIZE);
+
+bool brw_insert_load_reg(brw_shader &s);
+bool brw_lower_load_reg(brw_shader &s);

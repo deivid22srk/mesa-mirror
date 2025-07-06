@@ -9,9 +9,9 @@ use rusticl_opencl_gen::*;
 use rusticl_proc_macros::cl_entrypoint;
 use rusticl_proc_macros::cl_info_entrypoint;
 
-use std::collections::HashSet;
 use std::ptr;
 use std::sync::Arc;
+use std::sync::Weak;
 
 #[cl_info_entrypoint(clGetEventInfo)]
 unsafe impl CLInfo<cl_event_info> for cl_event {
@@ -27,7 +27,7 @@ unsafe impl CLInfo<cl_event_info> for cl_event {
             CL_EVENT_COMMAND_QUEUE => {
                 let ptr = match event.queue.as_ref() {
                     // Note we use as_ptr here which doesn't increase the reference count.
-                    Some(queue) => Arc::as_ptr(queue),
+                    Some(queue) => Weak::as_ptr(queue),
                     None => ptr::null_mut(),
                 };
                 v.write::<cl_command_queue>(cl_command_queue::from_ptr(ptr))
@@ -80,15 +80,15 @@ fn release_event(event: cl_event) -> CLResult<()> {
 fn wait_for_events(num_events: cl_uint, event_list: *const cl_event) -> CLResult<()> {
     let evs = Event::arcs_from_arr(event_list, num_events)?;
 
-    // CL_INVALID_VALUE if num_events is zero or event_list is NULL.
-    if evs.is_empty() {
+    if let Some((first, rest)) = evs.split_first() {
+        // > CL_INVALID_CONTEXT if events specified in event_list do not belong
+        // > to the same context.
+        if rest.iter().any(|e| e.context != first.context) {
+            return Err(CL_INVALID_CONTEXT);
+        }
+    } else {
+        // > CL_INVALID_VALUE if num_events is zero or event_list is NULL.
         return Err(CL_INVALID_VALUE);
-    }
-
-    // CL_INVALID_CONTEXT if events specified in event_list do not belong to the same context.
-    let contexts: HashSet<_> = evs.iter().map(|e| &e.context).collect();
-    if contexts.len() != 1 {
-        return Err(CL_INVALID_CONTEXT);
     }
 
     // find all queues we have to flush

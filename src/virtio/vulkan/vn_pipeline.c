@@ -238,6 +238,8 @@ struct vn_graphics_pipeline_fix_tmp {
    VkPipelineLibraryCreateInfoKHR *library_infos;
    VkPipelineRenderingCreateInfo *rendering_infos;
    VkPipelineRobustnessCreateInfo *robustness_infos;
+   VkRenderingAttachmentLocationInfo *ral_infos;
+   VkRenderingInputAttachmentIndexInfo *riai_infos;
 };
 
 /* shader module commands */
@@ -250,7 +252,7 @@ vn_CreateShaderModule(VkDevice device,
 {
    struct vn_device *dev = vn_device_from_handle(device);
    const VkAllocationCallbacks *alloc =
-      pAllocator ? pAllocator : &dev->base.base.alloc;
+      pAllocator ? pAllocator : &dev->base.vk.alloc;
 
    struct vn_shader_module *mod =
       vk_zalloc(alloc, sizeof(*mod), VN_DEFAULT_ALIGN,
@@ -277,7 +279,7 @@ vn_DestroyShaderModule(VkDevice device,
    struct vn_device *dev = vn_device_from_handle(device);
    struct vn_shader_module *mod = vn_shader_module_from_handle(shaderModule);
    const VkAllocationCallbacks *alloc =
-      pAllocator ? pAllocator : &dev->base.base.alloc;
+      pAllocator ? pAllocator : &dev->base.vk.alloc;
 
    if (!mod)
       return;
@@ -295,7 +297,7 @@ static void
 vn_pipeline_layout_destroy(struct vn_device *dev,
                            struct vn_pipeline_layout *pipeline_layout)
 {
-   const VkAllocationCallbacks *alloc = &dev->base.base.alloc;
+   const VkAllocationCallbacks *alloc = &dev->base.vk.alloc;
    if (pipeline_layout->push_descriptor_set_layout) {
       vn_descriptor_set_layout_unref(
          dev, pipeline_layout->push_descriptor_set_layout);
@@ -332,7 +334,7 @@ vn_CreatePipelineLayout(VkDevice device,
 {
    struct vn_device *dev = vn_device_from_handle(device);
    /* ignore pAllocator as the pipeline layout is reference-counted */
-   const VkAllocationCallbacks *alloc = &dev->base.base.alloc;
+   const VkAllocationCallbacks *alloc = &dev->base.vk.alloc;
 
    struct vn_pipeline_layout *layout =
       vk_zalloc(alloc, sizeof(*layout), VN_DEFAULT_ALIGN,
@@ -401,7 +403,7 @@ vn_CreatePipelineCache(VkDevice device,
 {
    struct vn_device *dev = vn_device_from_handle(device);
    const VkAllocationCallbacks *alloc =
-      pAllocator ? pAllocator : &dev->base.base.alloc;
+      pAllocator ? pAllocator : &dev->base.vk.alloc;
 
    struct vn_pipeline_cache *cache =
       vk_zalloc(alloc, sizeof(*cache), VN_DEFAULT_ALIGN,
@@ -441,7 +443,7 @@ vn_DestroyPipelineCache(VkDevice device,
    struct vn_pipeline_cache *cache =
       vn_pipeline_cache_from_handle(pipelineCache);
    const VkAllocationCallbacks *alloc =
-      pAllocator ? pAllocator : &dev->base.base.alloc;
+      pAllocator ? pAllocator : &dev->base.vk.alloc;
 
    if (!cache)
       return;
@@ -505,7 +507,7 @@ vn_GetPipelineCacheData(VkDevice device,
       return VK_INCOMPLETE;
    }
 
-   const struct vk_properties *props = &physical_dev->base.base.properties;
+   const struct vk_properties *props = &physical_dev->base.vk.properties;
    header->header_size = sizeof(*header);
    header->header_version = VK_PIPELINE_CACHE_HEADER_VERSION_ONE;
    header->vendor_id = props->vendorID;
@@ -562,6 +564,7 @@ vn_create_pipeline_handles(struct vn_device *dev,
       pipeline_size = sizeof(struct vn_graphics_pipeline);
       break;
    case VN_PIPELINE_TYPE_COMPUTE:
+   case VN_PIPELINE_TYPE_RAY_TRACING:
       pipeline_size = sizeof(struct vn_pipeline);
       break;
    }
@@ -657,6 +660,8 @@ vn_graphics_pipeline_fix_tmp_alloc(const VkAllocationCallbacks *alloc,
    VkPipelineLibraryCreateInfoKHR *library_infos;
    VkPipelineRenderingCreateInfo *rendering_infos;
    VkPipelineRobustnessCreateInfo *robustness_infos;
+   VkRenderingAttachmentLocationInfo *ral_infos;
+   VkRenderingInputAttachmentIndexInfo *riai_infos;
 
    VK_MULTIALLOC(ma);
    vk_multialloc_add(&ma, &tmp, __typeof__(*tmp), 1);
@@ -680,6 +685,9 @@ vn_graphics_pipeline_fix_tmp_alloc(const VkAllocationCallbacks *alloc,
                         info_count);
       vk_multialloc_add(&ma, &robustness_infos, __typeof__(*robustness_infos),
                         info_count);
+      vk_multialloc_add(&ma, &ral_infos, __typeof__(*ral_infos), info_count);
+      vk_multialloc_add(&ma, &riai_infos, __typeof__(*riai_infos),
+                        info_count);
    }
 
    if (!vk_multialloc_zalloc(&ma, alloc, VK_SYSTEM_ALLOCATION_SCOPE_COMMAND))
@@ -698,6 +706,8 @@ vn_graphics_pipeline_fix_tmp_alloc(const VkAllocationCallbacks *alloc,
       tmp->library_infos = library_infos;
       tmp->rendering_infos = rendering_infos;
       tmp->robustness_infos = robustness_infos;
+      tmp->ral_infos = ral_infos;
+      tmp->riai_infos = riai_infos;
    }
 
    return tmp;
@@ -1067,11 +1077,6 @@ vn_graphics_pipeline_state_fill(
    const uint32_t lib_count = lib_info ? lib_info->libraryCount : 0;
 
    const VkPipelineSampleLocationsStateCreateInfoEXT *sl_info = NULL;
-   if (info->pMultisampleState) {
-      sl_info = vk_find_struct_const(
-         info->pMultisampleState->pNext,
-         PIPELINE_SAMPLE_LOCATIONS_STATE_CREATE_INFO_EXT);
-   }
 
    /* This tracks which fields have valid values in the
     * VkGraphicsPipelineCreateInfo pNext chain.
@@ -1240,6 +1245,11 @@ vn_graphics_pipeline_state_fill(
           * VK_DYNAMIC_STATE_SAMPLE_LOCATIONS_ENABLE_EXT dynamic state is used
           * or the static sampleLocationsEnable is true.
           */
+         if (info->pMultisampleState) {
+            sl_info = vk_find_struct_const(
+               info->pMultisampleState->pNext,
+               PIPELINE_SAMPLE_LOCATIONS_STATE_CREATE_INFO_EXT);
+         }
          if (!state->dynamic.sample_locations) {
             if (state->dynamic.sample_locations_enable)
                valid.self.multisample_state_sample_locations = true;
@@ -1398,7 +1408,7 @@ vn_multisample_info_pnext_init(
    VkPipelineSampleLocationsStateCreateInfoEXT *sl =
       &fix_tmp->sl_infos[index];
 
-   VkBaseOutStructure *cur = (void *)&fix_tmp->infos[index].pMultisampleState;
+   VkBaseOutStructure *cur = (void *)fix_tmp->infos[index].pMultisampleState;
 
    vk_foreach_struct_const(src, info->pNext) {
       void *next = NULL;
@@ -1503,6 +1513,8 @@ vn_graphics_pipeline_create_info_pnext_init(
       &fix_tmp->rendering_infos[index];
    VkPipelineRobustnessCreateInfo *robustness =
       &fix_tmp->robustness_infos[index];
+   VkRenderingAttachmentLocationInfo *ral = &fix_tmp->ral_infos[index];
+   VkRenderingInputAttachmentIndexInfo *riai = &fix_tmp->riai_infos[index];
 
    VkBaseOutStructure *cur = (void *)&fix_tmp->infos[index];
 
@@ -1536,6 +1548,14 @@ vn_graphics_pipeline_create_info_pnext_init(
       case VK_STRUCTURE_TYPE_PIPELINE_ROBUSTNESS_CREATE_INFO:
          memcpy(robustness, src, sizeof(*robustness));
          next = robustness;
+         break;
+      case VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_LOCATION_INFO:
+         memcpy(ral, src, sizeof(*ral));
+         next = ral;
+         break;
+      case VK_STRUCTURE_TYPE_RENDERING_INPUT_ATTACHMENT_INDEX_INFO:
+         memcpy(riai, src, sizeof(*riai));
+         next = riai;
          break;
       default:
          break;
@@ -1657,7 +1677,7 @@ vn_CreateGraphicsPipelines(VkDevice device,
 {
    struct vn_device *dev = vn_device_from_handle(device);
    const VkAllocationCallbacks *alloc =
-      pAllocator ? pAllocator : &dev->base.base.alloc;
+      pAllocator ? pAllocator : &dev->base.vk.alloc;
    bool want_sync = false;
    VkResult result;
 
@@ -1750,7 +1770,7 @@ vn_CreateComputePipelines(VkDevice device,
 {
    struct vn_device *dev = vn_device_from_handle(device);
    const VkAllocationCallbacks *alloc =
-      pAllocator ? pAllocator : &dev->base.base.alloc;
+      pAllocator ? pAllocator : &dev->base.vk.alloc;
    bool want_sync = false;
    VkResult result;
 
@@ -1809,7 +1829,7 @@ vn_DestroyPipeline(VkDevice device,
    struct vn_device *dev = vn_device_from_handle(device);
    struct vn_pipeline *pipeline = vn_pipeline_from_handle(_pipeline);
    const VkAllocationCallbacks *alloc =
-      pAllocator ? pAllocator : &dev->base.base.alloc;
+      pAllocator ? pAllocator : &dev->base.vk.alloc;
 
    if (!pipeline)
       return;
@@ -1822,4 +1842,117 @@ vn_DestroyPipeline(VkDevice device,
 
    vn_object_base_fini(&pipeline->base);
    vk_free(alloc, pipeline);
+}
+
+VkResult
+vn_CreateRayTracingPipelinesKHR(
+   VkDevice device,
+   VkDeferredOperationKHR deferredOperation,
+   VkPipelineCache pipelineCache,
+   uint32_t createInfoCount,
+   const VkRayTracingPipelineCreateInfoKHR *pCreateInfos,
+   const VkAllocationCallbacks *pAllocator,
+   VkPipeline *pPipelines)
+{
+   struct vn_device *dev = vn_device_from_handle(device);
+   const VkAllocationCallbacks *alloc =
+      pAllocator ? pAllocator : &dev->base.vk.alloc;
+   bool want_sync = false;
+   VkResult result = VK_SUCCESS;
+
+   memset(pPipelines, 0, sizeof(*pPipelines) * createInfoCount);
+
+   if (!vn_create_pipeline_handles(dev, VN_PIPELINE_TYPE_RAY_TRACING,
+                                   createInfoCount, pPipelines, alloc))
+      return vn_error(dev->instance, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   for (uint32_t i = 0; i < createInfoCount; i++) {
+      struct vn_pipeline *pipeline = vn_pipeline_from_handle(pPipelines[i]);
+      struct vn_pipeline_layout *layout =
+         vn_pipeline_layout_from_handle(pCreateInfos[i].layout);
+      if (layout->push_descriptor_set_layout ||
+          layout->has_push_constant_ranges) {
+         pipeline->layout = vn_pipeline_layout_ref(dev, layout);
+      }
+
+      if (vn_pipeline_create_flags2(pCreateInfos[i].pNext,
+                                    pCreateInfos[i].flags) &
+          VN_PIPELINE_CREATE_SYNC_MASK)
+         want_sync = true;
+
+      vn_invalidate_pipeline_creation_feedback(
+         (const VkBaseInStructure *)pCreateInfos[i].pNext);
+   }
+
+   /* TODO take deferredOperation into consideration */
+   struct vn_ring *target_ring = vn_get_target_ring(dev);
+   if (!target_ring) {
+      vn_destroy_pipeline_handles(dev, createInfoCount, pPipelines, alloc);
+      return vn_error(dev->instance, VK_ERROR_OUT_OF_HOST_MEMORY);
+   }
+
+   /* The VUID-VkRayTracingPipelineCreateInfoKHR-* set of VUs have well
+    * validated the create info here. Nothing needs to be done.
+    */
+   if (want_sync || target_ring != dev->primary_ring) {
+      result = vn_call_vkCreateRayTracingPipelinesKHR(
+         target_ring, device, VK_NULL_HANDLE, pipelineCache, createInfoCount,
+         pCreateInfos, NULL, pPipelines);
+      if (result != VK_SUCCESS)
+         vn_destroy_failed_pipeline_handles(dev, createInfoCount, pPipelines,
+                                            alloc);
+   } else {
+      vn_async_vkCreateRayTracingPipelinesKHR(
+         target_ring, device, VK_NULL_HANDLE, pipelineCache, createInfoCount,
+         pCreateInfos, NULL, pPipelines);
+      result = VK_SUCCESS;
+   }
+
+   if (deferredOperation != VK_NULL_HANDLE)
+      return VK_OPERATION_DEFERRED_KHR;
+
+   return vn_result(dev->instance, result);
+}
+
+VkResult
+vn_GetRayTracingCaptureReplayShaderGroupHandlesKHR(VkDevice device,
+                                                   VkPipeline pipeline,
+                                                   uint32_t firstGroup,
+                                                   uint32_t groupCount,
+                                                   size_t dataSize,
+                                                   void *pData)
+{
+   struct vn_device *dev = vn_device_from_handle(device);
+
+   return vn_call_vkGetRayTracingCaptureReplayShaderGroupHandlesKHR(
+      dev->primary_ring, device, pipeline, firstGroup, groupCount, dataSize,
+      pData);
+}
+
+VkResult
+vn_GetRayTracingShaderGroupHandlesKHR(VkDevice device,
+                                      VkPipeline pipeline,
+                                      uint32_t firstGroup,
+                                      uint32_t groupCount,
+                                      size_t dataSize,
+                                      void *pData)
+{
+   struct vn_device *dev = vn_device_from_handle(device);
+
+   return vn_call_vkGetRayTracingShaderGroupHandlesKHR(
+      dev->primary_ring, device, pipeline, firstGroup, groupCount, dataSize,
+      pData);
+}
+
+VkDeviceSize
+vn_GetRayTracingShaderGroupStackSizeKHR(VkDevice device,
+                                        VkPipeline pipeline,
+                                        uint32_t group,
+                                        VkShaderGroupShaderKHR groupShader)
+{
+   struct vn_device *dev = vn_device_from_handle(device);
+
+   /* TODO per background/deferred rt pipeline cache for its shader groups */
+   return vn_call_vkGetRayTracingShaderGroupStackSizeKHR(
+      dev->primary_ring, device, pipeline, group, groupShader);
 }

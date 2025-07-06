@@ -84,7 +84,7 @@ bifrost_precompiled_kernel_prepare_push_uniforms(
 void bifrost_preprocess_nir(nir_shader *nir, unsigned gpu_id);
 
 void bifrost_compile_shader_nir(nir_shader *nir,
-                                const struct panfrost_compile_inputs *inputs,
+                                const struct pan_compile_inputs *inputs,
                                 struct util_dynarray *binary,
                                 struct pan_shader_info *info);
 
@@ -94,7 +94,7 @@ void bifrost_compile_shader_nir(nir_shader *nir,
       .lower_flrp16 = true,                                                    \
       .lower_flrp32 = true,                                                    \
       .lower_flrp64 = true,                                                    \
-      .lower_ffract = true,                                                    \
+      .lower_ffract = arch < 11,                                               \
       .lower_fmod = true,                                                      \
       .lower_fdiv = true,                                                      \
       .lower_isign = true,                                                     \
@@ -107,6 +107,8 @@ void bifrost_compile_shader_nir(nir_shader *nir,
                                                                                \
       .lower_bitfield_insert = true,                                           \
       .lower_bitfield_extract = true,                                          \
+      .lower_bitfield_extract8 = true,                                         \
+      .lower_bitfield_extract16 = true,                                        \
       .lower_insert_byte = true,                                               \
                                                                                \
       .lower_pack_64_4x16 = true,                                              \
@@ -120,7 +122,6 @@ void bifrost_compile_shader_nir(nir_shader *nir,
       .lower_unpack_snorm_2x16 = true,                                         \
       .lower_unpack_unorm_4x8 = true,                                          \
       .lower_unpack_snorm_4x8 = true,                                          \
-      .lower_pack_split = true,                                                \
                                                                                \
       .lower_doubles_options =                                                 \
          nir_lower_dmod, /* TODO: Don't lower supported 64-bit operations */   \
@@ -148,6 +149,11 @@ void bifrost_compile_shader_nir(nir_shader *nir,
       .scalarize_ddx = true,                                                   \
       .support_indirect_inputs = (uint8_t)BITFIELD_MASK(PIPE_SHADER_TYPES),    \
       .lower_hadd = arch >= 11,                                                \
+      .discard_is_demote = true,                                               \
+      .has_udot_4x8 = arch >= 9,                                               \
+      .has_udot_4x8_sat = arch >= 9,                                           \
+      .has_sdot_4x8 = arch >= 9,                                               \
+      .has_sdot_4x8_sat = arch >= 9,                                           \
    };
 
 DEFINE_OPTIONS(6);

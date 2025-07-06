@@ -113,14 +113,27 @@ void r600_draw_rectangle(struct blitter_context *blitter,
 			 int x1, int y1, int x2, int y2,
 			 float depth, unsigned num_instances,
 			 enum blitter_attrib_type type,
-			 const union blitter_attrib *attrib)
+			 const struct blitter_attrib *attrib)
 {
-	struct r600_common_context *rctx =
-		(struct r600_common_context*)util_blitter_get_pipe(blitter);
+	struct r600_context *cctx =
+		(struct r600_context*)util_blitter_get_pipe(blitter);
+	struct r600_common_context *rctx = &cctx->b;
 	struct pipe_viewport_state viewport;
 	struct pipe_resource *buf = NULL;
 	unsigned offset = 0;
 	float *vb;
+
+	if (unlikely(MAX2(abs(x1), abs(x2)) > INT16_MAX ||
+		     MAX2(abs(y1), abs(y2)) > INT16_MAX)) {
+		/* Fallback when coordinates can't fit in int16. */
+		util_blitter_save_vertex_elements(cctx->blitter,
+						  cctx->vertex_fetch_shader.cso);
+		util_blitter_draw_rectangle(blitter, vertex_elements_cso, get_vs,
+					    x1, y1, x2, y2,
+					    depth, num_instances,
+					    type, attrib);
+		return;
+	}
 
 	rctx->b.bind_vertex_elements_state(&rctx->b, vertex_elements_cso);
 	rctx->b.bind_vs_state(&rctx->b, get_vs(blitter));
@@ -163,11 +176,6 @@ void r600_draw_rectangle(struct blitter_context *blitter,
 	vb[19] = 1;
 
 	switch (type) {
-	case UTIL_BLITTER_ATTRIB_COLOR:
-		memcpy(vb+4, attrib->color, sizeof(float)*4);
-		memcpy(vb+12, attrib->color, sizeof(float)*4);
-		memcpy(vb+20, attrib->color, sizeof(float)*4);
-		break;
 	case UTIL_BLITTER_ATTRIB_TEXCOORD_XYZW:
 	case UTIL_BLITTER_ATTRIB_TEXCOORD_XY:
 		vb[6] = vb[14] = vb[22] = attrib->texcoord.z;
@@ -614,7 +622,7 @@ bool r600_common_context_init(struct r600_common_context *rctx,
 	if (!rctx->b.const_uploader)
 		return false;
 
-	rctx->ctx = rctx->ws->ctx_create(rctx->ws, RADEON_CTX_PRIORITY_MEDIUM, false);
+	rctx->ctx = rctx->ws->ctx_create(rctx->ws, context_flags);
 	if (!rctx->ctx)
 		return false;
 
@@ -798,54 +806,6 @@ static int r600_get_video_param(struct pipe_screen *screen,
 		return vl_level_supported(screen, profile);
 	default:
 		return 0;
-	}
-}
-
-const char *r600_get_llvm_processor_name(enum radeon_family family)
-{
-	switch (family) {
-	case CHIP_R600:
-	case CHIP_RV630:
-	case CHIP_RV635:
-	case CHIP_RV670:
-		return "r600";
-	case CHIP_RV610:
-	case CHIP_RV620:
-	case CHIP_RS780:
-	case CHIP_RS880:
-		return "rs880";
-	case CHIP_RV710:
-		return "rv710";
-	case CHIP_RV730:
-		return "rv730";
-	case CHIP_RV740:
-	case CHIP_RV770:
-		return "rv770";
-	case CHIP_PALM:
-	case CHIP_CEDAR:
-		return "cedar";
-	case CHIP_SUMO:
-	case CHIP_SUMO2:
-		return "sumo";
-	case CHIP_REDWOOD:
-		return "redwood";
-	case CHIP_JUNIPER:
-		return "juniper";
-	case CHIP_HEMLOCK:
-	case CHIP_CYPRESS:
-		return "cypress";
-	case CHIP_BARTS:
-		return "barts";
-	case CHIP_TURKS:
-		return "turks";
-	case CHIP_CAICOS:
-		return "caicos";
-	case CHIP_CAYMAN:
-        case CHIP_ARUBA:
-		return "cayman";
-
-	default:
-		return "";
 	}
 }
 
@@ -1181,6 +1141,8 @@ bool r600_common_screen_init(struct r600_common_screen *rscreen,
 		.lower_uadd_carry = true,
 		.lower_usub_borrow = true,
 		.lower_bitfield_extract = true,
+		.lower_bitfield_extract16 = true,
+		.lower_bitfield_extract8 = true,
 		.lower_bitfield_insert = true,
 		.lower_extract_byte = true,
 		.lower_extract_word = true,
@@ -1214,6 +1176,7 @@ bool r600_common_screen_init(struct r600_common_screen *rscreen,
 		.lower_image_offset_to_range_base = 1,
 		.vectorize_tess_levels = 1,
 		.io_options = nir_io_mediump_is_32bit,
+		.vertex_id_zero_based = rscreen->info.gfx_level >= EVERGREEN,
 	};
 
 	rscreen->nir_options = nir_options;
@@ -1234,8 +1197,14 @@ bool r600_common_screen_init(struct r600_common_screen *rscreen,
 	}
 
 	if (rscreen->info.gfx_level < CAYMAN) {
-		rscreen->nir_options.lower_doubles_options = nir_lower_fp64_full_software;
 		rscreen->nir_options.lower_atomic_offset_to_range_base = true;
+
+		rscreen->nir_options.lower_doubles_options =
+			nir_lower_fp64_full_software |
+			nir_lower_dceil |
+			nir_lower_dsqrt |
+			nir_lower_drcp |
+			nir_lower_drsq;
 	} else {
 		rscreen->nir_options.lower_doubles_options =
 			nir_lower_ddiv |

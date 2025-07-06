@@ -138,6 +138,23 @@ genX(cmd_buffer_ensure_wa_14018283232)(struct anv_cmd_buffer *cmd_buffer,
 #endif
 
 static inline bool
+genX(need_wa_16014912113)(const struct intel_urb_config *prev_urb_cfg,
+                          const struct intel_urb_config *next_urb_cfg)
+{
+#if INTEL_NEEDS_WA_16014912113
+   /* When the config change and there was at a previous config. */
+   return intel_urb_setup_changed(prev_urb_cfg, next_urb_cfg,
+                                  MESA_SHADER_TESS_EVAL) &&
+          prev_urb_cfg->size[0] != 0;
+#else
+   return false;
+#endif
+}
+
+void genX(batch_emit_wa_16014912113)(struct anv_batch *batch,
+                                     const struct intel_urb_config *urb_cfg);
+
+static inline bool
 genX(cmd_buffer_set_coarse_pixel_active)(struct anv_cmd_buffer *cmd_buffer,
                                          enum anv_coarse_pixel_state state)
 {
@@ -228,12 +245,6 @@ void genX(emit_sample_pattern)(struct anv_batch *batch,
 void genX(cmd_buffer_so_memcpy)(struct anv_cmd_buffer *cmd_buffer,
                                 struct anv_address dst, struct anv_address src,
                                 uint32_t size);
-
-void genX(cmd_buffer_dispatch_kernel)(struct anv_cmd_buffer *cmd_buffer,
-                                      struct anv_kernel *kernel,
-                                      const uint32_t *global_size, /* NULL for indirect */
-                                      uint32_t arg_count,
-                                      const struct anv_kernel_arg *args);
 
 void genX(blorp_init_dynamic_states)(struct blorp_context *context);
 

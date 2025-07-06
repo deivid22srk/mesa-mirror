@@ -281,6 +281,7 @@ spirv_builder_emit_vertex(struct spirv_builder *b, uint32_t stream, bool multist
    unsigned words = 1;
    SpvOp op = SpvOpEmitVertex;
    if (multistream) {
+      spirv_builder_emit_cap(b, SpvCapabilityGeometryStreams);
       op = SpvOpEmitStreamVertex;
       words++;
    }
@@ -295,6 +296,10 @@ spirv_builder_end_primitive(struct spirv_builder *b, uint32_t stream, bool multi
 {
    unsigned words = 1;
    SpvOp op = SpvOpEndPrimitive;
+
+   if (multistream)
+      spirv_builder_emit_cap(b, SpvCapabilityGeometryStreams);
+
    if (multistream || stream > 0) {
       op = SpvOpEndStreamPrimitive;
       words++;
@@ -478,6 +483,12 @@ spirv_builder_emit_load_aligned(struct spirv_builder *b, SpvId result_type, SpvI
    } else {
       return spirv_builder_emit_triop(b, SpvOpLoad, result_type, pointer, SpvMemoryAccessAlignedMask, alignment);
    }
+}
+
+SpvId
+spirv_builder_emit_load_volatile(struct spirv_builder *b, SpvId result_type, SpvId pointer)
+{
+   return spirv_builder_emit_binop(b, SpvOpLoad, result_type, pointer, SpvMemoryAccessVolatileMask);
 }
 
 void

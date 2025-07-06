@@ -106,11 +106,6 @@ struct ir3_context {
     */
    struct hash_table *addr0_ht[4];
 
-   /* The same for a1.x. We only support immediate values for a1.x, as this
-    * is the only use so far.
-    */
-   struct hash_table_u64 *addr1_ht;
-
    struct hash_table *sel_cond_conversions;
    struct hash_table *predicate_conversions;
 
@@ -210,23 +205,12 @@ ir3_get_src(struct ir3_context *ctx, nir_src *src)
 }
 
 void ir3_put_def(struct ir3_context *ctx, nir_def *def);
-struct ir3_instruction *ir3_create_collect(struct ir3_builder *build,
-                                           struct ir3_instruction *const *arr,
-                                           unsigned arrsz);
-void ir3_split_dest(struct ir3_builder *build, struct ir3_instruction **dst,
-                    struct ir3_instruction *src, unsigned base, unsigned n);
 void ir3_handle_bindless_cat6(struct ir3_instruction *instr, nir_src rsrc);
 void ir3_handle_nonuniform(struct ir3_instruction *instr,
                            nir_intrinsic_instr *intrin);
 void emit_intrinsic_image_size_tex(struct ir3_context *ctx,
                                    nir_intrinsic_instr *intr,
                                    struct ir3_instruction **dst);
-
-#define ir3_collect(build, ...)                                                \
-   ({                                                                          \
-      struct ir3_instruction *__arr[] = {__VA_ARGS__};                         \
-      ir3_create_collect(build, __arr, ARRAY_SIZE(__arr));                     \
-   })
 
 NORETURN void ir3_context_error(struct ir3_context *ctx, const char *format,
                                 ...);
@@ -239,8 +223,6 @@ NORETURN void ir3_context_error(struct ir3_context *ctx, const char *format,
 
 struct ir3_instruction *ir3_get_addr0(struct ir3_context *ctx,
                                       struct ir3_instruction *src, int align);
-struct ir3_instruction *ir3_get_addr1(struct ir3_context *ctx,
-                                      unsigned const_val);
 struct ir3_instruction *ir3_get_predicate(struct ir3_context *ctx,
                                           struct ir3_instruction *src);
 

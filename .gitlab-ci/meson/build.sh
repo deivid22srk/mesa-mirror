@@ -83,7 +83,7 @@ if [ -n "$HOST_BUILD_OPTIONS" ]; then
 
     section_switch meson-host-build "meson: host build"
 
-    meson configure
+    meson configure --no-pager
     ninja
     ninja install
     popd
@@ -121,7 +121,7 @@ case $CI_PIPELINE_SOURCE in
 	      LTO=false
       # enable one by one for now
       elif [ "$CI_JOB_NAME" == "fedora-release" ]; then
-	      LTO=true
+	      LTO=false
       else
 	      LTO=false
       fi
@@ -151,6 +151,7 @@ meson_subprojects=(
   pest_generator
   pest_meta
   roxmltree
+  rustc-hash
   indexmap
   ${FORCE_FALLBACK_FOR:-}
 )
@@ -177,7 +178,6 @@ meson setup _build \
       -D libunwind=${UNWIND} \
       ${DRI_LOADERS} \
       ${GALLIUM_ST} \
-      -D gallium-opencl=disabled \
       -D gallium-drivers=${GALLIUM_DRIVERS:-[]} \
       -D vulkan-drivers=${VULKAN_DRIVERS:-[]} \
       -D video-codecs=all \
@@ -186,7 +186,7 @@ meson setup _build \
       -D backend_max_links=${MAX_LD} \
       ${EXTRA_OPTION}
 cd _build
-meson configure
+meson configure --no-pager
 
 uncollapsed_section_switch meson-build "meson: build"
 

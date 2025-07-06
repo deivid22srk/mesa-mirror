@@ -307,12 +307,12 @@ crocus_lower_storage_image_derefs_instr(nir_builder *b,
    }
 }
 
-static void
+static bool
 crocus_lower_storage_image_derefs(nir_shader *nir)
 {
-   nir_shader_intrinsics_pass(nir, crocus_lower_storage_image_derefs_instr,
-                              nir_metadata_control_flow,
-                              NULL);
+   return nir_shader_intrinsics_pass(nir, crocus_lower_storage_image_derefs_instr,
+                                     nir_metadata_control_flow,
+                                     NULL);
 }
 
 // XXX: need unify_interfaces() at link time...
@@ -341,9 +341,8 @@ crocus_fix_edge_flags(nir_shader *nir)
    nir_fixup_deref_modes(nir);
 
    nir_foreach_function_impl(impl, nir) {
-      nir_metadata_preserve(impl, nir_metadata_control_flow |
-                            nir_metadata_live_defs |
-                            nir_metadata_loop_analysis);
+      nir_progress(true, impl,
+                   nir_metadata_control_flow | nir_metadata_live_defs | nir_metadata_loop_analysis);
    }
 
    return true;
@@ -1094,7 +1093,7 @@ crocus_vs_outputs_written(struct crocus_context *ice,
    if (devinfo->ver < 6) {
 
       if (key->copy_edgeflag)
-         outputs_written |= BITFIELD64_BIT(VARYING_SLOT_EDGE);
+         outputs_written |= VARYING_BIT_EDGE;
 
       /* Put dummy slots into the VUE for the SF to put the replaced
        * point sprite coords in.  We shouldn't need these dummy slots,
@@ -1108,10 +1107,10 @@ crocus_vs_outputs_written(struct crocus_context *ice,
       }
 
       /* if back colors are written, allocate slots for front colors too */
-      if (outputs_written & BITFIELD64_BIT(VARYING_SLOT_BFC0))
-         outputs_written |= BITFIELD64_BIT(VARYING_SLOT_COL0);
-      if (outputs_written & BITFIELD64_BIT(VARYING_SLOT_BFC1))
-         outputs_written |= BITFIELD64_BIT(VARYING_SLOT_COL1);
+      if (outputs_written & VARYING_BIT_BFC0)
+         outputs_written |= VARYING_BIT_COL0;
+      if (outputs_written & VARYING_BIT_BFC1)
+         outputs_written |= VARYING_BIT_COL1;
    }
 
    /* In order for legacy clipping to work, we need to populate the clip
@@ -1119,8 +1118,8 @@ crocus_vs_outputs_written(struct crocus_context *ice,
     * shader doesn't write to gl_ClipDistance.
     */
    if (key->nr_userclip_plane_consts > 0) {
-      outputs_written |= BITFIELD64_BIT(VARYING_SLOT_CLIP_DIST0);
-      outputs_written |= BITFIELD64_BIT(VARYING_SLOT_CLIP_DIST1);
+      outputs_written |= VARYING_BIT_CLIP_DIST0;
+      outputs_written |= VARYING_BIT_CLIP_DIST1;
    }
 
    return outputs_written;
@@ -1173,7 +1172,7 @@ crocus_compile_vs(struct crocus_context *ice,
       /* Check if variables were found. */
       if (nir_lower_clip_vs(nir, (1 << key->nr_userclip_plane_consts) - 1,
                             true, false, NULL)) {
-         nir_lower_io_to_temporaries(nir, impl, true, false);
+         nir_lower_io_vars_to_temporaries(nir, impl, true, false);
          nir_lower_global_vars_to_local(nir);
          nir_lower_vars_to_ssa(nir);
          nir_shader_gather_info(nir, impl);
@@ -1205,7 +1204,9 @@ crocus_compile_vs(struct crocus_context *ice,
       crocus_vs_outputs_written(ice, key, nir->info.outputs_written);
    elk_compute_vue_map(devinfo,
                        &vue_prog_data->vue_map, outputs_written,
-                       nir->info.separate_shader, /* pos slots */ 1);
+                       nir->info.separate_shader ?
+                       INTEL_VUE_LAYOUT_SEPARATE :
+                       INTEL_VUE_LAYOUT_FIXED, /* pos slots */ 1);
 
    /* Don't tell the backend about our clip plane constants, we've already
     * lowered them in NIR and we don't want it doing it again.
@@ -1531,7 +1532,7 @@ crocus_compile_tes(struct crocus_context *ice,
       nir_function_impl *impl = nir_shader_get_entrypoint(nir);
       nir_lower_clip_vs(nir, (1 << key->nr_userclip_plane_consts) - 1, true,
                         false, NULL);
-      nir_lower_io_to_temporaries(nir, impl, true, false);
+      nir_lower_io_vars_to_temporaries(nir, impl, true, false);
       nir_lower_global_vars_to_local(nir);
       nir_lower_vars_to_ssa(nir);
       nir_shader_gather_info(nir, impl);
@@ -1674,7 +1675,7 @@ crocus_compile_gs(struct crocus_context *ice,
       nir_function_impl *impl = nir_shader_get_entrypoint(nir);
       nir_lower_clip_gs(nir, (1 << key->nr_userclip_plane_consts) - 1, false,
                         NULL);
-      nir_lower_io_to_temporaries(nir, impl, true, false);
+      nir_lower_io_vars_to_temporaries(nir, impl, true, false);
       nir_lower_global_vars_to_local(nir);
       nir_lower_vars_to_ssa(nir);
       nir_shader_gather_info(nir, impl);
@@ -1695,7 +1696,9 @@ crocus_compile_gs(struct crocus_context *ice,
 
    elk_compute_vue_map(devinfo,
                        &vue_prog_data->vue_map, nir->info.outputs_written,
-                       nir->info.separate_shader, /* pos slots */ 1);
+                       nir->info.separate_shader ?
+                       INTEL_VUE_LAYOUT_SEPARATE :
+                       INTEL_VUE_LAYOUT_FIXED, /* pos slots */ 1);
 
    if (devinfo->ver == 6)
       gfx6_gs_xfb_setup(&ish->stream_output, gs_prog_data);
@@ -1970,7 +1973,7 @@ update_last_vue_map(struct crocus_context *ice,
          ice->state.stage_dirty_for_nos[CROCUS_NOS_LAST_VUE_MAP];
    }
 
-   if (changed_slots || (old_map && old_map->separate != vue_map->separate)) {
+   if (changed_slots || (old_map && old_map->layout != vue_map->layout)) {
       ice->state.dirty |= CROCUS_DIRTY_GEN7_SBE;
       if (devinfo->ver < 6)
          ice->state.dirty |= CROCUS_DIRTY_GEN4_FF_GS_PROG;
@@ -2134,8 +2137,8 @@ crocus_update_compiled_clip(struct crocus_context *ice)
 
             if (offset_back || offset_front) {
                double mrd = 0.0;
-               if (ice->state.framebuffer.zsbuf)
-                  mrd = util_get_depth_format_mrd(util_format_description(ice->state.framebuffer.zsbuf->format));
+               if (ice->state.framebuffer.zsbuf.texture)
+                  mrd = util_get_depth_format_mrd(util_format_description(ice->state.framebuffer.zsbuf.format));
                key.offset_units = rs_state->offset_units * mrd * 2;
                key.offset_factor = rs_state->offset_scale * mrd;
                key.offset_clamp = rs_state->offset_clamp * mrd;
@@ -2217,7 +2220,7 @@ crocus_update_compiled_sf(struct crocus_context *ice)
    switch (ice->state.reduced_prim_mode) {
    case MESA_PRIM_TRIANGLES:
    default:
-      if (key.attrs & BITFIELD64_BIT(VARYING_SLOT_EDGE))
+      if (key.attrs & VARYING_BIT_EDGE)
          key.primitive = ELK_SF_PRIM_UNFILLED_TRIS;
       else
          key.primitive = ELK_SF_PRIM_TRIANGLES;
@@ -2510,7 +2513,7 @@ crocus_compile_cs(struct crocus_context *ice,
 
    nir_shader *nir = nir_shader_clone(mem_ctx, ish->nir);
 
-   NIR_PASS_V(nir, elk_nir_lower_cs_intrinsics, devinfo, cs_prog_data);
+   NIR_PASS(_, nir, elk_nir_lower_cs_intrinsics, devinfo, cs_prog_data);
 
    crocus_setup_uniforms(devinfo, mem_ctx, nir, prog_data, &system_values,
                          &num_system_values, &num_cbufs);
@@ -2671,7 +2674,7 @@ crocus_create_uncompiled_shader(struct pipe_context *ctx,
    struct elk_nir_compiler_opts opts = {};
    elk_preprocess_nir(screen->compiler, nir, &opts);
 
-   NIR_PASS_V(nir, elk_nir_lower_storage_image,
+   NIR_PASS(_, nir, elk_nir_lower_storage_image,
               &(struct elk_nir_lower_storage_image_opts) {
                  .devinfo = devinfo,
                  .lower_loads = true,
@@ -2679,7 +2682,7 @@ crocus_create_uncompiled_shader(struct pipe_context *ctx,
                  .lower_atomics = true,
                  .lower_get_size = true,
               });
-   NIR_PASS_V(nir, crocus_lower_storage_image_derefs);
+   NIR_PASS(_, nir, crocus_lower_storage_image_derefs);
 
    nir_sweep(nir);
 
@@ -2873,7 +2876,7 @@ crocus_create_fs_state(struct pipe_context *ctx,
       if (devinfo->ver < 6) {
          elk_compute_vue_map(devinfo, &vue_map,
                              info->inputs_read | VARYING_BIT_POS,
-                             false, /* pos slots */ 1);
+                             INTEL_VUE_LAYOUT_FIXED, /* pos slots */ 1);
       }
       if (!crocus_disk_cache_retrieve(ice, ish, &key, sizeof(key)))
          crocus_compile_fs(ice, ish, &key, &vue_map);

@@ -37,8 +37,10 @@ static inline brw_reg offset(const brw_reg &, const brw_builder &,
 class brw_builder {
 public:
    /**
-    * Construct an brw_builder that inserts instructions into \p shader.
-    * \p dispatch_width gives the native execution width of the program.
+    * Construct an brw_builder that inserts instructions
+    * at the end of \p shader. The \p dispatch_width gives
+    * the execution width, that may differ from the shader
+    * dispatch_width.
     */
    brw_builder(brw_shader *shader,
                unsigned dispatch_width) :
@@ -48,18 +50,27 @@ public:
       force_writemask_all(false),
       annotation()
    {
+      if (shader)
+         cursor = (exec_node *)&shader->instructions.tail_sentinel;
    }
 
-   explicit brw_builder(brw_shader *s) : brw_builder(s, s->dispatch_width) {}
+   /**
+    * Construct an brw_builder that inserts instructions into \p shader,
+    * using its dispatch width.
+    */
+   explicit brw_builder(brw_shader *s = NULL) :
+      brw_builder(s, s ? s->dispatch_width : 0)
+   {
+   }
 
    /**
-    * Construct an brw_builder that inserts instructions into \p shader
-    * before instruction \p inst in basic block \p block.  The default
+    * Construct an brw_builder that inserts instructions before
+    * instruction \p inst in the same basic block.  The default
     * execution controls and debug annotation are initialized from the
     * instruction passed as argument.
     */
-   brw_builder(brw_shader *shader, bblock_t *block, brw_inst *inst) :
-      shader(shader), block(block), cursor(inst),
+   explicit brw_builder(brw_inst *inst) :
+      shader(inst->block->cfg->s), block(inst->block), cursor(inst),
       _dispatch_width(inst->exec_size),
       _group(inst->group),
       force_writemask_all(inst->force_writemask_all)
@@ -83,17 +94,6 @@ public:
       bld.block = block;
       bld.cursor = cursor;
       return bld;
-   }
-
-   /**
-    * Construct an brw_builder appending instructions at the end of the
-    * instruction list of the shader, inheriting other code generation
-    * parameters from this.
-    */
-   brw_builder
-   at_end() const
-   {
-      return at(NULL, (exec_node *)&shader->instructions.tail_sentinel);
    }
 
    /**
@@ -150,6 +150,15 @@ public:
       if (b)
          bld.force_writemask_all = true;
       return bld;
+   }
+
+   /**
+    * Construct a builder for SIMD1 operations.
+    */
+   brw_builder
+   uniform() const
+   {
+      return exec_all().group(1, 0);
    }
 
    /**
@@ -436,6 +445,17 @@ public:
    }
 
    /**
+    * Emit UNDEF for the given register if its data doesn't fully occupy
+    * the space we allocated.
+    */
+   void
+   emit_undef_for_partial_reg(const brw_reg &reg) const
+   {
+      if (brw_type_size_bytes(reg.type) * dispatch_width() < REG_SIZE)
+         UNDEF(reg);
+   }
+
+   /**
     * Assorted arithmetic ops.
     * @{
     */
@@ -451,7 +471,9 @@ public:
    brw_reg                                             \
    op(const brw_reg &src0, brw_inst **out = NULL) const \
    {                                                  \
-      brw_inst *inst = op(vgrf(src0.type), src0);      \
+      brw_reg dst = vgrf(src0.type);                  \
+      emit_undef_for_partial_reg(dst);                \
+      brw_inst *inst = op(dst, src0);                 \
       if (out) *out = inst;                           \
       return inst->dst;                               \
    }
@@ -468,7 +490,9 @@ public:
    {
       enum brw_reg_type inferred_dst_type =
          brw_type_larger_of(src0.type, src1.type);
-      brw_inst *inst = alu2(op, vgrf(inferred_dst_type), src0, src1);
+      brw_reg dst = vgrf(inferred_dst_type);
+      emit_undef_for_partial_reg(dst);
+      brw_inst *inst = alu2(op, dst, src0, src1);
       if (out) *out = inst;
       return inst->dst;
    }
@@ -646,15 +670,6 @@ public:
    }
 
    /**
-    * Gfx4 predicated IF.
-    */
-   brw_inst *
-   IF(brw_predicate predicate) const
-   {
-      return set_predicate(predicate, emit(BRW_OPCODE_IF));
-   }
-
-   /**
     * CSEL: dst = src2 <op> 0.0f ? src0 : src1
     */
    brw_inst *
@@ -750,11 +765,9 @@ public:
       inst->sdepth = sdepth;
       inst->rcount = rcount;
 
-      if (dst.type == BRW_TYPE_HF) {
-         inst->size_written = reg_unit(shader->devinfo) * rcount * REG_SIZE / 2;
-      } else {
-         inst->size_written = reg_unit(shader->devinfo) * rcount * REG_SIZE;
-      }
+      unsigned type_size = brw_type_size_bytes(dst.type);
+      assert(type_size == 4 || type_size == 2);
+      inst->size_written = rcount * reg_unit(shader->devinfo) * 8 * type_size;
 
       return inst;
    }
@@ -844,14 +857,67 @@ public:
       return component(dst, 0);
    }
 
+   brw_reg
+   LOAD_REG(const brw_reg &src0, brw_inst **out = NULL) const
+   {
+      /* LOAD_REG is a raw, bulk copy of one VGRF to another. The type is
+       * irrelevant. The pass that inserts LOAD_REG to encourage results to be
+       * defs will force all types to be integer types.  Forcing the type to
+       * always be integer here helps with uniformity, and it will also help
+       * implement unit tests that want to compare two shaders for equality.
+       */
+      brw_reg_type t = brw_type_with_size(BRW_TYPE_UD,
+                                          brw_type_size_bits(src0.type));
+      brw_reg dst = retype(brw_allocate_vgrf_units(*shader,
+                                                   shader->alloc.sizes[src0.nr]),
+                           t);
+
+      assert(src0.file == VGRF);
+      assert(shader->alloc.sizes[dst.nr] == shader->alloc.sizes[src0.nr]);
+
+      brw_inst *inst = emit(SHADER_OPCODE_LOAD_REG, dst, retype(src0, t));
+
+      inst->size_written = REG_SIZE * shader->alloc.sizes[src0.nr];
+
+      assert(shader->alloc.sizes[inst->dst.nr] * REG_SIZE == inst->size_written);
+      assert(!inst->is_partial_write());
+
+      if (out) *out = inst;
+      return retype(inst->dst, src0.type);
+   }
+
    brw_shader *shader;
 
-   brw_inst *BREAK()    { return emit(BRW_OPCODE_BREAK); }
-   brw_inst *DO()       { return emit(BRW_OPCODE_DO); }
-   brw_inst *ENDIF()    { return emit(BRW_OPCODE_ENDIF); }
-   brw_inst *NOP()      { return emit(BRW_OPCODE_NOP); }
-   brw_inst *WHILE()    { return emit(BRW_OPCODE_WHILE); }
-   brw_inst *CONTINUE() { return emit(BRW_OPCODE_CONTINUE); }
+   brw_inst *BREAK()    const { return emit(BRW_OPCODE_BREAK); }
+   brw_inst *ELSE()     const { return emit(BRW_OPCODE_ELSE); }
+   brw_inst *ENDIF()    const { return emit(BRW_OPCODE_ENDIF); }
+   brw_inst *NOP()      const { return emit(BRW_OPCODE_NOP); }
+   brw_inst *CONTINUE() const { return emit(BRW_OPCODE_CONTINUE); }
+
+   brw_inst *
+   IF(brw_predicate predicate = BRW_PREDICATE_NORMAL) const
+   {
+      return set_predicate(predicate, emit(BRW_OPCODE_IF));
+   }
+
+   brw_inst *
+   WHILE(brw_predicate predicate = BRW_PREDICATE_NONE) const
+   {
+      return set_predicate(predicate, emit(BRW_OPCODE_WHILE));
+   }
+
+   void
+   DO() const
+   {
+      emit(BRW_OPCODE_DO);
+      /* Ensure that there'll always be a block after DO to add
+       * instructions and serve as sucessor for predicated WHILE
+       * and CONTINUE.
+       *
+       * See more details in brw_cfg::validate().
+       */
+      emit(SHADER_OPCODE_FLOW);
+   }
 
    bool has_writemask_all() const {
       return force_writemask_all;

@@ -11,14 +11,17 @@
 #endif
 
 #include "panvk_blend.h"
+#include "panvk_cmd_desc_state.h"
 #include "panvk_cmd_oq.h"
 #include "panvk_entrypoints.h"
 #include "panvk_image.h"
 #include "panvk_image_view.h"
 #include "panvk_physical_device.h"
+#include "panvk_shader.h"
 
 #include "vk_command_buffer.h"
 #include "vk_format.h"
+#include "util/u_tristate.h"
 
 #include "pan_props.h"
 
@@ -41,6 +44,7 @@ struct panvk_rendering_state {
    VkRenderingFlags flags;
    uint32_t layer_count;
    uint32_t view_mask;
+   enum u_tristate first_provoking_vertex;
 
    enum vk_rp_attachment_flags bound_attachments;
    struct {
@@ -63,14 +67,17 @@ struct panvk_rendering_state {
       struct pan_fb_info info;
       bool crc_valid[MAX_RTS];
 
-#if PAN_ARCH <= 7
+      /* nr_samples to be used before framebuffer / tiler descriptor are emitted */
+      uint32_t nr_samples;
+
+#if PAN_ARCH < 9
       uint32_t bo_count;
       struct pan_kmod_bo *bos[MAX_RTS + 2];
 #endif
    } fb;
 
 #if PAN_ARCH >= 10
-   struct panfrost_ptr fbds;
+   struct pan_ptr fbds;
    uint64_t tiler;
 
    /* When a secondary command buffer has to flush draws, it disturbs the
@@ -79,6 +86,11 @@ struct panvk_rendering_state {
 
    /* True if the last render pass was suspended. */
    bool suspended;
+
+   /* Blocks that can patch to flip the provoking vertex mode if we need to
+    * emit FBDs/TDs before we know which mode the application is using */
+   struct cs_maybe *maybe_set_tds_provoking_vertex;
+   struct cs_maybe *maybe_set_fbds_provoking_vertex;
 
    struct {
       /* != 0 if the render pass contains one or more occlusion queries to
@@ -116,7 +128,7 @@ struct panvk_cmd_graphics_state {
    struct panvk_occlusion_query_state occlusion_query;
    struct panvk_graphics_sysvals sysvals;
 
-#if PAN_ARCH <= 7
+#if PAN_ARCH < 9
    struct panvk_shader_link link;
 #endif
 
@@ -125,7 +137,7 @@ struct panvk_cmd_graphics_state {
       struct panvk_shader_desc_state desc;
       uint64_t push_uniforms;
       bool required;
-#if PAN_ARCH <= 7
+#if PAN_ARCH < 9
       uint64_t rsd;
 #endif
    } fs;
@@ -134,7 +146,7 @@ struct panvk_cmd_graphics_state {
       const struct panvk_shader *shader;
       struct panvk_shader_desc_state desc;
       uint64_t push_uniforms;
-#if PAN_ARCH <= 7
+#if PAN_ARCH < 9
       uint64_t attribs;
       uint64_t attrib_bufs;
 #endif
@@ -145,10 +157,19 @@ struct panvk_cmd_graphics_state {
       unsigned count;
    } vb;
 
+#if PAN_ARCH >= 10
+   struct {
+      uint32_t attribs_changing_on_base_instance;
+   } vi;
+#endif
+
    /* Index buffer */
    struct {
-      struct panvk_buffer *buffer;
-      uint64_t offset;
+      uint64_t dev_addr;
+#if PAN_ARCH < 9
+      void *host_addr;
+#endif
+      uint64_t size;
       uint8_t index_size;
    } ib;
 
@@ -158,7 +179,9 @@ struct panvk_cmd_graphics_state {
 
    struct panvk_rendering_state render;
 
-#if PAN_ARCH <= 7
+   bool vk_meta;
+
+#if PAN_ARCH < 9
    uint64_t vpd;
 #endif
 
@@ -197,21 +220,38 @@ struct panvk_cmd_graphics_state {
       }                                                                        \
    } while (0)
 
+#if PAN_ARCH >= 10
+struct panvk_device_draw_context {
+   struct panvk_priv_bo *fns_bo;
+   uint64_t fn_set_fbds_provoking_vertex_stride;
+};
+#endif
+
+static inline void
+panvk_depth_range(const struct panvk_cmd_graphics_state *state,
+                  const struct vk_viewport_state *vp,
+                  float *z_min, float *z_max)
+{
+   float a = vp->depth_clip_negative_one_to_one ?
+      state->sysvals.viewport.offset.z - state->sysvals.viewport.scale.z :
+      state->sysvals.viewport.offset.z;
+   float b = state->sysvals.viewport.offset.z + state->sysvals.viewport.scale.z;
+   *z_min = MIN2(a, b);
+   *z_max = MAX2(a, b);
+}
+
 static inline uint32_t
 panvk_select_tiler_hierarchy_mask(const struct panvk_physical_device *phys_dev,
-                                  const struct panvk_cmd_graphics_state *state)
+                                  const struct panvk_cmd_graphics_state *state,
+                                  unsigned bin_ptr_mem_budget)
 {
-   struct panfrost_tiler_features tiler_features =
-      panfrost_query_tiler_features(&phys_dev->kmod.props);
+   struct pan_tiler_features tiler_features =
+      pan_query_tiler_features(&phys_dev->kmod.props);
 
-   uint32_t hierarchy_mask =
-      pan_select_tiler_hierarchy_mask(state->render.fb.info.width,
-                                      state->render.fb.info.height,
-                                      tiler_features.max_levels);
-
-   /* For effective tile size larger than 16x16, disable first level */
-   if (state->render.fb.info.tile_size > 16 * 16)
-      hierarchy_mask &= ~1;
+   uint32_t hierarchy_mask = GENX(pan_select_tiler_hierarchy_mask)(
+      state->render.fb.info.width, state->render.fb.info.height,
+      tiler_features.max_levels, state->render.fb.info.tile_size,
+      bin_ptr_mem_budget);
 
    return hierarchy_mask;
 }
@@ -306,6 +346,15 @@ cached_fs_required(ASSERTED const struct panvk_cmd_graphics_state *state,
          gfx_state_set_dirty(__cmdbuf, FS_PUSH_UNIFORMS);                      \
    } while (0)
 
+
+#if PAN_ARCH >= 10
+VkResult
+panvk_per_arch(device_draw_context_init)(struct panvk_device *dev);
+
+void
+panvk_per_arch(device_draw_context_cleanup)(struct panvk_device *dev);
+#endif
+
 void
 panvk_per_arch(cmd_init_render_state)(struct panvk_cmd_buffer *cmdbuf,
                                       const VkRenderingInfo *pRenderingInfo);
@@ -319,6 +368,7 @@ panvk_per_arch(cmd_preload_render_area_border)(struct panvk_cmd_buffer *cmdbuf,
                                                const VkRenderingInfo *render_info);
 
 void panvk_per_arch(cmd_resolve_attachments)(struct panvk_cmd_buffer *cmdbuf);
+void panvk_per_arch(cmd_select_tile_size)(struct panvk_cmd_buffer *cmdbuf);
 
 struct panvk_draw_info {
    struct {
@@ -327,7 +377,7 @@ struct panvk_draw_info {
    } index;
 
    struct {
-#if PAN_ARCH <= 7
+#if PAN_ARCH < 9
       int32_t raw_offset;
 #endif
       int32_t base;
@@ -341,11 +391,12 @@ struct panvk_draw_info {
 
    struct {
       uint64_t buffer_dev_addr;
+      uint64_t count_buffer_dev_addr;
       uint32_t draw_count;
       uint32_t stride;
    } indirect;
 
-#if PAN_ARCH <= 7
+#if PAN_ARCH < 9
    uint32_t layer_id;
 #endif
 };
@@ -353,5 +404,77 @@ struct panvk_draw_info {
 void
 panvk_per_arch(cmd_prepare_draw_sysvals)(struct panvk_cmd_buffer *cmdbuf,
                                          const struct panvk_draw_info *info);
+
+static inline uint32_t
+color_attachment_written_mask(
+   const struct panvk_shader *fs,
+   const struct vk_color_attachment_location_state *cal)
+{
+   uint32_t written_by_shader =
+      (fs->info.outputs_written >> FRAG_RESULT_DATA0) & BITFIELD_MASK(8);
+   uint32_t catt_written_mask = 0;
+
+   for (uint32_t i = 0; i < MAX_RTS; i++) {
+      if (cal->color_map[i] == MESA_VK_ATTACHMENT_UNUSED)
+         continue;
+
+      uint32_t shader_rt = cal->color_map[i];
+
+      if (written_by_shader & BITFIELD_BIT(shader_rt))
+         catt_written_mask |= BITFIELD_BIT(i);
+   }
+
+   return catt_written_mask;
+}
+
+static inline uint32_t
+color_attachment_read_mask(const struct panvk_shader *fs,
+                           const struct vk_input_attachment_location_state *ial,
+                           uint8_t color_attachment_mask)
+{
+   uint32_t color_attachment_count =
+      ial->color_attachment_count == MESA_VK_COLOR_ATTACHMENT_COUNT_UNKNOWN
+         ? util_last_bit(color_attachment_mask)
+         : ial->color_attachment_count;
+   uint32_t catt_read_mask = 0;
+
+   for (uint32_t i = 0; i < color_attachment_count; i++) {
+      if (ial->color_map[i] == MESA_VK_ATTACHMENT_UNUSED)
+         continue;
+
+      uint32_t catt_idx = ial->color_map[i] + 1;
+      if (fs->fs.input_attachment_read & BITFIELD_BIT(catt_idx)) {
+         assert(color_attachment_mask & BITFIELD_BIT(i));
+         catt_read_mask |= BITFIELD_BIT(i);
+      }
+   }
+
+   return catt_read_mask;
+}
+
+static inline bool
+z_attachment_read(const struct panvk_shader *fs,
+                  const struct vk_input_attachment_location_state *ial)
+{
+   uint32_t depth_mask = ial->depth_att == MESA_VK_ATTACHMENT_NO_INDEX
+                            ? BITFIELD_BIT(0)
+                         : ial->depth_att != MESA_VK_ATTACHMENT_UNUSED
+                            ? BITFIELD_BIT(ial->depth_att + 1)
+                            : 0;
+   return depth_mask & fs->fs.input_attachment_read;
+}
+
+static inline bool
+s_attachment_read(const struct panvk_shader *fs,
+                  const struct vk_input_attachment_location_state *ial)
+{
+   uint32_t stencil_mask = ial->stencil_att == MESA_VK_ATTACHMENT_NO_INDEX
+                              ? BITFIELD_BIT(0)
+                           : ial->stencil_att != MESA_VK_ATTACHMENT_UNUSED
+                              ? BITFIELD_BIT(ial->stencil_att + 1)
+                              : 0;
+
+   return stencil_mask & fs->fs.input_attachment_read;
+}
 
 #endif

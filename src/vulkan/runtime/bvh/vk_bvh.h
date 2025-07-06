@@ -94,7 +94,14 @@ struct vk_ir_header {
    uint32_t dispatch_size_y;
    uint32_t dispatch_size_z;
    vk_global_sync_data sync_data;
+   /* Generic offset used by the driver during encoding
+    * to write HW nodes in a compact way.
+    */
    uint32_t dst_node_offset;
+   /* Same as dst_node_offset but only useful if the driver
+    * uses a separate memory section for leaf nodes.
+    */
+   uint32_t dst_leaf_node_offset;
 };
 
 struct vk_ir_node {
@@ -104,10 +111,16 @@ struct vk_ir_node {
 #define VK_UNKNOWN_BVH_OFFSET 0xFFFFFFFF
 #define VK_NULL_BVH_OFFSET    0xFFFFFFFE
 
+/* Box node contains only opaque leaves */
+#define VK_BVH_BOX_FLAG_ONLY_OPAQUE  0x1
+/* Box node contains no opaque leaves */
+#define VK_BVH_BOX_FLAG_NO_OPAQUE    0x2
+
 struct vk_ir_box_node {
    vk_ir_node base;
    uint32_t children[2];
    uint32_t bvh_offset;
+   uint32_t flags;
 };
 
 struct vk_ir_aabb_node {
@@ -132,6 +145,8 @@ struct vk_ir_instance_node {
    uint32_t sbt_offset_and_flags;
    mat3x4 otw_matrix;
    uint32_t instance_id;
+   /* The root node's flags. */
+   uint32_t root_flags;
 };
 
 #define VK_BVH_INVALID_NODE 0xFFFFFFFF

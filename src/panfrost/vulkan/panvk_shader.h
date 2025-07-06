@@ -13,6 +13,7 @@
 #include "util/pan_ir.h"
 
 #include "pan_desc.h"
+#include "pan_earlyzs.h"
 
 #include "panvk_cmd_push_constant.h"
 #include "panvk_descriptor_set.h"
@@ -27,6 +28,35 @@ extern const struct vk_device_shader_ops panvk_per_arch(device_shader_ops);
 
 #define MAX_VS_ATTRIBS 16
 
+#if PAN_ARCH < 9
+
+/* We could theoretically use the MAX_PER_SET values here (except for UBOs
+ * where we're really limited to 256 on the shader side), but on Bifrost we
+ * have to copy some tables around, which comes at an extra memory/processing
+ * cost, so let's pick something smaller. */
+#define MAX_PER_STAGE_SAMPLED_IMAGES 256
+#define MAX_PER_STAGE_SAMPLERS 128
+#define MAX_PER_STAGE_UNIFORM_BUFFERS MAX_PER_SET_UNIFORM_BUFFERS
+#define MAX_PER_STAGE_STORAGE_BUFFERS 64
+#define MAX_PER_STAGE_STORAGE_IMAGES 32
+#define MAX_PER_STAGE_INPUT_ATTACHMENTS MAX_PER_SET_INPUT_ATTACHMENTS
+
+#else
+
+#define MAX_PER_STAGE_SAMPLED_IMAGES MAX_PER_SET_SAMPLED_IMAGES
+#define MAX_PER_STAGE_SAMPLERS MAX_PER_SET_SAMPLERS
+#define MAX_PER_STAGE_UNIFORM_BUFFERS MAX_PER_SET_UNIFORM_BUFFERS
+#define MAX_PER_STAGE_STORAGE_BUFFERS MAX_PER_SET_STORAGE_BUFFERS
+#define MAX_PER_STAGE_STORAGE_IMAGES MAX_PER_SET_STORAGE_IMAGES
+#define MAX_PER_STAGE_INPUT_ATTACHMENTS MAX_PER_SET_INPUT_ATTACHMENTS
+
+#endif
+
+#define MAX_PER_STAGE_RESOURCES (                                              \
+   MAX_PER_STAGE_SAMPLED_IMAGES + MAX_PER_STAGE_SAMPLERS +                     \
+   MAX_PER_STAGE_UNIFORM_BUFFERS + MAX_PER_STAGE_STORAGE_BUFFERS +             \
+   MAX_PER_STAGE_STORAGE_IMAGES + MAX_PER_STAGE_INPUT_ATTACHMENTS)
+
 struct nir_shader;
 struct pan_blend_state;
 struct panvk_device;
@@ -40,7 +70,7 @@ enum panvk_varying_buf_id {
    PANVK_VARY_BUF_MAX,
 };
 
-#if PAN_ARCH <= 7
+#if PAN_ARCH < 9
 enum panvk_desc_table_id {
    PANVK_DESC_TABLE_USER = 0,
    PANVK_DESC_TABLE_CS_DYN_SSBOS = MAX_SETS,
@@ -50,6 +80,18 @@ enum panvk_desc_table_id {
    PANVK_DESC_TABLE_GFX_COUNT = PANVK_DESC_TABLE_FS_DYN_SSBOS + 1,
 };
 #endif
+
+#define PANVK_COLOR_ATTACHMENT(x) (x)
+#define PANVK_ZS_ATTACHMENT       255
+
+struct panvk_input_attachment_info {
+   uint32_t target;
+   uint32_t conversion;
+};
+
+/* One attachment per color, one for depth, one for stencil, and the last one
+ * for the attachment without an InputAttachmentIndex attribute. */
+#define INPUT_ATTACHMENT_MAP_SIZE 11
 
 #define FAU_WORD_SIZE sizeof(uint64_t)
 
@@ -67,7 +109,7 @@ struct panvk_graphics_sysvals {
    } viewport;
 
    struct {
-#if PAN_ARCH <= 7
+#if PAN_ARCH < 9
       int32_t raw_vertex_offset;
 #endif
       int32_t first_vertex;
@@ -75,10 +117,13 @@ struct panvk_graphics_sysvals {
       uint32_t noperspective_varyings;
    } vs;
 
-   aligned_u64 push_consts;
+   /* Address of sysval/push constant buffer used for indirect loads */
+   aligned_u64 push_uniforms;
    aligned_u64 printf_buffer_address;
 
-#if PAN_ARCH <= 7
+   struct panvk_input_attachment_info iam[INPUT_ATTACHMENT_MAP_SIZE];
+
+#if PAN_ARCH < 9
    /* gl_Layer on Bifrost is a bit of hack. We have to issue one draw per
     * layer, and filter primitives at the VS level.
     */
@@ -92,10 +137,10 @@ struct panvk_graphics_sysvals {
 
 static_assert((sizeof(struct panvk_graphics_sysvals) % FAU_WORD_SIZE) == 0,
               "struct panvk_graphics_sysvals must be 8-byte aligned");
-static_assert((offsetof(struct panvk_graphics_sysvals, push_consts) %
+static_assert((offsetof(struct panvk_graphics_sysvals, push_uniforms) %
                FAU_WORD_SIZE) == 0,
-              "panvk_graphics_sysvals::push_consts must be 8-byte aligned");
-#if PAN_ARCH <= 7
+              "panvk_graphics_sysvals::push_uniforms must be 8-byte aligned");
+#if PAN_ARCH < 9
 static_assert((offsetof(struct panvk_graphics_sysvals, desc) % FAU_WORD_SIZE) ==
                  0,
               "panvk_graphics_sysvals::desc must be 8-byte aligned");
@@ -112,10 +157,11 @@ struct panvk_compute_sysvals {
       uint32_t x, y, z;
    } local_group_size;
 
-   aligned_u64 push_consts;
+   /* Address of sysval/push constant buffer used for indirect loads */
+   aligned_u64 push_uniforms;
    aligned_u64 printf_buffer_address;
 
-#if PAN_ARCH <= 7
+#if PAN_ARCH < 9
    struct {
       aligned_u64 sets[PANVK_DESC_TABLE_COMPUTE_COUNT];
    } desc;
@@ -124,10 +170,10 @@ struct panvk_compute_sysvals {
 
 static_assert((sizeof(struct panvk_compute_sysvals) % FAU_WORD_SIZE) == 0,
               "struct panvk_compute_sysvals must be 8-byte aligned");
-static_assert((offsetof(struct panvk_compute_sysvals, push_consts) %
+static_assert((offsetof(struct panvk_compute_sysvals, push_uniforms) %
                FAU_WORD_SIZE) == 0,
-              "panvk_compute_sysvals::push_consts must be 8-byte aligned");
-#if PAN_ARCH <= 7
+              "panvk_compute_sysvals::push_uniforms must be 8-byte aligned");
+#if PAN_ARCH < 9
 static_assert((offsetof(struct panvk_compute_sysvals, desc) % FAU_WORD_SIZE) ==
                  0,
               "panvk_compute_sysvals::desc must be 8-byte aligned");
@@ -210,13 +256,11 @@ static_assert((offsetof(struct panvk_compute_sysvals, desc) % FAU_WORD_SIZE) ==
 #define load_sysval_entry(__b, __ptype, __bitsz, __name, __dyn_idx)            \
    nir_load_push_constant(                                                     \
       __b, sysval_entry_size(__ptype, __name) / ((__bitsz) / 8), __bitsz,      \
-      nir_iadd_imm(                                                            \
-         __b,                                                                  \
-         nir_imul_imm(__b, __dyn_idx, sysval_entry_size(__ptype, __name)),     \
-         sysval_offset(__ptype, __name)),                                      \
-      .base = SYSVALS_PUSH_CONST_BASE)
+      nir_imul_imm(__b, __dyn_idx, sysval_entry_size(__ptype, __name)),        \
+      .base = SYSVALS_PUSH_CONST_BASE + sysval_offset(__ptype, __name),        \
+      .range = sysval_size(__ptype, __name))
 
-#if PAN_ARCH <= 7
+#if PAN_ARCH < 9
 enum panvk_bifrost_desc_table_type {
    PANVK_BIFROST_DESC_TABLE_INVALID = -1,
 
@@ -256,12 +300,22 @@ struct panvk_shader_fau_info {
 struct panvk_shader {
    struct vk_shader vk;
    struct pan_shader_info info;
-   struct pan_compute_dim local_size;
+
+   union {
+      struct {
+         struct pan_compute_dim local_size;
+      } cs;
+
+      struct {
+         struct pan_earlyzs_lut earlyzs_lut;
+         uint32_t input_attachment_read;
+      } fs;
+   };
 
    struct {
       uint32_t used_set_mask;
 
-#if PAN_ARCH <= 7
+#if PAN_ARCH < 9
       struct {
          uint32_t map[MAX_DYNAMIC_UNIFORM_BUFFERS];
          uint32_t count;
@@ -291,15 +345,20 @@ struct panvk_shader {
 
    struct panvk_priv_mem code_mem;
 
-#if PAN_ARCH <= 7
+#if PAN_ARCH < 9
    struct panvk_priv_mem rsd;
 #else
    union {
       struct panvk_priv_mem spd;
       struct {
+#if PAN_ARCH < 12
          struct panvk_priv_mem pos_points;
          struct panvk_priv_mem pos_triangles;
          struct panvk_priv_mem var;
+#else
+         struct panvk_priv_mem all_points;
+         struct panvk_priv_mem all_triangles;
+#endif
       } spds;
    };
 #endif
@@ -314,7 +373,7 @@ panvk_shader_get_dev_addr(const struct panvk_shader *shader)
    return shader != NULL ? panvk_priv_mem_dev_addr(shader->code_mem) : 0;
 }
 
-#if PAN_ARCH <= 7
+#if PAN_ARCH < 9
 struct panvk_shader_link {
    struct {
       struct panvk_priv_mem attribs;
@@ -339,7 +398,7 @@ void panvk_per_arch(nir_lower_descriptors)(
    nir_shader *nir, struct panvk_device *dev,
    const struct vk_pipeline_robustness_state *rs, uint32_t set_layout_count,
    struct vk_descriptor_set_layout *const *set_layouts,
-   struct panvk_shader *shader);
+   const struct vk_graphics_pipeline_state *state, struct panvk_shader *shader);
 
 /* This a stripped-down version of panvk_shader for internal shaders that
  * are managed by vk_meta (blend and preload shaders). Those don't need the
@@ -349,7 +408,7 @@ struct panvk_internal_shader {
    struct pan_shader_info info;
    struct panvk_priv_mem code_mem;
 
-#if PAN_ARCH <= 7
+#if PAN_ARCH < 9
    struct panvk_priv_mem rsd;
 #else
    struct panvk_priv_mem spd;
@@ -373,7 +432,7 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(panvk_internal_shader, vk.base, VkShaderEXT,
 
 VkResult panvk_per_arch(create_internal_shader)(
    struct panvk_device *dev, nir_shader *nir,
-   struct panfrost_compile_inputs *compiler_inputs,
+   struct pan_compile_inputs *compiler_inputs,
    struct panvk_internal_shader **shader_out);
 
 VkResult panvk_per_arch(create_shader_from_binary)(

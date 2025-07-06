@@ -217,7 +217,6 @@ run_vs(brw_shader &s)
    brw_assign_vs_urb_setup(s);
 
    brw_lower_3src_null_dest(s);
-   brw_workaround_memory_fence_before_eot(s);
    brw_workaround_emit_dummy_mov_instruction(s);
 
    brw_allocate_registers(s, true /* allow_spilling */);
@@ -236,7 +235,8 @@ brw_compile_vs(const struct brw_compiler *compiler,
    struct brw_vs_prog_data *prog_data = params->prog_data;
    const bool debug_enabled =
       brw_should_print_shader(nir, params->base.debug_flag ?
-                                   params->base.debug_flag : DEBUG_VS);
+                                   params->base.debug_flag : DEBUG_VS,
+                                   params->base.source_hash);
    const unsigned dispatch_width = brw_geometry_stage_dispatch_width(compiler->devinfo);
 
    /* We only expect slot compaction to be disabled when using device
@@ -246,9 +246,7 @@ brw_compile_vs(const struct brw_compiler *compiler,
     */
    assert(!key->no_vf_slot_compaction || key->vf_component_packing);
 
-   prog_data->base.base.stage = MESA_SHADER_VERTEX;
-   prog_data->base.base.ray_queries = nir->info.ray_queries;
-   prog_data->base.base.total_scratch = 0;
+   brw_prog_data_init(&prog_data->base.base, &params->base);
 
    brw_nir_apply_key(nir, compiler, &key->base, dispatch_width);
 

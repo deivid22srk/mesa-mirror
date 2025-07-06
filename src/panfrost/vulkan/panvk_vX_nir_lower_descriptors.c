@@ -30,6 +30,7 @@
 #include "panvk_device.h"
 #include "panvk_shader.h"
 
+#include "vk_graphics_state.h"
 #include "vk_pipeline.h"
 #include "vk_pipeline_layout.h"
 
@@ -53,7 +54,7 @@ struct panvk_shader_desc_map {
 
 struct panvk_shader_desc_info {
    uint32_t used_set_mask;
-#if PAN_ARCH <= 7
+#if PAN_ARCH < 9
    struct panvk_shader_desc_map dyn_ubos;
    struct panvk_shader_desc_map dyn_ssbos;
    struct panvk_shader_desc_map others[PANVK_BIFROST_DESC_TABLE_COUNT];
@@ -70,8 +71,10 @@ struct lower_desc_ctx {
    struct panvk_shader_desc_info desc_info;
    struct hash_table_u64 *ht;
    bool add_bounds_checks;
+   bool null_descriptor_support;
    nir_address_format ubo_addr_format;
    nir_address_format ssbo_addr_format;
+   struct panvk_shader *shader;
 };
 
 static nir_address_format
@@ -117,7 +120,7 @@ struct desc_id {
    };
 };
 
-#if PAN_ARCH <= 7
+#if PAN_ARCH < 9
 static enum panvk_bifrost_desc_table_type
 desc_type_to_table_type(
    const struct panvk_descriptor_set_binding_layout *binding_layout,
@@ -138,6 +141,7 @@ desc_type_to_table_type(
    case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
       return PANVK_BIFROST_DESC_TABLE_IMG;
    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+   case VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK:
       return PANVK_BIFROST_DESC_TABLE_UBO;
    default:
       return PANVK_BIFROST_DESC_TABLE_INVALID;
@@ -163,7 +167,7 @@ shader_desc_idx(uint32_t set, uint32_t binding,
       return pan_res_handle(set + 1, bind_layout->desc_idx + subdesc_idx);
 
    /* On Bifrost, the SSBO descriptors are read directly from the set. */
-   if (PAN_ARCH <= 7 && bind_layout->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
+   if (PAN_ARCH < 9 && bind_layout->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
       return bind_layout->desc_idx;
 
    struct desc_id src = {
@@ -178,7 +182,7 @@ shader_desc_idx(uint32_t set, uint32_t binding,
 
    const struct panvk_shader_desc_map *map;
 
-#if PAN_ARCH <= 7
+#if PAN_ARCH < 9
    if (bind_layout->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC) {
       map = &ctx->desc_info.dyn_ubos;
    } else if (bind_layout->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) {
@@ -197,7 +201,7 @@ shader_desc_idx(uint32_t set, uint32_t binding,
 
    uint32_t idx = entry - map->map;
 
-#if PAN_ARCH <= 7
+#if PAN_ARCH < 9
    /* Adjust the destination index for all dynamic UBOs, which are laid out
     * just after the regular UBOs in the UBO table. */
    if (bind_layout->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC)
@@ -217,6 +221,7 @@ addr_format_for_type(VkDescriptorType type, const struct lower_desc_ctx *ctx)
    switch (type) {
    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+   case VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK:
       return ctx->ubo_addr_format;
 
    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
@@ -229,7 +234,7 @@ addr_format_for_type(VkDescriptorType type, const struct lower_desc_ctx *ctx)
    }
 }
 
-#if PAN_ARCH <= 7
+#if PAN_ARCH < 9
 static uint32_t
 shader_ssbo_table(nir_builder *b, unsigned set, unsigned binding,
                   const struct lower_desc_ctx *ctx)
@@ -294,7 +299,7 @@ build_res_index(nir_builder *b, uint32_t set, uint32_t binding,
    uint32_t desc_idx = shader_desc_idx(set, binding, NO_SUBDESC, ctx);
 
    switch (addr_fmt) {
-#if PAN_ARCH <= 7
+#if PAN_ARCH < 9
    case nir_address_format_32bit_index_offset: {
       const uint32_t packed_desc_idx_array_size =
          (array_size - 1) << 16 | desc_idx;
@@ -335,7 +340,7 @@ build_res_reindex(nir_builder *b, nir_def *orig, nir_def *delta,
                   nir_address_format addr_format)
 {
    switch (addr_format) {
-#if PAN_ARCH <= 7
+#if PAN_ARCH < 9
    case nir_address_format_32bit_index_offset:
       return nir_vec2(b, nir_channel(b, orig, 0),
                       nir_iadd(b, nir_channel(b, orig, 1), delta));
@@ -370,7 +375,7 @@ build_buffer_addr_for_res_index(nir_builder *b, nir_def *res_index,
                                 const struct lower_desc_ctx *ctx)
 {
    switch (addr_format) {
-#if PAN_ARCH <= 7
+#if PAN_ARCH < 9
    case nir_address_format_32bit_index_offset: {
       nir_def *packed = nir_channel(b, res_index, 0);
       nir_def *array_index = nir_channel(b, res_index, 1);
@@ -537,7 +542,7 @@ load_resource_deref_desc(nir_builder *b, nir_deref_instr *deref,
 
    set_offset = nir_iadd_imm(b, set_offset, desc_offset);
 
-#if PAN_ARCH <= 7
+#if PAN_ARCH < 9
    nir_def *set_base_addr =
       b->shader->info.stage == MESA_SHADER_COMPUTE
          ? load_sysval_entry(b, compute, 64, desc.sets, nir_imm_int(b, set))
@@ -559,16 +564,29 @@ load_resource_deref_desc(nir_builder *b, nir_deref_instr *deref,
 }
 
 static nir_def *
+is_nulldesc(nir_builder *b, nir_deref_instr *deref,
+            enum VkDescriptorType desc_type, const struct lower_desc_ctx *ctx)
+{
+   nir_def *desc_header =
+      load_resource_deref_desc(b, deref, desc_type, 0, 1, 16, ctx);
+   /* If the first 16 bits are all zero (specifically the descriptor type),
+    * this is a nulldescriptor, in which case we need to avoid the "add 1"
+    * when loading the size from the descriptor. */
+   return nir_ieq_imm(b, desc_header, 0);
+}
+
+static nir_def *
 load_tex_size(nir_builder *b, nir_deref_instr *deref, enum glsl_sampler_dim dim,
               bool is_array, const struct lower_desc_ctx *ctx)
 {
+   nir_def *loaded_size;
    if (dim == GLSL_SAMPLER_DIM_BUF) {
       nir_def *tex_w = load_resource_deref_desc(
          b, deref, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 4, 1, 16, ctx);
 
       /* S dimension is 16 bits wide. We don't support combining S,T dimensions
        * to allow large buffers yet. */
-      return nir_iadd_imm(b, nir_u2u32(b, tex_w), 1);
+      loaded_size = nir_iadd_imm(b, nir_u2u32(b, tex_w), 1);
    } else {
       nir_def *tex_w_h = load_resource_deref_desc(
          b, deref, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 4, 2, 16, ctx);
@@ -587,8 +605,17 @@ load_tex_size(nir_builder *b, nir_deref_instr *deref, enum glsl_sampler_dim dim,
       /* The sizes are provided as 16-bit values with 1 subtracted so
        * convert to 32-bit and add 1.
        */
-      return nir_iadd_imm(b, nir_u2u32(b, tex_sz), 1);
+      loaded_size = nir_iadd_imm(b, nir_u2u32(b, tex_sz), 1);
    }
+
+   if (PAN_ARCH >= 9 && ctx->null_descriptor_support) {
+      nir_def *nulldesc =
+         is_nulldesc(b, deref, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, ctx);
+      return nir_bcsel(b, nulldesc, nir_u2u32(b, nir_imm_int(b, 0)),
+                       loaded_size);
+   }
+
+   return loaded_size;
 }
 
 static nir_def *
@@ -609,7 +636,7 @@ load_img_size(nir_builder *b, nir_deref_instr *deref, enum glsl_sampler_dim dim,
       nir_def *tex_sz = load_resource_deref_desc(
          b, deref, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 18, 3, 16, ctx);
 
-#if PAN_ARCH <= 7
+#if PAN_ARCH < 9
       if (is_array && dim == GLSL_SAMPLER_DIM_CUBE)
          tex_sz =
             nir_vector_insert_imm(b, tex_sz,
@@ -641,7 +668,15 @@ load_tex_levels(nir_builder *b, nir_deref_instr *deref,
    nir_def *tex_word2 = load_resource_deref_desc(
       b, deref, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 8, 1, 32, ctx);
    nir_def *lod_count = nir_iand_imm(b, nir_ushr_imm(b, tex_word2, 16), 0x1f);
-   return nir_iadd_imm(b, lod_count, 1);
+   nir_def *loaded_levels = nir_iadd_imm(b, lod_count, 1);
+
+   if (PAN_ARCH >= 9 && ctx->null_descriptor_support) {
+      nir_def *nulldesc =
+         is_nulldesc(b, deref, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, ctx);
+      return nir_bcsel(b, nulldesc, nir_imm_int(b, 0), loaded_levels);
+   }
+
+   return loaded_levels;
 }
 
 static nir_def *
@@ -654,7 +689,15 @@ load_tex_samples(nir_builder *b, nir_deref_instr *deref,
    nir_def *tex_word3 = load_resource_deref_desc(
       b, deref, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 12, 1, 32, ctx);
    nir_def *sample_count = nir_iand_imm(b, nir_ushr_imm(b, tex_word3, 13), 0x7);
-   return nir_ishl(b, nir_imm_int(b, 1), sample_count);
+   nir_def *loaded_samples = nir_ishl(b, nir_imm_int(b, 1), sample_count);
+
+   if (PAN_ARCH >= 9 && ctx->null_descriptor_support) {
+      nir_def *nulldesc =
+         is_nulldesc(b, deref, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, ctx);
+      return nir_bcsel(b, nulldesc, nir_imm_int(b, 0), loaded_samples);
+   }
+
+   return loaded_samples;
 }
 
 static nir_def *
@@ -827,6 +870,225 @@ get_img_index(nir_builder *b, nir_deref_instr *deref,
    }
 }
 
+struct panvk_lower_input_attachment_load_ctx {
+   uint32_t ro_color_mask;
+   struct panvk_shader *shader;
+};
+
+static bool
+lower_input_attachment_load(nir_builder *b, nir_intrinsic_instr *intr,
+                            void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_image_deref_load &&
+       intr->intrinsic != nir_intrinsic_image_deref_sparse_load)
+      return false;
+
+   nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+   enum glsl_sampler_dim image_dim = glsl_get_sampler_dim(deref->type);
+   if (image_dim != GLSL_SAMPLER_DIM_SUBPASS &&
+       image_dim != GLSL_SAMPLER_DIM_SUBPASS_MS)
+      return false;
+
+   const struct panvk_lower_input_attachment_load_ctx *ctx = data;
+   struct panvk_shader *shader = ctx->shader;
+   nir_variable *var = nir_deref_instr_get_variable(deref);
+   assert(var);
+
+   b->cursor = nir_before_instr(&intr->instr);
+
+   uint32_t set, binding, index_imm, max_idx;
+   nir_def *index_ssa;
+   get_resource_deref_binding(deref, &set, &binding, &index_imm, &index_ssa, &max_idx);
+   const unsigned base_idx =
+      var->data.index != NIR_VARIABLE_NO_INDEX ? var->data.index + 1 : 0;
+   index_imm += base_idx;
+   index_ssa = index_ssa ?
+      nir_iadd_imm(b, index_ssa, base_idx) : nir_imm_int(b, index_imm);
+
+   nir_alu_type dest_type = nir_intrinsic_dest_type(intr);
+
+   unsigned range = max_idx == UINT32_MAX ? 9 - index_imm : max_idx + 1;
+   shader->fs.input_attachment_read |= BITFIELD_RANGE(index_imm, range);
+
+   nir_def *target = nir_load_input_attachment_target_pan(b, index_ssa);
+   nir_def *load_img, *load_output;
+
+   nir_push_if(b, nir_ine_imm(b, target, ~0));
+   {
+      nir_def *is_color_att = nir_ilt_imm(b, target, 8);
+      nir_def *load_color, *load_zs;
+      nir_io_semantics iosem = {0};
+
+      nir_push_if(b, is_color_att);
+      {
+         nir_def *conversion =
+            nir_load_input_attachment_conv_pan(b, index_ssa);
+         nir_def *is_read_only =
+            nir_i2b(b, nir_iand_imm(b, nir_ishl(b, nir_imm_int(b, 1), target),
+                                    ctx->ro_color_mask));
+         nir_def *load_ro_color, *load_rw_color;
+
+         iosem.location = FRAG_RESULT_DATA0;
+         nir_push_if(b, is_read_only);
+	 {
+            load_ro_color = nir_load_readonly_output_pan(
+               b, intr->def.num_components, intr->def.bit_size, target,
+               intr->src[2].ssa, conversion, .dest_type = dest_type,
+               .access = nir_intrinsic_access(intr), .io_semantics = iosem);
+         }
+         nir_push_else(b, NULL);
+         {
+            load_rw_color = nir_load_converted_output_pan(
+               b, intr->def.num_components, intr->def.bit_size, target,
+               intr->src[2].ssa, conversion, .dest_type = dest_type,
+               .access = nir_intrinsic_access(intr), .io_semantics = iosem);
+         }
+         nir_pop_if(b, NULL);
+         load_color = nir_if_phi(b, load_ro_color, load_rw_color);
+      }
+      nir_push_else(b, NULL);
+      {
+#if PAN_ARCH < 9
+         /* On v7, we need to pass the depth format around. If we use a
+          * conversion of zero, like we do on v9+, the GPU reports an
+          * INVALID_INSTR_ENC. */
+         struct mali_internal_conversion_packed stencil_conv;
+
+         pan_pack(&stencil_conv, INTERNAL_CONVERSION, cfg) {
+            cfg.register_format = MALI_REGISTER_FILE_FORMAT_U32;
+            cfg.memory_format = GENX(pan_dithered_format_from_pipe_format)(
+               PIPE_FORMAT_S8_UINT, false);
+         }
+
+         nir_def *conversion =
+            dest_type == nir_type_uint32
+               ? nir_imm_int(b, stencil_conv.opaque[0])
+               : nir_load_input_attachment_conv_pan(b, index_ssa);
+#else
+         nir_def *conversion = nir_imm_int(b, 0);
+#endif
+
+         iosem.location = dest_type == nir_type_float32 ? FRAG_RESULT_DEPTH
+                                                        : FRAG_RESULT_STENCIL;
+         target = nir_imm_int(b, 0);
+         load_zs = nir_load_converted_output_pan(
+            b, intr->def.num_components, intr->def.bit_size, target,
+            intr->src[2].ssa, conversion, .dest_type = dest_type,
+            .access = nir_intrinsic_access(intr), .io_semantics = iosem);
+
+         /* If we loaded the stencil value, the upper 24 bits might contain
+	  * garbage, hence the masking done here. */
+         if (iosem.location == FRAG_RESULT_STENCIL)
+            load_zs = nir_iand_imm(b, load_zs, BITFIELD_MASK(8));
+      }
+      nir_pop_if(b, NULL);
+
+      load_output = nir_if_phi(b, load_color, load_zs);
+   }
+   nir_push_else(b, NULL);
+   {
+      load_img =
+         intr->intrinsic == nir_intrinsic_image_deref_sparse_load
+            ? nir_image_deref_sparse_load(
+                 b, intr->num_components, intr->def.bit_size, intr->src[0].ssa,
+                 intr->src[1].ssa, intr->src[2].ssa, intr->src[3].ssa,
+                 .image_dim = nir_intrinsic_image_dim(intr),
+                 .image_array = nir_intrinsic_image_array(intr),
+                 .format = nir_intrinsic_format(intr),
+                 .access = nir_intrinsic_access(intr), .dest_type = dest_type)
+            : nir_image_deref_load(
+                 b, intr->num_components, intr->def.bit_size, intr->src[0].ssa,
+                 intr->src[1].ssa, intr->src[2].ssa, intr->src[3].ssa,
+                 .image_dim = nir_intrinsic_image_dim(intr),
+                 .image_array = nir_intrinsic_image_array(intr),
+                 .format = nir_intrinsic_format(intr),
+                 .access = nir_intrinsic_access(intr), .dest_type = dest_type);
+   }
+   nir_pop_if(b, NULL);
+
+   nir_def_replace(&intr->def, nir_if_phi(b, load_output, load_img));
+
+   return true;
+}
+
+static bool
+collect_frag_writes(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_store_deref)
+      return false;
+
+   nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+
+   if (deref->modes != nir_var_shader_out)
+      return false;
+
+   nir_variable *var = nir_deref_instr_get_variable(deref);
+   assert(var);
+
+   if (var->data.location < FRAG_RESULT_DATA0 ||
+       var->data.location > FRAG_RESULT_DATA7)
+      return false;
+
+   uint32_t *written_mask = data;
+
+   *written_mask |= BITFIELD_BIT(var->data.location - FRAG_RESULT_DATA0);
+   return true;
+}
+
+static uint32_t
+readonly_color_mask(nir_shader *nir,
+                    const struct vk_graphics_pipeline_state *state)
+{
+   if (!state || !state->ial || !state->cal)
+      return 0;
+
+   uint32_t in_mask = 0, out_mask = 0;
+
+   for (uint32_t i = 0; i < ARRAY_SIZE(state->ial->color_map); i++) {
+      if (i >= state->ial->color_attachment_count)
+         break;
+
+      if (state->ial->color_map[i] != MESA_VK_ATTACHMENT_UNUSED)
+         in_mask |= BITFIELD_BIT(i);
+   }
+
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, collect_frag_writes,
+            nir_metadata_all, &out_mask);
+
+   for (uint32_t i = 0; i < ARRAY_SIZE(state->cal->color_map); i++) {
+      if (state->ial->color_map[i] == MESA_VK_ATTACHMENT_UNUSED)
+         out_mask &= ~BITFIELD_BIT(i);
+   }
+
+   return in_mask & ~out_mask;
+}
+
+static bool
+lower_input_attachment_loads(nir_shader *nir,
+                             const struct vk_graphics_pipeline_state *state,
+                             struct panvk_shader *shader)
+{
+   bool progress = false;
+   struct panvk_lower_input_attachment_load_ctx ia_load_ctx = {
+      .ro_color_mask = readonly_color_mask(nir, state),
+      .shader = shader,
+   };
+
+   NIR_PASS(progress, nir, nir_shader_intrinsics_pass,
+            lower_input_attachment_load, nir_metadata_control_flow,
+            &ia_load_ctx);
+
+   /* Lower the remaining input attachment loads. */
+   struct nir_input_attachment_options lower_input_attach_opts = {
+      .use_fragcoord_sysval = true,
+      .use_layer_id_sysval = true,
+   };
+   NIR_PASS(progress, nir, nir_lower_input_attachments,
+            &lower_input_attach_opts);
+
+   return progress;
+}
+
 static bool
 lower_img_intrinsic(nir_builder *b, nir_intrinsic_instr *intr,
                     struct lower_desc_ctx *ctx)
@@ -918,7 +1180,7 @@ record_binding(struct lower_desc_ctx *ctx, unsigned set, unsigned binding,
 
    /* SSBOs are accessed directly from the sets, no need to record accesses
     * to such resources. */
-   if (PAN_ARCH <= 7 &&
+   if (PAN_ARCH < 9 &&
        binding_layout->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
       return;
 
@@ -944,7 +1206,7 @@ record_binding(struct lower_desc_ctx *ctx, unsigned set, unsigned binding,
 
    uint32_t desc_count_diff = new_desc_count - old_desc_count;
 
-#if PAN_ARCH <= 7
+#if PAN_ARCH < 9
    if (binding_layout->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC) {
       ctx->desc_info.dyn_ubos.count += desc_count_diff;
    } else if (binding_layout->type ==
@@ -982,7 +1244,7 @@ fill_copy_descs_for_binding(struct lower_desc_ctx *ctx, unsigned set,
          binding_layout->desc_idx + (i * desc_stride) + subdesc_idx;
       struct panvk_shader_desc_map *map;
 
-#if PAN_ARCH <= 7
+#if PAN_ARCH < 9
       if (binding_layout->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC) {
          map = &ctx->desc_info.dyn_ubos;
       } else if (binding_layout->type ==
@@ -1014,7 +1276,7 @@ create_copy_table(nir_shader *nir, struct lower_desc_ctx *ctx)
    struct panvk_shader_desc_info *desc_info = &ctx->desc_info;
    uint32_t copy_count;
 
-#if PAN_ARCH <= 7
+#if PAN_ARCH < 9
    copy_count = desc_info->dyn_ubos.count + desc_info->dyn_ssbos.count;
    for (uint32_t i = 0; i < PANVK_BIFROST_DESC_TABLE_COUNT; i++)
       copy_count += desc_info->others[i].count;
@@ -1037,13 +1299,13 @@ create_copy_table(nir_shader *nir, struct lower_desc_ctx *ctx)
    }
    desc_info->dummy_sampler_handle = pan_res_handle(0, dummy_sampler_idx);
 
-   copy_count = desc_info->dyn_bufs.count + desc_info->dyn_bufs.count;
+   copy_count = desc_info->dyn_bufs.count;
 #endif
 
    if (copy_count == 0)
       return;
 
-#if PAN_ARCH <= 7
+#if PAN_ARCH < 9
    uint32_t *copy_table = rzalloc_array(ctx->ht, uint32_t, copy_count);
 
    assert(copy_table);
@@ -1064,6 +1326,7 @@ create_copy_table(nir_shader *nir, struct lower_desc_ctx *ctx)
    desc_info->dyn_bufs_start = dummy_sampler_idx + 1;
 
    desc_info->dyn_bufs.map = rzalloc_array(ctx->ht, uint32_t, copy_count);
+   desc_info->dyn_bufs.count = 0;
    assert(desc_info->dyn_bufs.map);
 #endif
 
@@ -1193,7 +1456,7 @@ static void
 upload_shader_desc_info(struct panvk_device *dev, struct panvk_shader *shader,
                         const struct panvk_shader_desc_info *desc_info)
 {
-#if PAN_ARCH <= 7
+#if PAN_ARCH < 9
    unsigned copy_count = 0;
    for (unsigned i = 0; i < ARRAY_SIZE(shader->desc_info.others.count); i++) {
       shader->desc_info.others.count[i] = desc_info->others[i].count;
@@ -1233,19 +1496,21 @@ panvk_per_arch(nir_lower_descriptors)(
    nir_shader *nir, struct panvk_device *dev,
    const struct vk_pipeline_robustness_state *rs, uint32_t set_layout_count,
    struct vk_descriptor_set_layout *const *set_layouts,
-   struct panvk_shader *shader)
+   const struct vk_graphics_pipeline_state *state, struct panvk_shader *shader)
 {
    struct lower_desc_ctx ctx = {
+      .shader = shader,
       .add_bounds_checks =
          rs->storage_buffers !=
             VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT ||
          rs->uniform_buffers !=
             VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT ||
          rs->images != VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED_EXT,
+      .null_descriptor_support = dev->vk.enabled_features.nullDescriptor,
    };
    bool progress = false;
 
-#if PAN_ARCH <= 7
+#if PAN_ARCH < 9
    ctx.ubo_addr_format = nir_address_format_32bit_index_offset;
    ctx.ssbo_addr_format =
       rs->storage_buffers != VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT
@@ -1278,6 +1543,9 @@ panvk_per_arch(nir_lower_descriptors)(
 #endif
    create_copy_table(nir, &ctx);
    upload_shader_desc_info(dev, shader, &ctx.desc_info);
+
+   if (nir->info.stage == MESA_SHADER_FRAGMENT)
+      NIR_PASS(progress, nir, lower_input_attachment_loads, state, shader);
 
    NIR_PASS(progress, nir, nir_shader_instructions_pass,
             lower_descriptors_instr, nir_metadata_control_flow, &ctx);

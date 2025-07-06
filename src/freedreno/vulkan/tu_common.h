@@ -55,9 +55,7 @@
 #include "ir3/ir3_compiler.h"
 #include "ir3/ir3_shader.h"
 
-#include "adreno_common.xml.h"
-#include "adreno_pm4.xml.h"
-#include "a6xx.xml.h"
+#include "fd6_hw.h"
 #include "fdl/freedreno_layout.h"
 #include "common/freedreno_dev_info.h"
 #include "common/freedreno_common.h"
@@ -137,6 +135,18 @@
 #define MIN_FDM_TEXEL_SIZE (1u << MIN_FDM_TEXEL_SIZE_LOG2)
 #define MAX_FDM_TEXEL_SIZE_LOG2 10
 #define MAX_FDM_TEXEL_SIZE (1u << MAX_FDM_TEXEL_SIZE_LOG2)
+
+/* This granularity is arbitrary, but there are two competing concerns here:
+ * 
+ * - The fragment area has to always divide the offset, and we don't want the
+ *   fragment area changing with the offset, so we have to clamp the fragment
+ *   area to this granularity. Therefore larger granularities lead to lower
+ *   minimum resolution.
+ * - The larger the offset granularity, the choppier the motion is.
+ *
+ * Choose 8 as a compromise between the two.
+ */
+#define TU_FDM_OFFSET_GRANULARITY 8
 
 #define TU_GENX(FUNC_NAME) FD_GENX(FUNC_NAME)
 

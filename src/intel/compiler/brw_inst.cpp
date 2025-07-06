@@ -303,6 +303,7 @@ brw_inst::can_do_source_mods(const struct intel_device_info *devinfo) const
    case SHADER_OPCODE_REDUCE:
    case SHADER_OPCODE_INCLUSIVE_SCAN:
    case SHADER_OPCODE_EXCLUSIVE_SCAN:
+   case SHADER_OPCODE_LOAD_REG:
    case SHADER_OPCODE_VOTE_ANY:
    case SHADER_OPCODE_VOTE_ALL:
    case SHADER_OPCODE_VOTE_EQUAL:
@@ -395,7 +396,7 @@ brw_inst::can_change_types() const
  * it.
  */
 bool
-brw_inst::is_partial_write() const
+brw_inst::is_partial_write(unsigned grf_size) const
 {
    if (this->predicate && !this->predicate_trivial &&
        this->opcode != BRW_OPCODE_SEL)
@@ -404,10 +405,10 @@ brw_inst::is_partial_write() const
    if (!this->dst.is_contiguous())
       return true;
 
-   if (this->dst.offset % REG_SIZE != 0)
+   if (this->dst.offset % grf_size != 0)
       return true;
 
-   return this->size_written % REG_SIZE != 0;
+   return this->size_written % grf_size != 0;
 }
 
 unsigned
@@ -483,11 +484,11 @@ brw_inst::components_read(unsigned i) const
    case SHADER_OPCODE_MEMORY_LOAD_LOGICAL:
       if (i == MEMORY_LOGICAL_DATA0)
          return 0;
-      /* fallthrough */
+      FALLTHROUGH;
    case SHADER_OPCODE_MEMORY_STORE_LOGICAL:
       if (i == MEMORY_LOGICAL_DATA1)
          return 0;
-      /* fallthrough */
+      FALLTHROUGH;
    case SHADER_OPCODE_MEMORY_ATOMIC_LOGICAL:
       if (i == MEMORY_LOGICAL_DATA0 || i == MEMORY_LOGICAL_DATA1)
          return src[MEMORY_LOGICAL_COMPONENTS].ud;
@@ -563,22 +564,21 @@ brw_inst::size_read(const struct intel_device_info *devinfo, int arg) const
        * coincidence, so this isn't so bad.
        */
       const unsigned reg_unit = this->exec_size / 8;
+      const unsigned type_size = brw_type_size_bytes(src[arg].type);
 
       switch (arg) {
       case 0:
-         if (src[0].type == BRW_TYPE_HF) {
-            return rcount * reg_unit * REG_SIZE / 2;
-         } else {
-            return rcount * reg_unit * REG_SIZE;
-         }
+         assert(type_size == 4 || type_size == 2);
+         return rcount * reg_unit * 8 * type_size;
       case 1:
          return sdepth * reg_unit * REG_SIZE;
       case 2:
          /* This is simpler than the formula described in the Bspec, but it
           * covers all of the cases that we support. Each inner sdepth
-          * iteration of the DPAS consumes a single dword for int8, uint8, or
-          * float16 types. These are the one source types currently
-          * supportable through Vulkan. This is independent of reg_unit.
+          * iteration of the DPAS consumes a single dword for int8, uint8,
+          * float16, or bfloat16 types. These are the one source types
+          * currently supportable through Vulkan. This is independent of
+          * reg_unit.
           */
          return rcount * sdepth * 4;
       default:
@@ -586,6 +586,11 @@ brw_inst::size_read(const struct intel_device_info *devinfo, int arg) const
       }
       break;
    }
+
+   case SHADER_OPCODE_LOAD_REG:
+      return is_uniform(src[arg]) ?
+         components_read(arg) * brw_type_size_bytes(src[arg].type) :
+         size_written;
 
    default:
       break;
@@ -808,6 +813,7 @@ brw_inst::is_control_flow_end() const
    case BRW_OPCODE_ELSE:
    case BRW_OPCODE_WHILE:
    case BRW_OPCODE_ENDIF:
+   case SHADER_OPCODE_FLOW:
       return true;
    default:
       return false;
@@ -825,7 +831,19 @@ brw_inst::is_control_flow() const
    case BRW_OPCODE_ENDIF:
    case BRW_OPCODE_BREAK:
    case BRW_OPCODE_CONTINUE:
+   case BRW_OPCODE_JMPI:
+   case BRW_OPCODE_BRD:
+   case BRW_OPCODE_BRC:
+   case BRW_OPCODE_HALT:
+   case BRW_OPCODE_CALLA:
+   case BRW_OPCODE_CALL:
+   case BRW_OPCODE_GOTO:
+   case BRW_OPCODE_RET:
+   case SHADER_OPCODE_FLOW:
       return true;
+   case BRW_OPCODE_MOV:
+   case BRW_OPCODE_ADD:
+      return dst.is_ip();
    default:
       return false;
    }
@@ -939,74 +957,29 @@ bool
 brw_inst::is_volatile() const
 {
    return opcode == SHADER_OPCODE_MEMORY_LOAD_LOGICAL ||
+          opcode == SHADER_OPCODE_LOAD_REG ||
           ((opcode == SHADER_OPCODE_SEND ||
             opcode == SHADER_OPCODE_SEND_GATHER) && send_is_volatile);
-}
-
-#ifndef NDEBUG
-static bool
-inst_is_in_block(const bblock_t *block, const brw_inst *inst)
-{
-   const exec_node *n = inst;
-
-   /* Find the tail sentinel. If the tail sentinel is the sentinel from the
-    * list header in the bblock_t, then this instruction is in that basic
-    * block.
-    */
-   while (!n->is_tail_sentinel())
-      n = n->get_next();
-
-   return n == &block->instructions.tail_sentinel;
-}
-#endif
-
-static void
-adjust_later_block_ips(bblock_t *start_block, int ip_adjustment)
-{
-   for (bblock_t *block_iter = start_block->next();
-        block_iter;
-        block_iter = block_iter->next()) {
-      block_iter->start_ip += ip_adjustment;
-      block_iter->end_ip += ip_adjustment;
-   }
-}
-
-void
-brw_inst::insert_after(bblock_t *block, brw_inst *inst)
-{
-   assert(this != inst);
-   assert(block->end_ip_delta == 0);
-
-   if (!this->is_head_sentinel())
-      assert(inst_is_in_block(block, this) || !"Instruction not in block");
-
-   block->end_ip++;
-
-   adjust_later_block_ips(block, 1);
-
-   exec_node::insert_after(inst);
 }
 
 void
 brw_inst::insert_before(bblock_t *block, brw_inst *inst)
 {
    assert(this != inst);
-   assert(block->end_ip_delta == 0);
 
-   if (!this->is_tail_sentinel())
-      assert(inst_is_in_block(block, this) || !"Instruction not in block");
-
-   block->end_ip++;
-
-   adjust_later_block_ips(block, 1);
+   assert(!inst->block || inst->block == block);
 
    exec_node::insert_before(inst);
+
+   inst->block = block;
+   inst->block->num_instructions++;
+   inst->block->cfg->total_instructions++;
 }
 
 void
-brw_inst::remove(bblock_t *block, bool defer_later_block_ip_updates)
+brw_inst::remove()
 {
-   assert(inst_is_in_block(block, this) || !"Instruction not in block");
+   assert(block);
 
    if (exec_list_is_singular(&block->instructions)) {
       this->opcode = BRW_OPCODE_NOP;
@@ -1016,25 +989,16 @@ brw_inst::remove(bblock_t *block, bool defer_later_block_ip_updates)
       return;
    }
 
-   if (defer_later_block_ip_updates) {
-      block->end_ip_delta--;
-   } else {
-      assert(block->end_ip_delta == 0);
-      adjust_later_block_ips(block, -1);
-   }
+   assert(block->num_instructions > 0);
+   assert(block->cfg->total_instructions > 0);
+   block->num_instructions--;
+   block->cfg->total_instructions--;
 
-   if (block->start_ip == block->end_ip) {
-      if (block->end_ip_delta != 0) {
-         adjust_later_block_ips(block, block->end_ip_delta);
-         block->end_ip_delta = 0;
-      }
-
+   if (block->num_instructions == 0)
       block->cfg->remove_block(block);
-   } else {
-      block->end_ip--;
-   }
 
    exec_node::remove();
+   block = NULL;
 }
 
 enum brw_reg_type
@@ -1049,7 +1013,7 @@ get_exec_type(const brw_inst *inst)
          if (brw_type_size_bytes(t) > brw_type_size_bytes(exec_type))
             exec_type = t;
          else if (brw_type_size_bytes(t) == brw_type_size_bytes(exec_type) &&
-                  brw_type_is_float(t))
+                  brw_type_is_float_or_bfloat(t))
             exec_type = t;
       }
    }
@@ -1107,7 +1071,7 @@ has_dst_aligned_region_restriction(const intel_device_info *devinfo,
     * simulator suggest that only 32x32-bit integer multiplication is
     * restricted.
     */
-   const bool is_dword_multiply = !brw_type_is_float(exec_type) &&
+   const bool is_dword_multiply = brw_type_is_int(exec_type) &&
       ((inst->opcode == BRW_OPCODE_MUL &&
         MIN2(brw_type_size_bytes(inst->src[0].type), brw_type_size_bytes(inst->src[1].type)) >= 4) ||
        (inst->opcode == BRW_OPCODE_MAD &&
@@ -1117,7 +1081,7 @@ has_dst_aligned_region_restriction(const intel_device_info *devinfo,
        (brw_type_size_bytes(exec_type) == 4 && is_dword_multiply))
       return intel_device_info_is_9lp(devinfo) || devinfo->verx10 >= 125;
 
-   else if (brw_type_is_float(dst_type))
+   else if (brw_type_is_float_or_bfloat(dst_type))
       return devinfo->verx10 >= 125;
 
    else
@@ -1257,4 +1221,3 @@ is_coalescing_payload(const brw_shader &s, const brw_inst *inst)
           inst->src[0].offset == 0 &&
           s.alloc.sizes[inst->src[0].nr] * REG_SIZE == inst->size_written;
 }
-

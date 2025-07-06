@@ -177,6 +177,11 @@ brw_generator::generate_send(brw_inst *inst,
    }
 
    if (ex_desc.file == IMM && ex_desc.ud == 0) {
+      /* An immediate extended descriptor value only happens when the extended
+       * descriptor is written indirectly (it already contains a SS/BSS
+       * surface handle)
+       */
+      assert(!inst->send_ex_desc_imm);
       brw_send_indirect_message(p, inst->sfid, dst, payload, desc, inst->eot, gather);
       if (inst->check_tdr)
          brw_eu_inst_set_opcode(p->isa, brw_last_inst, BRW_OPCODE_SENDC);
@@ -185,8 +190,10 @@ brw_generator::generate_send(brw_inst *inst,
        * also covers the dual-payload case because ex_mlen goes in ex_desc.
        */
       brw_send_indirect_split_message(p, inst->sfid, dst, payload, payload2,
-                                      desc, ex_desc, inst->ex_mlen,
-                                      inst->send_ex_bso, inst->eot, gather);
+                                      desc, ex_desc,
+                                      inst->send_ex_desc_imm ? inst->offset : 0,
+                                      inst->ex_mlen, inst->send_ex_bso,
+                                      inst->eot, gather);
       if (inst->check_tdr)
          brw_eu_inst_set_opcode(p->isa, brw_last_inst,
                              devinfo->ver >= 12 ? BRW_OPCODE_SENDC : BRW_OPCODE_SENDSC);
@@ -202,18 +209,8 @@ brw_generator::generate_mov_indirect(brw_inst *inst,
    assert(indirect_byte_offset.type == BRW_TYPE_UD);
    assert(indirect_byte_offset.file == FIXED_GRF);
    assert(!reg.abs && !reg.negate);
-
-   /* Gen12.5 adds the following region restriction:
-    *
-    *    "Vx1 and VxH indirect addressing for Float, Half-Float, Double-Float
-    *    and Quad-Word data must not be used."
-    *
-    * We require the source and destination types to match so stomp to an
-    * unsigned integer type.
-    */
+   assert(brw_type_is_uint(reg.type));
    assert(reg.type == dst.type);
-   reg.type = dst.type =
-      brw_type_with_size(BRW_TYPE_UD, brw_type_size_bits(reg.type));
 
    unsigned imm_byte_offset = reg.nr * REG_SIZE + reg.subnr;
 
@@ -337,18 +334,8 @@ brw_generator::generate_shuffle(brw_inst *inst,
     * implement for 64-bit values so we just don't bother.
     */
    assert(devinfo->has_64bit_float || brw_type_size_bytes(src.type) <= 4);
-
-   /* Gen12.5 adds the following region restriction:
-    *
-    *    "Vx1 and VxH indirect addressing for Float, Half-Float, Double-Float
-    *    and Quad-Word data must not be used."
-    *
-    * We require the source and destination types to match so stomp to an
-    * unsigned integer type.
-    */
+   assert(brw_type_is_uint(src.type));
    assert(src.type == dst.type);
-   src.type = dst.type =
-      brw_type_with_size(BRW_TYPE_UD, brw_type_size_bits(src.type));
 
    /* Because we're using the address register, we're limited to 16-wide
     * by the address register file and 8-wide for 64-bit types.  We could try
@@ -379,7 +366,8 @@ brw_generator::generate_shuffle(brw_inst *inst,
          /* We use VxH indirect addressing, clobbering a0.0 through a0.7. */
          struct brw_reg addr = vec8(brw_address_reg(0));
 
-         struct brw_reg group_idx = suboffset(idx, group);
+         struct brw_reg group_idx = idx.is_scalar || is_uniform(idx) ?
+            component(idx, 0) : suboffset(idx, group);
 
          if (lower_width == 8 && group_idx.width == BRW_WIDTH_16) {
             /* Things get grumpy if the register is too wide. */
@@ -661,6 +649,9 @@ brw_generator::generate_halt(brw_inst *)
    brw_HALT(p);
 }
 
+DEBUG_GET_ONCE_OPTION(shader_bin_override_path, "INTEL_SHADER_ASM_READ_PATH",
+                      NULL);
+
 /* The A32 messages take a buffer base address in header.5:[31:0] (See
  * MH1_A32_PSM for typed messages or MH_A32_GO for byte/dword scattered
  * and OWord block messages in the SKL PRM Vol. 2d for more details.)
@@ -740,19 +731,6 @@ brw_generator::enable_debug(const char *shader_name)
    this->shader_name = shader_name;
 }
 
-static gfx12_systolic_depth
-translate_systolic_depth(unsigned d)
-{
-   /* Could also return (ffs(d) - 1) & 3. */
-   switch (d) {
-   case 2:  return BRW_SYSTOLIC_DEPTH_2;
-   case 4:  return BRW_SYSTOLIC_DEPTH_4;
-   case 8:  return BRW_SYSTOLIC_DEPTH_8;
-   case 16: return BRW_SYSTOLIC_DEPTH_16;
-   default: unreachable("Invalid systolic depth.");
-   }
-}
-
 int
 brw_generator::generate_code(const cfg_t *cfg, int dispatch_width,
                             struct brw_shader_stats shader_stats,
@@ -772,7 +750,7 @@ brw_generator::generate_code(const cfg_t *cfg, int dispatch_width,
 
    struct disasm_info *disasm_info = disasm_initialize(p->isa, cfg);
 
-   enum opcode prev_opcode = BRW_OPCODE_ILLEGAL;
+   brw_inst *prev_inst = NULL;
    foreach_block_and_inst (block, brw_inst, inst, cfg) {
       if (inst->opcode == SHADER_OPCODE_UNDEF)
          continue;
@@ -1083,6 +1061,10 @@ brw_generator::generate_code(const cfg_t *cfg, int dispatch_width,
 	 brw_DO(p, brw_get_default_exec_size(p));
 	 break;
 
+      case SHADER_OPCODE_FLOW:
+         /* Do nothing. */
+         break;
+
       case BRW_OPCODE_BREAK:
 	 brw_BREAK(p);
 	 break;
@@ -1091,11 +1073,12 @@ brw_generator::generate_code(const cfg_t *cfg, int dispatch_width,
 	 break;
 
       case BRW_OPCODE_WHILE:
-         /* On LNL and newer, if we don't put a NOP in between two consecutive
-          * WHILE instructions we may end up with misrendering or GPU hangs.
-          * See HSD 22020521218.
+         /* Workaround for an issue with branch prediction for WHILE
+          * instructions that may lead to misrendering or GPU hangs.
+          * See HSDs 22020521218 and 16026360541.
           */
-         if (devinfo->ver >= 20 && unlikely(prev_opcode == BRW_OPCODE_WHILE))
+         if (devinfo->ver >= 20 && prev_inst &&
+             unlikely(prev_inst->is_control_flow()))
             brw_NOP(p);
 
          brw_WHILE(p);
@@ -1359,7 +1342,7 @@ brw_generator::generate_code(const cfg_t *cfg, int dispatch_width,
       case SHADER_OPCODE_LOAD_PAYLOAD:
          unreachable("Should be lowered by lower_load_payload()");
       }
-      prev_opcode = inst->opcode;
+      prev_inst = inst;
 
       if (multiple_instructions_emitted)
          continue;
@@ -1420,7 +1403,8 @@ brw_generator::generate_code(const cfg_t *cfg, int dispatch_width,
    unsigned char sha1[21];
    char sha1buf[41];
 
-   if (unlikely(debug_flag || dump_shader_bin)) {
+   auto override_path = debug_get_option_shader_bin_override_path();
+   if (unlikely(debug_flag || dump_shader_bin || override_path != NULL)) {
       _mesa_sha1_compute(p->store + start_offset / sizeof(brw_eu_inst),
                          after_size, sha1);
       _mesa_sha1_format(sha1buf, sha1);
@@ -1430,33 +1414,45 @@ brw_generator::generate_code(const cfg_t *cfg, int dispatch_width,
       brw_dump_shader_bin(p->store, start_offset, p->next_insn_offset,
                           sha1buf);
 
-   if (unlikely(debug_flag)) {
-      fprintf(stderr, "Native code for %s (src_hash 0x%08x) (sha1 %s)\n"
-              "SIMD%d shader: %d instructions. %d loops. %u cycles. "
-              "%d:%d spills:fills, %u sends, "
-              "scheduled with mode %s. "
-              "Promoted %u constants. "
-              "Non-SSA regs (after NIR): %u. "
-              "Compacted %d to %d bytes (%.0f%%)\n",
-              shader_name, params->source_hash, sha1buf,
-              dispatch_width,
-              before_size / 16 - nop_count - sync_nop_count,
-              loop_count, perf.latency,
-              shader_stats.spill_count,
-              shader_stats.fill_count,
-              send_count,
-              shader_stats.scheduler_mode,
-              shader_stats.promoted_constants,
-              shader_stats.non_ssa_registers_after_nir,
-              before_size, after_size,
-              100.0f * (before_size - after_size) / before_size);
+   if (unlikely(override_path != NULL &&
+                brw_try_override_assembly(p, start_offset, override_path,
+                                          sha1buf))) {
+      fprintf(stderr, "Successfully overrode shader with sha1 %s\n", sha1buf);
+      /* disasm_info and stats are no longer valid as we gathered
+       * them based on the original shader.
+       */
+      if (debug_flag) {
+         fprintf(stderr, "Skipping disassembly and statistics "
+                 "output for this shader.\n\n");
+      }
+      ralloc_free(disasm_info);
+      return start_offset;
+   }
 
-      /* overriding the shader makes disasm_info invalid */
-      if (!brw_try_override_assembly(p, start_offset, sha1buf)) {
+   if (unlikely(debug_flag)) {
+      if (!intel_shader_dump_filter ||
+          (intel_shader_dump_filter && intel_shader_dump_filter == params->source_hash)) {
+         fprintf(stderr, "Native code for %s (src_hash 0x%08x) (sha1 %s)\n"
+                 "SIMD%d shader: %d instructions. %d loops. %u cycles. "
+                 "%d:%d spills:fills, %u sends, "
+                 "scheduled with mode %s. "
+                 "Promoted %u constants. "
+                 "Non-SSA regs (after NIR): %u. "
+                 "Compacted %d to %d bytes (%.0f%%)\n",
+                 shader_name, params->source_hash, sha1buf,
+                 dispatch_width,
+                 before_size / 16 - nop_count - sync_nop_count,
+                 loop_count, perf.latency,
+                 shader_stats.spill_count,
+                 shader_stats.fill_count,
+                 send_count,
+                 shader_stats.scheduler_mode,
+                 shader_stats.promoted_constants,
+                 shader_stats.non_ssa_registers_after_nir,
+                 before_size, after_size,
+                 100.0f * (before_size - after_size) / before_size);
          dump_assembly(p->store, start_offset, p->next_insn_offset,
                        disasm_info, perf.block_latency);
-      } else {
-         fprintf(stderr, "Successfully overrode shader with sha1 %s\n\n", sha1buf);
       }
    }
    ralloc_free(disasm_info);
@@ -1535,4 +1531,17 @@ brw_generator::get_assembly()
    prog_data->relocs = brw_get_shader_relocs(p, &prog_data->num_relocs);
 
    return brw_get_program(p, &prog_data->program_size);
+}
+
+void brw_prog_data_init(struct brw_stage_prog_data *prog_data,
+                        const struct brw_compile_params *params)
+{
+   /* Do not memset the structure to 0, the driver might have put some bits of
+    * information in there.
+    */
+   prog_data->ray_queries = params->nir->info.ray_queries;
+   prog_data->stage = params->nir->info.stage;
+   prog_data->source_hash = params->source_hash;
+   prog_data->total_scratch = 0;
+   prog_data->total_shared = params->nir->info.shared_size;
 }

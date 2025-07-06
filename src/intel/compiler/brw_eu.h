@@ -165,7 +165,7 @@ void brw_dump_shader_bin(void *assembly, int start_offset, int end_offset,
                          const char *identifier);
 
 bool brw_try_override_assembly(struct brw_codegen *p, int start_offset,
-                               const char *identifier);
+                               const char *read_path, const char *identifier);
 
 void brw_realign(struct brw_codegen *p, unsigned alignment);
 int brw_append_data(struct brw_codegen *p, void *data,
@@ -930,7 +930,9 @@ brw_fb_write_desc_coarse_write(const struct intel_device_info *devinfo,
 static inline bool
 lsc_opcode_has_cmask(enum lsc_opcode opcode)
 {
-   return opcode == LSC_OP_LOAD_CMASK || opcode == LSC_OP_STORE_CMASK;
+   return opcode == LSC_OP_LOAD_CMASK || opcode == LSC_OP_STORE_CMASK ||
+          opcode == LSC_OP_LOAD_CMASK_MSRT ||
+          opcode == LSC_OP_STORE_CMASK_MSRT;
 }
 
 static inline bool
@@ -943,7 +945,8 @@ static inline bool
 lsc_opcode_is_store(enum lsc_opcode opcode)
 {
    return opcode == LSC_OP_STORE ||
-          opcode == LSC_OP_STORE_CMASK;
+          opcode == LSC_OP_STORE_CMASK ||
+          opcode == LSC_OP_STORE_CMASK_MSRT;
 }
 
 static inline bool
@@ -1006,6 +1009,7 @@ lsc_op_num_data_values(unsigned _op)
    case LSC_OP_LOAD:
    case LSC_OP_LOAD_CMASK:
    case LSC_OP_FENCE:
+   case LSC_OP_LOAD_CMASK_MSRT:
       /* XXX: actually check docs */
       return 0;
    default:
@@ -1062,6 +1066,8 @@ lsc_op_to_legacy_atomic(unsigned _op)
    case LSC_OP_STORE:
    case LSC_OP_STORE_CMASK:
    case LSC_OP_FENCE:
+   case LSC_OP_LOAD_CMASK_MSRT:
+   case LSC_OP_STORE_CMASK_MSRT:
       unreachable("not an atomic op");
    }
 
@@ -1289,11 +1295,12 @@ lsc_fence_msg_desc_backup_routing(UNUSED const struct intel_device_info *devinfo
 }
 
 static inline uint32_t
-lsc_bti_ex_desc(const struct intel_device_info *devinfo, unsigned bti)
+lsc_bti_ex_desc(const struct intel_device_info *devinfo, unsigned bti,
+                unsigned base_offset)
 {
    assert(devinfo->has_lsc);
    return SET_BITS(bti, 31, 24) |
-          SET_BITS(0, 23, 12);  /* base offset */
+          SET_BITS(base_offset, 23, 12);  /* base offset */
 }
 
 static inline unsigned
@@ -1310,6 +1317,14 @@ lsc_bti_ex_desc_index(const struct intel_device_info *devinfo,
 {
    assert(devinfo->has_lsc);
    return GET_BITS(ex_desc, 31, 24);
+}
+
+static inline unsigned
+lsc_flat_ex_desc(const struct intel_device_info *devinfo,
+                 uint32_t base_offset)
+{
+   assert(devinfo->has_lsc);
+   return SET_BITS(base_offset, 31, 12);
 }
 
 static inline unsigned
@@ -1419,6 +1434,19 @@ brw_pixel_interp_desc(UNUSED const struct intel_device_info *devinfo,
            SET_BITS(simd_mode, 16, 16));
 }
 
+static inline enum gfx12_systolic_depth
+translate_systolic_depth(unsigned d)
+{
+   /* Could also return (ffs(d) - 1) & 3. */
+   switch (d) {
+   case 2:  return BRW_SYSTOLIC_DEPTH_2;
+   case 4:  return BRW_SYSTOLIC_DEPTH_4;
+   case 8:  return BRW_SYSTOLIC_DEPTH_8;
+   case 16: return BRW_SYSTOLIC_DEPTH_16;
+   default: unreachable("Invalid systolic depth.");
+   }
+}
+
 /**
  * Send message to shared unit \p sfid with a possibly indirect descriptor \p
  * desc.  If \p desc is not an immediate it will be transparently loaded to an
@@ -1441,6 +1469,7 @@ brw_send_indirect_split_message(struct brw_codegen *p,
                                 struct brw_reg payload1,
                                 struct brw_reg desc,
                                 struct brw_reg ex_desc,
+                                uint32_t ex_desc_imm_inst,
                                 unsigned ex_mlen,
                                 bool ex_bso,
                                 bool eot,
@@ -1592,6 +1621,24 @@ next_offset(struct brw_codegen *p, void *store, int offset)
 
 /** Maximum SEND message length */
 #define BRW_MAX_MSG_LENGTH 15
+
+/** Offset encoding signed size limits (top bit is the sign) */
+#define LSC_ADDRESS_OFFSET_FLAT_BITS 20
+#define LSC_ADDRESS_OFFSET_SS_BITS   17
+#define LSC_ADDRESS_OFFSET_BTI_BITS  12
+
+static inline unsigned
+brw_max_immediate_offset_bits(enum lsc_addr_surface_type binding_type)
+{
+   static const unsigned max_bits[] = {
+      [LSC_ADDR_SURFTYPE_FLAT] = LSC_ADDRESS_OFFSET_FLAT_BITS,
+      [LSC_ADDR_SURFTYPE_BSS]  = LSC_ADDRESS_OFFSET_SS_BITS,
+      [LSC_ADDR_SURFTYPE_SS]   = LSC_ADDRESS_OFFSET_SS_BITS,
+      [LSC_ADDR_SURFTYPE_BTI]  = LSC_ADDRESS_OFFSET_BTI_BITS,
+   };
+   assert(binding_type <= LSC_ADDR_SURFTYPE_BTI);
+   return max_bits[binding_type];
+}
 
 #ifdef __cplusplus
 }

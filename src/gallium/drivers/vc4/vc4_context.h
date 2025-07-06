@@ -29,6 +29,7 @@
 
 #include "pipe/p_context.h"
 #include "pipe/p_state.h"
+#include "util/u_framebuffer.h"
 #include "util/slab.h"
 #include "util/u_debug_cb.h"
 #include "xf86drm.h"
@@ -66,7 +67,7 @@
 #define VC4_DIRTY_SCISSOR       (1 << 17)
 #define VC4_DIRTY_FLAT_SHADE_FLAGS (1 << 18)
 #define VC4_DIRTY_PRIM_MODE     (1 << 19)
-#define VC4_DIRTY_CLIP          (1 << 20)
+
 #define VC4_DIRTY_UNCOMPILED_VS (1 << 21)
 #define VC4_DIRTY_UNCOMPILED_FS (1 << 22)
 #define VC4_DIRTY_COMPILED_CS   (1 << 23)
@@ -189,8 +190,8 @@ struct vc4_vertex_stateobj {
 
 /* Hash table key for vc4->jobs */
 struct vc4_job_key {
-        struct pipe_surface *cbuf;
-        struct pipe_surface *zsbuf;
+        struct pipe_surface cbuf;
+        struct pipe_surface zsbuf;
 };
 
 struct vc4_hwperfmon {
@@ -228,12 +229,12 @@ struct vc4_job {
         uint32_t last_gem_handle_hindex;
 
         /** @{ Surfaces to submit rendering for. */
-        struct pipe_surface *color_read;
-        struct pipe_surface *color_write;
-        struct pipe_surface *zs_read;
-        struct pipe_surface *zs_write;
-        struct pipe_surface *msaa_color_write;
-        struct pipe_surface *msaa_zs_write;
+        struct pipe_surface color_read;
+        struct pipe_surface color_write;
+        struct pipe_surface zs_read;
+        struct pipe_surface zs_write;
+        struct pipe_surface msaa_color_write;
+        struct pipe_surface msaa_zs_write;
         /** @} */
         /** @{
          * Bounding box of the scissor across all queued drawing.
@@ -372,7 +373,6 @@ struct vc4_context {
         unsigned sample_mask;
         struct pipe_framebuffer_state framebuffer;
         struct pipe_poly_stipple stipple;
-        struct pipe_clip_state clip;
         struct pipe_viewport_state viewport;
         struct vc4_constbuf_stateobj constbuf[PIPE_SHADER_TYPES];
         struct vc4_vertexbuf_stateobj vertexbuf;
@@ -486,6 +486,8 @@ struct vc4_job *vc4_get_job(struct vc4_context *vc4,
                             struct pipe_surface *zsbuf);
 struct vc4_job *vc4_get_job_for_fbo(struct vc4_context *vc4);
 
+void vc4_job_attach_surface(struct pipe_surface *job_psurf,
+                            struct pipe_surface *src_psurf);
 void vc4_job_submit(struct vc4_context *vc4, struct vc4_job *job);
 void vc4_flush_jobs_writing_resource(struct vc4_context *vc4,
                                      struct pipe_resource *prsc);

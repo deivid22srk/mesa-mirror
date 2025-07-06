@@ -83,7 +83,7 @@ namespace {
             if (inst->src[i].file != BAD_FILE &&
                 !inst->is_control_source(i)) {
                const brw_reg_type t = inst->src[i].type;
-               has_int_src |= !brw_type_is_float(t);
+               has_int_src |= brw_type_is_int(t);
                has_long_src |= brw_type_size_bytes(t) >= 8;
             }
          }
@@ -116,7 +116,7 @@ namespace {
    inferred_exec_pipe(const struct intel_device_info *devinfo, const brw_inst *inst)
    {
       const brw_reg_type t = get_exec_type(inst);
-      const bool is_dword_multiply = !brw_type_is_float(t) &&
+      const bool is_dword_multiply = brw_type_is_int(t) &&
          ((inst->opcode == BRW_OPCODE_MUL &&
            MIN2(brw_type_size_bytes(inst->src[0].type),
                 brw_type_size_bytes(inst->src[1].type)) >= 4) ||
@@ -156,7 +156,7 @@ namespace {
          assert(devinfo->has_64bit_float || devinfo->has_64bit_int ||
                 devinfo->has_integer_dword_mul);
          return TGL_PIPE_LONG;
-      } else if (brw_type_is_float(inst->dst.type))
+      } else if (brw_type_is_float_or_bfloat(inst->dst.type))
          return TGL_PIPE_FLOAT;
       else
          return TGL_PIPE_INT;
@@ -185,6 +185,7 @@ namespace {
       case SHADER_OPCODE_UNDEF:
       case SHADER_OPCODE_HALT_TARGET:
       case FS_OPCODE_SCHEDULING_FENCE:
+      case SHADER_OPCODE_FLOW:
          return 0;
       default:
          /* Note that the following is inaccurate for virtual instructions
@@ -262,7 +263,7 @@ namespace {
    unsigned
    num_instructions(const brw_shader *shader)
    {
-      return shader->cfg->blocks[shader->cfg->num_blocks - 1]->end_ip + 1;
+      return shader->cfg->total_instructions;
    }
 
    /**
@@ -1125,6 +1126,7 @@ namespace {
       const scoreboard *delta_sbs = gather_block_scoreboards(shader, jps);
       scoreboard *in_sbs = new scoreboard[shader->cfg->num_blocks];
       scoreboard *out_sbs = new scoreboard[shader->cfg->num_blocks];
+      const brw_ip_ranges &ips = shader->ip_ranges_analysis.require();
 
       for (bool progress = true; progress;) {
          progress = false;
@@ -1140,8 +1142,8 @@ namespace {
                   int delta[IDX(TGL_PIPE_ALL)];
 
                   for (unsigned p = 0; p < IDX(TGL_PIPE_ALL); p++)
-                     delta[p] = jps[child_link->block->start_ip].jp[p]
-                        - jps[block->end_ip].jp[p]
+                     delta[p] = jps[ips.range(child_link->block).start].jp[p]
+                        - jps[ips.range(block).last()].jp[p]
                         - ordered_unit(shader->devinfo,
                                        static_cast<const brw_inst *>(block->end()), p);
 
@@ -1285,11 +1287,12 @@ namespace {
     * inserting additional SYNC instructions for dependencies that can't be
     * represented directly by annotating existing instructions.
     */
-   void
+   bool
    emit_inst_dependencies(brw_shader *shader,
                           const ordered_address *jps,
                           const dependency_list *deps)
    {
+      bool progress = false;
       const struct intel_device_info *devinfo = shader->devinfo;
       unsigned ip = 0;
 
@@ -1301,6 +1304,9 @@ namespace {
             baked_unordered_dependency_mode(devinfo, inst, deps[ip], jps[ip]);
          tgl_swsb swsb = !ordered_mode ? tgl_swsb() :
             ordered_dependency_swsb(deps[ip], jps[ip], exec_all);
+
+         if (deps[ip].size())
+            progress = true;
 
          for (unsigned i = 0; i < deps[ip].size(); i++) {
             const dependency &dep = deps[ip][i];
@@ -1320,9 +1326,8 @@ namespace {
                   /* Emit dependency into the SWSB of an extra SYNC
                    * instruction.
                    */
-                  const brw_builder ibld = brw_builder(shader, block, inst)
-                                           .exec_all().group(1, 0);
-                  brw_inst *sync = ibld.SYNC(TGL_SYNC_NOP);
+                  const brw_builder ubld = brw_builder(inst).uniform();
+                  brw_inst *sync = ubld.SYNC(TGL_SYNC_NOP);
                   sync->sched.sbid = dep.id;
                   sync->sched.mode = dep.unordered;
                   assert(!(sync->sched.mode & TGL_SBID_SET));
@@ -1343,9 +1348,8 @@ namespace {
                 * scenario with unordered dependencies should have been
                 * handled above.
                 */
-               const brw_builder ibld = brw_builder(shader, block, inst)
-                                        .exec_all().group(1, 0);
-               brw_inst *sync = ibld.SYNC(TGL_SYNC_NOP);
+               const brw_builder ubld = brw_builder(inst).uniform();
+               brw_inst *sync = ubld.SYNC(TGL_SYNC_NOP);
                sync->sched = ordered_dependency_swsb(deps[ip], jps[ip], true);
                break;
             }
@@ -1356,21 +1360,25 @@ namespace {
          inst->no_dd_check = inst->no_dd_clear = false;
          ip++;
       }
+
+      return progress;
    }
 }
 
 bool
 brw_lower_scoreboard(brw_shader &s)
 {
+   bool progress = false;
+
    if (s.devinfo->ver >= 12) {
       const ordered_address *jps = ordered_inst_addresses(&s);
       const dependency_list *deps0 = gather_inst_dependencies(&s, jps);
       const dependency_list *deps1 = allocate_inst_dependencies(&s, deps0);
-      emit_inst_dependencies(&s, jps, deps1);
+      progress = emit_inst_dependencies(&s, jps, deps1);
       delete[] deps1;
       delete[] deps0;
       delete[] jps;
    }
 
-   return true;
+   return progress;
 }

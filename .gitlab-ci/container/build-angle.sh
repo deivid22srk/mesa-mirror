@@ -3,13 +3,18 @@
 # When changing this file, you need to bump the following
 # .gitlab-ci/image-tags.yml tags:
 # DEBIAN_TEST_ANDROID_TAG
-# KERNEL_ROOTFS_TAG
+# DEBIAN_TEST_GL_TAG
 
 set -uex
 
-uncollapsed_section_start angle "Building ANGLE"
+section_start angle "Building ANGLE"
 
-ANGLE_REV="6abdc11741c4932e8e64ec055e67f556a7cbb5b1"
+# Do a very early check to make sure the tag is correct without the need of
+# setting up the environment variables locally
+ci_tag_build_time_check "ANGLE_TAG"
+
+ANGLE_REV="c39f4a5c553cbee39af8f866aa82a9ffa4f02f5b"
+DEPOT_REV="5982a1aeb33dc36382ed8c62eddf52a6135e7dd3"
 
 # Set ANGLE_ARCH based on DEBIAN_ARCH if it hasn't been explicitly defined
 if [[ -z "${ANGLE_ARCH:-}" ]]; then
@@ -20,9 +25,15 @@ if [[ -z "${ANGLE_ARCH:-}" ]]; then
 fi
 
 # DEPOT tools
-git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git /depot-tools
+mkdir /depot-tools
+pushd /depot-tools
+git init
+git remote add origin https://chromium.googlesource.com/chromium/tools/depot_tools.git
+git fetch --depth 1 origin "$DEPOT_REV"
+git checkout FETCH_HEAD
 export PATH=/depot-tools:$PATH
 export DEPOT_TOOLS_UPDATE=0
+popd
 
 mkdir /angle-build
 mkdir /angle
@@ -89,6 +100,7 @@ is_component_build=false
 is_debug=false
 target_cpu="${ANGLE_ARCH}"
 target_os="${ANGLE_TARGET}"
+treat_warnings_as_errors=false
 EOF
 
 case "$ANGLE_TARGET" in

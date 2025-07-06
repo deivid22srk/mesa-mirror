@@ -449,6 +449,9 @@ struct pipe_context {
    void (*set_min_samples)(struct pipe_context *,
                            unsigned min_samples);
 
+   /* Called to set user clip plane state.  Unused on GL drivers with
+    * !caps->clip_planes.
+    */
    void (*set_clip_state)(struct pipe_context *,
                           const struct pipe_clip_state *);
 
@@ -538,7 +541,6 @@ struct pipe_context {
                              enum pipe_shader_type shader,
                              unsigned start_slot, unsigned num_views,
                              unsigned unbind_num_trailing_slots,
-                             bool take_ownership,
                              struct pipe_sampler_view **views);
 
    void (*set_tess_state)(struct pipe_context *,
@@ -691,6 +693,20 @@ struct pipe_context {
                                 unsigned src_level,
                                 const struct pipe_box *src_box);
 
+   /**
+    * Perform a copy between an image and a buffer in either direction.
+    * buffer_stride=0 or buffer_layer_stride=0 means tightly packed on that axis
+    * Resources with nr_samples > 1 are not allowed.
+    */
+   void (*image_copy_buffer)(struct pipe_context *pipe,
+                             struct pipe_resource *dst,
+                             struct pipe_resource *src,
+                             unsigned buffer_offset,
+                             unsigned buffer_stride,
+                             unsigned buffer_layer_stride,
+                             unsigned level,
+                             const struct pipe_box *box);
+
    /* Optimal hardware path for blitting pixels.
     * Scaling, format conversion, up- and downsampling (resolve) are allowed.
     */
@@ -840,6 +856,19 @@ struct pipe_context {
    void (*sampler_view_destroy)(struct pipe_context *ctx,
                                 struct pipe_sampler_view *view);
 
+   /**
+    * Signal the driver that the frontend has released a view on a texture.
+    *
+    * \param ctx the current context
+    * \param view the view to be released
+    *
+    * \note The current context may not be the context in which the view was
+    *       created (view->context). Following this call, the driver has full
+    *       ownership of the view.
+    */
+   void (*sampler_view_release)(struct pipe_context *ctx,
+                                struct pipe_sampler_view *view);
+
 
    /**
     * Get a surface which is a "view" into a resource, used by
@@ -963,22 +992,6 @@ struct pipe_context {
 
    uint32_t (*get_compute_state_subgroup_size)(struct pipe_context *, void *,
                                                const uint32_t block[3]);
-
-   /**
-    * Bind an array of shader resources that will be used by the
-    * compute program.  Any resources that were previously bound to
-    * the specified range will be unbound after this call.
-    *
-    * \param start      first resource to bind.
-    * \param count      number of consecutive resources to bind.
-    * \param resources  array of pointers to the resources to bind, it
-    *                   should contain at least \a count elements
-    *                   unless it's NULL, in which case no new
-    *                   resources will be bound.
-    */
-   void (*set_compute_resources)(struct pipe_context *,
-                                 unsigned start, unsigned count,
-                                 struct pipe_surface **resources);
 
    /**
     * Bind an array of buffers to be mapped into the address space of

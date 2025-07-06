@@ -124,7 +124,6 @@ SOURCES = [
             Source('include/GL/glx.h',               None),  # FIXME: I don't know what the canonical source is
             Source('include/GL/internal/',           None),
             Source('include/GL/mesa_glinterop.h',    None),
-            Source('include/GL/osmesa.h',            None),
         ],
     },
 
@@ -180,10 +179,6 @@ SOURCES = [
             Source('include/CL/cl_dx9_media_sharing_intel.h',    'https://github.com/KhronosGroup/OpenCL-Headers/raw/main/CL/cl_dx9_media_sharing_intel.h'),
             Source('include/CL/cl_ext_intel.h',                  'https://github.com/KhronosGroup/OpenCL-Headers/raw/main/CL/cl_ext_intel.h'),
             Source('include/CL/cl_va_api_media_sharing_intel.h', 'https://github.com/KhronosGroup/OpenCL-Headers/raw/main/CL/cl_va_api_media_sharing_intel.h'),
-
-            Source('include/CL/cl.hpp',                          'https://github.com/KhronosGroup/OpenCL-CLHPP/raw/5f3cc41df821a3e5988490232082a3e3b82c0283/include/CL/cl.hpp'),
-            Source('include/CL/cl2.hpp',                         'https://github.com/KhronosGroup/OpenCL-CLHPP/raw/main/include/CL/cl2.hpp'),
-            Source('include/CL/opencl.hpp',                      'https://github.com/KhronosGroup/OpenCL-CLHPP/raw/main/include/CL/opencl.hpp'),
         ],
     },
 
@@ -217,6 +212,7 @@ SOURCES = [
             Source('include/vulkan/vulkan_ios.h',               'https://github.com/KhronosGroup/Vulkan-Headers/raw/main/include/vulkan/vulkan_ios.h'),
             Source('include/vulkan/vulkan_macos.h',             'https://github.com/KhronosGroup/Vulkan-Headers/raw/main/include/vulkan/vulkan_macos.h'),
             Source('include/vulkan/vulkan_metal.h',             'https://github.com/KhronosGroup/Vulkan-Headers/raw/main/include/vulkan/vulkan_metal.h'),
+            Source('include/vulkan/vulkan_ohos.h',              'https://github.com/KhronosGroup/Vulkan-Headers/raw/main/include/vulkan/vulkan_ohos.h'),
             Source('include/vulkan/vulkan_screen.h',            'https://github.com/KhronosGroup/Vulkan-Headers/raw/main/include/vulkan/vulkan_screen.h'),
             Source('include/vulkan/vulkan_vi.h',                'https://github.com/KhronosGroup/Vulkan-Headers/raw/main/include/vulkan/vulkan_vi.h'),
             Source('include/vulkan/vulkan_wayland.h',           'https://github.com/KhronosGroup/Vulkan-Headers/raw/main/include/vulkan/vulkan_wayland.h'),
@@ -228,12 +224,15 @@ SOURCES = [
                    template=VK_ANDROID_NATIVE_BUFFER_TEMPLATE, remove='#include <cutils/native_handle.h>\n'),
             Source('include/vk_video/vulkan_video_codec_av1std.h', 'https://github.com/KhronosGroup/Vulkan-Headers/raw/main/include/vk_video/vulkan_video_codec_av1std.h'),
             Source('include/vk_video/vulkan_video_codec_av1std_decode.h', 'https://github.com/KhronosGroup/Vulkan-Headers/raw/main/include/vk_video/vulkan_video_codec_av1std_decode.h'),
+            Source('include/vk_video/vulkan_video_codec_av1std_encode.h', 'https://github.com/KhronosGroup/Vulkan-Headers/raw/main/include/vk_video/vulkan_video_codec_av1std_encode.h'),
             Source('include/vk_video/vulkan_video_codec_h264std.h', 'https://github.com/KhronosGroup/Vulkan-Headers/raw/main/include/vk_video/vulkan_video_codec_h264std.h'),
             Source('include/vk_video/vulkan_video_codec_h264std_decode.h', 'https://github.com/KhronosGroup/Vulkan-Headers/raw/main/include/vk_video/vulkan_video_codec_h264std_decode.h'),
             Source('include/vk_video/vulkan_video_codec_h264std_encode.h', 'https://github.com/KhronosGroup/Vulkan-Headers/raw/main/include/vk_video/vulkan_video_codec_h264std_encode.h'),
             Source('include/vk_video/vulkan_video_codec_h265std.h', 'https://github.com/KhronosGroup/Vulkan-Headers/raw/main/include/vk_video/vulkan_video_codec_h265std.h'),
             Source('include/vk_video/vulkan_video_codec_h265std_decode.h', 'https://github.com/KhronosGroup/Vulkan-Headers/raw/main/include/vk_video/vulkan_video_codec_h265std_decode.h'),
             Source('include/vk_video/vulkan_video_codec_h265std_encode.h', 'https://github.com/KhronosGroup/Vulkan-Headers/raw/main/include/vk_video/vulkan_video_codec_h265std_encode.h'),
+            Source('include/vk_video/vulkan_video_codec_vp9std.h', 'https://github.com/KhronosGroup/Vulkan-Headers/raw/main/include/vk_video/vulkan_video_codec_vp9std.h'),
+            Source('include/vk_video/vulkan_video_codec_vp9std_decode.h', 'https://github.com/KhronosGroup/Vulkan-Headers/raw/main/include/vk_video/vulkan_video_codec_vp9std_decode.h'),
             Source('include/vk_video/vulkan_video_codecs_common.h', 'https://github.com/KhronosGroup/Vulkan-Headers/raw/main/include/vk_video/vulkan_video_codecs_common.h'),
             Source('include/vulkan/.editorconfig',              None),
         ],

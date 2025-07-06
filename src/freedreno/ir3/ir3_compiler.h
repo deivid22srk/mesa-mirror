@@ -54,6 +54,8 @@ struct ir3_compiler_options {
 
    /* "dual_color_blend_by_location" workaround is enabled: */
    bool dual_color_blend_by_location;
+
+   uint64_t uche_trap_base;
 };
 
 struct ir3_compiler {
@@ -108,6 +110,9 @@ struct ir3_compiler {
    /* on a650, vertex shader <-> tess control io uses LDL/STL */
    bool tess_use_shared;
 
+   /* Whether full and half regs are merged. */
+   bool mergedregs;
+
    /* The maximum number of constants, in vec4's, across the entire graphics
     * pipeline.
     */
@@ -126,6 +131,9 @@ struct ir3_compiler {
 
    /* The maximum number of constants, in vec4's, for compute shaders. */
    uint16_t max_const_compute;
+
+   /* See freedreno_dev_info::compute_lb_size. */
+   uint32_t compute_lb_size;
 
    /* Number of instructions that the shader's base address and length
     * (instrlen divides instruction count by this) must be aligned to.
@@ -198,6 +206,12 @@ struct ir3_compiler {
     * subgroup quad and arithmetic operations.
     */
    bool has_getfiberid;
+
+   /* Whether half register shared->non-shared moves are broken. */
+   bool mov_half_shared_quirk;
+
+   /* Whether movs is supported for subgroupBroadcast. */
+   bool has_movs;
 
    /* True if the shfl instruction is supported. Needed for subgroup rotate and
     * (more efficient) shuffle.
@@ -364,12 +378,13 @@ enum ir3_shader_debug {
    IR3_DBG_NOEARLYPREAMBLE = BITFIELD_BIT(17),
    IR3_DBG_NODESCPREFETCH = BITFIELD_BIT(18),
    IR3_DBG_EXPANDRPT = BITFIELD_BIT(19),
+   IR3_DBG_ASM_ROUNDTRIP = BITFIELD_BIT(20),
 
    /* MESA_DEBUG-only options: */
-   IR3_DBG_SCHEDMSGS = BITFIELD_BIT(20),
-   IR3_DBG_RAMSGS = BITFIELD_BIT(21),
-   IR3_DBG_NOALIASTEX = BITFIELD_BIT(22),
-   IR3_DBG_NOALIASRT = BITFIELD_BIT(23),
+   IR3_DBG_SCHEDMSGS = BITFIELD_BIT(21),
+   IR3_DBG_RAMSGS = BITFIELD_BIT(22),
+   IR3_DBG_NOALIASTEX = BITFIELD_BIT(23),
+   IR3_DBG_NOALIASRT = BITFIELD_BIT(24),
 };
 
 extern enum ir3_shader_debug ir3_shader_debug;

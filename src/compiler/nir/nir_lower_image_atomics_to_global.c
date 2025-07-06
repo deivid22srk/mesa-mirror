@@ -95,6 +95,8 @@ lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
                                  .atomic_op = atomic_op);
    }
 
+   b->shader->info.use_lowered_image_to_global = true;
+
    /* Replace the image atomic with the global atomic. Remove the image
     * explicitly because it has side effects so is not DCE'd.
     */
@@ -109,9 +111,10 @@ nir_lower_image_atomics_to_global(nir_shader *shader,
                                   const void *data)
 {
    struct lower_state state = {
-      .filter = filter, .data = data,
+      .filter = filter,
+      .data = data,
    };
    return nir_shader_intrinsics_pass(shader, lower,
                                      nir_metadata_control_flow,
-                                     (void *) &state);
+                                     (void *)&state);
 }

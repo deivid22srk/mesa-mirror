@@ -53,7 +53,6 @@ run_bs(brw_shader &s, bool allow_spilling)
    s.assign_curb_setup();
 
    brw_lower_3src_null_dest(s);
-   brw_workaround_memory_fence_before_eot(s);
    brw_workaround_emit_dummy_mov_instruction(s);
 
    brw_allocate_registers(s, allow_spilling);
@@ -74,90 +73,47 @@ compile_single_bs(const struct brw_compiler *compiler,
                   int *prog_offset,
                   uint64_t *bsr)
 {
-   const bool debug_enabled = brw_should_print_shader(shader, DEBUG_RT);
+   const bool debug_enabled = brw_should_print_shader(shader, DEBUG_RT, params->base.source_hash);
 
-   prog_data->base.stage = shader->info.stage;
    prog_data->max_stack_size = MAX2(prog_data->max_stack_size,
                                     shader->scratch_size);
 
-   const unsigned max_dispatch_width = 16;
-   brw_nir_apply_key(shader, compiler, &key->base, max_dispatch_width);
+   /* Since divergence is a lot more likely in RT than compute, it makes
+    * sense to limit ourselves to the smallest available SIMD for now.
+    */
+   const unsigned required_width = compiler->devinfo->ver >= 20 ? 16u : 8u;
+
+   brw_nir_apply_key(shader, compiler, &key->base, required_width);
    brw_postprocess_nir(shader, compiler, debug_enabled,
                        key->base.robust_flags);
 
-   brw_simd_selection_state simd_state{
-      .devinfo = compiler->devinfo,
-      .prog_data = prog_data,
+   brw_shader s(compiler, &params->base, &key->base, &prog_data->base, shader,
+                required_width, stats != NULL, debug_enabled);
 
-      /* Since divergence is a lot more likely in RT than compute, it makes
-       * sense to limit ourselves to the smallest available SIMD for now.
-       */
-      .required_width = compiler->devinfo->ver >= 20 ? 16u : 8u,
-   };
-
-   std::unique_ptr<brw_shader> v[2];
-
-   for (unsigned simd = 0; simd < ARRAY_SIZE(v); simd++) {
-      if (!brw_simd_should_compile(simd_state, simd))
-         continue;
-
-      const unsigned dispatch_width = 8u << simd;
-
-      if (dispatch_width == 8 && compiler->devinfo->ver >= 20)
-         continue;
-
-      v[simd] = std::make_unique<brw_shader>(compiler, &params->base,
-                                             &key->base,
-                                             &prog_data->base, shader,
-                                             dispatch_width,
-                                             stats != NULL,
-                                             debug_enabled);
-
-      const bool allow_spilling = !brw_simd_any_compiled(simd_state);
-      if (run_bs(*v[simd], allow_spilling)) {
-         brw_simd_mark_compiled(simd_state, simd, v[simd]->spilled_any_registers);
-      } else {
-         simd_state.error[simd] = ralloc_strdup(params->base.mem_ctx,
-                                                v[simd]->fail_msg);
-         if (simd > 0) {
-            brw_shader_perf_log(compiler, params->base.log_data,
-                                "SIMD%u shader failed to compile: %s",
-                                dispatch_width, v[simd]->fail_msg);
-         }
-      }
-   }
-
-   const int selected_simd = brw_simd_select(simd_state);
-   if (selected_simd < 0) {
+   const bool allow_spilling = true;
+   if (!run_bs(s, allow_spilling)) {
       params->base.error_str =
          ralloc_asprintf(params->base.mem_ctx,
-                         "Can't compile shader: "
-                         "SIMD8 '%s' and SIMD16 '%s'.\n",
-                         simd_state.error[0], simd_state.error[1]);
+                         "Can't compile shader: '%s'.\n",
+                         s.fail_msg);
       return 0;
    }
 
-   assert(selected_simd < int(ARRAY_SIZE(v)));
-   brw_shader *selected = v[selected_simd].get();
-   assert(selected);
-
-   const unsigned dispatch_width = selected->dispatch_width;
-
-   int offset = g->generate_code(selected->cfg, dispatch_width, selected->shader_stats,
-                                 selected->performance_analysis.require(), stats);
+   int offset = g->generate_code(s.cfg, s.dispatch_width, s.shader_stats,
+                                 s.performance_analysis.require(), stats);
    if (prog_offset)
       *prog_offset = offset;
    else
       assert(offset == 0);
 
    if (bsr)
-      *bsr = brw_bsr(compiler->devinfo, offset, dispatch_width, 0,
-                     selected->grf_used);
+      *bsr = brw_bsr(compiler->devinfo, offset, s.dispatch_width, 0,
+                     s.grf_used);
    else
       prog_data->base.grf_used = MAX2(prog_data->base.grf_used,
-                                      selected->grf_used);
+                                      s.grf_used);
 
-   return dispatch_width;
+   return s.dispatch_width;
 }
 
 const unsigned *
@@ -168,11 +124,9 @@ brw_compile_bs(const struct brw_compiler *compiler,
    struct brw_bs_prog_data *prog_data = params->prog_data;
    unsigned num_resume_shaders = params->num_resume_shaders;
    nir_shader **resume_shaders = params->resume_shaders;
-   const bool debug_enabled = brw_should_print_shader(shader, DEBUG_RT);
+   const bool debug_enabled = brw_should_print_shader(shader, DEBUG_RT, params->base.source_hash);
 
-   prog_data->base.stage = shader->info.stage;
-   prog_data->base.ray_queries = shader->info.ray_queries;
-   prog_data->base.total_scratch = 0;
+   brw_prog_data_init(&prog_data->base, &params->base);
 
    prog_data->max_stack_size = 0;
    prog_data->num_resume_shaders = num_resume_shaders;

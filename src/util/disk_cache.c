@@ -123,7 +123,7 @@ disk_cache_type_create(const char *gpu_name,
       goto path_fail;
 
    char *path = disk_cache_generate_cache_dir(local, gpu_name, driver_id,
-                                              cache_dir_name, cache_type);
+                                              cache_dir_name, cache_type, true);
    if (!path)
       goto path_fail;
 
@@ -223,17 +223,19 @@ disk_cache_create(const char *gpu_name, const char *driver_id,
    uint64_t max_size = 0;
    char *max_size_str;
 
-   if (debug_get_bool_option("MESA_DISK_CACHE_SINGLE_FILE", false))
+   if (debug_get_bool_option("MESA_DISK_CACHE_SINGLE_FILE", false)) {
       cache_type = DISK_CACHE_SINGLE_FILE;
-   else if (debug_get_bool_option("MESA_DISK_CACHE_MULTI_FILE", false))
-      cache_type = DISK_CACHE_MULTI_FILE;
-   else {
+   } else if (debug_get_bool_option("MESA_DISK_CACHE_DATABASE", false)) {
       cache_type = DISK_CACHE_DATABASE;
       /* Since switching the default cache to <mesa_shader_cache_db>, remove the
        * old cache folder if it hasn't been modified for more than 7 days.
        */
       if (!getenv("MESA_SHADER_CACHE_DIR") && !getenv("MESA_GLSL_CACHE_DIR") && disk_cache_enabled())
          disk_cache_delete_old_cache();
+   } else if (debug_get_bool_option("MESA_DISK_CACHE_MULTI_FILE", true)) {
+      cache_type = DISK_CACHE_MULTI_FILE;
+   } else {
+      return NULL;
    }
 
    max_size_str = getenv("MESA_SHADER_CACHE_MAX_SIZE");

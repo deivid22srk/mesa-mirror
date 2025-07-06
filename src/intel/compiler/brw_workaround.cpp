@@ -28,8 +28,7 @@ brw_workaround_emit_dummy_mov_instruction(brw_shader &s)
       return false;
 
    /* Insert dummy mov as first instruction. */
-   const brw_builder ubld =
-      brw_builder(&s, s.cfg->first_block(), (brw_inst *)first_inst).exec_all().group(8, 0);
+   const brw_builder ubld = brw_builder(first_inst).exec_all().group(8, 0);
    ubld.MOV(ubld.null_reg_ud(), brw_imm_ud(0u));
 
    s.invalidate_analysis(BRW_DEPENDENCY_INSTRUCTIONS |
@@ -43,7 +42,7 @@ needs_dummy_fence(const intel_device_info *devinfo, brw_inst *inst)
    /* This workaround is about making sure that any instruction writing
     * through UGM has completed before we hit EOT.
     */
-   if (inst->sfid != GFX12_SFID_UGM)
+   if (inst->sfid != BRW_SFID_UGM)
       return false;
 
    /* Any UGM, non-Scratch-surface Stores (not including Atomic) messages,
@@ -66,7 +65,7 @@ needs_dummy_fence(const intel_device_info *devinfo, brw_inst *inst)
    }
 
    /* Any UGM Atomic message WITHOUT return value */
-   if (lsc_opcode_is_atomic(opcode) && inst->dst.file == BAD_FILE)
+   if (lsc_opcode_is_atomic(opcode) && inst->dst.is_null())
       return true;
 
    return false;
@@ -89,6 +88,11 @@ brw_workaround_memory_fence_before_eot(brw_shader &s)
    if (!intel_needs_workaround(s.devinfo, 22013689345))
       return false;
 
+   /* Needs to happen after brw_lower_logical_sends & before
+    * brw_lower_send_descriptors.
+    */
+   assert(s.phase == BRW_SHADER_PHASE_AFTER_MIDDLE_LOWERING);
+
    foreach_block_and_inst_safe (block, brw_inst, inst, s.cfg) {
       if (!inst->eot) {
          if (needs_dummy_fence(s.devinfo, inst))
@@ -99,14 +103,19 @@ brw_workaround_memory_fence_before_eot(brw_shader &s)
       if (!has_ugm_write_or_atomic)
          break;
 
-      const brw_builder ibld(&s, block, inst);
-      const brw_builder ubld = ibld.exec_all().group(1, 0);
+      const brw_builder ubld = brw_builder(inst).uniform();
 
       brw_reg dst = ubld.vgrf(BRW_TYPE_UD);
-      brw_inst *dummy_fence = ubld.emit(SHADER_OPCODE_MEMORY_FENCE,
-                                       dst, brw_vec8_grf(0, 0),
-                                       /* commit enable */ brw_imm_ud(1));
-      dummy_fence->sfid = GFX12_SFID_UGM;
+      brw_inst *dummy_fence = ubld.emit(SHADER_OPCODE_SEND, dst);
+
+      dummy_fence->resize_sources(4);
+      dummy_fence->src[0] = brw_imm_ud(0);
+      dummy_fence->src[1] = brw_imm_ud(0);
+      dummy_fence->src[2] = brw_vec8_grf(0, 0);
+      dummy_fence->src[3] = brw_reg();
+      dummy_fence->mlen = reg_unit(s.devinfo);
+      dummy_fence->ex_mlen = 0;
+      dummy_fence->sfid = BRW_SFID_UGM;
       dummy_fence->desc = lsc_fence_msg_desc(s.devinfo, LSC_FENCE_TILE,
                                              LSC_FLUSH_TYPE_NONE_6, false);
       dummy_fence->size_written = REG_SIZE * reg_unit(s.devinfo);
@@ -227,7 +236,7 @@ brw_workaround_nomask_control_flow(brw_shader &s)
                 * instruction), in order to avoid getting a right-shifted
                 * value.
                 */
-               const brw_builder ubld = brw_builder(&s, block, inst)
+               const brw_builder ubld = brw_builder(inst)
                                        .exec_all().group(s.dispatch_width, 0);
                const brw_reg flag = retype(brw_flag_reg(0, 0),
                                           BRW_TYPE_UD);
@@ -343,8 +352,7 @@ brw_workaround_source_arf_before_eot(brw_shader &s)
           */
          assert(++eot_count == 1);
 
-         const brw_builder ibld(&s, block, inst);
-         const brw_builder ubld = ibld.exec_all().group(1, 0);
+         const brw_builder ubld = brw_builder(inst).uniform();
 
          if (flags_unread & 0x0f)
             ubld.MOV(ubld.null_reg_ud(), retype(brw_flag_reg(0, 0), BRW_TYPE_UD));

@@ -30,8 +30,14 @@ brw_print_instructions(const brw_shader &s, FILE *file)
          fprintf(file, "\n");
 
          foreach_inst_in_block(brw_inst, inst, block) {
-            if (inst->is_control_flow_end())
+            /* SHADER_OPCODE_FLOW ends a block, but it does not change the
+             * control flow nested (i.e., the indentation).
+             */
+            if (inst->is_control_flow_end() && inst->opcode != SHADER_OPCODE_FLOW) {
+               /* If cf_count is 0 and decremented, bad things will happen. */
+               assert(cf_count > 0);
                cf_count -= 1;
+            }
 
             if (rp) {
                max_pressure = MAX2(max_pressure, rp->regs_live_at_ip[ip]);
@@ -239,6 +245,8 @@ brw_instruction_name(const struct brw_isa_info *isa, enum opcode op)
       return "interp_shared_offset";
    case FS_OPCODE_INTERPOLATE_AT_PER_SLOT_OFFSET:
       return "interp_per_slot_offset";
+   case FS_OPCODE_READ_ATTRIBUTE_PAYLOAD:
+      return "fs_read_attribute_payload";
 
    case SHADER_OPCODE_BARRIER:
       return "barrier";
@@ -280,6 +288,8 @@ brw_instruction_name(const struct brw_isa_info *isa, enum opcode op)
       return "inclusive_scan";
    case SHADER_OPCODE_EXCLUSIVE_SCAN:
       return "exclusive_scan";
+   case SHADER_OPCODE_LOAD_REG:
+      return "load_reg";
    case SHADER_OPCODE_VOTE_ANY:
       return "vote_any";
    case SHADER_OPCODE_VOTE_ALL:
@@ -294,6 +304,9 @@ brw_instruction_name(const struct brw_isa_info *isa, enum opcode op)
       return "read_from_live_channel";
    case SHADER_OPCODE_READ_FROM_CHANNEL:
       return "read_from_channel";
+
+   case SHADER_OPCODE_FLOW:
+      return "flow";
    }
 
    unreachable("not reached");
@@ -309,7 +322,9 @@ static bool
 print_memory_logical_source(FILE *file, const brw_inst *inst, unsigned i)
 {
    if (inst->is_control_source(i)) {
-      assert(inst->src[i].file == IMM && inst->src[i].type == BRW_TYPE_UD);
+      assert(inst->src[i].file == IMM &&
+             (inst->src[i].type == BRW_TYPE_UD ||
+              inst->src[i].type == BRW_TYPE_D));
       assert(!inst->src[i].negate);
       assert(!inst->src[i].abs);
    }
@@ -339,6 +354,9 @@ print_memory_logical_source(FILE *file, const brw_inst *inst, unsigned i)
       return inst->src[i].file == BAD_FILE;
    case MEMORY_LOGICAL_ADDRESS:
       fprintf(file, " addr: ");
+      return false;
+   case MEMORY_LOGICAL_ADDRESS_OFFSET:
+      fprintf(file, " offset: ");
       return false;
    case MEMORY_LOGICAL_COORD_COMPONENTS:
       fprintf(file, " coord_comps:");
@@ -646,6 +664,15 @@ brw_print_instruction(const brw_shader &s, const brw_inst *inst, FILE *file, con
 
    if (inst->has_no_mask_send_params)
       fprintf(file, "NoMaskParams ");
+
+   if (is_send && inst->desc)
+      fprintf(file, "Desc 0x%08x ", inst->desc);
+
+   if (is_send && inst->ex_desc)
+      fprintf(file, "ExDesc 0x%08x ", inst->ex_desc);
+
+   if (is_send && inst->send_ex_desc_imm)
+      fprintf(file, "ExDescImmInst 0x%08x ", inst->offset);
 
    if (inst->sched.regdist || inst->sched.mode) {
       fprintf(file, "{ ");

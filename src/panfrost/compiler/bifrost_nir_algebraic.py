@@ -86,22 +86,24 @@ algebraic_late = [
     (('i2f16', 'a'), ('f2f16', ('i2f32', ('i2i32', a))), 'gpu_arch >= 11'),
     (('u2f16', 'a'), ('f2f16', ('u2f32', ('u2u32', a))), 'gpu_arch >= 11'),
 
+    # We don't have S32_TO_F16 on any arch
+    (('i2f16', 'a@32'), ('f2f16', ('i2f32', a))),
+    (('u2f16', 'a@32'), ('f2f16', ('u2f32', a))),
+
     # On v11+, V2F16_TO_V2S16 / V2F16_TO_V2U16 are gone
     (('f2i16', 'a@16'), ('f2i16', ('f2f32', a)), 'gpu_arch >= 11'),
     (('f2u16', 'a@16'), ('f2u16', ('f2f32', a)), 'gpu_arch >= 11'),
+
+    # On v11+, V2F32_TO_V2S16 is gone
+    (('pack_half_2x16_split', a, b), ('pack_32_2x16_split', ('f2f16', a), ('f2f16', b)), 'gpu_arch >= 11'),
 
     # On v11+, F16_TO_S32/F16_TO_U32 is gone but we still have F32_TO_S32/F32_TO_U32
     (('f2i32', 'a@16'), ('f2i32', ('f2f32', a)), 'gpu_arch >= 11'),
     (('f2u32', 'a@16'), ('f2u32', ('f2f32', a)), 'gpu_arch >= 11'),
 
-    # On v11+, IABS.v4s8 is gone
-    (('iabs', 'a@8'), ('i2i8', ('iabs', ('i2i16', a))), 'gpu_arch >= 11'),
-
-    # On v11+, ISUB.v4s8 is gone
-    (('ineg', 'a@8'), ('i2i8', ('ineg', ('i2i16', a))), 'gpu_arch >= 11'),
-    (('isub', 'a@8', 'b@8'), ('i2i8', ('isub', ('i2i16', a), ('i2i16', b))), 'gpu_arch >= 11'),
-    (('isub_sat', 'a@8', 'b@8'), ('i2i8', ('isub_sat', ('i2i16', a), ('i2i16', b))), 'gpu_arch >= 11'),
-    (('usub_sat', 'a@8', 'b@8'), ('u2u8', ('usub_sat', ('u2u16', a), ('u2u16', b))), 'gpu_arch >= 11'),
+    # On v11+, because FROUND.v2f16 is gone we end up with precision issues.
+    # We lower ffract here instead to ensure lower_bit_size has been performed.
+    (('ffract', a), ('fadd', a, ('fneg', ('ffloor', a))), 'gpu_arch >= 11'),
 ]
 
 # On v11+, ICMP_OR.v4u8 was removed

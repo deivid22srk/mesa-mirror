@@ -105,8 +105,14 @@ for T, sizes, one in [('f', [16, 32], 1.0),
 # This needs to be a separate pass that runs after lower_selects, in order to
 # pick up patterns like b2f32(iand(...))
 opt_selects = [
+        (('bcsel', ('ior(is_used_once)', ('inot', a), b), c, d),
+         ('bcsel', a, ('bcsel', b, c, d), c)),
+
         (('bcsel', ('ior(is_used_once)', a, b), c, d),
          ('bcsel', a, c, ('bcsel', b, c, d))),
+
+        (('bcsel', ('iand(is_used_once)', ('inot', a), b), c, d),
+         ('bcsel', a, d, ('bcsel', b, c, d))),
 
         (('bcsel', ('iand(is_used_once)', a, b), c, d),
          ('bcsel', a, ('bcsel', b, c, d), d)),
@@ -119,6 +125,16 @@ opt_selects.extend([
 
         (('ior', ('inot', 'a@1'), b), ('bcsel', a, b, True)),
         (('ior', 'a@1', b), ('bcsel', a, True, b)),
+])
+
+# Rewriting fneg to ixor costs a uniform but lets us CSE the bcsel if this is
+# applied to a whole vector, hence the has_multiple_uses heuristic.
+opt_selects.extend([
+        (('bcsel', 'a(has_multiple_uses)', ('fneg(is_used_once)', 'b@32'), b),
+         ('ixor', b, ('bcsel', a, 1 << 31, 0))),
+
+        (('bcsel', 'a(has_multiple_uses)', b, ('fneg(is_used_once)', 'b@32')),
+         ('ixor', b, ('bcsel', a, 0, 1 << 31))),
 ])
 
 fuse_extr = []
@@ -215,6 +231,9 @@ cleanup_amul = [
    # neither multiplication overflows.
    (('amul', ('ishl', ('u2u64', 'a@32'), '#b(is_ult_32)'), '#c'),
     ('amul', ('u2u64', a), ('ishl', c, b))),
+
+   # We depending on simplifying this.
+   (('iadd', a, 0), a),
 ]
 
 fuse_lea = []

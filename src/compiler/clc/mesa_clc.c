@@ -88,12 +88,6 @@ main(int argc, char **argv)
       util_dynarray_append(option ? &clang_args : &input_files, char *, arg);
    }
 
-   /* Set the OpenCL standard to CL 2.0, this enables everything at a frontend
-    * level. See comment below about driver support.
-    */
-   util_dynarray_append(&clang_args, char *, "-cl-std=cl2.0");
-   util_dynarray_append(&clang_args, char *, "-D__OPENCL_VERSION__=200");
-
    if (util_dynarray_num_elements(&input_files, char *) == 0) {
       fprintf(stderr, "No input file(s).\n");
       print_usage(argv[0], stderr);
@@ -139,6 +133,7 @@ main(int argc, char **argv)
          .source.value = map,
          .args = util_dynarray_begin(&clang_args),
          .num_args = util_dynarray_num_elements(&clang_args, char *),
+         .c_compatible = true,
       };
 
       /* Enable all features, we don't know the target here and it is the

@@ -564,8 +564,11 @@ emit_ps_null_export(nir_builder *b, lower_ps_state *s)
     * for discard.
     * In Primitive Ordered Pixel Shading, however, GFX11+ explicitly uses the `done` export to exit
     * the ordered section, and before GFX11, shaders with POPS also need an export.
+    * GFX11 DCC decompression also needs an export.
     */
-   if (s->options->gfx_level >= GFX10 && !s->options->uses_discard && !pops)
+   if (s->options->gfx_level >= GFX10 && !pops &&
+       !s->options->uses_discard &&
+       !s->options->dcc_decompress_gfx11)
       return;
 
    /* The `done` export exits the POPS ordered section on GFX11+, make sure UniformMemory and
@@ -687,7 +690,7 @@ export_ps_outputs(nir_builder *b, lower_ps_state *s)
       emit_ps_null_export(b, s);
    }
 
-   return true;
+   return nir_progress(true, b->impl, nir_metadata_control_flow);
 }
 
 bool

@@ -106,6 +106,8 @@ get_info(nir_intrinsic_op op)
       STORE(nir_var_shader_temp, scratch, -1, 1, -1, 0, 1)
       LOAD(nir_var_mem_ubo, ubo_uniform_block_intel, 0, 1, -1, 1)
       LOAD(nir_var_mem_ssbo, ssbo_uniform_block_intel, 0, 1, -1, 1)
+      LOAD(nir_var_mem_ssbo, ssbo_intel, 0, 1, -1, 1)
+      STORE(nir_var_mem_ssbo, ssbo_intel, 1, 2, -1, 0, 1)
       LOAD(nir_var_mem_shared, shared_uniform_block_intel, -1, 0, -1, 1)
       LOAD(nir_var_mem_global, global_constant_uniform_block_intel, -1, 0, -1, 1)
       INFO(nir_var_mem_ubo, ldc_nv, false, 0, 1, -1, -1, 1)
@@ -241,8 +243,13 @@ sort_entries(const void *a_, const void *b_)
       return 1;
    else if (a->offset_signed < b->offset_signed)
       return -1;
-   else
-      return 0;
+
+   if (a->index > b->index)
+      return 1;
+   else if (a->index < b->index)
+      return -1;
+
+   return 0;
 }
 
 static unsigned
@@ -593,8 +600,7 @@ create_entry(void *mem_ctx,
    entry->info = info;
    entry->is_store = entry->info->value_src >= 0;
    entry->num_components =
-      entry->is_store ? intrin->num_components :
-                        nir_def_last_component_read(&intrin->def) + 1;
+      entry->is_store ? intrin->num_components : nir_def_last_component_read(&intrin->def) + 1;
 
    if (entry->info->deref_src >= 0) {
       entry->deref = nir_src_as_deref(intrin->src[entry->info->deref_src]);
@@ -681,6 +687,10 @@ new_bitsize_acceptable(struct vectorize_ctx *ctx, unsigned new_bit_size,
    }
 
    unsigned high_offset = high->offset_signed - low->offset_signed;
+
+   /* This can cause issues when combining store data. */
+   if (high_offset % (new_bit_size / 8) != 0)
+      return false;
 
    /* check nir_extract_bits limitations */
    unsigned common_bit_size = MIN2(get_bit_size(low), get_bit_size(high));
@@ -789,11 +799,11 @@ vectorize_loads(nir_builder *b, struct vectorize_ctx *ctx,
    nir_def *high_undef = nir_undef(b, old_high_num_components, old_high_bit_size);
 
    nir_def *low_def = nir_extract_bits(
-      b, (nir_def*[]){data, low_undef}, 2, 0, old_low_num_components,
+      b, (nir_def *[]){ data, low_undef }, 2, 0, old_low_num_components,
       old_low_bit_size);
 
    nir_def *high_def = nir_extract_bits(
-      b, (nir_def*[]){data, high_undef}, 2, high_start,
+      b, (nir_def *[]){ data, high_undef }, 2, high_start,
       old_high_num_components, old_high_bit_size);
 
    /* convert booleans */
@@ -1400,8 +1410,10 @@ vectorize_sorted_entries(struct vectorize_ctx *ctx, nir_function_impl *impl,
           */
          unsigned max_hole =
             first->is_store ||
-            (ctx->options->has_shared2_amd &&
-             get_variable_mode(first) == nir_var_mem_shared) ? 0 : 28;
+                  (ctx->options->has_shared2_amd &&
+                   get_variable_mode(first) == nir_var_mem_shared)
+               ? 0
+               : 28;
          unsigned low_size = get_bit_size(low) / 8u * low->num_components;
          bool separate = diff > max_hole + low_size;
 
@@ -1625,9 +1637,8 @@ nir_opt_load_store_vectorize(nir_shader *shader, const nir_load_store_vectorize_
       nir_foreach_block(block, impl)
          progress |= process_block(impl, ctx, block);
 
-      nir_metadata_preserve(impl,
-                            nir_metadata_control_flow |
-                            nir_metadata_live_defs);
+      nir_progress(true, impl,
+                   nir_metadata_control_flow | nir_metadata_live_defs);
    }
 
    ralloc_free(ctx);
@@ -1659,6 +1670,7 @@ nir_opt_load_store_update_alignments(nir_shader *shader)
    return nir_shader_intrinsics_pass(shader,
                                      opt_load_store_update_alignments_callback,
                                      nir_metadata_control_flow |
-                                     nir_metadata_live_defs |
-                                     nir_metadata_instr_index, NULL);
+                                        nir_metadata_live_defs |
+                                        nir_metadata_instr_index,
+                                     NULL);
 }

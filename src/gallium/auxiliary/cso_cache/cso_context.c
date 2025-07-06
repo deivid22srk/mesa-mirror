@@ -402,7 +402,7 @@ cso_unbind_context(struct cso_context *cso)
                ctx->base.pipe->bind_sampler_states(ctx->base.pipe, sh, 0, maxsam, zeros);
             }
             if (maxview > 0) {
-               ctx->base.pipe->set_sampler_views(ctx->base.pipe, sh, 0, maxview, 0, false, views);
+               ctx->base.pipe->set_sampler_views(ctx->base.pipe, sh, 0, maxview, 0, views);
             }
             if (maxssbo > 0) {
                ctx->base.pipe->set_shader_buffers(ctx->base.pipe, sh, 0, maxssbo, ssbos, 0);
@@ -1171,9 +1171,9 @@ cso_restore_compute_samplers(struct cso_context_priv *ctx)
 }
 
 
-static void
-cso_set_vertex_elements_direct(struct cso_context_priv *ctx,
-                               const struct cso_velems_state *velems)
+static void *
+cso_get_vertex_elements(struct cso_context_priv *ctx,
+                        const struct cso_velems_state *velems)
 {
    /* Need to include the count into the stored state data too.
     * Otherwise first few count pipe_vertex_elements could be identical
@@ -1186,12 +1186,11 @@ cso_set_vertex_elements_direct(struct cso_context_priv *ctx,
    struct cso_hash_iter iter =
       cso_find_state_template(&ctx->cache, hash_key, CSO_VELEMENTS,
                               velems, key_size);
-   void *handle;
 
    if (cso_hash_iter_is_null(iter)) {
       struct cso_velements *cso = MALLOC(sizeof(struct cso_velements));
       if (!cso)
-         return;
+         return NULL;
 
       memcpy(&cso->state, velems, key_size);
 
@@ -1207,13 +1206,20 @@ cso_set_vertex_elements_direct(struct cso_context_priv *ctx,
       iter = cso_insert_state(&ctx->cache, hash_key, CSO_VELEMENTS, cso);
       if (cso_hash_iter_is_null(iter)) {
          FREE(cso);
-         return;
+         return NULL;
       }
 
-      handle = cso->data;
+      return cso->data;
    } else {
-      handle = ((struct cso_velements *)cso_hash_iter_data(iter))->data;
+      return ((struct cso_velements *)cso_hash_iter_data(iter))->data;
    }
+}
+
+static void
+cso_set_vertex_elements_direct(struct cso_context_priv *ctx,
+                               const struct cso_velems_state *velems)
+{
+   void *handle = cso_get_vertex_elements(ctx, velems);
 
    if (ctx->velements != handle) {
       ctx->velements = handle;
@@ -1221,6 +1227,24 @@ cso_set_vertex_elements_direct(struct cso_context_priv *ctx,
    }
 }
 
+/**
+ * Same as cso_set_vertex_elements_direct, but the caller is responsible for
+ * binding the state if the return value isn't NULL.
+ */
+void *
+cso_get_vertex_elements_for_bind(struct cso_context *cso,
+                                 const struct cso_velems_state *velems)
+{
+   struct cso_context_priv *ctx = (struct cso_context_priv *)cso;
+   void *handle = cso_get_vertex_elements(ctx, velems);
+
+   if (handle && ctx->velements != handle) {
+      ctx->velements = handle;
+      return handle;
+   }
+
+   return NULL;
+}
 
 enum pipe_error
 cso_set_vertex_elements(struct cso_context *cso,
@@ -1356,7 +1380,7 @@ set_sampler(struct cso_context_priv *ctx, enum pipe_shader_type shader_stage,
    if (cso_hash_iter_is_null(iter)) {
       cso = MALLOC(sizeof(struct cso_sampler));
       if (!cso)
-         return false;
+         return NULL;
 
       memcpy(&cso->state, templ, sizeof(*templ));
       cso->data = ctx->base.pipe->create_sampler_state(ctx->base.pipe, &cso->state);
@@ -1365,7 +1389,7 @@ set_sampler(struct cso_context_priv *ctx, enum pipe_shader_type shader_stage,
       iter = cso_insert_state(&ctx->cache, hash_key, CSO_SAMPLER, cso);
       if (cso_hash_iter_is_null(iter)) {
          FREE(cso);
-         return false;
+         return NULL;
       }
    } else {
       cso = cso_hash_iter_data(iter);
@@ -1703,10 +1727,10 @@ cso_restore_state(struct cso_context *ctx, unsigned unbind)
       cso_restore_vertex_shader(cso);
    if (unbind & CSO_UNBIND_FS_SAMPLERVIEWS)
       cso->base.pipe->set_sampler_views(cso->base.pipe, PIPE_SHADER_FRAGMENT, 0, 0,
-                                   cso->max_fs_samplerviews, false, NULL);
+                                   cso->max_fs_samplerviews, NULL);
    if (unbind & CSO_UNBIND_FS_SAMPLERVIEW0)
       cso->base.pipe->set_sampler_views(cso->base.pipe, PIPE_SHADER_FRAGMENT, 0, 0,
-                                   1, false, NULL);
+                                   1, NULL);
    if (state_mask & CSO_BIT_FRAGMENT_SAMPLERS)
       cso_restore_fragment_samplers(cso);
    if (unbind & CSO_UNBIND_FS_IMAGE0)

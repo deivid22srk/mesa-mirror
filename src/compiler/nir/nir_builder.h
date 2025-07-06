@@ -79,6 +79,10 @@ typedef bool (*nir_intrinsic_pass_cb)(struct nir_builder *,
                                       nir_intrinsic_instr *, void *);
 typedef bool (*nir_alu_pass_cb)(struct nir_builder *,
                                 nir_alu_instr *, void *);
+typedef bool (*nir_tex_pass_cb)(struct nir_builder *,
+                                nir_tex_instr *, void *);
+typedef bool (*nir_phi_pass_cb)(struct nir_builder *,
+                                nir_phi_instr *, void *);
 
 /**
  * Iterates over all the instructions in a NIR function and calls the given pass
@@ -105,13 +109,7 @@ nir_function_instructions_pass(nir_function_impl *impl,
       }
    }
 
-   if (progress) {
-      nir_metadata_preserve(impl, preserved);
-   } else {
-      nir_metadata_preserve(impl, nir_metadata_all);
-   }
-
-   return progress;
+   return nir_progress(progress, impl, preserved);
 }
 
 /**
@@ -168,13 +166,7 @@ nir_function_intrinsics_pass(nir_function_impl *impl,
       }
    }
 
-   if (progress) {
-      nir_metadata_preserve(impl, preserved);
-   } else {
-      nir_metadata_preserve(impl, nir_metadata_all);
-   }
-
-   return progress;
+   return nir_progress(progress, impl, preserved);
 }
 
 /**
@@ -224,12 +216,58 @@ nir_shader_alu_pass(nir_shader *shader,
          }
       }
 
-      if (func_progress) {
-         nir_metadata_preserve(impl, preserved);
-         progress = true;
-      } else {
-         nir_metadata_preserve(impl, nir_metadata_all);
+      progress |= nir_progress(func_progress, impl, preserved);
+   }
+
+   return progress;
+}
+
+/* As above, but for textures */
+static inline bool
+nir_shader_tex_pass(nir_shader *shader, nir_tex_pass_cb pass,
+                    nir_metadata preserved, void *cb_data)
+{
+   bool progress = false;
+
+   nir_foreach_function_impl(impl, shader) {
+      bool func_progress = false;
+      nir_builder b = nir_builder_create(impl);
+
+      nir_foreach_block_safe(block, impl) {
+         nir_foreach_instr_safe(instr, block) {
+            if (instr->type == nir_instr_type_tex) {
+               nir_tex_instr *tex = nir_instr_as_tex(instr);
+               func_progress |= pass(&b, tex, cb_data);
+            }
+         }
       }
+
+      progress |= nir_progress(func_progress, impl, preserved);
+   }
+
+   return progress;
+}
+
+/* As above, but for phis */
+static inline bool
+nir_shader_phi_pass(nir_shader *shader,
+                    nir_phi_pass_cb pass,
+                    nir_metadata preserved,
+                    void *cb_data)
+{
+   bool progress = false;
+
+   nir_foreach_function_impl(impl, shader) {
+      bool func_progress = false;
+      nir_builder b = nir_builder_create(impl);
+
+      nir_foreach_block_safe(block, impl) {
+         nir_foreach_phi_safe(phi, block) {
+            func_progress |= pass(&b, phi, cb_data);
+         }
+      }
+
+      progress |= nir_progress(func_progress, impl, preserved);
    }
 
    return progress;
@@ -724,6 +762,32 @@ nir_fdot(nir_builder *build, nir_def *src0, nir_def *src1)
 }
 
 static inline nir_def *
+nir_bfdot(nir_builder *build, nir_def *src0, nir_def *src1)
+{
+   assert(src0->num_components == src1->num_components);
+   switch (src0->num_components) {
+   case 1:
+      return nir_bfmul(build, src0, src1);
+   case 2:
+      return nir_bfdot2(build, src0, src1);
+   case 3:
+      return nir_bfdot3(build, src0, src1);
+   case 4:
+      return nir_bfdot4(build, src0, src1);
+   case 5:
+      return nir_bfdot5(build, src0, src1);
+   case 8:
+      return nir_bfdot8(build, src0, src1);
+   case 16:
+      return nir_bfdot16(build, src0, src1);
+   default:
+      unreachable("bad component size");
+   }
+
+   return NULL;
+}
+
+static inline nir_def *
 nir_ball_iequal(nir_builder *b, nir_def *src0, nir_def *src1)
 {
    switch (src0->num_components) {
@@ -1155,6 +1219,16 @@ nir_umod_imm(nir_builder *build, nir_def *x, uint64_t y)
    } else {
       return nir_umod(build, x, nir_imm_intN_t(build, y, x->bit_size));
    }
+}
+
+static inline nir_def *
+nir_align_imm(nir_builder *b, nir_def *x, uint64_t align)
+{
+   if (align == 1)
+      return x;
+
+   assert(util_is_power_of_two_nonzero64(align));
+   return nir_iand_imm(b, nir_iadd_imm(b, x, align - 1), ~(align - 1));
 }
 
 static inline nir_def *
@@ -2072,23 +2146,6 @@ DEF_DERIV(ddy)
 DEF_DERIV(ddy_fine)
 DEF_DERIV(ddy_coarse)
 
-/*
- * Find a texture source, remove it, and return its nir_def. If the texture
- * source does not exist, return NULL. This is useful for texture lowering pass
- * that consume their input sources and produce a new lowered source.
- */
-static inline nir_def *
-nir_steal_tex_src(nir_tex_instr *tex, nir_tex_src_type type_)
-{
-   int idx = nir_tex_instr_src_index(tex, type_);
-   if (idx < 0)
-      return NULL;
-
-   nir_def *ssa = tex->src[idx].src.ssa;
-   nir_tex_instr_remove_src(tex, idx);
-   return ssa;
-}
-
 static inline nir_def *
 nir_tex_deref(nir_builder *b, nir_deref_instr *t, nir_deref_instr *s,
               nir_def *coord)
@@ -2340,6 +2397,8 @@ nir_gen_rect_vertices(nir_builder *b, nir_def *z, nir_def *w);
  */
 void nir_printf_fmt(nir_builder *b, unsigned ptr_bit_size,
                     const char *fmt, ...);
+void nir_printf_fmt_at_px(nir_builder *b, unsigned ptr_bit_size,
+                          unsigned x, unsigned y, const char *fmt, ...);
 
 /* Call a serialized function. This is used internally by vtn_bindgen, it is not
  * intended for end-users of NIR.

@@ -231,7 +231,7 @@ iris_init_batch(struct iris_context *ice,
          batch->other_batches[batch->num_other_batches++] = other_batch;
    }
 
-   if (INTEL_DEBUG(DEBUG_BATCH | DEBUG_BATCH_STATS)) {
+   if (INTEL_DEBUG(DEBUG_BATCH) || INTEL_DEBUG(DEBUG_BATCH_STATS)) {
       const unsigned decode_flags = INTEL_BATCH_DECODE_DEFAULT_FLAGS |
          (INTEL_DEBUG(DEBUG_COLOR) ? INTEL_BATCH_DECODE_IN_COLOR : 0);
 
@@ -550,7 +550,7 @@ iris_batch_free(const struct iris_context *ice, struct iris_batch *batch)
 
    _mesa_hash_table_destroy(batch->bo_aux_modes, NULL);
 
-   if (INTEL_DEBUG(DEBUG_BATCH | DEBUG_BATCH_STATS))
+   if (INTEL_DEBUG(DEBUG_BATCH) || INTEL_DEBUG(DEBUG_BATCH_STATS))
       intel_batch_decode_ctx_finish(&batch->decoder);
 }
 
@@ -664,7 +664,7 @@ iris_finish_batch(struct iris_batch *batch)
 {
    const struct intel_device_info *devinfo = batch->screen->devinfo;
 
-   if (devinfo->ver == 12 && batch->name == IRIS_BATCH_RENDER) {
+   if (devinfo->ver == 12) {
       /* We re-emit constants at the beginning of every batch as a hardware
        * bug workaround, so invalidate indirect state pointers in order to
        * save ourselves the overhead of restoring constants redundantly when
@@ -925,7 +925,9 @@ _iris_batch_flush(struct iris_batch *batch, const char *file, int line)
 
    iris_finish_batch(batch);
 
-   if (INTEL_DEBUG(DEBUG_BATCH | DEBUG_SUBMIT | DEBUG_PIPE_CONTROL)) {
+   if (INTEL_DEBUG(DEBUG_BATCH) ||
+       INTEL_DEBUG(DEBUG_SUBMIT) ||
+       INTEL_DEBUG(DEBUG_PIPE_CONTROL)) {
       const char *basefile = strstr(file, "iris/");
       if (basefile)
          file = basefile + 5;

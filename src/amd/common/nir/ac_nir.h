@@ -27,7 +27,7 @@ enum
    AC_EXP_PARAM_DEFAULT_VAL_0001,
    AC_EXP_PARAM_DEFAULT_VAL_1110,
    AC_EXP_PARAM_DEFAULT_VAL_1111,
-   AC_EXP_PARAM_UNDEFINED = 255, /* deprecated, use AC_EXP_PARAM_DEFAULT_VAL_0000 instead */
+   AC_EXP_PARAM_UNDEFINED = 255,
 };
 
 enum {
@@ -89,7 +89,27 @@ bool ac_nir_optimize_outputs(nir_shader *nir, bool sprite_tex_disallowed,
                              int8_t slot_remap[NUM_TOTAL_VARYING_SLOTS],
                              uint8_t param_export_index[NUM_TOTAL_VARYING_SLOTS]);
 
+typedef struct {
+   /* Per-vertex slots and tess levels. */
+   uint64_t vram_output_mask;
+   uint64_t lds_output_mask;
+   uint64_t vgpr_output_mask; /* Hold the output values in VGPRs until the end. */
+   /* Generic per-patch slots. */
+   uint32_t vram_patch_output_mask;
+   uint32_t lds_patch_output_mask;
+   uint32_t vgpr_patch_output_mask; /* Hold the output values in VGPRs until the end. */
+
+   /* The highest index returned by map_io + 1. */
+   uint8_t highest_remapped_vram_output;
+   uint8_t highest_remapped_vram_patch_output;
+} ac_nir_tess_io_info;
+
 void
+ac_nir_get_tess_io_info(const nir_shader *tcs, const nir_tcs_info *tcs_info, uint64_t tes_inputs_read,
+                        uint32_t tes_patch_inputs_read, ac_nir_map_io_driver_location map_io,
+                        bool remapped_outputs_include_tess_levels, ac_nir_tess_io_info *io_info);
+
+bool
 ac_nir_lower_ls_outputs_to_mem(nir_shader *ls,
                                ac_nir_map_io_driver_location map,
                                enum amd_gfx_level gfx_level,
@@ -97,7 +117,7 @@ ac_nir_lower_ls_outputs_to_mem(nir_shader *ls,
                                uint64_t tcs_inputs_via_temp,
                                uint64_t tcs_inputs_via_lds);
 
-void
+bool
 ac_nir_lower_hs_inputs_to_mem(nir_shader *shader,
                               ac_nir_map_io_driver_location map,
                               enum amd_gfx_level gfx_level,
@@ -105,33 +125,32 @@ ac_nir_lower_hs_inputs_to_mem(nir_shader *shader,
                               uint64_t tcs_inputs_via_temp,
                               uint64_t tcs_inputs_via_lds);
 
-void
+bool
 ac_nir_lower_hs_outputs_to_mem(nir_shader *shader, const nir_tcs_info *info,
+                               const ac_nir_tess_io_info *io_info,
                                ac_nir_map_io_driver_location map,
                                enum amd_gfx_level gfx_level,
-                               uint64_t tes_inputs_read,
-                               uint32_t tes_patch_inputs_read,
                                unsigned wave_size);
 
-void
+bool
 ac_nir_lower_tes_inputs_to_mem(nir_shader *shader,
                                ac_nir_map_io_driver_location map);
 
 void
-ac_nir_compute_tess_wg_info(const struct radeon_info *info, const struct shader_info *tcs_info,
-                            unsigned wave_size, bool tess_uses_primid, bool all_invocations_define_tess_levels,
+ac_nir_compute_tess_wg_info(const struct radeon_info *info, const ac_nir_tess_io_info *io_info,
+                            unsigned tcs_vertices_out, unsigned wave_size, bool tess_uses_primid,
                             unsigned num_tcs_input_cp, unsigned lds_input_vertex_size,
-                            unsigned num_mem_tcs_outputs, unsigned num_mem_tcs_patch_outputs,
-                            unsigned *num_patches_per_wg, unsigned *hw_lds_size);
+                            unsigned num_remapped_tess_level_outputs, unsigned *num_patches_per_wg,
+                            unsigned *hw_lds_size);
 
-void
+bool
 ac_nir_lower_es_outputs_to_mem(nir_shader *shader,
                                ac_nir_map_io_driver_location map,
                                enum amd_gfx_level gfx_level,
                                unsigned esgs_itemsize,
                                uint64_t gs_inputs_read);
 
-void
+bool
 ac_nir_lower_gs_inputs_to_mem(nir_shader *shader,
                               ac_nir_map_io_driver_location map,
                               enum amd_gfx_level gfx_level,
@@ -146,7 +165,26 @@ typedef struct {
 
    unsigned max_workgroup_size;
    unsigned wave_size;
-   uint8_t clip_cull_dist_mask;
+   /* The mask of clip and cull distances that the shader should export. */
+   uint8_t export_clipdist_mask;
+   /* The mask of clip and cull distances that the shader should cull against.
+    * If no clip and cull distance outputs are present, it will load clip planes and cull
+    * either against CLIP_VERTEX or POS.
+    */
+   uint8_t cull_clipdist_mask;
+   /* This skips exporting cull distances to increase throughput by reducing the number of pos exports.
+    * If this is set, cull_clipdist_mask must be set to cull against cull distances in the shader because
+    * the hw won't do it without the exports. The best case scenario is 100% increase in throughput
+    * (2 pos exports -> 1 pos export).
+    */
+   bool dont_export_cull_distances;
+   bool write_pos_to_clipvertex;
+   /* Remove clip/cull distance components that are missing in export_clipdist_mask, improving
+    * throughput by up to 50% (3 pos exports -> 2 pos exports). The caller shouldn't set no-op
+    * components (>= 0) in export_clipdist_mask to remove those completely. No-op components
+    * should be determined by nir_opt_clip_cull_const before this.
+    */
+   bool pack_clip_cull_distances;
    const uint8_t *vs_output_param_offset; /* GFX11+ */
    bool has_param_exports;
    bool can_cull;
@@ -156,10 +194,14 @@ typedef struct {
    bool use_gfx12_xfb_intrinsic;
    bool has_gs_invocations_query;
    bool has_gs_primitives_query;
-   bool kill_pointsize;
-   bool kill_layer;
    bool force_vrs;
    bool compact_primitives;
+   /* Skip culling dependent on the viewport state, which is frustum culling and small prim
+    * culling. Set this when the shader writes the viewport index.
+    */
+   bool skip_viewport_state_culling;
+   /* Use the point-triangle intersection to cull small triangles. */
+   bool use_point_tri_intersection;
 
    /* VS */
    unsigned num_vertices_per_primitive;
@@ -169,19 +211,17 @@ typedef struct {
    bool export_primitive_id;
    bool export_primitive_id_per_prim;
    uint32_t instance_rate_inputs;
-   uint32_t user_clip_plane_enable_mask;
-
-   /* GS */
-   unsigned gs_out_vtx_bytes;
 } ac_nir_lower_ngg_options;
 
-void
-ac_nir_lower_ngg_nogs(nir_shader *shader, const ac_nir_lower_ngg_options *options);
+bool
+ac_nir_lower_ngg_nogs(nir_shader *shader, const ac_nir_lower_ngg_options *options,
+                      uint32_t *out_lds_vertex_size, uint8_t *out_lds_scratch_size);
 
-void
-ac_nir_lower_ngg_gs(nir_shader *shader, const ac_nir_lower_ngg_options *options);
+bool
+ac_nir_lower_ngg_gs(nir_shader *shader, const ac_nir_lower_ngg_options *options,
+                    uint32_t *out_lds_vertex_size, uint8_t *out_lds_scratch_size);
 
-void
+bool
 ac_nir_lower_ngg_mesh(nir_shader *shader,
                       const struct radeon_info *hw_info,
                       uint32_t clipdist_enable_mask,
@@ -194,13 +234,13 @@ ac_nir_lower_ngg_mesh(nir_shader *shader,
                       bool has_query,
                       bool fast_launch_2);
 
-void
+bool
 ac_nir_lower_task_outputs_to_mem(nir_shader *shader,
                                  unsigned task_payload_entry_bytes,
                                  unsigned task_num_entries,
                                  bool has_query);
 
-void
+bool
 ac_nir_lower_mesh_inputs_to_mem(nir_shader *shader,
                                 unsigned task_payload_entry_bytes,
                                 unsigned task_num_entries);
@@ -211,51 +251,35 @@ ac_nir_lower_global_access(nir_shader *shader);
 bool ac_nir_lower_resinfo(nir_shader *nir, enum amd_gfx_level gfx_level);
 bool ac_nir_lower_image_opcodes(nir_shader *nir);
 
-typedef struct ac_nir_gs_output_info {
-   const uint8_t *streams;
-   const uint8_t *streams_16bit_lo;
-   const uint8_t *streams_16bit_hi;
-
-   const uint8_t *varying_mask;
-   const uint8_t *varying_mask_16bit_lo;
-   const uint8_t *varying_mask_16bit_hi;
-
-   const uint8_t *sysval_mask;
-
-   /* type for each 16bit slot component */
-   nir_alu_type (*types_16bit_lo)[4];
-   nir_alu_type (*types_16bit_hi)[4];
-} ac_nir_gs_output_info;
-
-nir_shader *
-ac_nir_create_gs_copy_shader(const nir_shader *gs_nir,
-                             enum amd_gfx_level gfx_level,
-                             uint32_t clip_cull_mask,
-                             const uint8_t *param_offsets,
-                             bool has_param_exports,
-                             bool disable_streamout,
-                             bool kill_pointsize,
-                             bool kill_layer,
-                             bool force_vrs,
-                             ac_nir_gs_output_info *output_info);
-
-void
+bool
 ac_nir_lower_legacy_vs(nir_shader *nir,
                        enum amd_gfx_level gfx_level,
-                       uint32_t clip_cull_mask,
+                       uint32_t export_clipdist_mask,
+                       bool write_pos_to_clipvertex,
+                       bool pack_clip_cull_distances,
                        const uint8_t *param_offsets,
                        bool has_param_exports,
                        bool export_primitive_id,
                        bool disable_streamout,
-                       bool kill_pointsize,
-                       bool kill_layer,
                        bool force_vrs);
 
-void
-ac_nir_lower_legacy_gs(nir_shader *nir,
-                       bool has_gen_prim_query,
-                       bool has_pipeline_stats_query,
-                       ac_nir_gs_output_info *output_info);
+typedef struct {
+   bool has_gen_prim_query;
+   bool has_pipeline_stats_query;
+
+   enum amd_gfx_level gfx_level;
+   uint32_t export_clipdist_mask;
+   bool write_pos_to_clipvertex;
+   bool pack_clip_cull_distances;
+   const uint8_t *param_offsets;
+   bool has_param_exports;
+   bool disable_streamout;
+   bool force_vrs;
+} ac_nir_lower_legacy_gs_options;
+
+bool
+ac_nir_lower_legacy_gs(nir_shader *nir, ac_nir_lower_legacy_gs_options *options,
+                       nir_shader **gs_copy_shader);
 
 /* This is a pre-link pass. It should only eliminate code and do lowering that mostly doesn't
  * generate AMD-specific intrinsics.
@@ -333,6 +357,7 @@ typedef struct {
 
    /* Exports. */
    bool uses_discard;
+   bool dcc_decompress_gfx11;
    bool alpha_to_coverage_via_mrtz;
    bool dual_src_blend_swizzle;
    unsigned spi_shader_col_format;

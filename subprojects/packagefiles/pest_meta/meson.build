@@ -1,8 +1,8 @@
 project(
   'pest_meta',
   'rust',
-  version : '2.7.11',
-  license :'MIT OR Apache-2.0',
+  version : '2.8.0',
+  license : 'MIT OR Apache-2.0',
 )
 
 once_cell = subproject('once_cell').get_variable('lib')

@@ -232,6 +232,102 @@ private:
    bblock_t **parents;
 };
 
+struct brw_range {
+   int start;
+   int end;
+
+   /* If range not empty, this is the last value inside the range. */
+   inline int last() const
+   {
+      return end - 1;
+   }
+
+   inline bool is_empty() const
+   {
+      return end <= start;
+   }
+
+   inline int len() const
+   {
+      return end - start;
+   }
+
+   inline bool contains(int x) const
+   {
+      return start <= x && x < end;
+   }
+
+   inline bool contains(brw_range r) const
+   {
+      return start <= r.start && r.end <= end;
+   }
+};
+
+inline brw_range
+merge(brw_range a, brw_range b)
+{
+   if (a.is_empty())
+      return b;
+   if (b.is_empty())
+      return a;
+   return { MIN2(a.start, b.start), MAX2(a.end, b.end) };
+}
+
+inline brw_range
+merge(brw_range r, int x)
+{
+   if (r.is_empty())
+      return { x, x + 1 };
+   return { MIN2(r.start, x), MAX2(r.end, x + 1) };
+}
+
+inline bool
+overlaps(brw_range a, brw_range b)
+{
+   return a.start < b.end &&
+          b.start < a.end;
+}
+
+inline brw_range
+intersect(brw_range a, brw_range b)
+{
+   if (overlaps(a, b))
+      return { MAX2(a.start, b.start),
+               MIN2(a.end, b.end) };
+   else
+      return { 0, 0 };
+}
+
+inline brw_range
+clip_end(brw_range r, int n)
+{
+   assert(n >= 0);
+   return { r.start, r.end - n };
+}
+
+struct brw_ip_ranges {
+   brw_ip_ranges(const brw_shader *s);
+   ~brw_ip_ranges();
+
+   bool validate(const brw_shader *) const;
+
+   brw_analysis_dependency_class
+   dependency_class() const
+   {
+      return BRW_DEPENDENCY_INSTRUCTION_IDENTITY |
+             BRW_DEPENDENCY_BLOCKS;
+   }
+
+   brw_range range(const bblock_t *block) const {
+      int start = start_ip[block->num];
+      return { start, start + (int)block->num_instructions };
+   }
+
+private:
+   int num_blocks;
+   int *start_ip;
+};
+
 /**
  * Register pressure analysis of a shader.  Estimates how many registers
  * are live at any point of the program in GRF units.
@@ -270,13 +366,6 @@ public:
              def_insts[reg.nr] : NULL;
    }
 
-   bblock_t *
-   get_block(const brw_reg &reg) const
-   {
-      return reg.file == VGRF && reg.nr < def_count ?
-             def_blocks[reg.nr] : NULL;
-   }
-
    uint32_t
    get_use_count(const brw_reg &reg) const
    {
@@ -303,11 +392,10 @@ public:
 private:
    void mark_invalid(int);
    bool fully_defines(const brw_shader *v, brw_inst *);
-   void update_for_reads(const brw_idom_tree &idom, bblock_t *block, brw_inst *);
-   void update_for_write(const brw_shader *v, bblock_t *block, brw_inst *);
+   void update_for_reads(const brw_idom_tree &idom, brw_inst *);
+   void update_for_write(const brw_shader *v, brw_inst *);
 
    brw_inst **def_insts;
-   bblock_t **def_blocks;
    uint32_t *def_use_counts;
    unsigned def_count;
 };
@@ -350,6 +438,8 @@ public:
       BITSET_WORD flag_use[1];
       BITSET_WORD flag_livein[1];
       BITSET_WORD flag_liveout[1];
+
+      brw_range ip_range;
    };
 
    brw_live_variables(const brw_shader *s);
@@ -387,19 +477,19 @@ public:
    int num_vgrfs;
    int bitset_words;
 
+   unsigned max_vgrf_size;
+
    /** @{
     * Final computed live ranges for each var (each component of each virtual
     * GRF).
     */
-   int *start;
-   int *end;
+   brw_range *vars_range;
    /** @} */
 
    /** @{
     * Final computed live ranges for each VGRF.
     */
-   int *vgrf_start;
-   int *vgrf_end;
+   brw_range *vgrf_range;
    /** @} */
 
    /** Per-basic-block information on live variables */

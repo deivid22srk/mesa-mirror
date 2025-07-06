@@ -3,6 +3,7 @@
  * Copyright 2023 Valve Corporation
  * SPDX-License-Identifier: MIT
  */
+#include "asahi/lib/agx_abi.h"
 #include "compiler/libcl/libcl.h"
 #include "libagx_intrinsics.h"
 #include <agx_pack.h>
@@ -18,7 +19,7 @@ libagx_txs(constant struct agx_texture_packed *ptr, uint16_t lod,
     *
     *    OpImageQuery*...  return 0 if the bound descriptor is a null descriptor
     */
-   if (d.null)
+   if (d.address == AGX_ZERO_PAGE_ADDRESS)
       return 0;
 
    /* Buffer textures are lowered to 2D so the original size is irrecoverable.
@@ -67,7 +68,7 @@ libagx_texture_samples(constant struct agx_texture_packed *ptr)
    agx_unpack(NULL, ptr, TEXTURE, d);
 
    /* As above */
-   if (d.null)
+   if (d.address == AGX_ZERO_PAGE_ADDRESS)
       return 0;
 
    /* We may assume the input is multisampled, so just check the samples */
@@ -79,8 +80,7 @@ libagx_texture_levels(constant struct agx_texture_packed *ptr)
 {
    agx_unpack(NULL, ptr, TEXTURE, d);
 
-   /* As above */
-   if (d.null)
+   if (d.address == AGX_ZERO_PAGE_ADDRESS)
       return 0;
    else
       return (d.last_level - d.first_level) + 1;
@@ -124,9 +124,9 @@ libagx_lower_txf_robustness(constant struct agx_texture_packed *ptr,
    return valid ? x : 0xFFF0;
 }
 
-static uint32_t
-calculate_twiddled_coordinates(ushort2 coord, uint16_t tile_w_px,
-                               uint16_t tile_h_px, uint32_t aligned_width_px)
+uint32_t
+libagx_twiddle_coordinates(ushort2 coord, uint16_t tile_w_px,
+                           uint16_t tile_h_px, uint32_t aligned_width_px)
 {
    /* Modulo by the tile width/height to get the offsets within the tile */
    ushort2 tile_mask_vec = (ushort2)(tile_w_px - 1, tile_h_px - 1);
@@ -183,9 +183,9 @@ libagx_image_texel_address(constant const struct agx_pbe_packed *ptr,
          aligned_width_px = align(width_px, d.tile_width_sw);
       }
 
-      total_px = calculate_twiddled_coordinates(
-         convert_ushort2(coord.xy), d.tile_width_sw, d.tile_height_sw,
-         aligned_width_px);
+      total_px =
+         libagx_twiddle_coordinates(convert_ushort2(coord.xy), d.tile_width_sw,
+                                    d.tile_height_sw, aligned_width_px);
    }
 
    uint samples_log2 = is_msaa ? d.sample_count_log2_sw : 0;
@@ -201,7 +201,7 @@ libagx_image_texel_address(constant const struct agx_pbe_packed *ptr,
       return total_sa;
    else
       return (d.buffer + (is_msaa ? 0 : d.level_offset_sw)) +
-             (uint64_t)(total_sa * bytes_per_sample_B);
+             (uint64_t)total_sa * bytes_per_sample_B;
 }
 
 uint64_t

@@ -75,6 +75,7 @@ libradv_files = files(
   'nir/radv_nir_lower_intrinsics_early.c',
   'nir/radv_nir_lower_io.c',
   'nir/radv_nir_lower_primitive_shading_rate.c',
+  'nir/radv_nir_lower_printf.c',
   'nir/radv_nir_lower_ray_queries.c',
   'nir/radv_nir_lower_view_index.c',
   'nir/radv_nir_lower_viewport_to_zero.c',
@@ -111,8 +112,14 @@ libradv_files = files(
   'radv_device.h',
   'radv_device_memory.c',
   'radv_device_memory.h',
+  'radv_descriptors.c',
+  'radv_descriptors.h',
+  'radv_descriptor_pool.c',
+  'radv_descriptor_pool.h',
   'radv_descriptor_set.c',
   'radv_descriptor_set.h',
+  'radv_descriptor_update_template.c',
+  'radv_descriptor_update_template.h',
   'radv_dgc.c',
   'radv_dgc.h',
   'radv_event.c',
@@ -136,6 +143,8 @@ libradv_files = files(
   'radv_pipeline_compute.c',
   'radv_pipeline_compute.h',
   'radv_pipeline_graphics.c',
+  'radv_pipeline_layout.c',
+  'radv_pipeline_layout.h',
   'radv_pipeline_rt.c',
   'radv_pipeline_rt.h',
   'radv_printf.c',
@@ -145,6 +154,8 @@ libradv_files = files(
   'radv_radeon_winsys.h',
   'radv_rmv.c',
   'radv_rmv.h',
+  'radv_rra_gfx10_3.c',
+  'radv_rra_gfx12.c',
   'radv_rra.c',
   'radv_rra.h',
   'radv_sampler.c',
@@ -277,6 +288,7 @@ endif
 icd_command = [
   prog_python, '@INPUT0@',
   '--api-version', '1.4', '--xml', '@INPUT1@',
+  '--sizeof-pointer', sizeof_pointer,
   '--lib-path', join_paths(icd_lib_path, icd_file_name),
   '--out', '@OUTPUT@',
 ]
@@ -303,6 +315,7 @@ _dev_icd = custom_target(
   command : [
     prog_python, '@INPUT0@',
     '--api-version', '1.4', '--xml', '@INPUT1@',
+    '--sizeof-pointer', sizeof_pointer,
     '--lib-path', meson.current_build_dir() / icd_file_name,
     '--out', '@OUTPUT@',
   ],
@@ -313,7 +326,7 @@ devenv.append('VK_DRIVER_FILES', _dev_icd.full_path())
 # Deprecated: replaced by VK_DRIVER_FILES above
 devenv.append('VK_ICD_FILENAMES', _dev_icd.full_path())
 
-if with_tests
+if with_radv_tests
   test(
     'radv_tests',
     executable(
@@ -321,6 +334,10 @@ if with_tests
       files(
         'nir/radv_nir_lower_hit_attrib_derefs.c',
         'tests/radv_nir_lower_hit_attrib_derefs_tests.cpp',
+        'tests/helpers.cpp',
+        'tests/helpers.h',
+        'tests/drirc.cpp',
+        'tests/misc.cpp',
       ),
       cpp_args : [cpp_msvc_compat_args],
       gnu_symbol_visibility : 'hidden',
@@ -333,7 +350,8 @@ if with_tests
         inc_util,
         include_directories('.'),
       ],
-      dependencies : [dep_thread, idep_gtest, idep_nir, idep_mesautil],
+      link_with  : [ libvulkan_radeon ],
+      dependencies : [dep_llvm, dep_thread, idep_gtest, idep_nir, idep_mesautil, idep_vulkan_util_headers],
     ),
     suite : ['compiler', 'nir'],
     protocol : 'gtest',

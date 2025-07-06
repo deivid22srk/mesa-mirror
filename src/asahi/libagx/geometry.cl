@@ -4,16 +4,21 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "asahi/lib/agx_abi.h"
+#include "compiler/libcl/libcl_vk.h"
+#include "util/macros.h"
+#include "util/u_math.h"
 #include "geometry.h"
 #include "libagx_intrinsics.h"
 #include "query.h"
 #include "tessellator.h"
 
-/* Swap the two non-provoking vertices third vert in odd triangles. This
- * generates a vertex ID list with a consistent winding order.
+/* Swap the two non-provoking vertices in odd triangles. This generates a vertex
+ * ID list with a consistent winding order.
  *
- * With prim and flatshade_first, the map : [0, 1, 2] -> [0, 1, 2] is its own
- * inverse. This lets us reuse it for both vertex fetch and transform feedback.
+ * Holding prim and flatshade_first constant, the map : [0, 1, 2] -> [0, 1, 2]
+ * is its own inverse. It is hence used both vertex fetch and transform
+ * feedback.
  */
 uint
 libagx_map_vertex_in_tri_strip(uint prim, uint vert, bool flatshade_first)
@@ -26,12 +31,49 @@ libagx_map_vertex_in_tri_strip(uint prim, uint vert, bool flatshade_first)
    return (provoking || even) ? vert : ((3 - pv) - vert);
 }
 
-uint64_t
-libagx_xfb_vertex_address(global struct agx_geometry_params *p, uint base_index,
-                          uint vert, uint buffer, uint stride,
-                          uint output_offset)
+static inline uint
+xfb_prim(uint id, uint n, uint copy)
 {
-   uint index = base_index + vert;
+   return sub_sat(id, n - 1u) + copy;
+}
+
+/*
+ * Determine whether an output vertex has an n'th copy in the transform feedback
+ * buffer. This is written weirdly to let constant folding remove unnecessary
+ * stores when length is known statically.
+ */
+bool
+libagx_xfb_vertex_copy_in_strip(uint n, uint id, uint length, uint copy)
+{
+   uint prim = xfb_prim(id, n, copy);
+
+   int num_prims = length - (n - 1);
+   return copy == 0 || (prim < num_prims && id >= copy && copy < num_prims);
+}
+
+uint
+libagx_xfb_vertex_offset(uint n, uint invocation_base_prim,
+                         uint strip_base_prim, uint id_in_strip, uint copy,
+                         bool flatshade_first)
+{
+   uint prim = xfb_prim(id_in_strip, n, copy);
+   uint vert_0 = min(id_in_strip, n - 1);
+   uint vert = vert_0 - copy;
+
+   if (n == 3) {
+      vert = libagx_map_vertex_in_tri_strip(prim, vert, flatshade_first);
+   }
+
+   /* Tally up in the whole buffer */
+   uint base_prim = invocation_base_prim + strip_base_prim;
+   uint base_vertex = base_prim * n;
+   return base_vertex + (prim * n) + vert;
+}
+
+uint64_t
+libagx_xfb_vertex_address(constant struct agx_geometry_params *p, uint index,
+                          uint buffer, uint stride, uint output_offset)
+{
    uint xfb_offset = (index * stride) + output_offset;
 
    return (uintptr_t)(p->xfb_base[buffer]) + xfb_offset;
@@ -330,16 +372,30 @@ increment_counters(global uint32_t *a, global uint32_t *b, global uint32_t *c,
    }
 }
 
+static unsigned
+decomposed_prims_for_vertices_with_tess(enum mesa_prim prim, int vertices,
+                                        unsigned verts_per_patch)
+{
+   if (prim >= MESA_PRIM_PATCHES) {
+      return vertices / verts_per_patch;
+   } else {
+      return u_decomposed_prims_for_vertices(prim, vertices);
+   }
+}
+
 KERNEL(1)
 libagx_increment_ia(global uint32_t *ia_vertices,
                     global uint32_t *ia_primitives,
                     global uint32_t *vs_invocations, global uint32_t *c_prims,
                     global uint32_t *c_invs, constant uint32_t *draw,
-                    enum mesa_prim prim)
+                    enum mesa_prim prim, unsigned verts_per_patch)
 {
    increment_counters(ia_vertices, vs_invocations, NULL, draw[0] * draw[1]);
 
-   uint prims = u_decomposed_prims_for_vertices(prim, draw[0]) * draw[1];
+   uint prims =
+      decomposed_prims_for_vertices_with_tess(prim, draw[0], verts_per_patch) *
+      draw[1];
+
    increment_counters(ia_primitives, c_prims, c_invs, prims);
 }
 
@@ -351,7 +407,7 @@ libagx_increment_ia_restart(global uint32_t *ia_vertices,
                             constant uint32_t *draw, uint64_t index_buffer,
                             uint32_t index_buffer_range_el,
                             uint32_t restart_index, uint32_t index_size_B,
-                            enum mesa_prim prim)
+                            enum mesa_prim prim, unsigned verts_per_patch)
 {
    uint tid = cl_global_id.x;
    unsigned count = draw[0];
@@ -389,15 +445,15 @@ libagx_increment_ia_restart(global uint32_t *ia_vertices,
                                  index_size_B);
 
          if (index == restart_index) {
-            accum +=
-               u_decomposed_prims_for_vertices(prim, i - last_restart - 1);
+            accum += decomposed_prims_for_vertices_with_tess(
+               prim, i - last_restart - 1, verts_per_patch);
             last_restart = i;
          }
       }
 
       {
-         accum +=
-            u_decomposed_prims_for_vertices(prim, count - last_restart - 1);
+         accum += decomposed_prims_for_vertices_with_tess(
+            prim, count - last_restart - 1, verts_per_patch);
       }
 
       increment_counters(ia_primitives, c_prims, c_invs, accum * draw[1]);
@@ -427,9 +483,8 @@ first_true_thread_in_workgroup(bool cond, local uint *scratch)
  * sets up most of the new draw descriptor.
  */
 static global void *
-setup_unroll_for_draw(global struct agx_geometry_state *heap,
-                      constant uint *in_draw, global uint *out,
-                      enum mesa_prim mode, uint index_size_B)
+setup_unroll_for_draw(global struct agx_heap *heap, constant uint *in_draw,
+                      global uint *out, enum mesa_prim mode, uint index_size_B)
 {
    /* Determine an upper bound on the memory required for the index buffer.
     * Restarts only decrease the unrolled index buffer size, so the maximum size
@@ -444,8 +499,7 @@ setup_unroll_for_draw(global struct agx_geometry_state *heap,
     * TODO: For multidraw, should be atomic. But multidraw+unroll isn't
     * currently wired up in any driver.
     */
-   uint old_heap_bottom_B = heap->heap_bottom;
-   heap->heap_bottom += align(alloc_size, 8);
+   uint old_heap_bottom_B = agx_heap_alloc_nonatomic_offs(heap, alloc_size);
 
    /* Setup most of the descriptor. Count will be determined after unroll. */
    out[1] = in_draw[1];                       /* instance count */
@@ -454,19 +508,17 @@ setup_unroll_for_draw(global struct agx_geometry_state *heap,
    out[4] = in_draw[4];                       /* base instance */
 
    /* Return the index buffer we allocated */
-   return (global uchar *)heap->heap + old_heap_bottom_B;
+   return (global uchar *)heap->base + old_heap_bottom_B;
 }
 
 KERNEL(1024)
-libagx_unroll_restart(global struct agx_geometry_state *heap,
-                      uint64_t index_buffer, constant uint *in_draw,
-                      global uint32_t *out_draw, uint64_t zero_sink,
+libagx_unroll_restart(global struct agx_heap *heap, uint64_t index_buffer,
+                      constant uint *in_draw, global uint32_t *out_draw,
                       uint32_t max_draws, uint32_t restart_index,
-                      uint32_t index_buffer_size_el,
-                      uint32_t index_size_log2__3, uint32_t flatshade_first,
-                      uint mode__11)
+                      uint32_t index_buffer_size_el, uint32_t index_size_log2,
+                      uint32_t flatshade_first, uint mode__11)
 {
-   uint32_t index_size_B = 1 << index_size_log2__3;
+   uint32_t index_size_B = 1 << index_size_log2;
    enum mesa_prim mode = libagx_uncompact_prim(mode__11);
    uint tid = cl_local_id.x;
    uint count = in_draw[0];
@@ -480,7 +532,7 @@ libagx_unroll_restart(global struct agx_geometry_state *heap,
    barrier(CLK_LOCAL_MEM_FENCE);
 
    uintptr_t in_ptr = (uintptr_t)(libagx_index_buffer(
-      index_buffer, index_buffer_size_el, in_draw[2], index_size_B, zero_sink));
+      index_buffer, index_buffer_size_el, in_draw[2], index_size_B));
 
    local uint scratch[32];
 
@@ -530,81 +582,48 @@ libagx_unroll_restart(global struct agx_geometry_state *heap,
 }
 
 uint
-libagx_setup_xfb_buffer(global struct agx_geometry_params *p, uint i)
+libagx_setup_xfb_buffer(global struct agx_geometry_params *p, uint i,
+                        uint stride, uint max_output_end,
+                        uint vertices_per_prim)
 {
-   global uint *off_ptr = p->xfb_offs_ptrs[i];
-   if (!off_ptr)
-      return 0;
+   uint xfb_offset = *(p->xfb_offs_ptrs[i]);
+   p->xfb_base[i] = p->xfb_base_original[i] + xfb_offset;
 
-   uint off = *off_ptr;
-   p->xfb_base[i] = p->xfb_base_original[i] + off;
-   return off;
-}
-
-/*
- * Translate EndPrimitive for LINE_STRIP or TRIANGLE_STRIP output prims into
- * writes into the 32-bit output index buffer. We write the sequence (b, b + 1,
- * b + 2, ..., b + n - 1, -1), where b (base) is the first vertex in the prim, n
- * (count) is the number of verts in the prims, and -1 is the prim restart index
- * used to signal the end of the prim.
- *
- * For points, we write index buffers without restart, just as a sideband to
- * pass data into the vertex shader.
- */
-void
-libagx_end_primitive(global int *index_buffer, uint total_verts,
-                     uint verts_in_prim, uint total_prims,
-                     uint invocation_vertex_base, uint invocation_prim_base,
-                     uint geometry_base, bool restart)
-{
-   /* Previous verts/prims are from previous invocations plus earlier
-    * prims in this invocation. For the intra-invocation counts, we
-    * subtract the count for this prim from the inclusive sum NIR gives us.
+   /* Let output_end = output_offset + output_size.
+    *
+    * Primitive P will write up to (but not including) offset:
+    *
+    *    xfb_offset + ((P - 1) * (verts_per_prim * stride))
+    *               + ((verts_per_prim - 1) * stride)
+    *               + output_end
+    *
+    * To fit all outputs for P, that value must be less than the XFB
+    * buffer size for the output with maximal output_end, as everything
+    * else is constant here across outputs within a buffer/primitive:
+    *
+    *    floor(P) <= (stride + size - xfb_offset - output_end)
+    *                 // (stride * verts_per_prim)
     */
-   uint previous_verts_in_invoc = (total_verts - verts_in_prim);
-   uint previous_verts = invocation_vertex_base + previous_verts_in_invoc;
-   uint previous_prims = restart ? invocation_prim_base + (total_prims - 1) : 0;
-
-   /* The indices are encoded as: (unrolled ID * output vertices) + vertex. */
-   uint index_base = geometry_base + previous_verts_in_invoc;
-
-   /* Index buffer contains 1 index for each vertex and 1 for each prim */
-   global int *out = &index_buffer[previous_verts + previous_prims];
-
-   /* Write out indices for the strip */
-   for (uint i = 0; i < verts_in_prim; ++i) {
-      out[i] = index_base + i;
-   }
-
-   if (restart)
-      out[verts_in_prim] = -1;
+   int numer_s = p->xfb_size[i] + (stride - max_output_end) - xfb_offset;
+   uint numer = max(numer_s, 0);
+   return numer / (stride * vertices_per_prim);
 }
 
 void
-libagx_build_gs_draw(global struct agx_geometry_params *p, uint vertices,
-                     uint primitives)
+libagx_write_strip(GLOBAL uint32_t *index_buffer, uint32_t inv_index_offset,
+                   uint32_t prim_index_offset, uint32_t vertex_offset,
+                   uint32_t verts_in_prim, uint3 info)
 {
-   global uint *descriptor = p->indirect_desc;
-   global struct agx_geometry_state *state = p->state;
+   _libagx_write_strip(index_buffer, inv_index_offset + prim_index_offset,
+                       vertex_offset, verts_in_prim, info.x, info.y, info.z);
+}
 
-   /* Setup the indirect draw descriptor */
-   uint indices = vertices + primitives; /* includes restart indices */
-
-   /* Allocate the index buffer */
-   uint index_buffer_offset_B = state->heap_bottom;
-   p->output_index_buffer =
-      (global uint *)(state->heap + index_buffer_offset_B);
-   state->heap_bottom += (indices * 4);
-
-   descriptor[0] = indices;                   /* count */
-   descriptor[1] = 1;                         /* instance count */
-   descriptor[2] = index_buffer_offset_B / 4; /* start */
-   descriptor[3] = 0;                         /* index bias */
-   descriptor[4] = 0;                         /* start instance */
-
-   if (state->heap_bottom > state->heap_size) {
-      global uint *foo = (global uint *)(uintptr_t)0xdeadbeef;
-      *foo = 0x1234;
+void
+libagx_pad_index_gs(global int *index_buffer, uint inv_index_offset,
+                    uint nr_indices, uint alloc)
+{
+   for (uint i = nr_indices; i < alloc; ++i) {
+      index_buffer[inv_index_offset + i] = -1;
    }
 }
 
@@ -613,11 +632,13 @@ libagx_gs_setup_indirect(
    uint64_t index_buffer, constant uint *draw,
    global uintptr_t *vertex_buffer /* output */,
    global struct agx_ia_state *ia /* output */,
-   global struct agx_geometry_params *p /* output */, uint64_t zero_sink,
+   global struct agx_geometry_params *p /* output */,
+   global struct agx_heap *heap,
    uint64_t vs_outputs /* Vertex (TES) output mask */,
    uint32_t index_size_B /* 0 if no index bffer */,
    uint32_t index_buffer_range_el,
-   uint32_t prim /* Input primitive type, enum mesa_prim */)
+   uint32_t prim /* Input primitive type, enum mesa_prim */,
+   int is_prefix_summing, uint max_indices, enum agx_gs_shape shape)
 {
    /* Determine the (primitives, instances) grid size. */
    uint vertex_count = draw[0];
@@ -645,31 +666,43 @@ libagx_gs_setup_indirect(
     */
    if (index_size_B) {
       ia->index_buffer = libagx_index_buffer(
-         index_buffer, index_buffer_range_el, draw[2], index_size_B, zero_sink);
+         index_buffer, index_buffer_range_el, draw[2], index_size_B);
 
       ia->index_buffer_range_el =
          libagx_index_buffer_range_el(index_buffer_range_el, draw[2]);
    }
 
    /* We need to allocate VS and GS count buffers, do so now */
-   global struct agx_geometry_state *state = p->state;
-
    uint vertex_buffer_size =
       libagx_tcs_in_size(vertex_count * instance_count, vs_outputs);
 
-   p->count_buffer = (global uint *)(state->heap + state->heap_bottom);
-   state->heap_bottom +=
-      align(p->input_primitives * p->count_buffer_stride, 16);
+   if (is_prefix_summing) {
+      p->count_buffer = agx_heap_alloc_nonatomic(
+         heap, p->input_primitives * p->count_buffer_stride);
+   }
 
-   p->input_buffer = (uintptr_t)(state->heap + state->heap_bottom);
+   p->input_buffer =
+      (uintptr_t)agx_heap_alloc_nonatomic(heap, vertex_buffer_size);
    *vertex_buffer = p->input_buffer;
-   state->heap_bottom += align(vertex_buffer_size, 4);
 
    p->input_mask = vs_outputs;
 
-   if (state->heap_bottom > state->heap_size) {
-      global uint *foo = (global uint *)(uintptr_t)0x1deadbeef;
-      *foo = 0x1234;
+   /* Allocate the index buffer and write the draw consuming it */
+   global VkDrawIndexedIndirectCommand *cmd = (global void *)p->indirect_desc;
+
+   *cmd = (VkDrawIndexedIndirectCommand){
+      .indexCount = agx_gs_rast_vertices(shape, max_indices, prim_per_instance,
+                                         instance_count),
+      .instanceCount = agx_gs_rast_instances(shape, max_indices,
+                                             prim_per_instance, instance_count),
+   };
+
+   if (shape == AGX_GS_SHAPE_DYNAMIC_INDEXED) {
+      cmd->firstIndex =
+         agx_heap_alloc_nonatomic_offs(heap, cmd->indexCount * 4) / 4;
+
+      p->output_index_buffer =
+         (global uint *)(heap->base + (cmd->firstIndex * 4));
    }
 }
 
@@ -752,7 +785,8 @@ libagx_prefix_sum_geom(constant struct agx_geometry_params *p)
 }
 
 KERNEL(1024)
-libagx_prefix_sum_tess(global struct libagx_tess_args *p)
+libagx_prefix_sum_tess(global struct libagx_tess_args *p, global uint *c_prims,
+                       global uint *c_invs, uint increment_stats__2)
 {
    _libagx_prefix_sum(p->counts, p->nr_patches, 1 /* words */, 0 /* word */);
 
@@ -764,16 +798,13 @@ libagx_prefix_sum_tess(global struct libagx_tess_args *p)
       return;
 
    /* The last element of an inclusive prefix sum is the total sum */
-   uint total = p->counts[p->nr_patches - 1];
+   uint total = p->nr_patches > 0 ? p->counts[p->nr_patches - 1] : 0;
 
    /* Allocate 4-byte indices */
    uint32_t elsize_B = sizeof(uint32_t);
    uint32_t size_B = total * elsize_B;
-   uint alloc_B = p->heap->heap_bottom;
-   p->heap->heap_bottom += size_B;
-   p->heap->heap_bottom = align(p->heap->heap_bottom, 8);
-
-   p->index_buffer = (global uint32_t *)(((uintptr_t)p->heap->heap) + alloc_B);
+   uint alloc_B = agx_heap_alloc_nonatomic_offs(p->heap, size_B);
+   p->index_buffer = (global uint32_t *)(((uintptr_t)p->heap->base) + alloc_B);
 
    /* ...and now we can generate the API indexed draw */
    global uint32_t *desc = p->out_draws;
@@ -783,6 +814,19 @@ libagx_prefix_sum_tess(global struct libagx_tess_args *p)
    desc[2] = alloc_B / elsize_B; /* start */
    desc[3] = 0;                  /* index_bias */
    desc[4] = 0;                  /* start_instance */
+
+   /* If necessary, increment clipper statistics too. This is only used when
+    * there's no geometry shader following us. See agx_nir_lower_gs.c for more
+    * info on the emulation. We just need to calculate the # of primitives
+    * tessellated.
+    */
+   if (increment_stats__2) {
+      uint prims = p->points_mode ? total
+                   : p->isolines  ? (total / 2)
+                                  : (total / 3);
+
+      increment_counters(c_prims, c_invs, NULL, prims);
+   }
 }
 
 uintptr_t
@@ -805,4 +849,128 @@ unsigned
 libagx_input_vertices(constant struct agx_ia_state *ia)
 {
    return ia->verts_per_instance;
+}
+
+global uint *
+libagx_load_xfb_count_address(constant struct agx_geometry_params *p, int index,
+                              int count_words, uint unrolled_id)
+{
+   return &p->count_buffer[(unrolled_id * count_words) + index];
+}
+
+uint
+libagx_previous_xfb_primitives(global struct agx_geometry_params *p,
+                               int static_count, int count_index,
+                               int count_words, bool prefix_sum,
+                               uint unrolled_id)
+{
+   if (static_count >= 0) {
+      /* If the number of outputted vertices per invocation is known statically,
+       * we can calculate the base.
+       */
+      return unrolled_id * static_count;
+   } else {
+      /* Otherwise, load from the count buffer buffer. Note that the sums are
+       * inclusive, so index 0 is nonzero. This requires a little fixup here. We
+       * use a saturating unsigned subtraction so we don't read out-of-bounds.
+       *
+       * If we didn't prefix sum, there's only one element.
+       */
+      uint prim_minus_1 = prefix_sum ? sub_sat(unrolled_id, 1u) : 0;
+      uint count = p->count_buffer[(prim_minus_1 * count_words) + count_index];
+
+      return unrolled_id == 0 ? 0 : count;
+   }
+}
+
+/* Like u_foreach_bit, specialized for XFB to enable loop unrolling */
+#define libagx_foreach_xfb(word, index)                                        \
+   for (uint i = 0; i < 4; ++i)                                                \
+      if (word & BITFIELD_BIT(i))
+
+void
+libagx_pre_gs(global struct agx_geometry_params *p, uint streams,
+              uint buffers_written, uint4 buffer_to_stream, int4 count_index,
+              uint4 stride, uint4 output_end, int4 static_count,
+              uint invocations, uint vertices_per_prim,
+              global uint *gs_invocations, global uint *gs_primitives,
+              global uint *c_primitives, global uint *c_invocations)
+{
+   unsigned count_words = !!(count_index[0] >= 0) + !!(count_index[1] >= 0) +
+                          !!(count_index[2] >= 0) + !!(count_index[3] >= 0);
+   bool prefix_sum = count_words && buffers_written;
+   uint unrolled_in_prims = p->input_primitives;
+
+   /* Determine the number of primitives generated in each stream */
+   uint4 in_prims = 0;
+   libagx_foreach_xfb(streams, i) {
+      in_prims[i] = libagx_previous_xfb_primitives(
+         p, static_count[i], count_index[i], count_words, prefix_sum,
+         unrolled_in_prims);
+
+      *(p->prims_generated_counter[i]) += in_prims[i];
+   }
+
+   uint4 prims = in_prims;
+   uint emitted_prims = prims[0] + prims[1] + prims[2] + prims[3];
+
+   if (buffers_written) {
+      libagx_foreach_xfb(buffers_written, i) {
+         uint max_prims = libagx_setup_xfb_buffer(
+            p, i, stride[i], output_end[i], vertices_per_prim);
+
+         unsigned stream = buffer_to_stream[i];
+         prims[stream] = min(prims[stream], max_prims);
+      }
+
+      int4 overflow = prims < in_prims;
+
+      libagx_foreach_xfb(streams, i) {
+         p->xfb_verts[i] = prims[i] * vertices_per_prim;
+
+         *(p->xfb_overflow[i]) += (bool)overflow[i];
+         *(p->xfb_prims_generated_counter[i]) += prims[i];
+      }
+
+      *(p->xfb_any_overflow) += any(overflow);
+
+      /* Update XFB counters */
+      libagx_foreach_xfb(buffers_written, i) {
+         uint32_t prim_stride_B = stride[i] * vertices_per_prim;
+         unsigned stream = buffer_to_stream[i];
+
+         global uint *ptr = p->xfb_offs_ptrs[i];
+         if ((uintptr_t)ptr == AGX_ZERO_PAGE_ADDRESS) {
+            ptr = (global uint *)AGX_SCRATCH_PAGE_ADDRESS;
+         }
+
+         *ptr += prims[stream] * prim_stride_B;
+      }
+   }
+
+   /* The geometry shader is invoked once per primitive (after unrolling
+    * primitive restart). From the spec:
+    *
+    *    In case of instanced geometry shaders (see section 11.3.4.2) the
+    *    geometry shader invocations count is incremented for each separate
+    *    instanced invocation.
+    */
+   *gs_invocations += unrolled_in_prims * invocations;
+   *gs_primitives += emitted_prims;
+
+   /* Clipper queries are not well-defined, so we can emulate them in lots of
+    * silly ways. We need the hardware counters to implement them properly. For
+    * now, just consider all primitives emitted as passing through the clipper.
+    * This satisfies spec text:
+    *
+    *    The number of primitives that reach the primitive clipping stage.
+    *
+    * and
+    *
+    *    If at least one vertex of the primitive lies inside the clipping
+    *    volume, the counter is incremented by one or more. Otherwise, the
+    *    counter is incremented by zero or more.
+    */
+   *c_primitives += emitted_prims;
+   *c_invocations += emitted_prims;
 }

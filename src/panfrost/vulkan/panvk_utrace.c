@@ -41,7 +41,7 @@ panvk_utrace_delete_buffer(struct u_trace_context *utctx, void *buffer)
 
 uint64_t
 panvk_utrace_read_ts(struct u_trace_context *utctx, void *timestamps,
-                     uint64_t offset_B, void *flush_data)
+                     uint64_t offset_B, uint32_t flags, void *flush_data)
 {
    struct panvk_device *dev = to_dev(utctx);
    const struct panvk_physical_device *pdev =
@@ -68,6 +68,14 @@ panvk_utrace_read_ts(struct u_trace_context *utctx, void *timestamps,
       ts = (ts * NSEC_PER_SEC) / props->timestamp_frequency;
 
    return ts;
+}
+
+const void *
+panvk_utrace_get_data(struct u_trace_context *utctx, void *buffer,
+                      uint64_t offset_B, uint32_t size_B)
+{
+   const struct panvk_priv_bo *bo = buffer;
+   return bo->addr.host + offset_B;
 }
 
 void

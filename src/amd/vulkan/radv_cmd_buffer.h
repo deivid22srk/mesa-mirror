@@ -77,7 +77,9 @@ enum radv_dynamic_state_bits {
    RADV_DYNAMIC_COLOR_ATTACHMENT_MAP = 1ull << 51,
    RADV_DYNAMIC_INPUT_ATTACHMENT_MAP = 1ull << 52,
    RADV_DYNAMIC_DEPTH_CLAMP_RANGE = 1ull << 53,
-   RADV_DYNAMIC_ALL = (1ull << 54) - 1,
+   RADV_DYNAMIC_VIEWPORT_WITH_COUNT = 1ull << 54,
+   RADV_DYNAMIC_SCISSOR_WITH_COUNT = 1ull << 55,
+   RADV_DYNAMIC_ALL = (1ull << 56) - 1,
 };
 
 enum radv_cmd_dirty_bits {
@@ -99,7 +101,10 @@ enum radv_cmd_dirty_bits {
    RADV_CMD_DIRTY_TASK_STATE = 1ull << 15,
    RADV_CMD_DIRTY_DEPTH_STENCIL_STATE = 1ull << 16,
    RADV_CMD_DIRTY_RASTER_STATE = 1ull << 17,
-   RADV_CMD_DIRTY_ALL = (1ull << 18) - 1,
+   RADV_CMD_DIRTY_MSAA_STATE = 1ull << 18,
+   RADV_CMD_DIRTY_CLIP_RECTS_STATE = 1ull << 19,
+   RADV_CMD_DIRTY_TESS_STATE = 1ull << 20,
+   RADV_CMD_DIRTY_ALL = (1ull << 21) - 1,
 
    RADV_CMD_DIRTY_SHADER_QUERY = RADV_CMD_DIRTY_NGG_STATE | RADV_CMD_DIRTY_TASK_STATE,
 };
@@ -206,8 +211,14 @@ struct radv_rendering_state {
    struct radv_attachment color_att[MAX_RTS];
    struct radv_attachment ds_att;
    VkImageAspectFlags ds_att_aspects;
+   bool has_hiz_his; /* GFX12+ */
    struct radv_attachment vrs_att;
    VkExtent2D vrs_texel_size;
+};
+
+struct radv_push_descriptor_set {
+   struct radv_descriptor_set_header set;
+   uint32_t capacity;
 };
 
 struct radv_descriptor_state {
@@ -275,6 +286,7 @@ enum radv_tracked_reg {
 
    RADV_TRACKED_PA_SC_BINNER_CNTL_0,
    RADV_TRACKED_PA_SC_SHADER_CONTROL,
+   RADV_TRACKED_PA_SC_HISZ_CONTROL = RADV_TRACKED_PA_SC_SHADER_CONTROL, /* GFX12 (slot reused) */
    RADV_TRACKED_PA_SC_LINE_CNTL,
    RADV_TRACKED_PA_SC_LINE_STIPPLE,
    RADV_TRACKED_PA_SC_LINE_STIPPLE_RESET, /* GFX12 */
@@ -328,6 +340,18 @@ enum radv_tracked_reg {
    RADV_TRACKED_PA_SU_LINE_CNTL,
    RADV_TRACKED_PA_SU_SC_MODE_CNTL,
 
+   /* 2 consecutive registers */
+   RADV_TRACKED_PA_SC_AA_MASK_X0Y0_X1Y0,
+
+   RADV_TRACKED_DB_EQAA,
+   RADV_TRACKED_DB_ALPHA_TO_MASK,
+   RADV_TRACKED_PA_SC_CONSERVATIVE_RASTERIZATION_CNTL, /* GFX9+ */
+   RADV_TRACKED_PA_SC_AA_CONFIG,
+   RADV_TRACKED_PA_SC_MODE_CNTL_0,
+   RADV_TRACKED_PA_SC_SAMPLE_PROPERTIES, /* GFX12+ */
+
+   RADV_TRACKED_DB_RENDER_OVERRIDE, /* GFX12+ */
+
    RADV_NUM_ALL_TRACKED_REGS,
 };
 
@@ -373,6 +397,10 @@ struct radv_cmd_state {
    uint64_t index_va;
    int32_t last_index_type;
 
+   /* Primitive restart */
+   int32_t last_primitive_restart_en;
+   uint32_t last_primitive_reset_index;
+
    enum radv_cmd_flush_bits flush_bits;
    unsigned active_occlusion_queries;
    bool perfect_occlusion_queries_enabled;
@@ -403,9 +431,12 @@ struct radv_cmd_state {
    /* Conditional rendering info. */
    uint8_t predication_op; /* 32-bit or 64-bit predicate value */
    int predication_type;   /* -1: disabled, 0: normal, 1: inverted */
-   uint64_t predication_va;
+   uint64_t user_predication_va;     /* User predication VA. */
+   uint64_t emulated_predication_va; /* Emulated VA if no 32-bit predication support. */
    uint64_t mec_inv_pred_va;  /* For inverted predication when using MEC. */
    bool mec_inv_pred_emitted; /* To ensure we don't have to repeat inverting the VA. */
+   bool saved_user_cond_render;
+   bool is_user_cond_render_suspended;
 
    /* Inheritance info. */
    VkQueryPipelineStatisticFlags inherited_pipeline_statistics;
@@ -478,6 +509,7 @@ struct radv_cmd_state {
    uint8_t vtx_emit_num;
    bool uses_drawid;
    bool uses_baseinstance;
+   bool can_use_simple_vertex_input;
 
    bool uses_out_of_order_rast;
    bool uses_vrs;
@@ -490,7 +522,7 @@ struct radv_cmd_state {
 };
 
 struct radv_enc_state {
-   uint32_t task_size_offset;
+   uint32_t *p_task_size;
    uint32_t total_task_size;
    unsigned shifter;
    unsigned bits_in_shifter;
@@ -501,7 +533,7 @@ struct radv_enc_state {
    bool emulation_prevention;
    bool is_even_frame;
    unsigned task_id;
-   uint32_t copy_start_offset;
+   uint32_t *copy_start;
 };
 
 struct radv_cmd_buffer_upload {
@@ -512,10 +544,21 @@ struct radv_cmd_buffer_upload {
    struct list_head list;
 };
 
+/* A pair of values for SET_*_REG_PAIRS. */
+struct gfx12_reg {
+   uint32_t reg_offset;
+   uint32_t reg_value;
+};
+
 struct radv_cmd_buffer {
    struct vk_command_buffer vk;
 
    struct radv_tracked_regs tracked_regs;
+
+   uint32_t num_buffered_sh_regs;
+   struct {
+      struct gfx12_reg buffered_sh_regs[64];
+   } gfx12;
 
    VkCommandBufferUsageFlags usage_flags;
    struct radeon_cmdbuf *cs;
@@ -544,8 +587,8 @@ struct radv_cmd_buffer {
    bool tess_rings_needed;
    bool task_rings_needed;
    bool mesh_scratch_ring_needed;
-   bool gds_needed;    /* for GFX10 streamout and NGG GS queries */
-   bool gds_oa_needed; /* for GFX10 streamout */
+   bool gds_needed;    /* Emulated queries on GFX10-GFX10.3 */
+   bool gds_oa_needed; /* NGG streamout on GFX11-GFX11.5 */
    bool sample_positions_needed;
 
    uint64_t gfx9_fence_va;
@@ -666,39 +709,6 @@ radv_get_num_pipeline_stat_queries(struct radv_cmd_buffer *cmd_buffer)
    /* SAMPLE_STREAMOUTSTATS also requires PIPELINESTAT_START to be enabled. */
    return cmd_buffer->state.active_pipeline_queries + cmd_buffer->state.active_prims_gen_queries +
           cmd_buffer->state.active_prims_xfb_queries;
-}
-
-static inline void
-radv_emit_shader_pointer_head(struct radeon_cmdbuf *cs, unsigned sh_offset, unsigned pointer_count,
-                              bool use_32bit_pointers)
-{
-   radeon_emit(cs, PKT3(PKT3_SET_SH_REG, pointer_count * (use_32bit_pointers ? 1 : 2), 0));
-   radeon_emit(cs, (sh_offset - SI_SH_REG_OFFSET) >> 2);
-}
-
-static inline void
-radv_emit_shader_pointer_body(const struct radv_device *device, struct radeon_cmdbuf *cs, uint64_t va,
-                              bool use_32bit_pointers)
-{
-   const struct radv_physical_device *pdev = radv_device_physical(device);
-
-   radeon_emit(cs, va);
-
-   if (use_32bit_pointers) {
-      assert(va == 0 || (va >> 32) == pdev->info.address32_hi);
-   } else {
-      radeon_emit(cs, va >> 32);
-   }
-}
-
-static inline void
-radv_emit_shader_pointer(const struct radv_device *device, struct radeon_cmdbuf *cs, uint32_t sh_offset, uint64_t va,
-                         bool global)
-{
-   bool use_32bit_pointers = !global;
-
-   radv_emit_shader_pointer_head(cs, sh_offset, 1, use_32bit_pointers);
-   radv_emit_shader_pointer_body(device, cs, va, use_32bit_pointers);
 }
 
 bool radv_cmd_buffer_uses_mec(struct radv_cmd_buffer *cmd_buffer);
@@ -831,5 +841,24 @@ void radv_emit_compute_shader(const struct radv_physical_device *pdev, struct ra
 
 void radv_upload_indirect_descriptor_sets(struct radv_cmd_buffer *cmd_buffer,
                                           struct radv_descriptor_state *descriptors_state);
+
+static inline void
+radv_suspend_conditional_rendering(struct radv_cmd_buffer *cmd_buffer)
+{
+   assert(!cmd_buffer->state.is_user_cond_render_suspended);
+
+   cmd_buffer->state.saved_user_cond_render = cmd_buffer->state.predicating;
+   cmd_buffer->state.predicating = false;
+   cmd_buffer->state.is_user_cond_render_suspended = true;
+}
+
+static inline void
+radv_resume_conditional_rendering(struct radv_cmd_buffer *cmd_buffer)
+{
+   assert(cmd_buffer->state.is_user_cond_render_suspended);
+
+   cmd_buffer->state.predicating = cmd_buffer->state.saved_user_cond_render;
+   cmd_buffer->state.is_user_cond_render_suspended = false;
+}
 
 #endif /* RADV_CMD_BUFFER_H */

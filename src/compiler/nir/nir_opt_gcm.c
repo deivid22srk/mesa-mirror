@@ -212,6 +212,7 @@ is_src_scalarizable(nir_src *src)
       case nir_intrinsic_load_global_constant:
       case nir_intrinsic_load_input:
       case nir_intrinsic_load_per_primitive_input:
+      case nir_intrinsic_load_ssbo_intel:
          return true;
       default:
          break;
@@ -262,6 +263,7 @@ pin_intrinsic(nir_intrinsic_instr *intrin)
    if (!non_uniform &&
        (intrin->intrinsic == nir_intrinsic_load_ubo ||
         intrin->intrinsic == nir_intrinsic_load_ssbo ||
+        intrin->intrinsic == nir_intrinsic_load_ssbo_intel ||
         intrin->intrinsic == nir_intrinsic_get_ubo_size ||
         intrin->intrinsic == nir_intrinsic_get_ssbo_size ||
         nir_intrinsic_has_image_dim(intrin) ||
@@ -858,10 +860,10 @@ opt_gcm_impl(nir_shader *shader, nir_function_impl *impl, bool value_number)
    ralloc_free(state.instr_infos);
 
    if (state.progress) {
-      nir_metadata_preserve(impl, nir_metadata_control_flow);
+      nir_progress(true, impl, nir_metadata_control_flow);
    } else {
-      nir_metadata_preserve(impl, nir_metadata_control_flow |
-                                     nir_metadata_loop_analysis);
+      nir_progress(true, impl,
+                   nir_metadata_control_flow | nir_metadata_loop_analysis);
    }
 
    return state.progress;

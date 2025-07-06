@@ -40,7 +40,7 @@ brw_emit_gs_thread_end(brw_shader &s)
       s.emit_gs_control_data_bits(s.final_gs_vertex_count);
    }
 
-   const brw_builder abld = brw_builder(&s).at_end().annotate("thread end");
+   const brw_builder abld = brw_builder(&s).annotate("thread end");
    brw_inst *inst;
 
    if (gs_prog_data->static_vertex_count != -1) {
@@ -90,7 +90,7 @@ run_gs(brw_shader &s)
 
    s.payload_ = new brw_gs_thread_payload(s);
 
-   const brw_builder bld = brw_builder(&s).at_end();
+   const brw_builder bld = brw_builder(&s);
 
    s.final_gs_vertex_count = bld.vgrf(BRW_TYPE_UD);
 
@@ -123,7 +123,6 @@ run_gs(brw_shader &s)
    brw_assign_gs_urb_setup(s);
 
    brw_lower_3src_null_dest(s);
-   brw_workaround_memory_fence_before_eot(s);
    brw_workaround_emit_dummy_mov_instruction(s);
 
    brw_allocate_registers(s, true /* allow_spilling */);
@@ -147,11 +146,9 @@ brw_compile_gs(const struct brw_compiler *compiler,
    unsigned control_data_bits_per_vertex = 0;
    unsigned control_data_header_size_bits = 0;
 
-   const bool debug_enabled = brw_should_print_shader(nir, DEBUG_GS);
+   const bool debug_enabled = brw_should_print_shader(nir, DEBUG_GS, params->base.source_hash);
 
-   prog_data->base.base.stage = MESA_SHADER_GEOMETRY;
-   prog_data->base.base.ray_queries = nir->info.ray_queries;
-   prog_data->base.base.total_scratch = 0;
+   brw_prog_data_init(&prog_data->base.base, &params->base);
 
    /* The GLSL linker will have already matched up GS inputs and the outputs
     * of prior stages.  The driver does extend VS outputs in some cases, but
@@ -164,7 +161,7 @@ brw_compile_gs(const struct brw_compiler *compiler,
    GLbitfield64 inputs_read = nir->info.inputs_read;
    brw_compute_vue_map(compiler->devinfo,
                        &input_vue_map, inputs_read,
-                       nir->info.separate_shader, 1);
+                       key->base.vue_layout, 1);
 
    brw_nir_apply_key(nir, compiler, &key->base, dispatch_width);
    brw_nir_lower_vue_inputs(nir, &input_vue_map);
@@ -382,4 +379,3 @@ brw_compile_gs(const struct brw_compiler *compiler,
 
    return NULL;
 }
-

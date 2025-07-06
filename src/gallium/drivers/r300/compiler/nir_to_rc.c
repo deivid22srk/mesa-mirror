@@ -244,7 +244,7 @@ ntr_tgsi_var_usage_mask(const struct nir_variable *var)
    if (num_components == 0) /* structs */
       num_components = 4;
 
-   return u_bit_consecutive(var->data.location_frac, num_components);
+   return BITFIELD_RANGE(var->data.location_frac, num_components);
 }
 
 static struct ureg_dst
@@ -277,7 +277,7 @@ ntr_output_decl(struct ntr_compile *c, nir_intrinsic_instr *instr, uint32_t *fra
 
       tgsi_get_gl_varying_semantic(semantics.location, true, &semantic_name, &semantic_index);
 
-      uint32_t usage_mask = u_bit_consecutive(*frac, instr->num_components);
+      uint32_t usage_mask = BITFIELD_RANGE(*frac, instr->num_components);
       uint32_t gs_streams = semantics.gs_streams;
       for (int i = 0; i < 4; i++) {
          if (!(usage_mask & (1 << i)))
@@ -287,13 +287,8 @@ ntr_output_decl(struct ntr_compile *c, nir_intrinsic_instr *instr, uint32_t *fra
       /* No driver appears to use array_id of outputs. */
       unsigned array_id = 0;
 
-      /* This bit is lost in the i/o semantics, but it's unused in in-tree
-       * drivers.
-       */
-      bool invariant = semantics.invariant;
-
       out = ureg_DECL_output_layout(c->ureg, semantic_name, semantic_index, gs_streams, base,
-                                    usage_mask, array_id, semantics.num_slots, invariant);
+                                    usage_mask, array_id, semantics.num_slots, false);
    }
 
    unsigned write_mask;
@@ -1850,17 +1845,12 @@ nir_to_rc_lower_tex_instr_arg(nir_builder *b, nir_tex_instr *instr, nir_tex_src_
  * manage it on our own, and may lead to more vectorization.
  */
 static bool
-nir_to_rc_lower_tex_instr(nir_builder *b, nir_instr *instr, void *data)
+nir_to_rc_lower_tex_instr(nir_builder *b, nir_tex_instr *tex, void *data)
 {
-   if (instr->type != nir_instr_type_tex)
-      return false;
-
-   nir_tex_instr *tex = nir_instr_as_tex(instr);
-
    if (nir_tex_instr_src_index(tex, nir_tex_src_coord) < 0)
       return false;
 
-   b->cursor = nir_before_instr(instr);
+   b->cursor = nir_before_instr(&tex->instr);
 
    struct ntr_lower_tex_state s = {0};
 
@@ -1902,8 +1892,8 @@ nir_to_rc_lower_tex_instr(nir_builder *b, nir_instr *instr, void *data)
 static bool
 nir_to_rc_lower_tex(nir_shader *s)
 {
-   return nir_shader_instructions_pass(s, nir_to_rc_lower_tex_instr, nir_metadata_control_flow,
-                                       NULL);
+   return nir_shader_tex_pass(s, nir_to_rc_lower_tex_instr,
+                              nir_metadata_control_flow, NULL);
 }
 
 /* Lowers texture projectors if we can't do them as TGSI_OPCODE_TXP. */
@@ -1944,7 +1934,31 @@ nir_to_rc_lower_txp(nir_shader *s)
    /* nir_lower_tex must be run even if no options are set, because we need the
     * LOD to be set for query_levels and for non-fragment shaders.
     */
-   NIR_PASS_V(s, nir_lower_tex, &lower_tex_options);
+   NIR_PASS(_, s, nir_lower_tex, &lower_tex_options);
+}
+
+/* There are some issues with the tgsi_texcoord = false support in the state
+ * tracker, specifically we are still getting texcoords and pointcoord in some cases
+ * and ocassionally (with fixed function shaders) there are some inconsistencies
+ * like vs using generics and fs using texcoords. This function tries to fix it.
+ * See https://gitlab.freedesktop.org/mesa/mesa/-/issues/12749 for more details.
+ */
+static void
+ntr_fixup_varying_slots(nir_shader *s, nir_variable_mode mode)
+{
+   if (s->info.name && !strcmp(s->info.name, "st/drawtex VS"))
+      return;
+
+   nir_foreach_variable_with_modes (var, s, mode) {
+      if (var->data.location >= VARYING_SLOT_VAR0 && var->data.location < VARYING_SLOT_PATCH0) {
+         var->data.location += 9;
+      } else if (var->data.location == VARYING_SLOT_PNTC) {
+         var->data.location = VARYING_SLOT_VAR8;
+      } else if ((var->data.location >= VARYING_SLOT_TEX0) &&
+                 (var->data.location <= VARYING_SLOT_TEX7)) {
+         var->data.location += VARYING_SLOT_VAR0 - VARYING_SLOT_TEX0;
+      }
+   }
 }
 
 /**
@@ -1965,9 +1979,11 @@ nir_to_rc(struct nir_shader *s, struct pipe_screen *screen,
    c->screen = screen;
    c->lower_fabs = !is_r500 && s->info.stage == MESA_SHADER_VERTEX;
 
+   ntr_fixup_varying_slots(s, s->info.stage == MESA_SHADER_FRAGMENT ? nir_var_shader_in : nir_var_shader_out);
+
    if (s->info.stage == MESA_SHADER_FRAGMENT) {
       if (is_r500) {
-         NIR_PASS_V(s, r300_transform_fs_trig_input);
+         NIR_PASS(_, s, r300_transform_fs_trig_input);
       }
    } else if (r300_screen(screen)->caps.has_tcl) {
       if (is_r500) {
@@ -1976,11 +1992,11 @@ nir_to_rc(struct nir_shader *s, struct pipe_screen *screen,
           * the proper range for the trigonometric inputs.
           */
          if (!s->info.use_legacy_math_rules || !(s->info.name && !strcmp("TTN", s->info.name))) {
-            NIR_PASS_V(s, r300_transform_vs_trig_input);
+            NIR_PASS(_, s, r300_transform_vs_trig_input);
          }
       } else {
          if (r300_screen(screen)->caps.is_r400) {
-            NIR_PASS_V(s, r300_transform_vs_trig_input);
+            NIR_PASS(_, s, r300_transform_vs_trig_input);
          }
       }
    }
@@ -1995,12 +2011,12 @@ nir_to_rc(struct nir_shader *s, struct pipe_screen *screen,
     * having matching declarations.
     */
    if (s->info.stage == MESA_SHADER_FRAGMENT) {
-      NIR_PASS_V(s, nir_lower_indirect_derefs, nir_var_shader_in, UINT32_MAX);
-      NIR_PASS_V(s, nir_remove_dead_variables, nir_var_shader_in, NULL);
+      NIR_PASS(_, s, nir_lower_indirect_derefs, nir_var_shader_in, UINT32_MAX);
+      NIR_PASS(_, s, nir_remove_dead_variables, nir_var_shader_in, NULL);
    }
 
-   NIR_PASS_V(s, nir_lower_io, nir_var_shader_in | nir_var_shader_out, type_size,
-              nir_lower_io_use_interpolated_input_intrinsics);
+   NIR_PASS(_, s, nir_lower_io, nir_var_shader_in | nir_var_shader_out, type_size,
+            nir_lower_io_use_interpolated_input_intrinsics);
 
    if (s->info.stage == MESA_SHADER_FRAGMENT) {
       /* Shadow lowering. */
@@ -2016,12 +2032,12 @@ nir_to_rc(struct nir_shader *s, struct pipe_screen *screen,
             tex_swizzle[i].swizzle_b = GET_SWZ(state.unit[i].texture_swizzle, 2);
             tex_swizzle[i].swizzle_a = GET_SWZ(state.unit[i].texture_swizzle, 3);
          }
-         NIR_PASS_V(s, nir_lower_tex_shadow, num_texture_states, tex_compare_func,
-                    tex_swizzle, true);
+         NIR_PASS(_, s, nir_lower_tex_shadow, num_texture_states, tex_compare_func,
+                  tex_swizzle, true);
       }
 
       nir_to_rc_lower_txp(s);
-      NIR_PASS_V(s, nir_to_rc_lower_tex);
+      NIR_PASS(_, s, nir_to_rc_lower_tex);
    }
 
    bool progress;
@@ -2035,63 +2051,64 @@ nir_to_rc(struct nir_shader *s, struct pipe_screen *screen,
       progress = false;
       NIR_PASS(progress, s, nir_opt_algebraic_late);
       if (progress) {
-         NIR_PASS_V(s, nir_copy_prop);
-         NIR_PASS_V(s, nir_opt_dce);
-         NIR_PASS_V(s, nir_opt_cse);
+         NIR_PASS(_, s, nir_copy_prop);
+         NIR_PASS(_, s, nir_opt_dce);
+         NIR_PASS(_, s, nir_opt_cse);
       }
    } while (progress);
 
    if (s->info.stage == MESA_SHADER_FRAGMENT) {
-      NIR_PASS_V(s, r300_nir_prepare_presubtract);
+      NIR_PASS(_, s, r300_nir_prepare_presubtract);
    }
 
-   NIR_PASS_V(s, nir_lower_int_to_float);
-   NIR_PASS_V(s, nir_copy_prop);
-   NIR_PASS_V(s, r300_nir_post_integer_lowering);
-   NIR_PASS_V(s, nir_lower_bool_to_float, is_r500 || s->info.stage == MESA_SHADER_FRAGMENT);
+   NIR_PASS(_, s, nir_lower_int_to_float);
+   NIR_PASS(_, s, nir_copy_prop);
+   NIR_PASS(_, s, r300_nir_post_integer_lowering);
+   NIR_PASS(_, s, nir_lower_bool_to_float,
+            is_r500 || s->info.stage == MESA_SHADER_FRAGMENT);
    /* bool_to_float generates MOVs for b2f32 that we want to clean up. */
-   NIR_PASS_V(s, nir_copy_prop);
+   NIR_PASS(_, s, nir_copy_prop);
    /* CSE cleanup after late ftrunc lowering. */
-   NIR_PASS_V(s, nir_opt_cse);
+   NIR_PASS(_, s, nir_opt_cse);
    /* At this point we need to clean;
     *  a) fcsel_gt that come from the ftrunc lowering on R300,
     *  b) all flavours of fcsels that read three different temp sources on R500.
     */
    if (s->info.stage == MESA_SHADER_VERTEX) {
       if (is_r500)
-         NIR_PASS_V(s, r300_nir_lower_fcsel_r500);
+         NIR_PASS(_, s, r300_nir_lower_fcsel_r500);
       else
-         NIR_PASS_V(s, r300_nir_lower_fcsel_r300);
-      NIR_PASS_V(s, r300_nir_lower_flrp);
+         NIR_PASS(_, s, r300_nir_lower_fcsel_r300);
+      NIR_PASS(_, s, r300_nir_lower_flrp);
    } else {
-      NIR_PASS_V(s, r300_nir_lower_comparison_fs);
+      NIR_PASS(_, s, r300_nir_lower_comparison_fs);
    }
-   NIR_PASS_V(s, r300_nir_opt_algebraic_late);
-   NIR_PASS_V(s, nir_opt_dce);
-   NIR_PASS_V(s, nir_opt_shrink_vectors, false);
-   NIR_PASS_V(s, nir_opt_dce);
+   NIR_PASS(_, s, r300_nir_opt_algebraic_late);
+   NIR_PASS(_, s, nir_opt_dce);
+   NIR_PASS(_, s, nir_opt_shrink_vectors, false);
+   NIR_PASS(_, s, nir_opt_dce);
 
    nir_move_options move_all = nir_move_const_undef | nir_move_load_ubo | nir_move_load_input |
                                nir_move_comparisons | nir_move_copies | nir_move_load_ssbo;
 
-   NIR_PASS_V(s, nir_opt_move, move_all);
-   NIR_PASS_V(s, nir_move_vec_src_uses_to_dest, true);
+   NIR_PASS(_, s, nir_opt_move, move_all);
+   NIR_PASS(_, s, nir_move_vec_src_uses_to_dest, true);
    /* Late vectorizing after nir_move_vec_src_uses_to_dest helps instructions but
     * increases register usage. Testing shows this is beneficial only in VS.
     */
    if (s->info.stage == MESA_SHADER_VERTEX)
-      NIR_PASS_V(s, nir_opt_vectorize, ntr_should_vectorize_instr, NULL);
+      NIR_PASS(_, s, nir_opt_vectorize, ntr_should_vectorize_instr, NULL);
 
-   NIR_PASS_V(s, nir_convert_from_ssa, true, false);
-   NIR_PASS_V(s, nir_lower_vec_to_regs, NULL, NULL);
+   NIR_PASS(_, s, nir_convert_from_ssa, true, false);
+   NIR_PASS(_, s, nir_lower_vec_to_regs, NULL, NULL);
 
    /* locals_to_reg_intrinsics will leave dead derefs that are good to clean up.
     */
-   NIR_PASS_V(s, nir_lower_locals_to_regs, 32);
-   NIR_PASS_V(s, nir_opt_dce);
+   NIR_PASS(_, s, nir_lower_locals_to_regs, 32);
+   NIR_PASS(_, s, nir_opt_dce);
 
    /* See comment in ntr_get_alu_src for supported modifiers */
-   NIR_PASS_V(s, nir_legacy_trivialize, !c->lower_fabs);
+   NIR_PASS(_, s, nir_legacy_trivialize, !c->lower_fabs);
 
    if (NIR_DEBUG(TGSI)) {
       fprintf(stderr, "NIR before translation to TGSI:\n");

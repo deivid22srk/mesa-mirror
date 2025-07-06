@@ -73,6 +73,13 @@ can_use_two_fau_indices(enum bi_opcode op)
 }
 
 static bool
+can_run_on_message_unit(enum bi_opcode op)
+{
+   return bi_opcode_props[op].message != BIFROST_MESSAGE_NONE ||
+          op == BI_OPCODE_ATEST || op == BI_OPCODE_BLEND;
+}
+
+static bool
 fau_is_special(enum bir_fau fau)
 {
    return !(fau & (BIR_FAU_UNIFORM | BIR_FAU_IMMEDIATE));
@@ -114,6 +121,12 @@ fau_state_special(struct fau_state *fau, bi_index idx, enum bi_opcode op)
          return false;
    }
 
+   /* Instructions executed by the messaging unit should not encode WARP_ID or
+    * anything from special page 3. */
+   if (can_run_on_message_unit(op) &&
+       (va_fau_page(idx.value) == 3 || idx.value == BIR_FAU_WARP_ID))
+      return false;
+
    return fau->uniform_slot == -1 || can_use_two_fau_indices(op);
 }
 
@@ -123,6 +136,15 @@ valid_src(struct fau_state *fau, unsigned fau_page, bi_index src,
 {
    if (src.type != BI_INDEX_FAU)
       return true;
+
+   if (src.value & BIR_FAU_IMMEDIATE) {
+      /* There are no small constant restrictions in message instructions */
+      if (can_use_two_fau_indices(op))
+         return true;
+      /* Otherwise we just need to ensure that we don't access more than a
+       * total of 64 bits of distinct FAU+small constant values */
+      return fau_state_buffer(fau, src);
+   }
 
    bool valid = (fau_page == va_fau_page(src.value));
    valid &= fau_state_buffer(fau, src);

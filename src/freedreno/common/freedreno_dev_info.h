@@ -9,6 +9,7 @@
 
 #include <assert.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -49,6 +50,18 @@ struct fd_dev_info {
    uint32_t threadsize_base;
 
    uint32_t max_waves;
+
+   /* Local Memory (i.e. shared memory in GL/Vulkan) and compute shader
+    * const registers, as well as other things not relevant here, share the
+    * same storage space, called the Local Buffer or LB. This is the size of
+    * the part of the LB used for consts and LM. Consts are duplicated
+    * wavesize_granularity times, and the size of duplicated consts + local
+    * memory must not exceed it. If it is left 0, assume that it is
+    * compute constlen + wavesize_granularity * cs_shared_mem_size, which is
+    * enough to hold both the maximum possible compute consts and local
+    * memory at the same time.
+    */
+   uint32_t compute_lb_size;
 
    /* number of CCU is always equal to the number of SP */
    union {
@@ -121,6 +134,8 @@ struct fd_dev_info {
       bool has_lpac;
 
       bool has_getfiberid;
+      bool mov_half_shared_quirk;
+      bool has_movs;
 
       bool has_dp2acc;
       bool has_dp4acc;
@@ -159,7 +174,7 @@ struct fd_dev_info {
       /* see enum a6xx_ccu_cache_size */
       uint32_t gmem_ccu_color_cache_fraction;
 
-      /* Corresponds to HLSQ_CONTROL_1_REG::PRIMALLOCTHRESHOLD */
+      /* Corresponds to SP_LB_PARAM_LIMIT::PRIMALLOCTHRESHOLD */
       uint32_t prim_alloc_threshold;
 
       uint32_t vs_max_inputs_count;
@@ -206,6 +221,9 @@ struct fd_dev_info {
       /* Whether the sad instruction (iadd3) is supported. */
       bool has_sad;
 
+      /* A702 cuts A LOT of things.. */
+      bool is_a702;
+
       struct {
          uint32_t PC_POWER_CNTL;
          uint32_t TPL1_DBG_ECO_CNTL;
@@ -221,7 +239,7 @@ struct fd_dev_info {
          uint32_t VPC_DBG_ECO_CNTL;
          uint32_t UCHE_UNKNOWN_0E12;
 
-         uint32_t RB_UNKNOWN_8E06;
+         uint32_t RB_CCU_DBG_ECO_CNTL;
       } magic;
 
       struct {
@@ -262,11 +280,11 @@ struct fd_dev_info {
       uint32_t sysmem_vpc_attr_buf_size;
       uint32_t gmem_vpc_attr_buf_size;
 
-      /* Whether UBWC is supported on all IBOs. Prior to this, only readonly
-       * or writeonly IBOs could use UBWC and mixing reads and writes was not
+      /* Whether UBWC is supported on all UAVs. Prior to this, only readonly
+       * or writeonly UAVs could use UBWC and mixing reads and writes was not
        * permitted.
        */
-      bool supports_ibo_ubwc;
+      bool supports_uav_ubwc;
 
       /* Whether the UBWC fast-clear values for snorn, unorm, and int formats
        * are the same. This is the case from a740 onwards. These formats were
@@ -311,7 +329,7 @@ struct fd_dev_info {
       /* Whether r8g8 UBWC fast-clear work correctly. */
       bool r8g8_faulty_fast_clear_quirk;
 
-      /* a750 has a bug where writing and then reading a UBWC-compressed IBO
+      /* a750 has a bug where writing and then reading a UBWC-compressed UAV
        * requires flushing UCHE. This is reproducible in many CTS tests, for
        * example dEQP-VK.image.load_store.with_format.2d.*.
        */
@@ -321,9 +339,6 @@ struct fd_dev_info {
        * on every suspend/resume.
        */
       bool has_persistent_counter;
-
-      /* Whether only 256 vec4 constants are available for compute */
-      bool compute_constlen_quirk;
 
       bool has_primitive_shading_rate;
 
@@ -349,6 +364,9 @@ struct fd_dev_info {
 
       /* Whether CP_SET_BIN_DATA5::ABS_MASK exists */
       bool has_abs_bin_mask;
+
+      /* On a750 the control register layout is rearranged. */
+      bool new_control_regs;
    } a7xx;
 };
 
@@ -378,6 +396,14 @@ fd_dev_gpu_id(const struct fd_dev_id *id)
 
 /* Unmodified dev info as defined in freedreno_devices.py */
 const struct fd_dev_info *fd_dev_info_raw(const struct fd_dev_id *id);
+
+/* Helper to check if GPU is known before going any further */
+static inline uint8_t
+fd_dev_is_supported(const struct fd_dev_id *id) {
+   assert(id);
+   assert(id->gpu_id || id->chip_id);
+   return fd_dev_info_raw(id) != NULL;
+}
 
 /* Final dev info with dbg options and everything else applied.  */
 const struct fd_dev_info fd_dev_info(const struct fd_dev_id *id);

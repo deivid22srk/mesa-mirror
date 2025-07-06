@@ -55,6 +55,25 @@ get_temp_registers(Instruction* instr)
    return demand_after;
 }
 
+RegisterDemand get_temp_reg_changes(Instruction* instr)
+{
+   RegisterDemand available_def_space;
+
+   for (Definition def : instr->definitions) {
+      if (def.isTemp())
+         available_def_space += def.getTemp();
+   }
+
+   for (Operand op : instr->operands) {
+      if (op.isFirstKillBeforeDef() || op.isCopyKill())
+         available_def_space -= op.getTemp();
+      else if (op.isClobbered() && !op.isKill())
+         available_def_space -= op.getTemp();
+   }
+
+   return available_def_space;
+}
+
 namespace {
 
 struct live_ctx {
@@ -194,6 +213,28 @@ process_live_temps_per_block(live_ctx& ctx, Block* block)
          }
       }
 
+      /* we need to do this in a separate loop because the next one can
+       * setKill() for several operands at once and we don't want to
+       * overwrite that in a later iteration */
+      bool is_vector_op = false;
+      for (Operand& op : insn->operands) {
+         op.setKill(false);
+         /* Linear vgprs must be late kill: this is to ensure linear VGPR operands and
+          * normal VGPR definitions don't try to use the same register, which is problematic
+          * because of assignment restrictions.
+          */
+         bool lateKill =
+            op.hasRegClass() && op.regClass().is_linear_vgpr() && !op.isUndefined() && has_vgpr_def;
+
+         /* If this Operand is part of a vector which is only partially killed by the instruction,
+          * a definition might not fit into the gaps that get created. Mitigate by using lateKill.
+          */
+         // TODO: is it beneficial to skip that if the vector is fully killed?
+         lateKill |= is_vector_op || op.isVectorAligned();
+         op.setLateKill(lateKill);
+         is_vector_op = op.isVectorAligned();
+      }
+
       if (ctx.program->gfx_level >= GFX10 && insn->isVALU() &&
           insn->definitions.back().regClass() == s2) {
          /* RDNA2 ISA doc, 6.2.4. Wave64 Destination Restrictions:
@@ -226,26 +267,19 @@ process_live_temps_per_block(live_ctx& ctx, Block* block)
       }
 
       /* Check if a definition clobbers some operand */
-      int op_idx = get_op_fixed_to_def(insn);
-      if (op_idx != -1)
+      RegisterDemand operand_demand;
+      auto tied_defs = get_tied_defs(insn);
+      for (auto op_idx : tied_defs) {
+         Temp tmp = insn->operands[op_idx].getTemp();
+         if (std::any_of(tied_defs.begin(), tied_defs.end(), [&](uint32_t i)
+                         { return i < op_idx && insn->operands[i].getTemp() == tmp; })) {
+            operand_demand += tmp;
+            insn->operands[op_idx].setCopyKill(true);
+         }
          insn->operands[op_idx].setClobbered(true);
-
-      /* we need to do this in a separate loop because the next one can
-       * setKill() for several operands at once and we don't want to
-       * overwrite that in a later iteration */
-      for (Operand& op : insn->operands) {
-         op.setKill(false);
-         /* Linear vgprs must be late kill: this is to ensure linear VGPR operands and
-          * normal VGPR definitions don't try to use the same register, which is problematic
-          * because of assignment restrictions.
-          */
-         if (op.hasRegClass() && op.regClass().is_linear_vgpr() && !op.isUndefined() &&
-             has_vgpr_def)
-            op.setLateKill(true);
       }
 
       /* GEN */
-      RegisterDemand operand_demand;
       for (unsigned i = 0; i < insn->operands.size(); ++i) {
          Operand& operand = insn->operands[i];
          if (!operand.isTemp())
@@ -275,6 +309,33 @@ process_live_temps_per_block(live_ctx& ctx, Block* block)
                   operand_demand += temp;
                   insn->operands[j].setCopyKill(true);
                }
+            }
+         }
+         /* If this operand is part of a vector, check if the temporary needs to be duplicated. */
+         if (is_vector_op || operand.isVectorAligned()) {
+            /* Set copyKill if any other vector-operand uses the same temporary. If a scalar operand
+             * uses the same temporary, assume that it can share the register. This ignores other
+             * register constraints like tied definitions or precolored registers.
+             */
+            bool other_is_vector_op = false;
+            for (unsigned j = 0; j < i; j++) {
+               if ((other_is_vector_op || insn->operands[j].isVectorAligned()) &&
+                   insn->operands[j].getTemp() == temp) {
+                  operand_demand += temp;
+                  insn->register_demand += temp; /* Because of lateKill */
+                  operand.setCopyKill(true);
+                  break;
+               }
+               other_is_vector_op = insn->operands[j].isVectorAligned();
+            }
+         }
+         is_vector_op = operand.isVectorAligned();
+
+         if (operand.isLateKill()) {
+            /* Make sure that same temporaries have same lateKill flags. */
+            for (Operand& other : insn->operands) {
+               if (other.isTemp() && other.getTemp() == operand.getTemp())
+                  other.setLateKill(true);
             }
          }
 

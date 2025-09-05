@@ -1,50 +1,49 @@
-name: macOS-CI
+name: Linux-CI
 
-# Permite que o workflow seja executado manualmente e também no push
+# Permite execução manual e push
 on:
   push:
-  workflow_dispatch:  # Isso adiciona o botão "Run workflow" no GitHub Actions
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  macOS-CI:
+  linux-CI:
     strategy:
       matrix:
         glx_option: ['dri', 'xlib']
-    runs-on: macos-11
+    runs-on: ubuntu-latest
     env:
       GALLIUM_DUMP_CPU: true
-      MESON_EXEC: /Users/runner/Library/Python/3.11/bin/meson
+      MESON_EXEC: $HOME/.local/bin/meson
 
     steps:
       # 1️⃣ Checkout do código
       - name: Checkout
         uses: actions/checkout@v3
 
-      # 2️⃣ Instalar dependências via Homebrew
+      # 2️⃣ Instalar dependências via apt
       - name: Install Dependencies
         run: |
-          cat > Brewfile <<EOL
-          brew "bison"
-          brew "expat"
-          brew "gettext"
-          brew "libx11"
-          brew "libxcb"
-          brew "libxdamage"
-          brew "libxext"
-          brew "molten-vk"
-          brew "ninja"
-          brew "pkg-config"
-          brew "python@3.10"
-          EOL
-
-          brew update
-          brew bundle --verbose
+          sudo apt-get update
+          sudo apt-get install -y \
+            bison \
+            expat \
+            gettext \
+            libx11-dev \
+            libxcb1-dev \
+            libxdamage-dev \
+            libxext-dev \
+            ninja-build \
+            pkg-config \
+            python3.10 \
+            python3-pip \
+            libllvm-dev \
+            llvm
 
       # 3️⃣ Instalar Mako e Meson via pip
-      - name: Install Mako and meson
+      - name: Install Mako and Meson
         run: pip3 install --user mako meson
 
       # 4️⃣ Configuração do build
@@ -52,10 +51,9 @@ jobs:
         run: |
           cat > native_config <<EOL
           [binaries]
-          llvm-config = '/usr/local/opt/llvm/bin/llvm-config'
+          llvm-config = "$(which llvm-config)"
           EOL
           $MESON_EXEC . build --native-file=native_config \
-            -Dmoltenvk-dir=$(brew --prefix molten-vk) \
             -Dbuild-tests=true \
             -Dgallium-drivers=swrast,zink \
             -Dglx=${{ matrix.glx_option }}
@@ -77,7 +75,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: macos-${{ matrix.glx_option }}-result
+          name: linux-${{ matrix.glx_option }}-result
           path: |
             build/meson-logs/
             install/

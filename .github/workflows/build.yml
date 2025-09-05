@@ -1,0 +1,62 @@
+name: Build Mesa Fork
+
+on:
+  workflow_dispatch:   # permite rodar manualmente
+  push:
+    branches:
+      - "**"
+  pull_request:
+    branches:
+      - "**"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout código
+      uses: actions/checkout@v4
+
+    - name: Instalar dependências
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          meson ninja-build python3-mako python3-pip \
+          libx11-dev libx11-xcb-dev libxext-dev libxdamage-dev libxfixes-dev \
+          libxcb-glx0-dev libxcb-dri2-0-dev libxcb-dri3-dev \
+          libxcb-present-dev libxcb-sync-dev libxcb-shm0-dev libxshmfence-dev \
+          libxxf86vm-dev libxrandr-dev libwayland-dev wayland-protocols \
+          libzstd-dev libexpat1-dev libvulkan-dev \
+          glslang-tools libglvnd-dev libvdpau-dev libdrm-dev
+
+    - name: Configurar build
+      run: |
+        mkdir build
+        cd build
+        meson setup .. \
+          -Dvulkan-drivers=wrapper \
+          -Dgallium-drivers= \
+          -Dgallium-opencl=disabled \
+          -Dgallium-rusticl=false \
+          -Dopencl-spirv=false \
+          -Dopengl=false \
+          -Dgles1=disabled \
+          -Dgles2=disabled \
+          -Degl=disabled \
+          -Dglx=disabled
+
+    - name: Compilar
+      run: |
+        cd build
+        ninja
+
+    - name: Empacotar em tar.gz
+      run: |
+        cd build
+        tar -czvf mesa-build.tar.gz *
+
+    - name: Upload artefato
+      uses: actions/upload-artifact@v4
+      with:
+        name: mesa-build
+        path: build/mesa-build.tar.gz
